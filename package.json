@@ -1,0 +1,39 @@
+{
+  "name": "page2webmcp",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "packageManager": "pnpm@10.14.0",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "lint": "node scripts/check-source.mjs",
+    "typecheck": "tsc --project tsconfig.base.json --noEmit",
+    "test": "tsx --test test-support/**/*.test.ts apps/**/*.test.ts packages/**/*.test.ts",
+    "test:e2e": "tsx --test e2e/**/*.test.ts && playwright test",
+    "test:db:local": "bash scripts/test-rls-local.sh",
+    "test:all": "pnpm lint && pnpm typecheck && pnpm test && pnpm test:e2e",
+    "infra:up": "node infra/scripts/infra.mjs up",
+    "infra:down": "node infra/scripts/infra.mjs down",
+    "infra:reset": "node infra/scripts/reset-test-data.mjs",
+    "dev": "node scripts/dev.mjs",
+    "build": "pnpm --filter @page2webmcp/acme-support build && pnpm --filter @page2webmcp/control-plane build"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.62.1",
+    "@types/node": "22.15.0",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.5",
+    "playwright": "^1.62.1",
+    "tsx": "4.20.5",
+    "typescript": "5.9.2"
+  },
+  "dependencies": {
+    "next": "^16.3.3",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "yaml": "2.8.1",
+    "zod": "^4.4.3"
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "name": "@page2webmcp/acme-support",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start"
+  },
+  "devDependencies": {
+    "@types/react": "19.2.18"
+  }
+}
