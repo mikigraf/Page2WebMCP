@@ -18,6 +18,23 @@ pnpm test:db:local
 
 `test:all` starts both Next.js applications and performs all browser setup itself. It does not need cloud credentials, Docker, clicks, or personal accounts. The separate database command creates and removes a disposable local PostgreSQL cluster.
 
+## Environment configuration
+
+`.env.example` documents every local and future live-integration setting. A safe local `.env` is already present but ignored by Git; it contains only fixture values and empty placeholders. To reset it, copy the tracked template:
+
+```bash
+cp .env.example .env
+```
+
+Keep `PAGE2WEBMCP_PROVIDER_MODE=local` for all built-in checks. Set it to `live` only after provisioning dedicated disposable credentials and public deployment URLs. Add the following values only in your local `.env` or the relevant deployment platform’s secret manager—never in Git, browser-visible code, screenshots, or test evidence:
+
+- Supabase URL/keys and server-side database URL
+- GitHub App ID, installation ID, private key, and webhook secret
+- Browser Use (or equivalent) API key and project endpoint
+- optional worker queue URL
+
+`NEXT_PUBLIC_*` keys are intentionally public browser configuration; all other credentials must remain server-only. Deployment-provider access tokens are not represented in `.env`: store them in Vercel, Render, or your chosen CI secret manager rather than the application runtime environment.
+
 ## Fixture accounts
 
 | Application | Email | Password | Role |
