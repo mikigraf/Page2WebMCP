@@ -27,6 +27,8 @@ The fixture HTTP server is exercised by the test suite. Its public API contract 
 
 See [the local operation guide](docs/OPERATIONS.md) for fixture accounts, the three-path demo, supported scope, and the security model.
 
+Additional project references: [architecture](docs/architecture.md), [testing](docs/testing.md), [demo](docs/demo.md), and [security reporting](SECURITY.md).
+
 ## Current WebMCP API alignment
 
 Generated artifacts use `document.modelContext`, which Chrome documents as the current imperative API; they do not use the deprecated `navigator.modelContext` surface. Tool registrations use an `AbortSignal` for lifecycle cleanup, and generated code does not opt into cross-origin exposure. See Chrome’s [imperative API guide](https://developer.chrome.com/docs/ai/webmcp/imperative-api) and [tool security guidance](https://developer.chrome.com/docs/ai/webmcp/secure-tools).

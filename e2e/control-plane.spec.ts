@@ -9,7 +9,7 @@ test("control-plane creates and analyzes website, OpenAPI, and GitHub projects w
   await page.getByLabel("Source type").selectOption("website");
   await page.getByLabel("Source URL").fill("https://acme.example");
   await page.getByRole("button", { name: "Create project" }).click();
-  await expect(page.getByText("Project project-1 created")).toBeVisible();
+  await expect(page.getByRole("status")).toHaveText(/Project project-\d+ created/);
   await page.getByRole("button", { name: "Analyze website" }).click();
   await expect(page.getByText("find_order", { exact: true })).toBeVisible();
   await expect(page.getByText("delete_account: blocked")).toBeVisible();

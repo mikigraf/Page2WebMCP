@@ -17,6 +17,7 @@
     "infra:up": "node infra/scripts/infra.mjs up",
     "infra:down": "node infra/scripts/infra.mjs down",
     "infra:reset": "node infra/scripts/reset-test-data.mjs",
+    "demo:seed": "node scripts/demo-seed.mjs",
     "dev": "node scripts/dev.mjs",
     "build": "pnpm --filter @page2webmcp/acme-support build && pnpm --filter @page2webmcp/control-plane build"
   },
