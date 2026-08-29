@@ -1,4 +1,45 @@
-import { NextResponse } from "next/server";
-import { evaluateRelease, VerificationReport } from "../../../../../../packages/evals/src/verify";
+import { z } from "zod";
+import { getControlPlaneRepository } from "../../../../../../packages/database/src/factory.ts";
+import {
+  assertSameOrigin,
+  createRequestId,
+  errorResponse,
+  parseJsonBody,
+  requireActor,
+  successResponse
+} from "../../../../src/api.ts";
+import { verifyPersistedRelease } from "../../../../src/releases.ts";
+import { recordLifecycle, recordLifecycleFailure } from "../../../../src/telemetry.ts";
 
-export async function POST(request: Request) { const report = await request.json() as VerificationReport; return NextResponse.json(evaluateRelease(report)); }
+const VerifyInputSchema = z.object({
+  projectId: z.string().uuid(),
+  analysisRunId: z.string().uuid()
+}).strict();
+
+export async function POST(request: Request) {
+  const requestId = createRequestId();
+  const startedAt = Date.now();
+  try {
+    assertSameOrigin(request);
+    const actor = requireActor(request);
+    const input = await parseJsonBody(request, VerifyInputSchema);
+    const verification = await verifyPersistedRelease(
+      getControlPlaneRepository(),
+      actor,
+      input.projectId,
+      input.analysisRunId
+    );
+    await recordLifecycle({
+      event: "release_verified",
+      operation: "verify",
+      outcome: verification.eligible ? "success" : "failure",
+      requestId,
+      properties: { duration_ms: Date.now() - startedAt }
+    });
+    return successResponse({ verification }, requestId);
+  } catch (error) {
+    const response = errorResponse(error, requestId);
+    await recordLifecycleFailure({ event: "release_verified", operation: "verify", requestId, startedAt }, error, response.status);
+    return response;
+  }
+}

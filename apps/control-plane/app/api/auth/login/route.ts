@@ -1,12 +1,32 @@
-import { NextResponse } from "next/server";
 import { z } from "zod";
-import { authenticate } from "../../../../src/auth";
+import {
+  ApiError,
+  assertSameOrigin,
+  createRequestId,
+  errorResponse,
+  parseJsonBody,
+  successResponse
+} from "../../../../src/api.ts";
+import { authenticate, issueSession, sessionCookie } from "../../../../src/auth.ts";
 
 const InputSchema = z.object({ email: z.string().email(), password: z.string().min(1) }).strict();
 
 export async function POST(request: Request) {
-  const input = InputSchema.safeParse(await request.json().catch(() => null));
-  const role = input.success ? authenticate(input.data.email, input.data.password) : undefined;
-  if (!role) return NextResponse.json({ code: "AUTH_REQUIRED" }, { status: 401 });
-  return new NextResponse(JSON.stringify({ role }), { status: 200, headers: { "content-type": "application/json", "set-cookie": `page2webmcp_role=${role}; Path=/; HttpOnly; SameSite=Lax` } });
+  const requestId = createRequestId();
+  try {
+    assertSameOrigin(request);
+    const input = await parseJsonBody(request, InputSchema);
+    const actor = authenticate(input.email, input.password);
+    if (!actor) throw new ApiError("AUTH_REQUIRED", 401);
+    const token = issueSession(actor);
+    const secure = new URL(request.url).protocol === "https:" || process.env.NODE_ENV === "production";
+    return successResponse(
+      { actorId: actor.id, role: actor.role },
+      requestId,
+      200,
+      { "set-cookie": sessionCookie(token, secure) }
+    );
+  } catch (error) {
+    return errorResponse(error, requestId);
+  }
 }

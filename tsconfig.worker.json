@@ -1,0 +1,12 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "allowImportingTsExtensions": true,
+    "noEmit": false,
+    "outDir": ".dist/worker",
+    "rootDir": ".",
+    "rewriteRelativeImportExtensions": true,
+    "sourceMap": true
+  },
+  "include": ["apps/worker/src/main.ts"]
+}

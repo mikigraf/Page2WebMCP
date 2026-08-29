@@ -1,5 +1,7 @@
 # Page2WebMCP — Product Requirements Document
 
+> **Status: historical, aspirational hackathon brief — not the implemented product contract.** This document records the original product vision and includes unimplemented live-provider, autonomous-browser, agent-orchestration, installation, and rollback concepts. The current supported behavior is the fixed Acme fixture scope documented in [README.md](README.md), [docs/architecture.md](docs/architecture.md), and [docs/OPERATIONS.md](docs/OPERATIONS.md). Production startup deliberately rejects unsupported live-provider mode.
+
 ## Paste your website or OpenAPI URL → get a production-ready WebMCP layer in minutes
 
 **Version:** 1.0  

@@ -4,7 +4,16 @@ import { execFileSync } from "node:child_process";
 import root from "../package.json" with { type: "json" };
 
 test("exposes a fully autonomous verification command", () => {
-  assert.equal(root.scripts["test:all"], "pnpm lint && pnpm typecheck && pnpm test && pnpm test:e2e");
+  const command = root.scripts["test:all"];
+  for (const required of [
+    "pnpm lint",
+    "pnpm security:policy",
+    "pnpm typecheck",
+    "pnpm test",
+    "pnpm test:db:local",
+    "pnpm build",
+    "pnpm test:e2e"
+  ]) assert.match(command, new RegExp(required.replaceAll(":", "\\:")));
 });
 
 test("exposes a machine-readable local demo seed command", () => {
