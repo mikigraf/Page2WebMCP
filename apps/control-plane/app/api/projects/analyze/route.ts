@@ -1,16 +1,51 @@
-import { NextResponse } from "next/server";
+import { createHash } from "node:crypto";
 import { z } from "zod";
-import { AcmeSupport } from "../../../../../acme-support/src/app";
-import { runFixtureSourceHardening, runFixtureWorkflow } from "../../../../../worker/src/workflow";
+import { InMemoryControlPlaneRepository } from "../../../../../../packages/database/src/control-plane.ts";
+import { getControlPlaneRepository } from "../../../../../../packages/database/src/factory.ts";
+import { processNextAnalysis } from "../../../../../worker/src/runner.ts";
+import {
+  ApiError,
+  assertSameOrigin,
+  createRequestId,
+  errorResponse,
+  parseJsonBody,
+  requireActor,
+  successResponse
+} from "../../../../src/api.ts";
 
-const InputSchema = z.object({ sourceType: z.enum(["website", "openapi", "github"]) }).strict();
+const AnalyzeInputSchema = z.object({ projectId: z.string().uuid() }).strict();
+const IDEMPOTENCY_KEY = /^[a-zA-Z0-9._:-]{8,128}$/;
 
 export async function POST(request: Request) {
-  const input = InputSchema.safeParse(await request.json().catch(() => null));
-  if (!input.success) return NextResponse.json({ code: "INVALID_SOURCE_TYPE" }, { status: 400 });
-  if (input.data.sourceType === "github") {
-    return NextResponse.json({ sourceType: "github", draftPullRequest: runFixtureSourceHardening() });
+  const requestId = createRequestId();
+  try {
+    assertSameOrigin(request);
+    const actor = requireActor(request);
+    const input = await parseJsonBody(request, AnalyzeInputSchema);
+    const idempotencyKey = request.headers.get("idempotency-key") ?? "";
+    if (!IDEMPOTENCY_KEY.test(idempotencyKey)) throw new ApiError("IDEMPOTENCY_KEY_REQUIRED", 400);
+
+    const repository = getControlPlaneRepository();
+    await repository.getProject(actor, input.projectId);
+    const inputHash = createHash("sha256").update(JSON.stringify(input)).digest("hex");
+    const run = await repository.enqueueAnalysis(actor, {
+      projectId: input.projectId,
+      idempotencyKey,
+      inputHash
+    });
+
+    // The fixture adapter has no external process, but still exercises the same
+    // durable claim/lease/completion protocol as the PostgreSQL worker.
+    if (repository instanceof InMemoryControlPlaneRepository && run.status === "queued") {
+      for (let processed = 0; processed < 256; processed += 1) {
+        const target = await repository.getAnalysis(actor, run.id);
+        if (target.status !== "queued") break;
+        if (!await processNextAnalysis(repository)) break;
+      }
+    }
+    const current = await repository.getAnalysis(actor, run.id);
+    return successResponse({ runId: current.id, status: current.status }, requestId, 202);
+  } catch (error) {
+    return errorResponse(error, requestId);
   }
-  const result = runFixtureWorkflow(new AcmeSupport(), "https://acme.example");
-  return NextResponse.json({ sourceType: input.data.sourceType, capabilities: result.capabilities, evidence: result.evidence, contentHash: result.release.contentHash });
 }

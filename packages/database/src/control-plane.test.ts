@@ -1,0 +1,654 @@
+import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import test from "node:test";
+import {
+  capabilityStateDigest,
+  InMemoryControlPlaneRepository,
+  RepositoryError,
+  type RepositoryActor
+} from "./control-plane.ts";
+
+const owner: RepositoryActor = {
+  id: "11111111-1111-1111-1111-111111111111",
+  organizationId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+  role: "owner"
+};
+const editor: RepositoryActor = {
+  id: "33333333-3333-3333-3333-333333333333",
+  organizationId: owner.organizationId,
+  role: "editor"
+};
+const outsider: RepositoryActor = {
+  id: "22222222-2222-2222-2222-222222222222",
+  organizationId: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+  role: "owner"
+};
+
+function releaseCandidate(code: string, allowedOrigin = "https://acme.example") {
+  return {
+    code,
+    contentHash: createHash("sha256").update(Buffer.from(code)).digest("hex"),
+    allowedOrigin,
+    manifest: { version: 1 }
+  };
+}
+
+test("capability-state digests use locale-independent canonical ordering", () => {
+  const capabilities = [
+    {
+      id: "a",
+      analysisRunId: "run",
+      stableName: "ä_tool",
+      riskTier: "R1",
+      status: "blocked",
+      version: 2
+    },
+    {
+      id: "b",
+      analysisRunId: "run",
+      stableName: "z_tool",
+      riskTier: "R0",
+      status: "proposed",
+      version: 1
+    }
+  ] as const;
+
+  assert.equal(
+    capabilityStateDigest(capabilities),
+    "71a8f219e95565fdadc374a69c693616def0658799b53985cfd91fa8fc1dc078"
+  );
+});
+
+test("projects are tenant scoped and use opaque identifiers", async () => {
+  const repository = new InMemoryControlPlaneRepository();
+  const request = {
+    name: "Acme Support",
+    sourceType: "website",
+    url: "https://acme.example",
+    idempotencyKey: "project-opaque",
+    inputHash: "project-opaque"
+  } as const;
+  const project = await repository.createProject(owner, request);
+
+  assert.match(project.id, /^[0-9a-f-]{36}$/);
+  assert.equal((await repository.createProject(owner, request)).id, project.id);
+  await assert.rejects(
+    repository.createProject(owner, { ...request, inputHash: "project-changed" }),
+    (error: unknown) => error instanceof RepositoryError && error.code === "IDEMPOTENCY_CONFLICT"
+  );
+  assert.deepEqual(await repository.listProjects(editor), [project]);
+  await assert.rejects(repository.getProject(outsider, project.id), (error: unknown) =>
+    error instanceof RepositoryError && error.code === "NOT_FOUND");
+});
+
+test("in-memory records cannot mutate persisted repository state", async () => {
+  const repository = new InMemoryControlPlaneRepository();
+  const project = await repository.createProject(owner, {
+    name: "Immutable boundary",
+    sourceType: "website",
+    url: "https://acme.example",
+    idempotencyKey: "project-immutable-boundary",
+    inputHash: "project-immutable-boundary"
+  });
+
+  project.name = "caller mutation";
+  const listed = await repository.listProjects(owner);
+  listed[0].status = "failed";
+
+  const persisted = await repository.getProject(owner, project.id);
+  assert.equal(persisted.name, "Immutable boundary");
+  assert.equal(persisted.status, "created");
+});
+
+test("analysis enqueue is idempotent and leased jobs recover after expiry", async () => {
+  let now = new Date("2026-08-29T12:00:00.000Z");
+  const repository = new InMemoryControlPlaneRepository(() => now);
+  const project = await repository.createProject(owner, {
+    name: "Acme Support",
+    sourceType: "openapi",
+    url: "https://acme.example/openapi.json",
+    idempotencyKey: "project-analysis-one",
+    inputHash: "project-analysis-one"
+  });
+  const input = {
+    projectId: project.id,
+    idempotencyKey: "analysis-one",
+    inputHash: "same-input"
+  };
+
+  const first = await repository.enqueueAnalysis(owner, input);
+  const duplicate = await repository.enqueueAnalysis(owner, input);
+  assert.equal(duplicate.id, first.id);
+  await assert.rejects(
+    repository.enqueueAnalysis(owner, { ...input, inputHash: "changed-input" }),
+    (error: unknown) => error instanceof RepositoryError && error.code === "IDEMPOTENCY_CONFLICT"
+  );
+
+  const claimed = await repository.claimAnalysis("worker-a", 60_000);
+  assert.equal(claimed?.id, first.id);
+  assert.equal(claimed?.attempts, 1);
+  assert.equal(claimed?.sourceType, "openapi");
+  assert.equal(claimed?.sourceUrl, "https://acme.example/openapi.json");
+  assert.equal(await repository.claimAnalysis("worker-b", 60_000), undefined);
+
+  now = new Date(now.getTime() + 61_000);
+  const recovered = await repository.claimAnalysis("worker-b", 60_000);
+  assert.equal(recovered?.id, first.id);
+  assert.equal(recovered?.attempts, 2);
+});
+
+test("analysis completion persists capability ownership and optimistic reviews", async () => {
+  const repository = new InMemoryControlPlaneRepository();
+  const project = await repository.createProject(owner, {
+    name: "Acme Support",
+    sourceType: "website",
+    url: "https://acme.example",
+    idempotencyKey: "project-capabilities",
+    inputHash: "project-capabilities"
+  });
+  const run = await repository.enqueueAnalysis(owner, {
+    projectId: project.id,
+    idempotencyKey: "analysis-two",
+    inputHash: "input"
+  });
+  await repository.claimAnalysis("worker-a", 60_000);
+  const completed = await repository.completeAnalysis("worker-a", run.id, {
+    capabilities: [
+      { stableName: "find_order", riskTier: "R0", status: "proposed" },
+      { stableName: "create_support_ticket", riskTier: "R1", status: "proposed" },
+      { stableName: "delete_account", riskTier: "R3", status: "blocked" }
+    ],
+    evidence: [{ source: "openapi", path: "/api/orders" }],
+    release: { code: "export const fixture = true;", contentHash: "candidate", allowedOrigin: "https://acme.example" }
+  });
+  assert.equal(completed.status, "succeeded");
+  assert.equal(completed.leaseOwner, undefined);
+  assert.equal(completed.leaseExpiresAt, undefined);
+
+  const capabilities = await repository.listCapabilities(owner, project.id);
+  const ticket = capabilities.find((item) => item.stableName === "create_support_ticket");
+  const blocked = capabilities.find((item) => item.stableName === "delete_account");
+  assert.ok(ticket);
+  assert.ok(blocked);
+
+  await assert.rejects(
+    repository.reviewCapability(editor, ticket.id, { action: "approve", expectedVersion: 1 }),
+    (error: unknown) => error instanceof RepositoryError && error.code === "OWNER_APPROVAL_REQUIRED"
+  );
+  const reviewed = await repository.reviewCapability(owner, ticket.id, { action: "approve", expectedVersion: 1 });
+  assert.equal(reviewed.status, "reviewed");
+  assert.equal(reviewed.version, 2);
+  assert.equal(
+    (await repository.getAnalysisResult(owner, run.id))?.capabilities
+      .find((item) => item.stableName === ticket.stableName)?.status,
+    "reviewed"
+  );
+  await assert.rejects(
+    repository.reviewCapability(owner, ticket.id, { action: "approve", expectedVersion: 1 }),
+    (error: unknown) => error instanceof RepositoryError && error.code === "VERSION_CONFLICT"
+  );
+  await assert.rejects(
+    repository.reviewCapability(owner, blocked.id, { action: "approve", expectedVersion: 1 }),
+    (error: unknown) => error instanceof RepositoryError && error.code === "HIGH_RISK_ACTION"
+  );
+});
+
+test("eligible publication is content addressed and idempotent", async () => {
+  const repository = new InMemoryControlPlaneRepository();
+  const project = await repository.createProject(owner, {
+    name: "Acme Support",
+    sourceType: "website",
+    url: "https://acme.example",
+    idempotencyKey: "project-publish",
+    inputHash: "project-publish"
+  });
+  const run = await repository.enqueueAnalysis(owner, {
+    projectId: project.id,
+    idempotencyKey: "analysis-three",
+    inputHash: "input"
+  });
+  await repository.claimAnalysis("worker", 60_000);
+  await repository.completeAnalysis("worker", run.id, {
+    capabilities: [{ stableName: "find_order", riskTier: "R0", status: "proposed" }],
+    evidence: [{ source: "runtime", path: "/api/orders" }],
+    release: { code: "export const fixture = true;", contentHash: "candidate", allowedOrigin: "https://acme.example" }
+  });
+  const capabilityState = capabilityStateDigest(await repository.listAnalysisCapabilities(owner, run.id));
+  const verificationInput = {
+    analysisRunId: run.id,
+    capabilityStateDigest: capabilityState,
+    candidate: releaseCandidate("export const fixture = true;"),
+    schema: true,
+    authenticated: true,
+    replayPasses: 3,
+    noSecretLeakage: true,
+    browserExecution: true,
+    selectionScore: 20
+  };
+  const verification = await repository.saveVerification(owner, project.id, verificationInput);
+
+  const request = {
+    projectId: project.id,
+    analysisRunId: run.id,
+    capabilityStateDigest: capabilityState,
+    candidateContentHash: verification.candidateContentHash,
+    idempotencyKey: "publish-one",
+    inputHash: "publish-input"
+  };
+  const release = await repository.publishRelease(owner, request);
+  const retriedVerification = await repository.saveVerification(owner, project.id, verificationInput);
+  assert.equal(retriedVerification.id, verification.id);
+  const duplicate = await repository.publishRelease(owner, request);
+  assert.equal(duplicate.id, release.id);
+  assert.equal(release.capabilityStateDigest, capabilityState);
+  assert.match(release.contentHash, /^[0-9a-f]{64}$/);
+  assert.match(release.sri, /^sha256-/);
+  assert.equal((await repository.getReleaseArtifact(release.contentHash)).code, "export const fixture = true;");
+  await assert.rejects(repository.saveVerification(owner, project.id, {
+    ...verificationInput,
+    candidate: releaseCandidate("export const changedAfterPublish = true;")
+  }), (error: unknown) => error instanceof RepositoryError
+    && error.code === "RELEASE_GATE_FAILED"
+    && error.details?.includes("CANDIDATE_CHANGED"));
+  await assert.rejects(
+    repository.publishRelease(editor, { ...request, idempotencyKey: "publish-editor" }),
+    (error: unknown) => error instanceof RepositoryError && error.code === "FORBIDDEN"
+  );
+});
+
+test("publication rejects an exact analysis run without evidence", async () => {
+  const repository = new InMemoryControlPlaneRepository();
+  const project = await repository.createProject(owner, {
+    name: "Evidence gate",
+    sourceType: "website",
+    url: "https://acme.example",
+    idempotencyKey: "project-evidence-gate",
+    inputHash: "project-evidence-gate"
+  });
+  const run = await repository.enqueueAnalysis(owner, {
+    projectId: project.id,
+    idempotencyKey: "analysis-evidence-gate",
+    inputHash: "analysis-evidence-gate"
+  });
+  await repository.claimAnalysis("evidence-worker", 60_000);
+  await repository.completeAnalysis("evidence-worker", run.id, {
+    capabilities: [{ stableName: "find_order", riskTier: "R0", status: "proposed" }],
+    evidence: [],
+    release: releaseCandidate("export const evidenceGate = true;")
+  });
+  const digest = capabilityStateDigest(await repository.listAnalysisCapabilities(owner, run.id));
+  const verification = await repository.saveVerification(owner, project.id, {
+    analysisRunId: run.id,
+    capabilityStateDigest: digest,
+    candidate: releaseCandidate("export const evidenceGate = true;"),
+    schema: true,
+    authenticated: true,
+    replayPasses: 3,
+    noSecretLeakage: true,
+    browserExecution: true,
+    selectionScore: 20
+  });
+
+  await assert.rejects(repository.publishRelease(owner, {
+    projectId: project.id,
+    analysisRunId: run.id,
+    capabilityStateDigest: digest,
+    candidateContentHash: verification.candidateContentHash,
+    idempotencyKey: "publish-evidence-gate",
+    inputHash: "publish-evidence-gate"
+  }), (error: unknown) => error instanceof RepositoryError
+    && error.code === "RELEASE_GATE_FAILED"
+    && error.details?.includes("EVIDENCE_MISSING_OR_EXPIRED"));
+});
+
+test("only one analysis can be active for a project and expired idempotency keys can be reused", async () => {
+  let now = new Date("2026-08-29T12:00:00.000Z");
+  const repository = new InMemoryControlPlaneRepository(() => now);
+  const project = await repository.createProject(owner, {
+    name: "Acme Support",
+    sourceType: "website",
+    url: "https://acme.example",
+    idempotencyKey: "project-active",
+    inputHash: "project-active"
+  });
+  const request = { projectId: project.id, idempotencyKey: "bounded-key", inputHash: "first" };
+  const first = await repository.enqueueAnalysis(owner, request);
+
+  await assert.rejects(
+    repository.enqueueAnalysis(owner, { ...request, idempotencyKey: "another-key" }),
+    (error: unknown) => error instanceof RepositoryError && error.code === "INVALID_STATE"
+  );
+
+  await repository.claimAnalysis("worker", 60_000);
+  await repository.failAnalysis("worker", first.id, "TERMINAL", false);
+  now = new Date(now.getTime() + 24 * 60 * 60 * 1_000 + 1);
+
+  const replacement = await repository.enqueueAnalysis(owner, request);
+  assert.notEqual(replacement.id, first.id);
+});
+
+test("idempotency is organization scoped even when an actor identifier is reused", async () => {
+  const repository = new InMemoryControlPlaneRepository();
+  const projectA = await repository.createProject(owner, {
+    name: "A",
+    sourceType: "website",
+    url: "https://acme.example",
+    idempotencyKey: "project-org-a",
+    inputHash: "project-org-a"
+  });
+  const sameActorOtherOrganization: RepositoryActor = {
+    ...owner,
+    organizationId: outsider.organizationId
+  };
+  const projectB = await repository.createProject(sameActorOtherOrganization, {
+    name: "B",
+    sourceType: "website",
+    url: "https://acme.example",
+    idempotencyKey: "project-org-b",
+    inputHash: "project-org-b"
+  });
+  const first = await repository.enqueueAnalysis(owner, {
+    projectId: projectA.id,
+    idempotencyKey: "same-key",
+    inputHash: "same-input"
+  });
+  const second = await repository.enqueueAnalysis(sameActorOtherOrganization, {
+    projectId: projectB.id,
+    idempotencyKey: "same-key",
+    inputHash: "same-input"
+  });
+  assert.notEqual(first.id, second.id);
+});
+
+test("expired leases cannot be heartbeated or completed and exhausted jobs fail the project", async () => {
+  let now = new Date("2026-08-29T12:00:00.000Z");
+  const repository = new InMemoryControlPlaneRepository(() => now);
+  const project = await repository.createProject(owner, {
+    name: "Acme Support",
+    sourceType: "website",
+    url: "https://acme.example",
+    idempotencyKey: "project-lease",
+    inputHash: "project-lease"
+  });
+  const run = await repository.enqueueAnalysis(owner, {
+    projectId: project.id,
+    idempotencyKey: "lease",
+    inputHash: "lease"
+  });
+
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    assert.equal((await repository.claimAnalysis(`worker-${attempt}`, 1_000))?.attempts, attempt);
+    now = new Date(now.getTime() + 1_001);
+    await assert.rejects(
+      repository.heartbeatAnalysis(`worker-${attempt}`, run.id, 60_000),
+      (error: unknown) => error instanceof RepositoryError && error.code === "LEASE_LOST"
+    );
+  }
+
+  assert.equal(await repository.claimAnalysis("worker-4", 1_000), undefined);
+  assert.equal((await repository.getAnalysis(owner, run.id)).status, "failed");
+  assert.equal((await repository.getProject(owner, project.id)).status, "failed");
+});
+
+test("retryable failures use the same bounded queue backoff as Postgres", async () => {
+  let now = new Date("2026-08-29T12:00:00.000Z");
+  const repository = new InMemoryControlPlaneRepository(() => now);
+  const project = await repository.createProject(owner, {
+    name: "Backoff",
+    sourceType: "website",
+    url: "https://acme.example",
+    idempotencyKey: "project-backoff",
+    inputHash: "project-backoff"
+  });
+  const run = await repository.enqueueAnalysis(owner, {
+    projectId: project.id,
+    idempotencyKey: "analysis-backoff",
+    inputHash: "analysis-backoff"
+  });
+  await repository.claimAnalysis("worker", 60_000);
+  const failedAttempt = await repository.failAnalysis("worker", run.id, "RETRYABLE", true);
+  assert.equal(failedAttempt.status, "queued");
+  assert.equal(failedAttempt.errorCode, "RETRYABLE");
+  assert.equal(failedAttempt.leaseOwner, undefined);
+  assert.equal(await repository.claimAnalysis("worker", 60_000), undefined);
+  now = new Date(now.getTime() + 1_001);
+  assert.equal((await repository.claimAnalysis("worker", 60_000))?.attempts, 2);
+});
+
+test("publication atomically rejects a stale capability-state verification", async () => {
+  const repository = new InMemoryControlPlaneRepository();
+  const project = await repository.createProject(owner, {
+    name: "Acme Support",
+    sourceType: "website",
+    url: "https://acme.example",
+    idempotencyKey: "project-stale",
+    inputHash: "project-stale"
+  });
+  const run = await repository.enqueueAnalysis(owner, {
+    projectId: project.id,
+    idempotencyKey: "analysis-state",
+    inputHash: "analysis-state"
+  });
+  await repository.claimAnalysis("worker", 60_000);
+  await repository.completeAnalysis("worker", run.id, {
+    capabilities: [{ stableName: "create_support_ticket", riskTier: "R1", status: "proposed" }],
+    evidence: [],
+    release: { code: "export const state = true;", contentHash: "ignored", allowedOrigin: "https://acme.example" }
+  });
+  const [capability] = await repository.listAnalysisCapabilities(owner, run.id);
+  const staleDigest = capabilityStateDigest([capability]);
+  const verification = await repository.saveVerification(owner, project.id, {
+    analysisRunId: run.id,
+    capabilityStateDigest: staleDigest,
+    candidate: releaseCandidate("export const state = true;"),
+    schema: true,
+    authenticated: true,
+    replayPasses: 3,
+    noSecretLeakage: true,
+    browserExecution: true,
+    selectionScore: 20
+  });
+  await repository.reviewCapability(owner, capability.id, { action: "approve", expectedVersion: 1 });
+
+  await assert.rejects(
+    repository.publishRelease(owner, {
+      projectId: project.id,
+      analysisRunId: run.id,
+      capabilityStateDigest: staleDigest,
+      candidateContentHash: verification.candidateContentHash,
+      idempotencyKey: "stale-release",
+      inputHash: "stale-release"
+    }),
+    (error: unknown) => error instanceof RepositoryError
+      && error.code === "RELEASE_GATE_FAILED"
+      && error.details?.includes("CAPABILITIES_CHANGED")
+  );
+});
+
+test("a blocked capability publishes reviewed bytes without mutating the worker candidate", async () => {
+  const repository = new InMemoryControlPlaneRepository();
+  const project = await repository.createProject(owner, {
+    name: "Reviewed subset",
+    sourceType: "website",
+    url: "https://acme.example",
+    idempotencyKey: "project-reviewed-subset",
+    inputHash: "project-reviewed-subset"
+  });
+  const run = await repository.enqueueAnalysis(owner, {
+    projectId: project.id,
+    idempotencyKey: "analysis-reviewed-subset",
+    inputHash: "analysis-reviewed-subset"
+  });
+  await repository.claimAnalysis("subset-worker", 60_000);
+  const sourceCandidate = releaseCandidate("export const includesAll = true;");
+  await repository.completeAnalysis("subset-worker", run.id, {
+    capabilities: [
+      { stableName: "find_order", riskTier: "R0", status: "proposed" },
+      { stableName: "create_support_ticket", riskTier: "R1", status: "proposed" }
+    ],
+    evidence: [{ source: "runtime", path: "/api/orders" }],
+    release: sourceCandidate
+  });
+  const capabilities = await repository.listAnalysisCapabilities(owner, run.id);
+  const read = capabilities.find((capability) => capability.stableName === "find_order");
+  const mutation = capabilities.find((capability) => capability.stableName === "create_support_ticket");
+  assert.ok(read);
+  assert.ok(mutation);
+  await repository.reviewCapability(owner, mutation.id, { action: "block", expectedVersion: 1 });
+
+  const reviewed = await repository.listAnalysisCapabilities(owner, run.id);
+  const digest = capabilityStateDigest(reviewed);
+  const candidate = releaseCandidate("export const reviewedSubset = ['find_order'];");
+  const verification = await repository.saveVerification(owner, project.id, {
+    analysisRunId: run.id,
+    capabilityStateDigest: digest,
+    candidate,
+    schema: true,
+    authenticated: true,
+    replayPasses: 3,
+    noSecretLeakage: true,
+    browserExecution: true,
+    selectionScore: 20
+  });
+  const release = await repository.publishRelease(owner, {
+    projectId: project.id,
+    analysisRunId: run.id,
+    capabilityStateDigest: digest,
+    candidateContentHash: verification.candidateContentHash,
+    idempotencyKey: "publish-reviewed-subset",
+    inputHash: "publish-reviewed-subset"
+  });
+
+  assert.equal(release.code, candidate.code);
+  assert.equal(release.contentHash, candidate.contentHash);
+  assert.equal((await repository.getAnalysisResult(owner, run.id))?.release.code, sourceCandidate.code);
+});
+
+test("candidate hashes are validated and a later verification cannot be overwritten by an older publish", async () => {
+  const repository = new InMemoryControlPlaneRepository();
+  const project = await repository.createProject(owner, {
+    name: "Candidate race",
+    sourceType: "website",
+    url: "https://acme.example",
+    idempotencyKey: "project-candidate-race",
+    inputHash: "project-candidate-race"
+  });
+  const run = await repository.enqueueAnalysis(owner, {
+    projectId: project.id,
+    idempotencyKey: "analysis-candidate-race",
+    inputHash: "analysis-candidate-race"
+  });
+  await repository.claimAnalysis("candidate-worker", 60_000);
+  await repository.completeAnalysis("candidate-worker", run.id, {
+    capabilities: [{ stableName: "find_order", riskTier: "R0", status: "proposed" }],
+    evidence: [{ source: "runtime", path: "/api/orders" }],
+    release: releaseCandidate("export const initial = true;")
+  });
+  const digest = capabilityStateDigest(await repository.listAnalysisCapabilities(owner, run.id));
+  await assert.rejects(repository.saveVerification(owner, project.id, {
+    analysisRunId: run.id,
+    capabilityStateDigest: digest,
+    candidate: { ...releaseCandidate("export const bad = true;"), contentHash: "0".repeat(64) },
+    schema: true,
+    authenticated: true,
+    replayPasses: 3,
+    noSecretLeakage: true,
+    browserExecution: true,
+    selectionScore: 20
+  }), (error: unknown) => error instanceof RepositoryError
+    && error.code === "RELEASE_GATE_FAILED"
+    && error.details?.includes("CANDIDATE_HASH_MISMATCH"));
+
+  const first = await repository.saveVerification(owner, project.id, {
+    analysisRunId: run.id,
+    capabilityStateDigest: digest,
+    candidate: releaseCandidate("export const candidate = 'first';"),
+    schema: true,
+    authenticated: true,
+    replayPasses: 3,
+    noSecretLeakage: true,
+    browserExecution: true,
+    selectionScore: 20
+  });
+  const second = await repository.saveVerification(owner, project.id, {
+    analysisRunId: run.id,
+    capabilityStateDigest: digest,
+    candidate: releaseCandidate("export const candidate = 'second';"),
+    schema: true,
+    authenticated: true,
+    replayPasses: 3,
+    noSecretLeakage: true,
+    browserExecution: true,
+    selectionScore: 20
+  });
+  await assert.rejects(repository.publishRelease(owner, {
+    projectId: project.id,
+    analysisRunId: run.id,
+    capabilityStateDigest: digest,
+    candidateContentHash: first.candidateContentHash,
+    idempotencyKey: "publish-old-candidate",
+    inputHash: "publish-old-candidate"
+  }), (error: unknown) => error instanceof RepositoryError
+    && error.code === "RELEASE_GATE_FAILED"
+    && error.details?.includes("CANDIDATE_CHANGED"));
+
+  const release = await repository.publishRelease(owner, {
+    projectId: project.id,
+    analysisRunId: run.id,
+    capabilityStateDigest: digest,
+    candidateContentHash: second.candidateContentHash,
+    idempotencyKey: "publish-new-candidate",
+    inputHash: "publish-new-candidate"
+  });
+  assert.equal(release.code, "export const candidate = 'second';");
+});
+
+test("identical code remains attributable to each exact analysis run", async () => {
+  const repository = new InMemoryControlPlaneRepository();
+  const project = await repository.createProject(owner, {
+    name: "Acme Support",
+    sourceType: "website",
+    url: "https://acme.example",
+    idempotencyKey: "project-attribution",
+    inputHash: "project-attribution"
+  });
+  const releases = [];
+  for (let index = 0; index < 2; index += 1) {
+    const run = await repository.enqueueAnalysis(owner, {
+      projectId: project.id,
+      idempotencyKey: `analysis-${index}`,
+      inputHash: `analysis-${index}`
+    });
+    await repository.claimAnalysis(`worker-${index}`, 60_000);
+    await repository.completeAnalysis(`worker-${index}`, run.id, {
+      capabilities: [{ stableName: "find_order", riskTier: "R0", status: "proposed" }],
+      evidence: [{ source: "runtime", path: "/api/orders" }],
+      release: { code: "export const same = true;", contentHash: "ignored", allowedOrigin: "https://acme.example" }
+    });
+    const digest = capabilityStateDigest(await repository.listAnalysisCapabilities(owner, run.id));
+    const verification = await repository.saveVerification(owner, project.id, {
+      analysisRunId: run.id,
+      capabilityStateDigest: digest,
+      candidate: releaseCandidate("export const same = true;"),
+      schema: true,
+      authenticated: true,
+      replayPasses: 3,
+      noSecretLeakage: true,
+      browserExecution: true,
+      selectionScore: 20
+    });
+    releases.push(await repository.publishRelease(owner, {
+      projectId: project.id,
+      analysisRunId: run.id,
+      capabilityStateDigest: digest,
+      candidateContentHash: verification.candidateContentHash,
+      idempotencyKey: `release-${index}`,
+      inputHash: `release-${index}`
+    }));
+  }
+
+  assert.notEqual(releases[0].id, releases[1].id);
+  assert.notEqual(releases[0].analysisRunId, releases[1].analysisRunId);
+  assert.equal(releases[0].contentHash, releases[1].contentHash);
+  assert.equal((await repository.getReleaseArtifact(releases[0].contentHash)).code, "export const same = true;");
+});

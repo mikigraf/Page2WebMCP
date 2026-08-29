@@ -8,6 +8,7 @@
     "start": "next start"
   },
   "devDependencies": {
+    "@apidevtools/swagger-parser": "10.1.1",
     "@types/react": "19.2.18"
   }
 }

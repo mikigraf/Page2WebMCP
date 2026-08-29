@@ -1,32 +1,44 @@
 # Page2WebMCP
 
-Page2WebMCP compiles existing web and OpenAPI evidence into a constrained, imperative WebMCP tool layer.
+Page2WebMCP turns the repository's existing Acme website, OpenAPI, and GitHub fixture evidence into a constrained WebMCP artifact. The implemented product scope is deliberately narrow: it supports only the committed Acme fixture adapters and rejects unsupported live-provider mode.
 
-## Implemented vertical slice
+## What works end to end
 
-- TypeScript Acme Support fixture app with authenticated order search/status, ticket creation, and an intentionally blocked account deletion action.
-- OpenAPI 3.1 evidence for the fixture.
-- Shared `CapabilityIR` status model that blocks R3 and gates production publication on deterministic verification.
-- Security primitives for HTTPS/public-target checks, read-only discovery firewalling, origin allowlisting, and recursive credential redaction.
-- Imperative WebMCP artifact compiler using current `document.modelContext.registerTool()` registration, strict schemas, same-origin defaults, annotations, and abort-driven unregistration.
-- Worker workflow that derives the fixture’s three executable tools and preserves the high-risk capability as blocked evidence.
-- Fully automated TypeScript end-to-end acceptance test, with no interactive login or external service requirement.
+- Signed, expiring control-plane sessions for the fixture owner and editor.
+- Idempotent project creation, durable analysis jobs, bounded worker leases/retries, and recovery after an expired lease.
+- Deterministic website, OpenAPI, and GitHub fixture analysis.
+- Tenant-scoped capability review with optimistic concurrency and fail-closed R3 handling.
+- Verification derived from persisted evidence, release code, manifest, and the exact reviewed capability state.
+- Idempotent publication of content-addressed JavaScript with SHA-256/SRI, immutable caching, ETags, and exact-run attribution.
+- Generated tools with strict schemas, same-origin credentials, bounded request/response handling, confirmation for mutation, and deterministic registration cleanup.
+- PostgreSQL row-level security, composite tenant constraints, separate application/worker roles, and a least-privileged integration test.
+- Structured lifecycle logs plus optional, allowlisted Langfuse traces and PostHog server events.
 
-## Run verification
+The runtime is a deterministic queue and state machine. It does not use an LLM-agent swarm, so adding multi-agent orchestration would introduce failure modes without supporting an existing workflow.
+
+## Verify the repository
+
+Use Node.js 24 and the pnpm version pinned in `package.json`:
 
 ```bash
 corepack enable
-pnpm install
+pnpm install --frozen-lockfile
 pnpm test:all
-pnpm test:db:local
 ```
 
-`test:db:local` starts a disposable local PostgreSQL cluster, applies the committed Supabase migration, and verifies tenant RLS as an owner, a viewer in a second organization, and an anonymous caller. It is intentionally separate from `test:all` because it needs local PostgreSQL binaries; `supabase test db` remains the equivalent pgTAP suite when the Docker-based Supabase stack is available.
+`test:all` runs static and source-policy checks, type checking, Node tests, a disposable PostgreSQL/RLS integration suite, production builds, and production-mode browser tests. CI additionally runs a pinned, checksum-verified Gitleaks scan over the complete Git history. Local PostgreSQL client/server binaries (`pg_config`, `initdb`, `pg_ctl`, and `psql`) are required for the database suite.
 
-The fixture HTTP server is exercised by the test suite. Its public API contract is available from `AcmeSupport#openApiDocument()` and at `/openapi.json` when started through `startAcmeServer()`.
+For local development:
 
-See [the local operation guide](docs/OPERATIONS.md) for fixture accounts, the three-path demo, supported scope, and the security model.
+```bash
+cp .env.example .env.local
+pnpm dev
+```
 
-## Current WebMCP API alignment
+Then open `http://127.0.0.1:3100`. `pnpm dev` starts the control plane and Acme Support fixture together; the in-memory adapter processes analysis through the same claim/lease/completion protocol used by the PostgreSQL worker.
 
-Generated artifacts use `document.modelContext`, which Chrome documents as the current imperative API; they do not use the deprecated `navigator.modelContext` surface. Tool registrations use an `AbortSignal` for lifecycle cleanup, and generated code does not opt into cross-origin exposure. See Chrome’s [imperative API guide](https://developer.chrome.com/docs/ai/webmcp/imperative-api) and [tool security guidance](https://developer.chrome.com/docs/ai/webmcp/secure-tools).
+See [operations](docs/OPERATIONS.md), [architecture](docs/architecture.md), [testing](docs/testing.md), [demo](docs/demo.md), and [security reporting](SECURITY.md).
+
+## WebMCP API alignment
+
+Generated artifacts use the current imperative `document.modelContext.registerTool()` API. They do not use the deprecated `navigator.modelContext` surface or opt into cross-origin exposure. Tool registrations are tied to an `AbortSignal` so route changes and replacement releases clean up deterministically.

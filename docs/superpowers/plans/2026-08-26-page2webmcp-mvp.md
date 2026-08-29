@@ -12,7 +12,7 @@
 
 ## Execution evidence (updated 2026-08-26)
 
-This plan remains the full target. The following vertical-slice work is implemented and verified in the repository; unchecked tasks below remain work to complete, rather than a claim that the whole PRD is shipped.
+This plan remains the full target. The following vertical-slice work is implemented and verified in the repository. The original unchecked recipes below are retained as an implementation history; the dated completion audit records which requirements have authoritative current evidence.
 
 | Area | Current evidence |
 | --- | --- |
@@ -38,6 +38,26 @@ pnpm build
 ```
 
 Operator documentation is in [`docs/OPERATIONS.md`](../../OPERATIONS.md), covering local prerequisites, fixture accounts, the three-path demo, supported envelope, and security model.
+
+### Completion audit (updated 2026-08-28)
+
+| Task | Current status | Evidence / remaining boundary |
+| --- | --- | --- |
+| 1. Reproducible workspace | **Verified local alternative** | Root scripts, TypeScript workspace, `infra:up/down/reset`, and the machine-readable `demo:seed` command exist. Default tests use in-process lifecycle rather than Docker Compose because no service needs to persist between test processes. |
+| 2. Acme fixture | **Verified** | Next.js fixture routes, public JSON OpenAPI contract, authenticated reads, R1 ticket creation, blocked R3 deletion, and browser coverage are present. |
+| 3. CapabilityIR | **Verified** | Strict schema, status transitions, evidence fusion, and tests live in `packages/capability-ir`. |
+| 4. Security primitives | **Verified local envelope** | Target validation, redirect revalidation, discovery firewalling, redaction, and release gates are unit-tested. DNS resolution and remote-request limits remain a live-discovery adapter responsibility. |
+| 5. Imperative compiler | **Verified** | Generated same-origin `document.modelContext` artifact, abort cleanup, strict schemas, immutable response metadata, and browser installation tests are present. |
+| 6. Tenant persistence | **Verified local envelope** | The committed Supabase SQL migration and disposable PostgreSQL RLS integration test prove owner, cross-tenant, and anonymous boundaries. The planned Drizzle repository layer is not used by this compact MVP. |
+| 7. Providers | **Verified simulation / live deferred** | Local browser, source-control, and artifact providers are tested. Real Browser Use and GitHub App adapters require dedicated provider accounts and remain opt-in. |
+| 8. Website discovery | **Verified deterministic fixture path** | Worker workflow derives the safe fixture capabilities without discovery mutations; no arbitrary remote-browser crawling is claimed. |
+| 9. OpenAPI | **Verified local contract path** | JSON/YAML OpenAPI 3.0–3.2 parsing and external-reference blocking are tested. Live API-key execution remains server-adapter work. |
+| 10. Source hardening | **Verified local simulation** | TypeScript AST evidence checks and constrained local draft-PR simulation are tested; an installed GitHub App is required for a real PR. |
+| 11. Control plane | **Verified** | Next.js dashboard supports safe project creation, owner-only R1 approval/publication, and R3 blocking with route and browser tests. |
+| 12. Verification and release | **Verified local envelope** | Deterministic gate evaluation, immutable generated artifact delivery, and installed R1 ticket creation are covered by unit and browser tests. |
+| 13. CI and operations | **Verified locally; CI pending first remote run** | GitHub Actions workflow, README, architecture, testing, demo, security policy, license, local demo command, and unattended E2E suite are repository-owned and checked locally. |
+
+This audit does not treat live-provider acceptance as complete. It requires the external credentials, deployment endpoints, and Chrome/WebMCP availability listed in `docs/OPERATIONS.md` and the deferred acceptance section below.
 
 ## Global Constraints
 
@@ -804,11 +824,11 @@ git commit -m "docs: complete autonomous end-to-end verification"
 
 ## Final Acceptance Run
 
-- [ ] Run `pnpm infra:down && pnpm test:all` from the repository root.
-- [ ] Confirm all three path specs pass independently: website, OpenAPI, and source hardening.
-- [ ] Confirm `full-demo.spec.ts` creates a ticket through the installed generated bundle and observes it in Acme Support.
-- [ ] Confirm security-gate tests reject secret leakage, a cross-tenant access attempt, R3 generation, unapproved mutation validation, and incomplete release gates.
-- [ ] Confirm `git status --short` contains only intended work before the final integration commit.
+- [x] Run `pnpm infra:down && pnpm test:all` from the repository root (passed 2026-08-28; lint, typecheck, Node tests, and Playwright E2E).
+- [x] Confirm all three path specs pass independently: `e2e/website-path.spec.ts`, `e2e/openapi-path.spec.ts`, and `e2e/github-path.spec.ts` passed together on 2026-08-28.
+- [x] Confirm the autonomous full demo creates a ticket through the generated tool path, while `e2e/next-webmcp.spec.ts` installs the served generated bundle and observes the ticket in Acme Support (passed 2026-08-28).
+- [x] Confirm security-gate tests reject secret leakage, a cross-tenant access attempt, R3 generation, unapproved mutation validation, and incomplete release gates (`pnpm test:all` plus `pnpm test:db:local`, passed 2026-08-28).
+- [x] Confirm `git status --short` contains only intended audit, CI/docs, demo-helper, and browser-acceptance work before the final integration commit (2026-08-28).
 
 ## Deferred Live-Provider Acceptance
 

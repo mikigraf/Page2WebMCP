@@ -1,0 +1,76 @@
+name: Verify Page2WebMCP
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Scan complete Git history for committed secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          readonly gitleaks_version="8.30.1"
+          readonly gitleaks_archive="gitleaks_${gitleaks_version}_linux_x64.tar.gz"
+          readonly gitleaks_sha256="551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+          curl --fail --silent --show-error --location \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${gitleaks_version}/${gitleaks_archive}" \
+            --output "/tmp/${gitleaks_archive}"
+          echo "${gitleaks_sha256}  /tmp/${gitleaks_archive}" | sha256sum --check
+          tar -xzf "/tmp/${gitleaks_archive}" -C /tmp gitleaks
+          /tmp/gitleaks git --redact --no-banner --log-opts="--all"
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+        with:
+          version: 10.14.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm audit --prod --audit-level=high
+      - run: pnpm exec playwright install --with-deps chromium
+      - run: pnpm test:all
+      - name: Smoke test the production Next server
+        shell: bash
+        run: |
+          set -euo pipefail
+          task_port="$(node -e 'const net=require("node:net"); const server=net.createServer(); server.listen(0, "127.0.0.1", () => { console.log(server.address().port); server.close(); });')"
+          PAGE2WEBMCP_ALLOW_EPHEMERAL_STORAGE=true \
+          PAGE2WEBMCP_TEST_MODE=true \
+          PAGE2WEBMCP_SESSION_SECRET=page2webmcp-ci-smoke-session-secret-2026 \
+          PAGE2WEBMCP_OWNER_PASSWORD=page2webmcp-ci-owner-password-2026-secure \
+          PAGE2WEBMCP_EDITOR_PASSWORD=page2webmcp-ci-editor-password-2026-secure \
+          PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN="http://127.0.0.1:$task_port" \
+          PAGE2WEBMCP_STORAGE_MODE=memory \
+          pnpm --filter @page2webmcp/control-plane start -- --port "$task_port" > control-plane-start.log 2>&1 &
+          task_pid=$!
+          trap 'kill "$task_pid" 2>/dev/null || true' EXIT
+          for attempt in {1..30}; do
+            if curl --fail --silent --show-error "http://127.0.0.1:$task_port/" >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          cat control-plane-start.log
+          exit 1
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: verification-failure-${{ github.run_attempt }}
+          path: |
+            control-plane-start.log
+            playwright-report
+            test-results
+          if-no-files-found: ignore
+          retention-days: 7

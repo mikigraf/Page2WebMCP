@@ -1,8 +1,10 @@
 node_modules/
 .next/
-.env
-.env.local
+.env*
+!.env.example
 coverage/
 playwright-report/
 test-results/
+.dist/
 *.log
+*.tsbuildinfo

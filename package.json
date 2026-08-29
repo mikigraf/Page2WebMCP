@@ -4,36 +4,53 @@
   "version": "0.1.0",
   "type": "module",
   "packageManager": "pnpm@10.14.0",
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
+  },
   "engines": {
-    "node": ">=22.0.0"
+    "node": ">=24.0.0"
   },
   "scripts": {
-    "lint": "node scripts/check-source.mjs",
+    "lint": "eslint . --max-warnings=0 && node scripts/lint-source.mjs",
+    "security:policy": "node scripts/check-source.mjs",
     "typecheck": "tsc --project tsconfig.base.json --noEmit",
     "test": "tsx --test test-support/**/*.test.ts apps/**/*.test.ts packages/**/*.test.ts",
     "test:e2e": "tsx --test e2e/**/*.test.ts && playwright test",
+    "test:e2e:production": "pnpm build && pnpm test:e2e:production:built",
+    "test:e2e:production:built": "tsx --test e2e/**/*.test.ts && PAGE2WEBMCP_E2E_PRODUCTION=true playwright test",
     "test:db:local": "bash scripts/test-rls-local.sh",
-    "test:all": "pnpm lint && pnpm typecheck && pnpm test && pnpm test:e2e",
-    "infra:up": "node infra/scripts/infra.mjs up",
-    "infra:down": "node infra/scripts/infra.mjs down",
-    "infra:reset": "node infra/scripts/reset-test-data.mjs",
-    "dev": "node scripts/dev.mjs",
-    "build": "pnpm --filter @page2webmcp/acme-support build && pnpm --filter @page2webmcp/control-plane build"
+    "test:coverage": "node --import tsx --test --experimental-test-coverage --test-coverage-include='apps/**/app/**/*.ts' --test-coverage-include='apps/**/app/**/*.tsx' --test-coverage-include='apps/**/src/**/*.ts' --test-coverage-include='apps/**/src/**/*.tsx' --test-coverage-include='packages/**/src/**/*.ts' --test-coverage-exclude='**/*.test.ts' --test-coverage-exclude='**/*.spec.ts' --test-coverage-exclude='**/tests/**' --test-coverage-exclude='**/*.d.ts' --test-coverage-lines=80 --test-coverage-functions=75 --test-coverage-branches=70 test-support/**/*.test.ts apps/**/*.test.ts packages/**/*.test.ts",
+    "test:all": "pnpm lint && pnpm security:policy && pnpm typecheck && pnpm test:coverage && pnpm test:db:local && pnpm build && pnpm test:e2e:production:built",
+    "demo:seed": "node scripts/demo-seed.mjs",
+    "dev": "node --env-file-if-exists=.env.local scripts/dev.mjs",
+    "worker": "node --env-file-if-exists=.env.local .dist/worker/apps/worker/src/main.js",
+    "build:worker": "tsc --project tsconfig.worker.json",
+    "build": "pnpm --filter @page2webmcp/acme-support build && pnpm --filter @page2webmcp/control-plane build && pnpm build:worker"
   },
   "devDependencies": {
     "@playwright/test": "^1.62.1",
-    "@types/node": "22.15.0",
+    "@types/node": "24.13.3",
+    "@types/pg": "8.23.1",
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.5",
-    "playwright": "^1.62.1",
-    "tsx": "4.20.5",
+    "eslint": "9.39.5",
+    "eslint-config-next": "16.3.3",
+    "tsx": "4.23.12",
     "typescript": "5.9.2"
   },
   "dependencies": {
+    "@langfuse/otel": "5.11.0",
+    "@langfuse/tracing": "5.11.0",
+    "@opentelemetry/api": "1.9.1",
+    "@opentelemetry/sdk-node": "0.221.0",
     "next": "^16.3.3",
+    "pg": "8.23.0",
+    "posthog-node": "5.51.4",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
-    "yaml": "2.8.1",
-    "zod": "^4.4.3"
+    "yaml": "2.9.0",
+    "zod": "^4.5.2"
   }
 }
