@@ -6,7 +6,7 @@ import { GET as getArtifact } from "../app/api/releases/[artifact]/route.ts";
 import { POST as publish } from "../app/api/projects/[projectId]/releases/route.ts";
 import { authenticate, issueSession } from "../src/auth.ts";
 import { compileWebMcpRelease } from "../../../packages/compiler/src/compiler.ts";
-import { acmeCapabilityPlans } from "../../acme-support/src/capability-plans.ts";
+import { acmeCapabilityEvidence, acmeCapabilityPlans } from "../../acme-support/src/capability-plans.ts";
 import {
   InMemoryControlPlaneRepository,
   type AnalysisResult,
@@ -15,13 +15,15 @@ import {
   type VerificationRequest
 } from "../../../packages/database/src/control-plane.ts";
 import { setControlPlaneRepositoryForTest } from "../../../packages/database/src/factory.ts";
+import { deriveVerification } from "../src/releases.ts";
 
 const owner = authenticate("owner@example.test", "fixture-password")!;
 const editor = authenticate("editor@example.test", "fixture-password")!;
 
 async function fixture(
   repository: InMemoryControlPlaneRepository,
-  evidence: AnalysisResult["evidence"] = [{ source: "openapi", operation: "findOrder" }]
+  evidence: AnalysisResult["evidence"] = acmeCapabilityEvidence()
+    .filter(({ reference }) => reference !== acmeCapabilityPlans("https://acme.example")[1]!.evidence[0]!.reference)
 ) {
   const candidate = compileWebMcpRelease(acmeCapabilityPlans("https://acme.example")
     .filter((plan) => plan.tool.name !== "get_order_status"));
@@ -38,12 +40,10 @@ async function fixture(
     inputHash: "analysis"
   });
   await repository.claimAnalysis("worker", 60_000);
+  const persistedPlans = acmeCapabilityPlans("https://acme.example")
+    .filter((plan) => plan.tool.name !== "get_order_status");
   await repository.completeAnalysis("worker", run.id, {
-    capabilities: [
-      { stableName: "find_order", riskTier: "R0", status: "proposed" },
-      { stableName: "create_support_ticket", riskTier: "R1", status: "proposed" },
-      { stableName: "delete_account", riskTier: "R3", status: "blocked" }
-    ],
+    capabilities: persistedPlans.map((plan) => ({ plan, status: "proposed" as const })),
     evidence,
     release: {
       code: candidate.code,
@@ -54,6 +54,93 @@ async function fixture(
   });
   return { project, run, candidate };
 }
+
+test("verification binds the reviewed complete plan, not a same-name shallow capability", () => {
+  const reviewedPlan = acmeCapabilityPlans("https://acme.example")
+    .find((plan) => plan.tool.name === "find_order")!;
+  const mutation = acmeCapabilityPlans("https://acme.example")
+    .find((plan) => plan.tool.name === "create_support_ticket")!;
+  const substitutions = [
+    { ...mutation, tool: { ...mutation.tool, name: reviewedPlan.tool.name } },
+    { ...reviewedPlan, request: { ...reviewedPlan.request, pathTemplate: "/api/other-orders" } },
+    { ...reviewedPlan, authentication: { ...reviewedPlan.authentication, requiredScopes: ["orders:admin"] } },
+    {
+      ...reviewedPlan,
+      schemas: {
+        ...reviewedPlan.schemas,
+        input: {
+          ...reviewedPlan.schemas.input,
+          properties: { query: { type: "string" as const, minLength: 1, maxLength: 12 } },
+        },
+      },
+    },
+  ];
+
+  for (const substitutedPlan of substitutions) {
+    const candidate = compileWebMcpRelease([substitutedPlan]);
+    const planDigest = createHash("sha256").update(JSON.stringify(reviewedPlan)).digest("hex");
+    const verification = deriveVerification("run-reviewed", "https://acme.example", {
+      capabilities: [],
+      evidence: acmeCapabilityEvidence(),
+      release: {
+        code: candidate.code,
+        contentHash: candidate.contentHash,
+        allowedOrigin: candidate.allowedOrigin,
+        manifest: candidate.manifest,
+      },
+    }, [{
+      id: "capability-reviewed",
+      organizationId: "org-reviewed",
+      projectId: "project-reviewed",
+      analysisRunId: "run-reviewed",
+      stableName: reviewedPlan.tool.name,
+      riskTier: reviewedPlan.effects.riskTier as "R0" | "R1" | "R2",
+      status: "proposed",
+      version: 1,
+      plan: reviewedPlan,
+      planDigest,
+      reviewedPlanDigest: planDigest,
+    }]);
+    assert.equal(verification.schema, false, substitutedPlan.request.pathTemplate);
+    assert.equal(verification.selectionScore, 0, substitutedPlan.request.pathTemplate);
+  }
+});
+
+class TamperedEvidenceRepository extends InMemoryControlPlaneRepository {
+  constructor(private readonly tamper: (evidence: AnalysisResult["evidence"], runId: string) => AnalysisResult["evidence"]) {
+    super();
+  }
+
+  override async getAnalysisResult(actor: RepositoryActor, runId: string): Promise<AnalysisResult | undefined> {
+    const result = await super.getAnalysisResult(actor, runId);
+    return result ? { ...result, evidence: this.tamper(result.evidence, runId) } : result;
+  }
+}
+
+test("verification rejects missing, changed, cross-run, and expired evidence references", async (context) => {
+  const cases: Array<[string, (evidence: AnalysisResult["evidence"], runId: string) => AnalysisResult["evidence"]]> = [
+    ["missing", (evidence) => evidence.slice(0, 1)],
+    ["changed", (evidence) => evidence.map((item, index) => index === 0 ? { ...item, content: `${item.content}:changed` } : item)],
+    ["cross-run", (evidence) => evidence.map((item) => ({ ...item, analysisRunId: "00000000-0000-0000-0000-000000000000" }))],
+    ["expired", (evidence) => evidence.map((item) => ({ ...item, expiresAt: "2020-01-01T00:00:00.000Z" }))],
+  ];
+
+  for (const [name, tamper] of cases) {
+    await context.test(name, async () => {
+      const repository = new TamperedEvidenceRepository(tamper);
+      setControlPlaneRepositoryForTest(repository);
+      const { project, run } = await fixture(repository);
+      await approveTicket(repository, project.id);
+      const response = await verify(verificationRequest(project.id, run.id));
+      assert.equal(response.status, 409);
+      assert.deepEqual((await response.json()).error, {
+        code: "RELEASE_GATE_FAILED",
+        retryable: false,
+        details: ["EVIDENCE_MISSING_OR_EXPIRED"],
+      });
+    });
+  }
+});
 
 class ExpiringEvidenceRepository extends InMemoryControlPlaneRepository {
   #expired = false;
@@ -126,9 +213,9 @@ async function approveTicket(repository: InMemoryControlPlaneRepository, project
 }
 
 test("verification and publication fail closed when exact-run evidence is absent", async () => {
-  const repository = new InMemoryControlPlaneRepository();
+  const repository = new TamperedEvidenceRepository(() => []);
   setControlPlaneRepositoryForTest(repository);
-  const { project, run } = await fixture(repository, []);
+  const { project, run } = await fixture(repository);
   await approveTicket(repository, project.id);
 
   const verification = await verify(verificationRequest(project.id, run.id));
@@ -174,7 +261,7 @@ test("publication cannot reuse verification after its exact-run evidence expires
   });
 });
 
-test("publication rejects a worker artifact that downgrades vetted untrusted content", async () => {
+test("analysis ingestion rejects a worker artifact that downgrades vetted untrusted content", async () => {
   const repository = new InMemoryControlPlaneRepository();
   setControlPlaneRepositoryForTest(repository);
   const canonical = compileWebMcpRelease(acmeCapabilityPlans("https://acme.example")
@@ -195,23 +282,18 @@ test("publication rejects a worker artifact that downgrades vetted untrusted con
     inputHash: "untrusted-analysis"
   });
   await repository.claimAnalysis("worker", 60_000);
-  await repository.completeAnalysis("worker", run.id, {
-    capabilities: [{ stableName: "get_order_status", riskTier: "R0", status: "proposed" }],
-    evidence: [{ source: "openapi", operation: "getOrderStatus" }],
+  const reviewedPlan = acmeCapabilityPlans("https://acme.example")
+    .find((plan) => plan.tool.name === "get_order_status")!;
+  await assert.rejects(repository.completeAnalysis("worker", run.id, {
+    capabilities: [{ plan: reviewedPlan, status: "proposed" }],
+    evidence: acmeCapabilityEvidence().filter(({ reference }) => reference === reviewedPlan.evidence[0]!.reference),
     release: {
       code,
       contentHash: createHash("sha256").update(code).digest("hex"),
       allowedOrigin: "https://acme.example",
       manifest: downgradedManifest
     }
-  });
-
-  const response = await publish(
-    request(project.id, run.id, "publish-downgraded-untrusted-content"),
-    { params: Promise.resolve({ projectId: project.id }) }
-  );
-  assert.equal(response.status, 409);
-  assert.equal((await response.json()).code, "RELEASE_GATE_FAILED");
+  }), { code: "INVALID_STATE" });
 });
 
 test("publication derives verification from persisted state and requires R1 review", async () => {

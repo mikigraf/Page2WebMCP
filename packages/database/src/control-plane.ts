@@ -1,4 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
+import {
+  canonicalizeCapabilityPlans,
+  type CapabilityPlan,
+} from "../../capability-ir/src/plan.ts";
 
 export type RepositoryRole = "owner" | "editor" | "viewer";
 export type RepositoryActor = { id: string; organizationId: string; role: RepositoryRole };
@@ -40,9 +44,23 @@ export type CapabilityRecord = {
   projectId: string;
   analysisRunId: string;
   stableName: string;
-  riskTier: "R0" | "R1" | "R2" | "R3";
+  riskTier: "R0" | "R1" | "R2";
   status: "proposed" | "reviewed" | "verified" | "blocked";
+  plan: CapabilityPlan;
+  planDigest: string;
+  reviewedPlanDigest?: string;
   version: number;
+};
+
+export type AnalysisEvidence = {
+  id?: string;
+  organizationId?: string;
+  projectId?: string;
+  analysisRunId?: string;
+  source: "openapi" | "github" | "runtime" | "owner_review" | "source";
+  content: string;
+  reference: string;
+  expiresAt?: string;
 };
 
 export type CandidateRelease = {
@@ -53,8 +71,8 @@ export type CandidateRelease = {
 };
 
 export type AnalysisResult = {
-  capabilities: Array<Pick<CapabilityRecord, "stableName" | "riskTier" | "status">>;
-  evidence: Array<Record<string, unknown>>;
+  capabilities: Array<{ plan: CapabilityPlan; status: Pick<CapabilityRecord, "status">["status"] }>;
+  evidence: AnalysisEvidence[];
   release: CandidateRelease;
   draftPullRequest?: { draft: boolean; url?: string; files?: string[] };
 };
@@ -167,7 +185,7 @@ const MAX_RELEASE_BYTES = 64 * 1_024;
 
 export function capabilityStateDigest(
   capabilities: ReadonlyArray<Pick<CapabilityRecord,
-    "id" | "analysisRunId" | "stableName" | "riskTier" | "status" | "version">>
+    "id" | "analysisRunId" | "stableName" | "riskTier" | "status" | "planDigest" | "reviewedPlanDigest" | "version">>
 ): string {
   const canonical = capabilities
     .map((capability) => ({
@@ -176,9 +194,16 @@ export function capabilityStateDigest(
       stableName: capability.stableName,
       riskTier: capability.riskTier,
       status: capability.status,
+      planDigest: capability.planDigest,
+      reviewedPlanDigest: capability.reviewedPlanDigest,
       version: capability.version
     }))
     .sort((left, right) => compareCodePoints(left.stableName, right.stableName) || compareCodePoints(left.id, right.id));
+  return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
+}
+
+export function capabilityPlanDigest(plan: CapabilityPlan): string {
+  const canonical = canonicalizeCapabilityPlans([plan])[0]!;
   return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
 }
 
@@ -282,7 +307,7 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
   async listProjects(actor: RepositoryActor): Promise<ProjectRecord[]> {
     return [...this.#projects.values()]
       .filter((project) => project.organizationId === actor.organizationId)
-      .sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id))
+      .sort((left, right) => compareCodePoints(left.createdAt, right.createdAt) || compareCodePoints(left.id, right.id))
       .slice(0, MAX_PROJECTS)
       .map(copy);
   }
@@ -335,7 +360,7 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
   async claimAnalysis(workerId: string, leaseMs: number): Promise<ClaimedAnalysisRunRecord | undefined> {
     const now = this.clock();
     const boundedLease = Math.max(1_000, Math.min(leaseMs, 300_000));
-    const candidates = [...this.#runs.values()].sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+    const candidates = [...this.#runs.values()].sort((left, right) => compareCodePoints(left.createdAt, right.createdAt));
     for (const run of candidates) {
       const expired = run.status === "running" && run.leaseExpiresAt !== undefined && new Date(run.leaseExpiresAt) <= now;
       if (run.status !== "queued" && !expired) continue;
@@ -381,13 +406,37 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
     if (!run || run.status !== "running" || run.leaseOwner !== workerId || !run.leaseExpiresAt
       || new Date(run.leaseExpiresAt) <= this.clock()) throw new RepositoryError("LEASE_LOST");
     if (result.capabilities.length > MAX_CAPABILITIES || result.evidence.length > MAX_CAPABILITIES
-      || Buffer.byteLength(result.release.code) > MAX_RELEASE_BYTES
-      || new Set(result.capabilities.map((capability) => capability.stableName)).size !== result.capabilities.length) {
+      || Buffer.byteLength(result.release.code) > MAX_RELEASE_BYTES) {
+      throw new RepositoryError("INVALID_STATE");
+    }
+    let canonicalPlans: readonly CapabilityPlan[];
+    try {
+      canonicalPlans = canonicalizeCapabilityPlans(result.capabilities.map(({ plan }) => plan));
+    } catch {
+      throw new RepositoryError("INVALID_STATE");
+    }
+    const sourcePlans = plansFromManifest(result.release.manifest);
+    if (!sourcePlans || !equalPlanSets(sourcePlans, canonicalPlans)) throw new RepositoryError("INVALID_STATE");
+    const statuses = new Map(result.capabilities.map(({ plan, status }) => [plan.tool.name, status]));
+    const expiresAt = new Date(this.clock().getTime() + IDEMPOTENCY_TTL_MS).toISOString();
+    const normalizedEvidence = result.evidence.map((item) => normalizeEvidence(
+      item,
+      run,
+      expiresAt,
+      this.clock(),
+    ));
+    if (new Set(normalizedEvidence.map(({ reference }) => reference)).size !== normalizedEvidence.length
+      || normalizedEvidence.reduce((total, item) => total + Buffer.byteLength(item.content), 0) > MAX_RELEASE_BYTES) {
+      throw new RepositoryError("INVALID_STATE");
+    }
+    if (!evidenceResolves(normalizedEvidence, canonicalPlans, run, this.clock())) {
       throw new RepositoryError("INVALID_STATE");
     }
     const releaseCode = Buffer.from(result.release.code);
     const normalizedResult: AnalysisResult = {
       ...structuredClone(result),
+      capabilities: canonicalPlans.map((plan) => ({ plan, status: statuses.get(plan.tool.name) ?? "proposed" })),
+      evidence: normalizedEvidence,
       release: {
         ...structuredClone(result.release),
         contentHash: createHash("sha256").update(releaseCode).digest("hex"),
@@ -395,15 +444,20 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
       }
     };
     this.#results.set(run.id, normalizedResult);
-    for (const input of result.capabilities) {
+    for (const plan of canonicalPlans) {
+      const planDigest = capabilityPlanDigest(plan);
+      const status = statuses.get(plan.tool.name) ?? "proposed";
       const capability: CapabilityRecord = {
         id: randomUUID(),
         organizationId: run.organizationId,
         projectId: run.projectId,
         analysisRunId: run.id,
-        stableName: input.stableName,
-        riskTier: input.riskTier,
-        status: input.riskTier === "R3" ? "blocked" : input.status,
+        stableName: plan.tool.name,
+        riskTier: plan.effects.riskTier as CapabilityRecord["riskTier"],
+        status,
+        plan,
+        planDigest,
+        reviewedPlanDigest: plan.effects.riskTier === "R0" || status === "blocked" ? planDigest : undefined,
         version: 1
       };
       this.#capabilities.set(capability.id, capability);
@@ -453,11 +507,8 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
     if (!result) return undefined;
     return {
       ...structuredClone(result),
-      capabilities: this.#analysisCapabilities(runId).map(({ stableName, riskTier, status }) => ({
-        stableName,
-        riskTier,
-        status
-      }))
+      capabilities: this.#analysisCapabilities(runId).map(({ plan, status }) => ({ plan, status })),
+      evidence: result.evidence.filter(({ expiresAt }) => expiresAt !== undefined && new Date(expiresAt) > this.clock())
     };
   }
 
@@ -465,7 +516,7 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
     this.#assertProject(actor, projectId);
     return [...this.#capabilities.values()]
       .filter((item) => item.projectId === projectId)
-      .sort((left, right) => left.stableName.localeCompare(right.stableName) || left.id.localeCompare(right.id))
+      .sort((left, right) => compareCodePoints(left.stableName, right.stableName) || compareCodePoints(left.id, right.id))
       .slice(0, MAX_CAPABILITIES)
       .map(copy);
   }
@@ -478,7 +529,7 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
   #analysisCapabilities(runId: string): CapabilityRecord[] {
     return [...this.#capabilities.values()]
       .filter((item) => item.analysisRunId === runId)
-      .sort((left, right) => left.stableName.localeCompare(right.stableName) || left.id.localeCompare(right.id))
+      .sort((left, right) => compareCodePoints(left.stableName, right.stableName) || compareCodePoints(left.id, right.id))
       .slice(0, MAX_CAPABILITIES)
       .map(copy);
   }
@@ -488,13 +539,23 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
     const capability = this.#capabilities.get(capabilityId);
     if (!capability || capability.organizationId !== actor.organizationId) throw new RepositoryError("NOT_FOUND");
     if (capability.version !== input.expectedVersion) throw new RepositoryError("VERSION_CONFLICT");
-    if (capability.riskTier === "R3") throw new RepositoryError("HIGH_RISK_ACTION");
     if (input.action === "approve" && capability.riskTier !== "R0" && actor.role !== "owner") {
       throw new RepositoryError("OWNER_APPROVAL_REQUIRED");
+    }
+    if (input.action === "approve") {
+      const run = this.#runs.get(capability.analysisRunId);
+      const result = this.#results.get(capability.analysisRunId);
+      if (!run || !result || !capabilityPlanBindingValid(capability)) {
+        throw new RepositoryError("RELEASE_GATE_FAILED", ["CAPABILITY_PLAN_MISMATCH"]);
+      }
+      if (!evidenceResolves(result.evidence, [capability.plan], run, this.clock())) {
+        throw new RepositoryError("RELEASE_GATE_FAILED", ["EVIDENCE_MISSING_OR_EXPIRED"]);
+      }
     }
     const updated: CapabilityRecord = {
       ...capability,
       status: input.action === "approve" ? "reviewed" : "blocked",
+      reviewedPlanDigest: capability.planDigest,
       version: capability.version + 1
     };
     this.#capabilities.set(updated.id, updated);
@@ -512,7 +573,11 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
     const run = this.#runs.get(input.analysisRunId);
     if (!run || run.organizationId !== actor.organizationId) throw new RepositoryError("NOT_FOUND");
     if (run.projectId !== projectId || run.status !== "succeeded") throw new RepositoryError("INVALID_STATE");
-    const currentDigest = capabilityStateDigest(this.#analysisCapabilities(run.id));
+    const currentCapabilities = this.#analysisCapabilities(run.id);
+    if (currentCapabilities.some((capability) => !capabilityPlanBindingValid(capability))) {
+      throw new RepositoryError("RELEASE_GATE_FAILED", ["CAPABILITY_PLAN_MISMATCH"]);
+    }
+    const currentDigest = capabilityStateDigest(currentCapabilities);
     if (currentDigest !== input.capabilityStateDigest) {
       throw new RepositoryError("RELEASE_GATE_FAILED", ["CAPABILITIES_CHANGED"]);
     }
@@ -525,6 +590,16 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
     }
     const existingResult = this.#results.get(run.id);
     if (!existingResult) throw new RepositoryError("INVALID_STATE");
+    const candidatePlans = plansFromManifest(input.candidate.manifest);
+    const selectedPlans = currentCapabilities
+      .filter(({ status }) => status !== "blocked")
+      .map(({ plan }) => plan);
+    if (!candidatePlans || !equalPlanSets(candidatePlans, selectedPlans)) {
+      throw new RepositoryError("RELEASE_GATE_FAILED", ["CAPABILITY_PLAN_MISMATCH"]);
+    }
+    if (!evidenceResolves(existingResult.evidence, candidatePlans, run, this.clock())) {
+      throw new RepositoryError("RELEASE_GATE_FAILED", ["EVIDENCE_MISSING_OR_EXPIRED"]);
+    }
     const publishedReleaseId = this.#releaseByRun.get(run.id);
     if (publishedReleaseId) {
       const publishedRelease = this.#releases.get(publishedReleaseId);
@@ -587,21 +662,34 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
       throw new RepositoryError("RELEASE_GATE_FAILED", ["CANDIDATE_CHANGED"]);
     }
     const currentCapabilities = this.#analysisCapabilities(run.id);
+    if (currentCapabilities.some((capability) => !capabilityPlanBindingValid(capability))) {
+      throw new RepositoryError("RELEASE_GATE_FAILED", ["CAPABILITY_PLAN_MISMATCH"]);
+    }
     const currentDigest = capabilityStateDigest(currentCapabilities);
     if (currentDigest !== input.capabilityStateDigest) {
       throw new RepositoryError("RELEASE_GATE_FAILED", ["CAPABILITIES_CHANGED"]);
     }
     const reviewFailures = currentCapabilities.flatMap((capability) => {
-      if (capability.riskTier === "R3" && capability.status !== "blocked") return ["HIGH_RISK_ACTION"];
       if ((capability.riskTier === "R1" || capability.riskTier === "R2")
-        && capability.status === "proposed") return ["REVIEW_REQUIRED"];
+        && capability.status !== "blocked"
+        && (capability.status !== "reviewed" || capability.reviewedPlanDigest !== capability.planDigest)) {
+        return ["REVIEW_REQUIRED"];
+      }
+      if (capability.status !== "blocked" && capability.reviewedPlanDigest !== capability.planDigest) {
+        return ["CAPABILITY_PLAN_MISMATCH"];
+      }
       return [];
     });
     if (reviewFailures.length > 0) throw new RepositoryError("RELEASE_GATE_FAILED", [...new Set(reviewFailures)]);
     const result = this.#results.get(verification.analysisRunId);
     const candidate = this.#verificationCandidates.get(verification.analysisRunId);
     if (!result || !candidate) throw new RepositoryError("INVALID_STATE");
-    if (result.evidence.length === 0) {
+    const candidatePlans = plansFromManifest(candidate.manifest);
+    if (!candidatePlans
+      || !equalPlanSets(candidatePlans, currentCapabilities.filter(({ status }) => status !== "blocked").map(({ plan }) => plan))) {
+      throw new RepositoryError("RELEASE_GATE_FAILED", ["CAPABILITY_PLAN_MISMATCH"]);
+    }
+    if (!evidenceResolves(result.evidence, candidatePlans, run, this.clock())) {
       throw new RepositoryError("RELEASE_GATE_FAILED", ["EVIDENCE_MISSING_OR_EXPIRED"]);
     }
     const codeBytes = Buffer.from(candidate.code);
@@ -676,12 +764,93 @@ function candidateMatches(candidate: CandidateRelease, stored: CandidateRelease)
     && canonicalJson(candidate.manifest ?? {}) === canonicalJson(stored.manifest ?? {});
 }
 
+function plansFromManifest(manifest: unknown): readonly CapabilityPlan[] | undefined {
+  if (!manifest || typeof manifest !== "object" || !("plans" in manifest)
+    || !Array.isArray((manifest as { plans?: unknown }).plans)) return undefined;
+  try {
+    return canonicalizeCapabilityPlans((manifest as { plans: CapabilityPlan[] }).plans);
+  } catch {
+    return undefined;
+  }
+}
+
+function equalPlanSets(left: readonly CapabilityPlan[], right: readonly CapabilityPlan[]): boolean {
+  if (left.length !== right.length) return false;
+  const leftDigests = left.map((plan) => `${plan.tool.name}:${capabilityPlanDigest(plan)}`).sort(compareCodePoints);
+  const rightDigests = right.map((plan) => `${plan.tool.name}:${capabilityPlanDigest(plan)}`).sort(compareCodePoints);
+  return leftDigests.every((value, index) => value === rightDigests[index]);
+}
+
+function capabilityPlanBindingValid(capability: CapabilityRecord): boolean {
+  try {
+    return capability.stableName === capability.plan.tool.name
+      && capability.riskTier === capability.plan.effects.riskTier
+      && capability.planDigest === capabilityPlanDigest(capability.plan);
+  } catch {
+    return false;
+  }
+}
+
+function normalizeEvidence(
+  evidence: AnalysisEvidence,
+  run: AnalysisRunRecord,
+  defaultExpiresAt: string,
+  now: Date,
+): AnalysisEvidence {
+  if (!evidence || typeof evidence !== "object"
+    || !["openapi", "github", "runtime", "owner_review", "source"].includes(evidence.source)
+    || typeof evidence.content !== "string"
+    || evidence.content.length === 0
+    || Buffer.byteLength(evidence.content) > MAX_RELEASE_BYTES
+    || typeof evidence.reference !== "string"
+    || evidence.organizationId !== undefined && evidence.organizationId !== run.organizationId
+    || evidence.projectId !== undefined && evidence.projectId !== run.projectId
+    || evidence.analysisRunId !== undefined && evidence.analysisRunId !== run.id) {
+    throw new RepositoryError("INVALID_STATE");
+  }
+  const reference = `urn:sha256:${createHash("sha256").update(evidence.content).digest("hex")}`;
+  const expiry = evidence.expiresAt ?? defaultExpiresAt;
+  if (evidence.reference !== reference || !Number.isFinite(Date.parse(expiry)) || new Date(expiry) <= now) {
+    throw new RepositoryError("INVALID_STATE");
+  }
+  return {
+    id: randomUUID(),
+    organizationId: run.organizationId,
+    projectId: run.projectId,
+    analysisRunId: run.id,
+    source: evidence.source,
+    content: evidence.content,
+    reference,
+    expiresAt: new Date(expiry).toISOString(),
+  };
+}
+
+function evidenceResolves(
+  evidence: readonly AnalysisEvidence[],
+  plans: readonly CapabilityPlan[],
+  run: AnalysisRunRecord,
+  now: Date,
+): boolean {
+  const byReference = new Map<string, AnalysisEvidence>();
+  for (const item of evidence) {
+    if (item.organizationId !== run.organizationId || item.projectId !== run.projectId
+      || item.analysisRunId !== run.id || item.expiresAt === undefined || new Date(item.expiresAt) <= now
+      || `urn:sha256:${createHash("sha256").update(item.content).digest("hex")}` !== item.reference
+      || byReference.has(item.reference)) return false;
+    byReference.set(item.reference, item);
+  }
+  return plans.every((plan) => plan.evidence.every(({ source, reference }) => {
+    const resolved = byReference.get(reference);
+    return resolved?.source === source;
+  }));
+}
+
 function canonicalJson(value: unknown): string {
   const normalize = (item: unknown): unknown => {
     if (Array.isArray(item)) return item.map(normalize);
     if (item !== null && typeof item === "object") {
       const record = item as Record<string, unknown>;
-      return Object.fromEntries(Object.keys(record).sort().map((key) => [key, normalize(record[key])]));
+      return Object.fromEntries(Object.keys(record).sort(compareCodePoints).map((key) => [key, normalize(record[key])]));
     }
     return item;
   };

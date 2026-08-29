@@ -9,7 +9,7 @@ import type {
 } from "../../../packages/database/src/control-plane.ts";
 import { getObservability } from "../../../packages/observability/src/server.ts";
 import { runFixtureSourceHardening, runFixtureWorkflow } from "./workflow.ts";
-import { acmeCapabilityPlans } from "../../acme-support/src/capability-plans.ts";
+import { acmeCapabilityEvidence, acmeCapabilityPlans } from "../../acme-support/src/capability-plans.ts";
 
 const LEASE_MS = 60_000;
 const HEARTBEAT_MS = 15_000;
@@ -86,8 +86,9 @@ function buildResult(source: ClaimedAnalysisRunRecord): AnalysisResult {
     const origin = fixtureOrigin();
     const release = compileWebMcpRelease(acmeCapabilityPlans(origin).slice(0, 1));
     return {
-      capabilities: [],
-      evidence: [{ source: "source", draft: true, changedFiles: draftPullRequest.files?.length ?? 0 }],
+      capabilities: release.manifest.plans.map((plan) => ({ plan, status: "proposed" })),
+      evidence: acmeCapabilityEvidence()
+        .filter(({ reference }) => release.manifest.plans.some((plan) => plan.evidence.some((item) => item.reference === reference))),
       release: {
         code: release.code,
         contentHash: release.contentHash,
@@ -100,14 +101,15 @@ function buildResult(source: ClaimedAnalysisRunRecord): AnalysisResult {
 
   const origin = new URL(source.sourceUrl).origin;
   const workflow = runFixtureWorkflow(new AcmeSupport(), origin);
-  const capabilities = workflow.capabilities.map((capability) => ({
-    stableName: capability.identity.name,
-    riskTier: capability.safety.riskTier,
-    status: capability.status === "blocked" ? "blocked" as const : "proposed" as const
+  const statusByName = new Map(workflow.capabilities.map((capability) => [capability.identity.name, capability.status]));
+  const capabilities = workflow.release.manifest.plans.map((plan) => ({
+    plan,
+    status: statusByName.get(plan.tool.name) === "blocked" ? "blocked" as const : "proposed" as const
   }));
   return {
     capabilities,
-    evidence: workflow.evidence,
+    evidence: acmeCapabilityEvidence()
+      .filter(({ reference }) => workflow.release.manifest.plans.some((plan) => plan.evidence.some((item) => item.reference === reference))),
     release: {
       code: workflow.release.code,
       contentHash: workflow.release.contentHash,

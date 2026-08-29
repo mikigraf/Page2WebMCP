@@ -15,6 +15,7 @@ import { createPostgresRepository } from "../../../packages/database/src/postgre
 
 const appConnectionString = process.env.PAGE2WEBMCP_TEST_APP_DATABASE_URL;
 const workerConnectionString = process.env.PAGE2WEBMCP_TEST_WORKER_DATABASE_URL;
+const trustedTsxCli = process.env.PAGE2WEBMCP_TEST_TSX_CLI;
 const controlOrigin = "https://control.example";
 const workspaceRoot = fileURLToPath(new URL("../../../", import.meta.url));
 
@@ -67,7 +68,9 @@ test("PostgreSQL route lifecycle is completed by a separately launched durable w
     const accepted = await analyzeResponse.json() as { runId: string; status: string };
     assert.equal(accepted.status, "queued", "PostgreSQL work must not execute inside the request process");
 
-    worker = spawn(process.execPath, ["--import", "tsx", "apps/worker/src/main.ts"], {
+    worker = spawn(process.execPath, trustedTsxCli
+      ? [trustedTsxCli, "apps/worker/src/main.ts"]
+      : ["--import", "tsx", "apps/worker/src/main.ts"], {
       cwd: workspaceRoot,
       env: {
         ...process.env,

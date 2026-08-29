@@ -4,7 +4,8 @@ import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import pg from "pg";
 import { compileWebMcpRelease } from "../../compiler/src/compiler.ts";
-import { acmeCapabilityPlans } from "../../../apps/acme-support/src/capability-plans.ts";
+import { acmeCapabilityEvidence, acmeCapabilityPlans } from "../../../apps/acme-support/src/capability-plans.ts";
+import type { CapabilityPlan } from "../../capability-ir/src/plan.ts";
 import { createPostgresRepository } from "./postgres.ts";
 import {
   capabilityStateDigest,
@@ -15,12 +16,28 @@ import {
 const connectionString = process.env.PAGE2WEBMCP_TEST_DATABASE_URL;
 const adminConnectionString = process.env.PAGE2WEBMCP_TEST_ADMIN_DATABASE_URL;
 
-function releaseCandidate(code: string, allowedOrigin = "https://acme.example") {
+const canonicalFixturePlans = acmeCapabilityPlans("https://acme.example");
+
+function plans(...names: string[]): CapabilityPlan[] {
+  return names.map((name) => canonicalFixturePlans.find((plan) => plan.tool.name === name)!);
+}
+
+function capabilities(...names: string[]) {
+  return plans(...names).map((plan) => ({ plan, status: "proposed" as const }));
+}
+
+function evidenceFor(selectedPlans: CapabilityPlan[]) {
+  const references = new Set(selectedPlans.flatMap((plan) => plan.evidence.map(({ reference }) => reference)));
+  return acmeCapabilityEvidence().filter(({ reference }) => references.has(reference));
+}
+
+function releaseCandidate(code: string, selectedPlans = plans("find_order"), allowedOrigin = "https://acme.example") {
+  const compiled = compileWebMcpRelease(selectedPlans);
   return {
     code,
     contentHash: createHash("sha256").update(Buffer.from(code)).digest("hex"),
     allowedOrigin,
-    manifest: { version: 1 }
+    manifest: compiled.manifest
   };
 }
 
@@ -74,23 +91,15 @@ test("Postgres repository persists and recovers the fixture lifecycle", { skip: 
     assert.equal(claimed?.sourceUrl, "https://acme.example");
 
     const completed = await repository.completeAnalysis("postgres-worker", run.id, {
-      capabilities: [
-        { stableName: "find_order", riskTier: "R0", status: "proposed" },
-        { stableName: "delete_account", riskTier: "R3", status: "blocked" }
-      ],
-      evidence: [{ source: "openapi", path: "/api/orders" }],
-      release: {
-        code: "export const persisted = true;",
-        contentHash: "candidate",
-        allowedOrigin: "https://acme.example",
-        manifest: { version: 1 }
-      }
+      capabilities: capabilities("find_order"),
+      evidence: evidenceFor(plans("find_order")),
+      release: releaseCandidate("export const persisted = true;")
     });
     assert.equal(completed.status, "succeeded");
     assert.equal(completed.leaseOwner, undefined);
     assert.equal(completed.leaseExpiresAt, undefined);
     assert.equal((await repository.getAnalysis(actor, run.id)).status, "succeeded");
-    assert.equal((await repository.listCapabilities(actor, project.id)).length, 2);
+    assert.equal((await repository.listCapabilities(actor, project.id)).length, 1);
 
     const capabilityDigest = capabilityStateDigest(await repository.listAnalysisCapabilities(actor, run.id));
     const verificationInput = {
@@ -131,13 +140,9 @@ test("Postgres repository persists and recovers the fixture lifecycle", { skip: 
     });
     assert.equal((await repository.claimAnalysis("postgres-worker-two", 60_000))?.id, secondRun.id);
     await repository.completeAnalysis("postgres-worker-two", secondRun.id, {
-      capabilities: [{ stableName: "find_order", riskTier: "R0", status: "proposed" }],
-      evidence: [{ source: "runtime", path: "/api/orders" }],
-      release: {
-        code: "export const persisted = true;",
-        contentHash: "untrusted-candidate-hash",
-        allowedOrigin: "https://acme.example"
-      }
+      capabilities: capabilities("find_order"),
+      evidence: evidenceFor(plans("find_order")),
+      release: releaseCandidate("export const persisted = true;")
     });
     const secondDigest = capabilityStateDigest(await repository.listAnalysisCapabilities(actor, secondRun.id));
     const secondVerification = await repository.saveVerification(actor, project.id, {
@@ -287,12 +292,9 @@ test("Postgres queue exhaustion and stale release gates match the in-memory cont
     });
     assert.equal((await repository.claimAnalysis("stale-worker", 60_000))?.id, publishRun.id);
     await repository.completeAnalysis("stale-worker", publishRun.id, {
-      capabilities: [
-        { stableName: "create_support_ticket", riskTier: "R1", status: "proposed" },
-        { stableName: "find_order", riskTier: "R0", status: "proposed" }
-      ],
-      evidence: [{ source: "runtime", path: "/api/orders" }],
-      release: { code: "export const stale = true;", contentHash: "ignored", allowedOrigin: "https://acme.example" }
+      capabilities: capabilities("create_support_ticket", "find_order"),
+      evidence: evidenceFor(plans("create_support_ticket", "find_order")),
+      release: releaseCandidate("export const stale = true;", plans("create_support_ticket", "find_order"))
     });
     const initialCapabilities = await repository.listAnalysisCapabilities(actor, publishRun.id);
     const capability = initialCapabilities.find((item) => item.stableName === "create_support_ticket");
@@ -303,7 +305,7 @@ test("Postgres queue exhaustion and stale release gates match the in-memory cont
     const verification = await repository.saveVerification(actor, publishProject.id, {
       analysisRunId: publishRun.id,
       capabilityStateDigest: staleDigest,
-      candidate: releaseCandidate("export const stale = true;"),
+      candidate: releaseCandidate("export const stale = true;", plans("create_support_ticket", "find_order")),
       schema: true,
       authenticated: true,
       replayPasses: 3,
@@ -435,11 +437,8 @@ test("Postgres preserves the worker candidate across capability changes and publ
     });
     assert.equal((await repository.claimAnalysis("immutable-source-worker", 60_000))?.id, run.id);
     await repository.completeAnalysis("immutable-source-worker", run.id, {
-      capabilities: [
-        { stableName: "find_order", riskTier: "R0", status: "proposed" },
-        { stableName: "create_support_ticket", riskTier: "R1", status: "proposed" }
-      ],
-      evidence: [{ source: "runtime", path: "/api/orders" }],
+      capabilities: fixturePlans.map((plan) => ({ plan, status: "proposed" as const })),
+      evidence: evidenceFor(fixturePlans),
       release: source
     });
     const ticket = (await repository.listAnalysisCapabilities(actor, run.id))
@@ -561,8 +560,8 @@ test("publication evidence locking serializes with retention cleanup", {
     });
     assert.equal((await repository.claimAnalysis("retention-race-worker", 60_000))?.id, run.id);
     await repository.completeAnalysis("retention-race-worker", run.id, {
-      capabilities: [{ stableName: "find_order", riskTier: "R0", status: "proposed" }],
-      evidence: [{ source: "runtime", path: "/api/orders" }],
+      capabilities: capabilities("find_order"),
+      evidence: evidenceFor(plans("find_order")),
       release: releaseCandidate("export const retentionRace = true;")
     });
     const digest = capabilityStateDigest(await repository.listAnalysisCapabilities(actor, run.id));

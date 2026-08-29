@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import test from "node:test";
+import { acmeCapabilityEvidence, acmeCapabilityPlans } from "../../../apps/acme-support/src/capability-plans.ts";
+import type { CapabilityPlan } from "../../capability-ir/src/plan.ts";
+import { compileWebMcpRelease } from "../../compiler/src/compiler.ts";
 import {
   capabilityStateDigest,
   InMemoryControlPlaneRepository,
@@ -24,12 +27,28 @@ const outsider: RepositoryActor = {
   role: "owner"
 };
 
-function releaseCandidate(code: string, allowedOrigin = "https://acme.example") {
+const fixturePlans = acmeCapabilityPlans("https://acme.example");
+
+function plans(...names: string[]): CapabilityPlan[] {
+  return names.map((name) => fixturePlans.find((plan) => plan.tool.name === name)!);
+}
+
+function capabilities(...names: string[]) {
+  return plans(...names).map((plan) => ({ plan, status: "proposed" as const }));
+}
+
+function evidenceFor(selectedPlans: CapabilityPlan[]) {
+  const references = new Set(selectedPlans.flatMap((plan) => plan.evidence.map(({ reference }) => reference)));
+  return acmeCapabilityEvidence().filter(({ reference }) => references.has(reference));
+}
+
+function releaseCandidate(code: string, selectedPlans = plans("find_order"), allowedOrigin = "https://acme.example") {
+  const compiled = compileWebMcpRelease(selectedPlans);
   return {
     code,
     contentHash: createHash("sha256").update(Buffer.from(code)).digest("hex"),
     allowedOrigin,
-    manifest: { version: 1 }
+    manifest: compiled.manifest
   };
 }
 
@@ -41,6 +60,8 @@ test("capability-state digests use locale-independent canonical ordering", () =>
       stableName: "ä_tool",
       riskTier: "R1",
       status: "blocked",
+      planDigest: "a".repeat(64),
+      reviewedPlanDigest: "a".repeat(64),
       version: 2
     },
     {
@@ -49,13 +70,15 @@ test("capability-state digests use locale-independent canonical ordering", () =>
       stableName: "z_tool",
       riskTier: "R0",
       status: "proposed",
+      planDigest: "b".repeat(64),
+      reviewedPlanDigest: "b".repeat(64),
       version: 1
     }
   ] as const;
 
   assert.equal(
     capabilityStateDigest(capabilities),
-    "71a8f219e95565fdadc374a69c693616def0658799b53985cfd91fa8fc1dc078"
+    "b0bc597d219d762df7aa9900a075dc42fba1af6eaefb49d92b285a84ab159261"
   );
 });
 
@@ -153,23 +176,17 @@ test("analysis completion persists capability ownership and optimistic reviews",
   });
   await repository.claimAnalysis("worker-a", 60_000);
   const completed = await repository.completeAnalysis("worker-a", run.id, {
-    capabilities: [
-      { stableName: "find_order", riskTier: "R0", status: "proposed" },
-      { stableName: "create_support_ticket", riskTier: "R1", status: "proposed" },
-      { stableName: "delete_account", riskTier: "R3", status: "blocked" }
-    ],
-    evidence: [{ source: "openapi", path: "/api/orders" }],
-    release: { code: "export const fixture = true;", contentHash: "candidate", allowedOrigin: "https://acme.example" }
+    capabilities: capabilities("find_order", "create_support_ticket"),
+    evidence: evidenceFor(plans("find_order", "create_support_ticket")),
+    release: releaseCandidate("export const fixture = true;", plans("find_order", "create_support_ticket"))
   });
   assert.equal(completed.status, "succeeded");
   assert.equal(completed.leaseOwner, undefined);
   assert.equal(completed.leaseExpiresAt, undefined);
 
-  const capabilities = await repository.listCapabilities(owner, project.id);
-  const ticket = capabilities.find((item) => item.stableName === "create_support_ticket");
-  const blocked = capabilities.find((item) => item.stableName === "delete_account");
+  const listedCapabilities = await repository.listCapabilities(owner, project.id);
+  const ticket = listedCapabilities.find((item) => item.stableName === "create_support_ticket");
   assert.ok(ticket);
-  assert.ok(blocked);
 
   await assert.rejects(
     repository.reviewCapability(editor, ticket.id, { action: "approve", expectedVersion: 1 }),
@@ -180,16 +197,12 @@ test("analysis completion persists capability ownership and optimistic reviews",
   assert.equal(reviewed.version, 2);
   assert.equal(
     (await repository.getAnalysisResult(owner, run.id))?.capabilities
-      .find((item) => item.stableName === ticket.stableName)?.status,
+      .find((item) => item.plan.tool.name === ticket.stableName)?.status,
     "reviewed"
   );
   await assert.rejects(
     repository.reviewCapability(owner, ticket.id, { action: "approve", expectedVersion: 1 }),
     (error: unknown) => error instanceof RepositoryError && error.code === "VERSION_CONFLICT"
-  );
-  await assert.rejects(
-    repository.reviewCapability(owner, blocked.id, { action: "approve", expectedVersion: 1 }),
-    (error: unknown) => error instanceof RepositoryError && error.code === "HIGH_RISK_ACTION"
   );
 });
 
@@ -209,9 +222,9 @@ test("eligible publication is content addressed and idempotent", async () => {
   });
   await repository.claimAnalysis("worker", 60_000);
   await repository.completeAnalysis("worker", run.id, {
-    capabilities: [{ stableName: "find_order", riskTier: "R0", status: "proposed" }],
-    evidence: [{ source: "runtime", path: "/api/orders" }],
-    release: { code: "export const fixture = true;", contentHash: "candidate", allowedOrigin: "https://acme.example" }
+    capabilities: capabilities("find_order"),
+    evidence: evidenceFor(plans("find_order")),
+    release: releaseCandidate("export const fixture = true;")
   });
   const capabilityState = capabilityStateDigest(await repository.listAnalysisCapabilities(owner, run.id));
   const verificationInput = {
@@ -256,7 +269,7 @@ test("eligible publication is content addressed and idempotent", async () => {
   );
 });
 
-test("publication rejects an exact analysis run without evidence", async () => {
+test("analysis ingestion rejects an exact plan without its immutable evidence", async () => {
   const repository = new InMemoryControlPlaneRepository();
   const project = await repository.createProject(owner, {
     name: "Evidence gate",
@@ -271,34 +284,47 @@ test("publication rejects an exact analysis run without evidence", async () => {
     inputHash: "analysis-evidence-gate"
   });
   await repository.claimAnalysis("evidence-worker", 60_000);
-  await repository.completeAnalysis("evidence-worker", run.id, {
-    capabilities: [{ stableName: "find_order", riskTier: "R0", status: "proposed" }],
+  await assert.rejects(repository.completeAnalysis("evidence-worker", run.id, {
+    capabilities: capabilities("find_order"),
     evidence: [],
     release: releaseCandidate("export const evidenceGate = true;")
-  });
-  const digest = capabilityStateDigest(await repository.listAnalysisCapabilities(owner, run.id));
-  const verification = await repository.saveVerification(owner, project.id, {
-    analysisRunId: run.id,
-    capabilityStateDigest: digest,
-    candidate: releaseCandidate("export const evidenceGate = true;"),
-    schema: true,
-    authenticated: true,
-    replayPasses: 3,
-    noSecretLeakage: true,
-    browserExecution: true,
-    selectionScore: 20
-  });
+  }), (error: unknown) => error instanceof RepositoryError && error.code === "INVALID_STATE");
+});
 
-  await assert.rejects(repository.publishRelease(owner, {
+test("capability approval rejects evidence that expired after analysis", async () => {
+  let now = new Date("2026-08-29T12:00:00.000Z");
+  const repository = new InMemoryControlPlaneRepository(() => now);
+  const project = await repository.createProject(owner, {
+    name: "Review evidence gate",
+    sourceType: "website",
+    url: "https://acme.example",
+    idempotencyKey: "project-review-evidence",
+    inputHash: "project-review-evidence"
+  });
+  const run = await repository.enqueueAnalysis(owner, {
     projectId: project.id,
-    analysisRunId: run.id,
-    capabilityStateDigest: digest,
-    candidateContentHash: verification.candidateContentHash,
-    idempotencyKey: "publish-evidence-gate",
-    inputHash: "publish-evidence-gate"
-  }), (error: unknown) => error instanceof RepositoryError
-    && error.code === "RELEASE_GATE_FAILED"
-    && error.details?.includes("EVIDENCE_MISSING_OR_EXPIRED"));
+    idempotencyKey: "analysis-review-evidence",
+    inputHash: "analysis-review-evidence"
+  });
+  await repository.claimAnalysis("review-evidence-worker", 60_000);
+  await repository.completeAnalysis("review-evidence-worker", run.id, {
+    capabilities: capabilities("create_support_ticket"),
+    evidence: evidenceFor(plans("create_support_ticket")).map((item) => ({
+      ...item,
+      expiresAt: new Date(now.getTime() + 1_000).toISOString(),
+    })),
+    release: releaseCandidate("export const reviewEvidence = true;", plans("create_support_ticket"))
+  });
+  const [capability] = await repository.listAnalysisCapabilities(owner, run.id);
+  assert.ok(capability);
+  now = new Date(now.getTime() + 1_001);
+
+  await assert.rejects(
+    repository.reviewCapability(owner, capability.id, { action: "approve", expectedVersion: 1 }),
+    (error: unknown) => error instanceof RepositoryError
+      && error.code === "RELEASE_GATE_FAILED"
+      && error.details?.includes("EVIDENCE_MISSING_OR_EXPIRED")
+  );
 });
 
 test("only one analysis can be active for a project and expired idempotency keys can be reused", async () => {
@@ -431,16 +457,16 @@ test("publication atomically rejects a stale capability-state verification", asy
   });
   await repository.claimAnalysis("worker", 60_000);
   await repository.completeAnalysis("worker", run.id, {
-    capabilities: [{ stableName: "create_support_ticket", riskTier: "R1", status: "proposed" }],
-    evidence: [],
-    release: { code: "export const state = true;", contentHash: "ignored", allowedOrigin: "https://acme.example" }
+    capabilities: capabilities("create_support_ticket"),
+    evidence: evidenceFor(plans("create_support_ticket")),
+    release: releaseCandidate("export const state = true;", plans("create_support_ticket"))
   });
   const [capability] = await repository.listAnalysisCapabilities(owner, run.id);
   const staleDigest = capabilityStateDigest([capability]);
   const verification = await repository.saveVerification(owner, project.id, {
     analysisRunId: run.id,
     capabilityStateDigest: staleDigest,
-    candidate: releaseCandidate("export const state = true;"),
+    candidate: releaseCandidate("export const state = true;", plans("create_support_ticket")),
     schema: true,
     authenticated: true,
     replayPasses: 3,
@@ -480,25 +506,22 @@ test("a blocked capability publishes reviewed bytes without mutating the worker 
     inputHash: "analysis-reviewed-subset"
   });
   await repository.claimAnalysis("subset-worker", 60_000);
-  const sourceCandidate = releaseCandidate("export const includesAll = true;");
+  const sourceCandidate = releaseCandidate("export const includesAll = true;", plans("find_order", "create_support_ticket"));
   await repository.completeAnalysis("subset-worker", run.id, {
-    capabilities: [
-      { stableName: "find_order", riskTier: "R0", status: "proposed" },
-      { stableName: "create_support_ticket", riskTier: "R1", status: "proposed" }
-    ],
-    evidence: [{ source: "runtime", path: "/api/orders" }],
+    capabilities: capabilities("find_order", "create_support_ticket"),
+    evidence: evidenceFor(plans("find_order", "create_support_ticket")),
     release: sourceCandidate
   });
-  const capabilities = await repository.listAnalysisCapabilities(owner, run.id);
-  const read = capabilities.find((capability) => capability.stableName === "find_order");
-  const mutation = capabilities.find((capability) => capability.stableName === "create_support_ticket");
+  const listedCapabilities = await repository.listAnalysisCapabilities(owner, run.id);
+  const read = listedCapabilities.find((capability) => capability.stableName === "find_order");
+  const mutation = listedCapabilities.find((capability) => capability.stableName === "create_support_ticket");
   assert.ok(read);
   assert.ok(mutation);
   await repository.reviewCapability(owner, mutation.id, { action: "block", expectedVersion: 1 });
 
   const reviewed = await repository.listAnalysisCapabilities(owner, run.id);
   const digest = capabilityStateDigest(reviewed);
-  const candidate = releaseCandidate("export const reviewedSubset = ['find_order'];");
+  const candidate = releaseCandidate("export const reviewedSubset = ['find_order'];", plans("find_order"));
   const verification = await repository.saveVerification(owner, project.id, {
     analysisRunId: run.id,
     capabilityStateDigest: digest,
@@ -540,8 +563,8 @@ test("candidate hashes are validated and a later verification cannot be overwrit
   });
   await repository.claimAnalysis("candidate-worker", 60_000);
   await repository.completeAnalysis("candidate-worker", run.id, {
-    capabilities: [{ stableName: "find_order", riskTier: "R0", status: "proposed" }],
-    evidence: [{ source: "runtime", path: "/api/orders" }],
+    capabilities: capabilities("find_order"),
+    evidence: evidenceFor(plans("find_order")),
     release: releaseCandidate("export const initial = true;")
   });
   const digest = capabilityStateDigest(await repository.listAnalysisCapabilities(owner, run.id));
@@ -621,9 +644,9 @@ test("identical code remains attributable to each exact analysis run", async () 
     });
     await repository.claimAnalysis(`worker-${index}`, 60_000);
     await repository.completeAnalysis(`worker-${index}`, run.id, {
-      capabilities: [{ stableName: "find_order", riskTier: "R0", status: "proposed" }],
-      evidence: [{ source: "runtime", path: "/api/orders" }],
-      release: { code: "export const same = true;", contentHash: "ignored", allowedOrigin: "https://acme.example" }
+      capabilities: capabilities("find_order"),
+      evidence: evidenceFor(plans("find_order")),
+      release: releaseCandidate("export const same = true;")
     });
     const digest = capabilityStateDigest(await repository.listAnalysisCapabilities(owner, run.id));
     const verification = await repository.saveVerification(owner, project.id, {

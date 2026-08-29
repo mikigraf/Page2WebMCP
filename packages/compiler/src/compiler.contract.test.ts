@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { createServer } from "node:http";
+import { once } from "node:events";
 import test from "node:test";
 import type { CapabilityPlan } from "../../capability-ir/src/plan.ts";
 import { compileWebMcpRelease } from "./compiler.ts";
@@ -97,7 +99,7 @@ function plans(origin = "https://widgets.example"): CapabilityPlan[] {
         csrf: {
           reviewed: true,
           headerName: "x-csrf-token",
-          resolution: { kind: "meta", selector: "meta[name=csrf-token]", attribute: "content" },
+          resolution: { kind: "meta", name: "csrf-token", attribute: "content" },
         },
       },
       effects: {
@@ -106,6 +108,11 @@ function plans(origin = "https://widgets.example"): CapabilityPlan[] {
         reversible: true,
         summary: "Creates one widget draft that can be deleted.",
         confirmation: "always",
+        sourceNativeConfirmation: {
+          reviewed: true,
+          globalName: "__page2webmcpConfirmWidget",
+          evidenceReference: `urn:sha256:${HASH_A}`,
+        },
       },
       idempotency: { strategy: "header", headerName: "idempotency-key", verified: true, retry: "safe_once" },
       request: { method: "POST", pathTemplate: "/v7/widget-drafts", path: {}, query: {}, body: { label: "label" } },
@@ -129,17 +136,27 @@ function plans(origin = "https://widgets.example"): CapabilityPlan[] {
   ];
 }
 
-function installEnvironment(origin: string, tools: GeneratedTool[], options: { csrf?: string; supported?: boolean } = {}) {
+function installEnvironment(
+  origin: string,
+  tools: GeneratedTool[],
+  options: { csrf?: string | string[]; supported?: boolean; confirm?: (request: unknown) => boolean | Promise<boolean> } = {},
+) {
   const events = new EventTarget();
   Object.defineProperty(globalThis, "window", {
     configurable: true,
     value: Object.assign(events, { location: { origin } }),
   });
   const documentValue: Record<string, unknown> = {
-    querySelector: (selector: string) => selector === "meta[name=csrf-token]" && options.csrf !== undefined
-      ? { getAttribute: (name: string) => name === "content" ? options.csrf : null }
-      : null,
+    getElementsByTagName: (tagName: string) => tagName === "meta" && options.csrf !== undefined
+      ? (Array.isArray(options.csrf) ? options.csrf : [options.csrf]).map((csrf) => ({
+        getAttribute: (name: string) => name === "name" ? "csrf-token" : name === "content" ? csrf : null,
+      }))
+      : [],
   };
+  Object.defineProperty(globalThis, "__page2webmcpConfirmWidget", {
+    configurable: true,
+    value: options.confirm ?? (async () => true),
+  });
   if (options.supported !== false) {
     documentValue.modelContext = {
       registerTool: async (tool: GeneratedTool, registration: { signal: AbortSignal }) => {
@@ -219,9 +236,6 @@ test("generated module fails closed on wrong origin and unsupported WebMCP", asy
 test("generated read projects output, sends credentials, maps errors, and bounds content type", async () => {
   const tools: GeneratedTool[] = [];
   installEnvironment("https://widgets.example", tools);
-  const artifact = await importRelease(plans());
-  await artifact.autoRegistration;
-  const read = tools.find((tool) => tool.name === "search_widgets")!;
   const originalFetch = globalThis.fetch;
   let request: { url: string; init?: RequestInit } | undefined;
   try {
@@ -229,15 +243,28 @@ test("generated read projects output, sends credentials, maps errors, and bounds
       request = { url: String(input), init };
       return Response.json([{ widget_id: "w-1", display_name: "Alpha", secret: "drop" }]);
     };
+    const artifact = await importRelease(plans());
+    await artifact.autoRegistration;
+    const read = tools.find((tool) => tool.name === "search_widgets")!;
     const output = await read.execute({ query: "alpha" }, { signal: new AbortController().signal });
     assert.deepEqual((output as Array<Record<string, unknown>>).map((item) => ({ ...item })), [{ id: "w-1", label: "Alpha" }]);
     assert.equal(request?.url, "https://widgets.example/v7/widgets?q=alpha");
     assert.equal(request?.init?.credentials, "same-origin");
 
+    request = undefined;
+    const signedOutTools: GeneratedTool[] = [];
+    installEnvironment("https://widgets.example", signedOutTools);
     globalThis.fetch = async () => new Response("signed out", { status: 401 });
-    await assert.rejects(read.execute({ query: "alpha" }, { signal: new AbortController().signal }), { code: "AUTHENTICATION_REQUIRED" });
+    const signedOutArtifact = await importRelease([plans()[0]!]);
+    await signedOutArtifact.autoRegistration;
+    const signedOutRead = signedOutTools[0]!;
+    await assert.rejects(signedOutRead.execute({ query: "alpha" }, { signal: new AbortController().signal }), { code: "AUTHENTICATION_REQUIRED" });
+    const htmlTools: GeneratedTool[] = [];
+    installEnvironment("https://widgets.example", htmlTools);
     globalThis.fetch = async () => new Response("<html>not json</html>", { status: 200, headers: { "content-type": "text/html" } });
-    await assert.rejects(read.execute({ query: "alpha" }, { signal: new AbortController().signal }), { code: "UNSUPPORTED_CONTENT_TYPE" });
+    const htmlArtifact = await importRelease([plans()[0]!]);
+    await htmlArtifact.autoRegistration;
+    await assert.rejects(htmlTools[0]!.execute({ query: "alpha" }, { signal: new AbortController().signal }), { code: "UNSUPPORTED_CONTENT_TYPE" });
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -245,12 +272,11 @@ test("generated read projects output, sends credentials, maps errors, and bounds
 
 test("generated mutation resolves reviewed CSRF, confirms, and safely replays with one idempotency key", async () => {
   const tools: GeneratedTool[] = [];
-  installEnvironment("https://widgets.example", tools, { csrf: "csrf-from-page" });
-  const artifact = await importRelease(plans());
-  await artifact.autoRegistration;
   let confirmations = 0;
-  await artifact.registerPage2WebMCPTools({ confirm: async () => { confirmations += 1; return true; } });
-  const mutation = tools.find((tool) => tool.name === "create_widget_draft")!;
+  installEnvironment("https://widgets.example", tools, {
+    csrf: "csrf-from-page",
+    confirm: async () => { confirmations += 1; return true; },
+  });
   const originalFetch = globalThis.fetch;
   const headers: Headers[] = [];
   let calls = 0;
@@ -261,6 +287,9 @@ test("generated mutation resolves reviewed CSRF, confirms, and safely replays wi
       if (calls === 1) throw new TypeError("response dropped after commit");
       return Response.json({ widget_id: "w-2", state: "draft" }, { status: 201 });
     };
+    const artifact = await importRelease(plans());
+    await artifact.autoRegistration;
+    const mutation = tools.find((tool) => tool.name === "create_widget_draft")!;
     const result = await mutation.execute({ label: "Beta" }, { signal: new AbortController().signal });
     assert.deepEqual({ ...(result as Record<string, unknown>) }, { id: "w-2", state: "draft" });
     assert.equal(confirmations, 1);
@@ -309,12 +338,18 @@ test("generated built-in confirmation is encapsulated, labelled, described, and 
     return element;
   };
   currentDocument.body = new FakeElement("body");
-  const artifact = await importRelease(plans());
+  const dialogPlans = plans().map((plan) => {
+    if (plan.effects.kind !== "mutation") return plan;
+    const effects = { ...plan.effects };
+    delete effects.sourceNativeConfirmation;
+    return { ...plan, effects } as CapabilityPlan;
+  });
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => Response.json({ widget_id: "w-dialog", state: "draft" }, { status: 201 });
+  const artifact = await importRelease(dialogPlans);
   await artifact.autoRegistration;
   const mutation = tools.find((tool) => tool.name === "create_widget_draft")!;
-  const originalFetch = globalThis.fetch;
   try {
-    globalThis.fetch = async () => Response.json({ widget_id: "w-dialog", state: "draft" }, { status: 201 });
     const approved = mutation.execute({ label: "Dialog approval" }, { signal: new AbortController().signal });
     for (let attempt = 0; attempt < 100 && !created.some((element) => element.tagName === "dialog"); attempt += 1) {
       await new Promise((resolve) => setTimeout(resolve, 1));
@@ -346,31 +381,271 @@ test("generated built-in confirmation is encapsulated, labelled, described, and 
 
 test("generated confirmation denial, caller cancellation, and timeout make no uncontrolled effect", async () => {
   const deniedTools: GeneratedTool[] = [];
-  installEnvironment("https://widgets.example", deniedTools, { csrf: "csrf-from-page" });
-  const denied = await importRelease(plans());
-  await denied.autoRegistration;
-  await denied.registerPage2WebMCPTools({ confirm: async () => false });
-  const mutation = deniedTools.find((tool) => tool.name === "create_widget_draft")!;
+  installEnvironment("https://widgets.example", deniedTools, { csrf: "csrf-from-page", confirm: async () => false });
   let calls = 0;
   const originalFetch = globalThis.fetch;
   try {
     globalThis.fetch = async () => { calls += 1; return Response.json({}); };
+    const denied = await importRelease(plans());
+    await denied.autoRegistration;
+    const mutation = deniedTools.find((tool) => tool.name === "create_widget_draft")!;
     await assert.rejects(mutation.execute({ label: "No" }, { signal: new AbortController().signal }), { code: "CONFIRMATION_DECLINED" });
     assert.equal(calls, 0);
 
     const timeoutTools: GeneratedTool[] = [];
     installEnvironment("https://widgets.example", timeoutTools);
-    const timeout = await importRelease([plans()[0]!], { deadlineMs: 5 });
-    await timeout.autoRegistration;
     globalThis.fetch = async (_input, init) => new Promise<Response>((_resolve, reject) => {
       init?.signal?.addEventListener("abort", () => reject(init.signal!.reason), { once: true });
     });
+    const timeout = await importRelease([plans()[0]!], { deadlineMs: 5 });
+    await timeout.autoRegistration;
     await assert.rejects(timeoutTools[0]!.execute({ query: "x" }, { signal: new AbortController().signal }), { code: "DEADLINE_EXCEEDED" });
 
     const caller = new AbortController();
     const pending = timeoutTools[0]!.execute({ query: "x" }, { signal: caller.signal });
     caller.abort();
     await assert.rejects(pending, { code: "ABORTED" });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("generated requests reject every redirect without contacting its target", async () => {
+  let redirectStatus = 307;
+  let sinkCalls = 0;
+  const sink = createServer((_request, response) => {
+    sinkCalls += 1;
+    response.writeHead(201, { "content-type": "application/json" });
+    response.end(JSON.stringify({ widget_id: "redirected", state: "draft" }));
+  });
+  sink.listen(0, "127.0.0.1");
+  await once(sink, "listening");
+  const sinkAddress = sink.address();
+  assert.ok(sinkAddress && typeof sinkAddress !== "string");
+  const sinkOrigin = `http://127.0.0.1:${sinkAddress.port}`;
+
+  const source = createServer((_request, response) => {
+    response.writeHead(redirectStatus, { location: `${sinkOrigin}/sink` });
+    response.end();
+  });
+  source.listen(0, "127.0.0.1");
+  await once(source, "listening");
+  const sourceAddress = source.address();
+  assert.ok(sourceAddress && typeof sourceAddress !== "string");
+  const sourceOrigin = `http://127.0.0.1:${sourceAddress.port}`;
+
+  const originalFetch = globalThis.fetch;
+  try {
+    const tools: GeneratedTool[] = [];
+    installEnvironment(sourceOrigin, tools, { csrf: "csrf-from-page" });
+    globalThis.fetch = originalFetch;
+    const artifact = await importRelease(plans(sourceOrigin));
+    await artifact.autoRegistration;
+    await artifact.registerPage2WebMCPTools({ confirm: async () => true });
+    const mutation = tools.find((tool) => tool.name === "create_widget_draft")!;
+    for (const status of [301, 302, 303, 307, 308]) {
+      redirectStatus = status;
+      await assert.rejects(
+        mutation.execute({ label: `redirect-${status}` }, { signal: new AbortController().signal }),
+        { code: "TARGET_ERROR" },
+      );
+    }
+    assert.equal(sinkCalls, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+    source.close();
+    sink.close();
+    await Promise.all([once(source, "close"), once(sink, "close")]);
+  }
+});
+
+test("lifecycle teardown aborts an in-flight execution", async () => {
+  const tools: GeneratedTool[] = [];
+  const events = installEnvironment("https://widgets.example", tools);
+  const originalFetch = globalThis.fetch;
+  let requestSignal: AbortSignal | undefined;
+  globalThis.fetch = async (_input, init) => new Promise<Response>((_resolve, reject) => {
+    requestSignal = init?.signal ?? undefined;
+    init?.signal?.addEventListener("abort", () => reject(init.signal!.reason), { once: true });
+  });
+  try {
+    const artifact = await importRelease([plans()[0]!]);
+    await artifact.autoRegistration;
+    const execution = tools[0]!.execute({ query: "active" }, { signal: new AbortController().signal });
+    while (!requestSignal) await new Promise((resolve) => setTimeout(resolve, 1));
+    events.dispatchEvent(new Event("pagehide"));
+    await assert.rejects(execution, { code: "ABORTED" });
+    assert.equal(requestSignal.aborted, true);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("lifecycle teardown aborts an in-flight mutation after confirmation", async () => {
+  const tools: GeneratedTool[] = [];
+  const events = installEnvironment("https://widgets.example", tools, { csrf: "csrf-from-page" });
+  const originalFetch = globalThis.fetch;
+  let requestSignal: AbortSignal | undefined;
+  globalThis.fetch = async (_input, init) => new Promise<Response>((_resolve, reject) => {
+    requestSignal = init?.signal ?? undefined;
+    init?.signal?.addEventListener("abort", () => reject(init.signal!.reason), { once: true });
+  });
+  try {
+    const artifact = await importRelease([plans()[1]!]);
+    await artifact.autoRegistration;
+    const execution = tools[0]!.execute({ label: "active mutation" }, { signal: new AbortController().signal });
+    while (!requestSignal) await new Promise((resolve) => setTimeout(resolve, 1));
+    events.dispatchEvent(new Event("beforeunload"));
+    await assert.rejects(execution, { code: "ABORTED" });
+    assert.equal(requestSignal.aborted, true);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("structured CSRF resolution fails closed when the reviewed token is ambiguous", async () => {
+  const tools: GeneratedTool[] = [];
+  let confirmations = 0;
+  let fetchCalls = 0;
+  installEnvironment("https://widgets.example", tools, {
+    csrf: ["first-token", "second-token"],
+    confirm: async () => { confirmations += 1; return true; },
+  });
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    fetchCalls += 1;
+    return Response.json({ widget_id: "unsafe", state: "draft" }, { status: 201 });
+  };
+  try {
+    const artifact = await importRelease([plans()[1]!]);
+    await artifact.autoRegistration;
+    await assert.rejects(
+      tools[0]!.execute({ label: "ambiguous token" }, { signal: new AbortController().signal }),
+      { code: "CSRF_UNAVAILABLE" },
+    );
+    assert.equal(confirmations, 0);
+    assert.equal(fetchCalls, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("generated module captures transport before later page-code replacement", async () => {
+  const tools: GeneratedTool[] = [];
+  installEnvironment("https://widgets.example", tools);
+  const originalFetch = globalThis.fetch;
+  let capturedCalls = 0;
+  let replacementCalls = 0;
+  globalThis.fetch = async () => {
+    capturedCalls += 1;
+    return Response.json([{ widget_id: "trusted", display_name: "Trusted" }]);
+  };
+  try {
+    const artifact = await importRelease([plans()[0]!]);
+    await artifact.autoRegistration;
+    globalThis.fetch = async () => {
+      replacementCalls += 1;
+      return Response.json([{ widget_id: "replaced", display_name: "Replaced" }]);
+    };
+    const output = await tools[0]!.execute({ query: "x" }, { signal: new AbortController().signal });
+    assert.deepEqual({ ...(output as Array<Record<string, unknown>>)[0]! }, { id: "trusted", label: "Trusted" });
+    assert.equal(capturedCalls, 1);
+    assert.equal(replacementCalls, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("unapproved registration hooks cannot bypass built-in confirmation", async () => {
+  const tools: GeneratedTool[] = [];
+  installEnvironment("https://widgets.example", tools, { csrf: "csrf-from-page" });
+  const originalFetch = globalThis.fetch;
+  let fetchCalls = 0;
+  globalThis.fetch = async () => {
+    fetchCalls += 1;
+    return Response.json({ widget_id: "unsafe", state: "draft" }, { status: 201 });
+  };
+  try {
+    const unapprovedPlans = plans().map((plan) => {
+      if (plan.effects.kind !== "mutation") return plan;
+      const effects = { ...plan.effects };
+      delete effects.sourceNativeConfirmation;
+      return { ...plan, effects } as CapabilityPlan;
+    });
+    const artifact = await importRelease(unapprovedPlans);
+    await artifact.autoRegistration;
+    await artifact.registerPage2WebMCPTools({ confirm: async () => true });
+    const mutation = tools.find((tool) => tool.name === "create_widget_draft")!;
+    await assert.rejects(
+      mutation.execute({ label: "must show built-in" }, { signal: new AbortController().signal }),
+      { code: "CONFIRMATION_FAILED" },
+    );
+    assert.equal(fetchCalls, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("unverified no-retry mutations never reuse recovery state", async () => {
+  const unverified = {
+    ...plans()[1]!,
+    idempotency: { strategy: "header", headerName: "idempotency-key", verified: false, retry: "none" },
+  } as CapabilityPlan;
+  const tools: GeneratedTool[] = [];
+  installEnvironment("https://widgets.example", tools, { csrf: "csrf-from-page" });
+  const originalFetch = globalThis.fetch;
+  const keys: string[] = [];
+  let calls = 0;
+  globalThis.fetch = async (_input, init) => {
+    calls += 1;
+    keys.push(new Headers(init?.headers).get("idempotency-key") ?? "");
+    if (calls === 1) throw new TypeError("ambiguous network failure");
+    return Response.json({ widget_id: "fresh", state: "draft" }, { status: 201 });
+  };
+  try {
+    const artifact = await importRelease([unverified]);
+    await artifact.autoRegistration;
+    await artifact.registerPage2WebMCPTools({ confirm: async () => true });
+    await assert.rejects(tools[0]!.execute({ label: "same" }, { signal: new AbortController().signal }), { code: "TARGET_ERROR" });
+    await tools[0]!.execute({ label: "same" }, { signal: new AbortController().signal });
+    assert.equal(keys.length, 2);
+    assert.notEqual(keys[0], keys[1]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("runtime string bounds count Unicode code points for input and output", async () => {
+  const unicode = {
+    ...plans()[0]!,
+    schemas: {
+      input: {
+        type: "object",
+        properties: { query: { type: "string", minLength: 1, maxLength: 1 } },
+        required: ["query"],
+        additionalProperties: false,
+      },
+      output: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: { id: { type: "string", maxLength: 1 }, label: { type: "string", maxLength: 1 } },
+          required: ["id", "label"],
+          additionalProperties: false,
+        },
+        maxItems: 1,
+      },
+    },
+  } as CapabilityPlan;
+  const tools: GeneratedTool[] = [];
+  installEnvironment("https://widgets.example", tools);
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => Response.json([{ widget_id: "😀", display_name: "😀" }]);
+  try {
+    const artifact = await importRelease([unicode]);
+    await artifact.autoRegistration;
+    const result = await tools[0]!.execute({ query: "😀" }, { signal: new AbortController().signal });
+    assert.deepEqual({ ...(result as Array<Record<string, unknown>>)[0]! }, { id: "😀", label: "😀" });
   } finally {
     globalThis.fetch = originalFetch;
   }

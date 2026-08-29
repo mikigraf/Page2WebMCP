@@ -35,8 +35,8 @@ export type CapabilityPlan = {
       reviewed: true;
       headerName: string;
       resolution:
-        | { kind: "meta"; selector: string; attribute: "content" }
-        | { kind: "dom"; selector: string; attribute: string };
+        | { kind: "meta"; name: string; attribute: "content" }
+        | { kind: "hidden_input"; name: string; attribute: "value" };
     };
   };
   effects: {
@@ -45,6 +45,11 @@ export type CapabilityPlan = {
     reversible: boolean;
     summary: string;
     confirmation: "none" | "always";
+    sourceNativeConfirmation?: {
+      reviewed: true;
+      globalName: string;
+      evidenceReference: string;
+    };
   };
   idempotency: {
     strategy: "none" | "header";
@@ -90,7 +95,7 @@ const JsonSchemaSchema: z.ZodType<JsonSchema> = z.lazy(() => z.discriminatedUnio
     type: z.literal("string"),
     minLength: z.number().int().min(0).optional(),
     maxLength: z.number().int().min(0).optional(),
-    enum: z.array(z.string()).min(1).optional(),
+    enum: z.array(z.string().max(4096)).min(1).max(100).optional(),
   }).strict(),
   z.object({ type: z.literal("boolean") }).strict(),
   z.object({
@@ -112,7 +117,7 @@ const JsonSchemaSchema: z.ZodType<JsonSchema> = z.lazy(() => z.discriminatedUnio
   z.object({
     type: z.literal("object"),
     properties: z.record(z.string(), JsonSchemaSchema),
-    required: z.array(z.string()),
+    required: z.array(z.string()).max(100),
     additionalProperties: z.literal(false),
   }).strict(),
 ]));
@@ -120,7 +125,7 @@ const JsonSchemaSchema: z.ZodType<JsonSchema> = z.lazy(() => z.discriminatedUnio
 const ObjectJsonSchemaSchema = z.object({
   type: z.literal("object"),
   properties: z.record(z.string(), JsonSchemaSchema),
-  required: z.array(z.string()),
+  required: z.array(z.string()).max(100),
   additionalProperties: z.literal(false),
 }).strict();
 
@@ -155,11 +160,15 @@ const CapabilityPlanStructureSchema = z.object({
       reviewed: z.literal(true),
       headerName: z.string().regex(/^[A-Za-z0-9!#$%&'*+.^_`|~-]{1,128}$/),
       resolution: z.discriminatedUnion("kind", [
-        z.object({ kind: z.literal("meta"), selector: z.string().min(1).max(256), attribute: z.literal("content") }).strict(),
         z.object({
-          kind: z.literal("dom"),
-          selector: z.string().min(1).max(256),
-          attribute: z.string().regex(/^(?:value|data-[a-z0-9-]{1,100})$/),
+          kind: z.literal("meta"),
+          name: z.string().regex(/^[A-Za-z][A-Za-z0-9_-]{0,127}$/),
+          attribute: z.literal("content"),
+        }).strict(),
+        z.object({
+          kind: z.literal("hidden_input"),
+          name: z.string().regex(/^[A-Za-z_][A-Za-z0-9_-]{0,127}$/),
+          attribute: z.literal("value"),
         }).strict(),
       ]),
     }).strict().optional(),
@@ -170,6 +179,11 @@ const CapabilityPlanStructureSchema = z.object({
     reversible: z.boolean(),
     summary: z.string().trim().min(1).max(300),
     confirmation: z.enum(["none", "always"]),
+    sourceNativeConfirmation: z.object({
+      reviewed: z.literal(true),
+      globalName: z.string().regex(/^__page2webmcp[A-Za-z0-9_]{1,100}$/),
+      evidenceReference: z.string().regex(/^urn:sha256:[a-f0-9]{64}$/),
+    }).strict().optional(),
   }).strict(),
   idempotency: z.object({
     strategy: z.enum(["none", "header"]),
@@ -203,13 +217,29 @@ const CapabilityPlanStructureSchema = z.object({
   }).strict()).min(1).max(500),
 }).strict();
 
-export const CapabilityPlanSchema: z.ZodType<CapabilityPlan> = CapabilityPlanStructureSchema.superRefine((plan, context) => {
+const ValidatedCapabilityPlanSchema = CapabilityPlanStructureSchema.superRefine((plan, context) => {
   try {
     validateCapabilityPlan(plan);
   } catch (error) {
     context.addIssue({ code: "custom", message: error instanceof Error ? error.message : "invalid CapabilityPlan" });
   }
 });
+
+export const CapabilityPlanSchema: z.ZodType<CapabilityPlan> = z.preprocess((input) => {
+  rejectPoisonKeys(input);
+  return input;
+}, ValidatedCapabilityPlanSchema);
+
+const POISON_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
+function rejectPoisonKeys(value: unknown, seen = new WeakSet<object>()): void {
+  if (!value || typeof value !== "object" || seen.has(value)) return;
+  seen.add(value);
+  for (const key of Object.keys(value)) {
+    if (POISON_KEYS.has(key)) throw new Error(`unsafe poison key: ${key}`);
+    rejectPoisonKeys((value as Record<string, unknown>)[key], seen);
+  }
+}
 
 function validateExactOrigin(value: string): void {
   let url: URL;
@@ -231,12 +261,33 @@ function assertUnique(values: readonly unknown[], label: string): void {
   if (new Set(values).size !== values.length) throw new Error(`${label} contains duplicates`);
 }
 
-function validateSchema(schema: JsonSchema, label: string): void {
+const MAX_SCHEMA_DEPTH = 8;
+const MAX_SCHEMA_PROPERTIES = 100;
+const MAX_INPUT_STRING_LENGTH = 4096;
+const MAX_INPUT_ARRAY_ITEMS = 1000;
+const MAX_REQUEST_BODY_BYTES = 32768;
+const MAX_REQUEST_URL_BYTES = 8192;
+const MAX_INPUT_VALIDATION_UNITS = 32768;
+
+type SchemaBudget = { properties: number };
+
+function validateSchema(
+  schema: JsonSchema,
+  label: string,
+  options: { input: boolean; depth: number; budget: SchemaBudget },
+): void {
+  if (options.depth > MAX_SCHEMA_DEPTH) throw new Error(`${label} exceeds schema depth bound`);
   if (schema.type === "string") {
     if (schema.minLength !== undefined && schema.maxLength !== undefined && schema.minLength > schema.maxLength) {
       throw new Error(`${label} has incompatible string bounds`);
     }
     if (schema.enum) assertUnique(schema.enum, `${label}.enum`);
+    if (options.input && schema.maxLength === undefined && schema.enum === undefined) {
+      throw new Error(`${label} must have a bounded maxLength`);
+    }
+    if (schema.maxLength !== undefined && schema.maxLength > MAX_INPUT_STRING_LENGTH) {
+      throw new Error(`${label} maxLength exceeds the supported bound`);
+    }
     return;
   }
   if (schema.type === "number" || schema.type === "integer") {
@@ -249,21 +300,29 @@ function validateSchema(schema: JsonSchema, label: string): void {
     if (schema.minItems !== undefined && schema.maxItems !== undefined && schema.minItems > schema.maxItems) {
       throw new Error(`${label} has incompatible array bounds`);
     }
-    validateSchema(schema.items, `${label}.items`);
+    if (options.input && schema.maxItems === undefined) throw new Error(`${label} must have bounded maxItems`);
+    if (schema.maxItems !== undefined && schema.maxItems > MAX_INPUT_ARRAY_ITEMS) {
+      throw new Error(`${label} maxItems exceeds the supported bound`);
+    }
+    validateSchema(schema.items, `${label}.items`, { ...options, depth: options.depth + 1 });
     return;
   }
   if (schema.type === "object") {
+    options.budget.properties += Object.keys(schema.properties).length;
+    if (options.budget.properties > MAX_SCHEMA_PROPERTIES) throw new Error(`${label} exceeds the schema property bound`);
     assertUnique(schema.required, `${label}.required`);
     for (const field of schema.required) {
       if (!Object.prototype.hasOwnProperty.call(schema.properties, field)) throw new Error(`${label} requires an unknown property`);
     }
-    for (const [field, property] of Object.entries(schema.properties)) validateSchema(property, `${label}.${field}`);
+    for (const [field, property] of Object.entries(schema.properties)) {
+      validateSchema(property, `${label}.${field}`, { ...options, depth: options.depth + 1 });
+    }
   }
 }
 
-function stableCsrfSelector(resolution: NonNullable<CapabilityPlan["authentication"]["csrf"]>["resolution"]): boolean {
-  if (resolution.kind === "meta") return /^meta\[name=(?:"[A-Za-z0-9_.:-]+"|[A-Za-z0-9_.:-]+)\]$/.test(resolution.selector);
-  return /^(?:#[A-Za-z][A-Za-z0-9_:.-]{0,127}|[a-z][a-z0-9-]*\[(?:name|data-[a-z0-9-]+)="[A-Za-z0-9_.:-]+"\])$/.test(resolution.selector);
+function validCsrfTokenName(name: string): boolean {
+  const credentialMarker = /(?:^|[-_])(?:password|passwd|passcode|otp|one[-_]?time|credential|secret|session|cookie|authorization|bearer)(?:$|[-_])/i;
+  return !credentialMarker.test(name) && /(?:^|[-_])(?:csrf|xsrf)(?:[-_]?token)?(?:$|[-_])/i.test(name);
 }
 
 function validateRequestPath(plan: CapabilityPlan): void {
@@ -300,10 +359,58 @@ function referencedOutputSchema(plan: CapabilityPlan): ObjectJsonSchema | undefi
   return undefined;
 }
 
+function maximumScalarJsonBytes(schema: JsonSchema): number {
+  if (schema.type === "string") {
+    if (schema.enum) return Math.max(...schema.enum.map((value) => utf8Bytes(JSON.stringify(value))));
+    return (schema.maxLength ?? MAX_INPUT_STRING_LENGTH) * 6 + 2;
+  }
+  if (schema.type === "boolean") return 5;
+  if (schema.type === "number" || schema.type === "integer") return 64;
+  return Number.POSITIVE_INFINITY;
+}
+
+function utf8Bytes(value: string): number {
+  return new TextEncoder().encode(value).byteLength;
+}
+
+function maximumScalarUrlBytes(schema: JsonSchema): number {
+  if (schema.type === "string") {
+    const maximumLength = schema.enum
+      ? Math.max(...schema.enum.map((value) => Array.from(value).length))
+      : schema.maxLength ?? MAX_INPUT_STRING_LENGTH;
+    return maximumLength * 12;
+  }
+  if (schema.type === "boolean") return 5;
+  if (schema.type === "number" || schema.type === "integer") return 64;
+  return Number.POSITIVE_INFINITY;
+}
+
+function maximumValidationUnits(schema: JsonSchema): number {
+  if (schema.type === "string") {
+    if (schema.enum) return 1 + Math.max(...schema.enum.map((value) => Array.from(value).length));
+    return 1 + (schema.maxLength ?? MAX_INPUT_STRING_LENGTH);
+  }
+  if (schema.type === "boolean" || schema.type === "number" || schema.type === "integer") return 1;
+  if (schema.type === "array") return 1 + (schema.maxItems ?? MAX_INPUT_ARRAY_ITEMS) * maximumValidationUnits(schema.items);
+  return 1 + Object.values(schema.properties)
+    .reduce((total, property) => total + maximumValidationUnits(property), 0);
+}
+
 function validateCapabilityPlan(plan: CapabilityPlan): void {
   validateExactOrigin(plan.targetOrigin);
-  validateSchema(plan.schemas.input, `${plan.tool.name}.schemas.input`);
-  validateSchema(plan.schemas.output, `${plan.tool.name}.schemas.output`);
+  validateSchema(plan.schemas.input, `${plan.tool.name}.schemas.input`, {
+    input: true,
+    depth: 1,
+    budget: { properties: 0 },
+  });
+  validateSchema(plan.schemas.output, `${plan.tool.name}.schemas.output`, {
+    input: false,
+    depth: 1,
+    budget: { properties: 0 },
+  });
+  if (maximumValidationUnits(plan.schemas.input) > MAX_INPUT_VALIDATION_UNITS) {
+    throw new Error(`input validation bound exceeds the supported limit for ${plan.tool.name}`);
+  }
   validateRequestPath(plan);
 
   if (plan.effects.riskTier === "R3") throw new Error(`R3 capability ${plan.tool.name} cannot be compiled`);
@@ -313,6 +420,9 @@ function validateCapabilityPlan(plan: CapabilityPlan): void {
     }
     if (plan.request.method !== "GET" || Object.keys(plan.request.body).length > 0) {
       throw new Error(`read capability must use GET without a body for ${plan.tool.name}`);
+    }
+    if (plan.effects.sourceNativeConfirmation) {
+      throw new Error(`read capability cannot declare source-native confirmation for ${plan.tool.name}`);
     }
   } else {
     if (plan.annotations.readOnly || plan.effects.riskTier === "R0" || plan.effects.confirmation !== "always") {
@@ -340,8 +450,14 @@ function validateCapabilityPlan(plan: CapabilityPlan): void {
     throw new Error(`public authentication cannot require scopes for ${plan.tool.name}`);
   }
   assertUnique(plan.authentication.requiredScopes, `${plan.tool.name}.authentication.requiredScopes`);
-  if (plan.authentication.csrf && !stableCsrfSelector(plan.authentication.csrf.resolution)) {
-    throw new Error(`stable CSRF selector required for ${plan.tool.name}`);
+  if (plan.authentication.csrf) {
+    const csrfHeader = plan.authentication.csrf.headerName.toLowerCase();
+    if (!/^(?:x-)?(?:csrf|xsrf)-?token$/.test(csrfHeader)) {
+      throw new Error(`non-credential CSRF header required for ${plan.tool.name}`);
+    }
+    if (!validCsrfTokenName(plan.authentication.csrf.resolution.name)) {
+      throw new Error(`non-credential CSRF token locator required for ${plan.tool.name}`);
+    }
   }
 
   const requiredInputs = new Set(plan.schemas.input.required);
@@ -357,6 +473,46 @@ function validateCapabilityPlan(plan: CapabilityPlan): void {
     }
     if (!requiredInputs.has(field)) throw new Error(`request plan references an optional input field for ${plan.tool.name}`);
   }
+  for (const field of [...Object.values(plan.request.path), ...Object.values(plan.request.query)]) {
+    const schema = inputProperties[field]!;
+    if (schema.type === "object" || schema.type === "array") {
+      throw new Error(`path and query mappings require scalar input fields for ${plan.tool.name}`);
+    }
+  }
+  let maximumBodyBytes = 2;
+  for (const [target, field] of Object.entries(plan.request.body)) {
+    const schema = inputProperties[field]!;
+    if (schema.type === "object" || schema.type === "array") {
+      throw new Error(`request body mappings require scalar input fields for ${plan.tool.name}`);
+    }
+    maximumBodyBytes += utf8Bytes(JSON.stringify(target)) + 1 + maximumScalarJsonBytes(schema) + 1;
+  }
+  if (maximumBodyBytes > MAX_REQUEST_BODY_BYTES) {
+    throw new Error(`request body exceeds the supported bound for ${plan.tool.name}`);
+  }
+  let maximumUrlBytes = utf8Bytes(plan.targetOrigin) + utf8Bytes(plan.request.pathTemplate);
+  for (const field of Object.values(plan.request.path)) maximumUrlBytes += maximumScalarUrlBytes(inputProperties[field]!);
+  for (const [target, field] of Object.entries(plan.request.query)) {
+    maximumUrlBytes += utf8Bytes(target) + 2 + maximumScalarUrlBytes(inputProperties[field]!);
+  }
+  if (maximumUrlBytes > MAX_REQUEST_URL_BYTES) {
+    throw new Error(`request URL exceeds the supported bound for ${plan.tool.name}`);
+  }
+
+  const reservedHeaders = new Set([
+    "authorization", "connection", "content-length", "content-type", "cookie", "host", "origin", "proxy-authorization",
+    "referer", "te", "trailer", "transfer-encoding", "upgrade",
+  ]);
+  const idempotencyHeader = plan.idempotency.headerName?.toLowerCase();
+  const csrfHeader = plan.authentication.csrf?.headerName.toLowerCase();
+  if (idempotencyHeader && (reservedHeaders.has(idempotencyHeader) || idempotencyHeader.startsWith("sec-")
+    || idempotencyHeader.startsWith("proxy-") || !/^(?:x-)?idempotency(?:-key)?$/.test(idempotencyHeader))) {
+    throw new Error(`reserved or unsupported idempotency header for ${plan.tool.name}`);
+  }
+  if (csrfHeader && reservedHeaders.has(csrfHeader)) throw new Error(`reserved CSRF header for ${plan.tool.name}`);
+  if (csrfHeader && idempotencyHeader && csrfHeader === idempotencyHeader) {
+    throw new Error(`CSRF and idempotency headers collide for ${plan.tool.name}`);
+  }
 
   assertUnique(plan.response.contentTypes, `${plan.tool.name}.response.contentTypes`);
   for (const contentType of plan.response.contentTypes) {
@@ -365,6 +521,9 @@ function validateCapabilityPlan(plan: CapabilityPlan): void {
     }
   }
   assertUnique(plan.success.statusCodes, `${plan.tool.name}.success.statusCodes`);
+  if (plan.success.statusCodes.some((status) => status === 204 || status === 205)) {
+    throw new Error(`204 and 205 are unsupported by the JSON response adapter for ${plan.tool.name}`);
+  }
   assertUnique(plan.success.requiredOutputFields, `${plan.tool.name}.success.requiredOutputFields`);
   for (const status of Object.keys(plan.response.errorMappings)) {
     if (status !== "default" && !/^[45][0-9]{2}$/.test(status)) throw new Error(`invalid error status mapping for ${plan.tool.name}`);
@@ -402,6 +561,10 @@ function validateCapabilityPlan(plan: CapabilityPlan): void {
 
   const evidenceKeys = plan.evidence.map(({ source, reference }) => `${source}:${reference}`);
   assertUnique(evidenceKeys, `${plan.tool.name}.evidence`);
+  if (plan.effects.sourceNativeConfirmation
+    && !plan.evidence.some(({ reference }) => reference === plan.effects.sourceNativeConfirmation!.evidenceReference)) {
+    throw new Error(`source-native confirmation evidence is missing for ${plan.tool.name}`);
+  }
 }
 
 function sortedRecord<T>(record: Record<string, T>): Record<string, T> {
@@ -413,17 +576,17 @@ function compareStrings(left: string, right: string): number {
 }
 
 function canonicalSchema(schema: JsonSchema): JsonSchema {
-  if (schema.type === "string") return { ...schema, ...(schema.enum ? { enum: [...schema.enum].sort() } : {}) };
+  if (schema.type === "string") return { ...schema, ...(schema.enum ? { enum: [...schema.enum].sort(compareStrings) } : {}) };
   if (schema.type === "array") return { ...schema, items: canonicalSchema(schema.items) };
   if (schema.type === "object") {
     return {
       type: "object",
       properties: Object.fromEntries(
         Object.entries(schema.properties)
-          .sort(([left], [right]) => left.localeCompare(right))
+          .sort(([left], [right]) => compareStrings(left, right))
           .map(([field, property]) => [field, canonicalSchema(property)]),
       ),
-      required: [...schema.required].sort(),
+      required: [...schema.required].sort(compareStrings),
       additionalProperties: false,
     };
   }
@@ -436,7 +599,17 @@ function canonicalPlan(plan: CapabilityPlan): CapabilityPlan {
     schemas: { input: canonicalSchema(plan.schemas.input) as ObjectJsonSchema, output: canonicalSchema(plan.schemas.output) },
     authentication: {
       ...plan.authentication,
-      requiredScopes: [...plan.authentication.requiredScopes].sort(),
+      requiredScopes: [...plan.authentication.requiredScopes].sort(compareStrings),
+      ...(plan.authentication.csrf ? {
+        csrf: {
+          ...plan.authentication.csrf,
+          headerName: plan.authentication.csrf.headerName.toLowerCase(),
+        },
+      } : {}),
+    },
+    idempotency: {
+      ...plan.idempotency,
+      ...(plan.idempotency.headerName ? { headerName: plan.idempotency.headerName.toLowerCase() } : {}),
     },
     request: {
       ...plan.request,
@@ -445,7 +618,7 @@ function canonicalPlan(plan: CapabilityPlan): CapabilityPlan {
       body: sortedRecord(plan.request.body),
     },
     response: {
-      contentTypes: [...plan.response.contentTypes].sort(),
+      contentTypes: [...plan.response.contentTypes].sort(compareStrings),
       projection: plan.response.projection.kind === "identity"
         ? { kind: "identity" }
         : { ...plan.response.projection, fields: sortedRecord(plan.response.projection.fields) },
@@ -453,7 +626,7 @@ function canonicalPlan(plan: CapabilityPlan): CapabilityPlan {
     },
     success: {
       statusCodes: [...plan.success.statusCodes].sort((left, right) => left - right),
-      requiredOutputFields: [...plan.success.requiredOutputFields].sort(),
+      requiredOutputFields: [...plan.success.requiredOutputFields].sort(compareStrings),
     },
     evidence: [...plan.evidence].sort((left, right) =>
       compareStrings(left.reference, right.reference) || compareStrings(left.source, right.source)),

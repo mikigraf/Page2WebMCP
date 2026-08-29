@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { compileWebMcpRelease } from "../../../packages/compiler/src/compiler.ts";
+import { acmeCapabilityEvidence, acmeCapabilityPlans } from "../../acme-support/src/capability-plans.ts";
 import { InMemoryControlPlaneRepository, type AnalysisResult, type RepositoryActor } from "../../../packages/database/src/control-plane.ts";
 import { processNextAnalysis } from "./runner.ts";
 
@@ -109,10 +111,13 @@ test("heartbeats are serialized and stop before completion", async () => {
       active -= 1;
     }
   };
+  const plans = acmeCapabilityPlans("https://acme.example").slice(0, 1);
+  const release = compileWebMcpRelease(plans);
   const result: AnalysisResult = {
-    capabilities: [],
-    evidence: [],
-    release: { code: "export {};", contentHash: "ignored", allowedOrigin: "https://acme.example" }
+    capabilities: plans.map((plan) => ({ plan, status: "proposed" })),
+    evidence: acmeCapabilityEvidence().filter(({ reference }) =>
+      plans.some((plan) => plan.evidence.some((item) => item.reference === reference))),
+    release
   };
   const completed = await processNextAnalysis(repository, {
     workerId: "heartbeat-worker",

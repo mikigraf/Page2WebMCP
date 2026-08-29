@@ -4,9 +4,16 @@ import {
   type CapabilityPlan,
 } from "../../capability-ir/src/plan.ts";
 
+const MAX_RELEASE_BYTES = 64 * 1024;
+
 export type CapabilityReleaseManifest = Readonly<{
   version: 3;
+  rendererId: string;
   releaseId: string;
+  integrityPolicy: Readonly<{
+    enforcement: "trusted-loader-required";
+    algorithms: readonly ["sha256", "sha384"];
+  }>;
   targetOrigin: string;
   plans: readonly CapabilityPlan[];
 }>;
@@ -15,6 +22,7 @@ export type CompiledRelease = {
   code: string;
   contentHash: string;
   integrity: string;
+  integrityRequired: true;
   allowedOrigin: string;
   manifest: CapabilityReleaseManifest;
 };
@@ -50,9 +58,19 @@ export class Page2WebMCPError extends Error {
 }
 
 const MAX_RESPONSE_BYTES = 65536;
+const MAX_REQUEST_BODY_BYTES = 32768;
+const MAX_REQUEST_URL_BYTES = 8192;
+const MAX_OBJECT_PROPERTIES = 100;
 const EXECUTION_DEADLINE_MS = 15000;
 const REGISTRY_SYMBOL = Symbol.for("page2webmcp.release.registry.v1");
 const RELEASE_KEY = releaseManifest.releaseId;
+const platformFetch = typeof globalThis.fetch === "function" ? globalThis.fetch.bind(globalThis) : undefined;
+const sourceNativeConfirmations = new Map();
+for (const spec of releaseManifest.plans) {
+  const integration = spec.effects.sourceNativeConfirmation;
+  const callback = integration ? globalThis[integration.globalName] : undefined;
+  if (typeof callback === "function") sourceNativeConfirmations.set(spec.tool.name, callback.bind(globalThis));
+}
 let lastRegistrationStatus = "idle";
 
 function releaseRegistry() {
@@ -77,9 +95,19 @@ function emitDiagnostic(state, phase, code) {
 function validateAndProject(schema, value, code) {
   const fail = () => { throw new Page2WebMCPError(code); };
   if (schema.type === "string") {
+    const shorterThan = (minimum) => {
+      let count = 0;
+      for (const _codePoint of value) { count += 1; if (count >= minimum) return false; }
+      return true;
+    };
+    const longerThan = (maximum) => {
+      let count = 0;
+      for (const _codePoint of value) { count += 1; if (count > maximum) return true; }
+      return false;
+    };
     if (typeof value !== "string"
-      || (schema.minLength !== undefined && value.length < schema.minLength)
-      || (schema.maxLength !== undefined && value.length > schema.maxLength)
+      || (schema.minLength !== undefined && shorterThan(schema.minLength))
+      || (schema.maxLength !== undefined && longerThan(schema.maxLength))
       || (schema.enum && !schema.enum.includes(value))) fail();
     return value;
   }
@@ -100,8 +128,12 @@ function validateAndProject(schema, value, code) {
     return value.map((item) => validateAndProject(schema.items, item, code));
   }
   if (!value || typeof value !== "object" || Array.isArray(value)) fail();
-  const keys = Object.keys(value);
-  if (keys.some((key) => !Object.prototype.hasOwnProperty.call(schema.properties, key))) fail();
+  let propertyCount = 0;
+  for (const key in value) {
+    if (!Object.prototype.hasOwnProperty.call(value, key)) continue;
+    propertyCount += 1;
+    if (propertyCount > MAX_OBJECT_PROPERTIES || !Object.prototype.hasOwnProperty.call(schema.properties, key)) fail();
+  }
   if (schema.required.some((key) => !Object.prototype.hasOwnProperty.call(value, key))) fail();
   const output = Object.create(null);
   for (const [key, propertySchema] of Object.entries(schema.properties)) {
@@ -178,6 +210,7 @@ function requestUrl(request, input) {
   const url = new URL(path, releaseManifest.targetOrigin);
   if (url.origin !== releaseManifest.targetOrigin) throw new Page2WebMCPError("ORIGIN_MISMATCH");
   for (const [parameter, field] of Object.entries(request.query)) url.searchParams.set(parameter, input[field]);
+  if (new TextEncoder().encode(url.href).byteLength > MAX_REQUEST_URL_BYTES) throw new Page2WebMCPError("INVALID_INPUT");
   return url;
 }
 
@@ -189,14 +222,16 @@ function assertExecutionActive(signal) {
   if (signal.aborted) throw signalError(signal);
 }
 
-async function runExecution(callerSignal, operation) {
-  if (callerSignal?.aborted) throw new Page2WebMCPError("ABORTED");
+async function runExecution(callerSignal, lifecycleSignal, operation) {
+  if (callerSignal?.aborted || lifecycleSignal.aborted) throw new Page2WebMCPError("ABORTED");
   const controller = new AbortController();
   const abort = (code) => {
     if (!controller.signal.aborted) controller.abort(new Page2WebMCPError(code));
   };
   const onCallerAbort = () => abort("ABORTED");
+  const onLifecycleAbort = () => abort("ABORTED");
   callerSignal?.addEventListener("abort", onCallerAbort, { once: true });
+  lifecycleSignal.addEventListener("abort", onLifecycleAbort, { once: true });
   const timer = setTimeout(() => abort("DEADLINE_EXCEEDED"), EXECUTION_DEADLINE_MS);
   const aborted = new Promise((_resolve, reject) => {
     controller.signal.addEventListener("abort", () => reject(signalError(controller.signal)), { once: true });
@@ -206,6 +241,7 @@ async function runExecution(callerSignal, operation) {
   } finally {
     clearTimeout(timer);
     callerSignal?.removeEventListener("abort", onCallerAbort);
+    lifecycleSignal.removeEventListener("abort", onLifecycleAbort);
   }
 }
 
@@ -262,7 +298,13 @@ async function requestJsonOnce(state, spec, url, init, signal) {
   assertAllowedOrigin();
   assertExecutionActive(signal);
   try {
-    const response = await globalThis.fetch(url, { ...init, credentials: "same-origin", signal });
+    if (!platformFetch) throw new Page2WebMCPError("TARGET_ERROR");
+    const response = await platformFetch(url, {
+      ...init,
+      credentials: "same-origin",
+      redirect: "error",
+      signal,
+    });
     assertExecutionActive(signal);
     if (!spec.success.statusCodes.includes(response.status)) {
       void response.body?.cancel().catch(() => undefined);
@@ -306,11 +348,19 @@ async function requestJson(state, spec, url, init, signal) {
 function resolveCsrf(spec) {
   const csrf = spec.authentication.csrf;
   if (!csrf) return undefined;
-  const element = globalThis.document?.querySelector?.(csrf.resolution.selector);
+  const tagName = csrf.resolution.kind === "meta" ? "meta" : "input";
+  const candidates = Array.from(globalThis.document?.getElementsByTagName?.(tagName) || []);
+  const matches = candidates.filter((candidate) => {
+    if (candidate.getAttribute?.("name") !== csrf.resolution.name) return false;
+    if (csrf.resolution.kind === "meta") return true;
+    const type = String(candidate.type || candidate.getAttribute?.("type") || "").toLowerCase();
+    const autocomplete = String(candidate.getAttribute?.("autocomplete") || "").toLowerCase();
+    return type === "hidden" && (autocomplete === "" || autocomplete === "off");
+  });
+  if (matches.length !== 1) throw new Page2WebMCPError("CSRF_UNAVAILABLE");
+  const element = matches[0];
   let value;
-  if (element) {
-    value = csrf.resolution.attribute === "value" ? element.value : element.getAttribute?.(csrf.resolution.attribute);
-  }
+  value = csrf.resolution.attribute === "value" ? element.value : element.getAttribute?.(csrf.resolution.attribute);
   if (typeof value !== "string" || value.length < 1 || value.length > 4096) {
     throw new Page2WebMCPError("CSRF_UNAVAILABLE");
   }
@@ -369,24 +419,31 @@ function builtInConfirmation(spec, signal) {
 async function confirmMutation(state, spec, input, idempotencyKey, signal) {
   assertAllowedOrigin();
   assertExecutionActive(signal);
-  const hook = state.bridge?.confirm;
-  const approved = typeof hook === "function"
-    ? await hook({
+  const hook = sourceNativeConfirmations.get(spec.tool.name);
+  let approved;
+  if (typeof hook === "function") {
+    try {
+      approved = await hook(Object.freeze({
         toolName: spec.tool.name,
         title: spec.tool.title,
         summary: spec.effects.summary,
         input,
         idempotencyKey,
         signal,
-      })
-    : await builtInConfirmation(spec, signal);
+      }));
+    } catch {
+      throw new Page2WebMCPError("CONFIRMATION_FAILED");
+    }
+  } else {
+    approved = await builtInConfirmation(spec, signal);
+  }
   assertExecutionActive(signal);
   if (approved !== true) throw new Page2WebMCPError("CONFIRMATION_DECLINED");
 }
 
 async function executeWithinDeadline(state, spec, rawInput, signal) {
   assertAllowedOrigin();
-  const input = validateAndProject(spec.schemas.input, rawInput, "INVALID_INPUT");
+  const input = deepFreeze(validateAndProject(spec.schemas.input, rawInput, "INVALID_INPUT"));
   const headers = new Headers();
   const bodyValue = Object.create(null);
   for (const [targetField, inputField] of Object.entries(spec.request.body)) bodyValue[targetField] = input[inputField];
@@ -396,22 +453,33 @@ async function executeWithinDeadline(state, spec, rawInput, signal) {
   if (csrf) headers.set(csrf.name, csrf.value);
 
   let pending;
+  let idempotencyKey;
   let finalRequestStarted = false;
   try {
     if (spec.effects.kind === "mutation") {
       if (spec.idempotency.strategy === "header") {
-        pending = await acquirePendingMutation(state, spec, input);
-        headers.set(spec.idempotency.headerName, pending.key);
+        if (spec.idempotency.verified && spec.idempotency.retry === "safe_once") {
+          pending = await acquirePendingMutation(state, spec, input);
+          idempotencyKey = pending.key;
+        } else {
+          idempotencyKey = globalThis.crypto?.randomUUID?.();
+          if (!validIdempotencyKey(idempotencyKey)) throw new Page2WebMCPError("IDEMPOTENCY_UNAVAILABLE");
+        }
+        headers.set(spec.idempotency.headerName, idempotencyKey);
       }
-      await confirmMutation(state, spec, input, pending?.key, signal);
+      await confirmMutation(state, spec, input, idempotencyKey, signal);
     }
     assertAllowedOrigin();
     assertExecutionActive(signal);
     finalRequestStarted = true;
+    const body = hasBody ? JSON.stringify(bodyValue) : undefined;
+    if (body !== undefined && new TextEncoder().encode(body).byteLength > MAX_REQUEST_BODY_BYTES) {
+      throw new Page2WebMCPError("INVALID_INPUT");
+    }
     const raw = await requestJson(state, spec, requestUrl(spec.request, input), {
       method: spec.request.method,
       headers,
-      body: hasBody ? JSON.stringify(bodyValue) : undefined,
+      body,
     }, signal);
     const projected = projectResponse(spec.response.projection, raw);
     const output = validateAndProject(spec.schemas.output, projected, "INVALID_OUTPUT");
@@ -426,7 +494,8 @@ async function executeWithinDeadline(state, spec, rawInput, signal) {
 
 async function executePlan(state, spec, input, callerSignal) {
   try {
-    return await runExecution(callerSignal, (signal) => executeWithinDeadline(state, spec, input, signal));
+    return await runExecution(callerSignal, state.controller.signal,
+      (signal) => executeWithinDeadline(state, spec, input, signal));
   } catch (error) {
     const safeError = error instanceof Page2WebMCPError ? error : new Page2WebMCPError("INTERNAL_ERROR");
     emitDiagnostic(state, "execution", safeError.code);
@@ -435,7 +504,6 @@ async function executePlan(state, spec, input, callerSignal) {
 }
 
 function mergeBridge(state, bridge) {
-  if (typeof bridge?.confirm === "function") state.bridge.confirm = bridge.confirm;
   if (typeof bridge?.onDiagnostic === "function") state.bridge.onDiagnostic = bridge.onDiagnostic;
 }
 
@@ -456,6 +524,10 @@ export async function registerPage2WebMCPTools(bridge = {}) {
     try { await existing.promise; } catch {
       emitDiagnostic(existing, "registration", "REGISTRATION_FAILED");
       throw new Page2WebMCPError("REGISTRATION_FAILED");
+    }
+    if (existing.controller.signal.aborted || existing.status !== "registered") {
+      lastRegistrationStatus = "unregistered";
+      return { supported: false, reason: "REGISTRATION_CANCELLED" };
     }
     lastRegistrationStatus = existing.status;
     return { supported: true, alreadyRegistered: true };
@@ -532,6 +604,14 @@ export const autoRegistration = registerPage2WebMCPTools().catch(() => ({
 }));
 `;
 
+function renderReleaseModule(manifestJson: string): string {
+  return `"use strict";\nconst deepFreeze = (value) => { if (value && typeof value === "object" && !Object.isFrozen(value)) { Object.freeze(value); for (const nested of Object.values(value)) deepFreeze(nested); } return value; };\nexport const releaseManifest = deepFreeze(${manifestJson});\n${runtimeSource.trimStart()}`;
+}
+
+const RENDERER_ID = createHash("sha256")
+  .update(renderReleaseModule("__PAGE2WEBMCP_CANONICAL_MANIFEST__"))
+  .digest("hex");
+
 function deepFreeze<T>(value: T): T {
   if (value && typeof value === "object" && !Object.isFrozen(value)) {
     Object.freeze(value);
@@ -543,17 +623,47 @@ function deepFreeze<T>(value: T): T {
 export function compileWebMcpRelease(plans: readonly CapabilityPlan[]): CompiledRelease {
   const canonicalPlans = canonicalizeCapabilityPlans(plans);
   const targetOrigin = canonicalPlans[0]!.targetOrigin;
-  const releaseIdentity = JSON.stringify({ version: 3, targetOrigin, plans: canonicalPlans });
+  const releaseIdentity = JSON.stringify({ version: 3, rendererId: RENDERER_ID, targetOrigin, plans: canonicalPlans });
   const releaseId = createHash("sha256").update(releaseIdentity).digest("hex");
-  const manifest = deepFreeze({ version: 3 as const, releaseId, targetOrigin, plans: canonicalPlans });
-  const code = `"use strict";\nconst deepFreeze = (value) => { if (value && typeof value === "object" && !Object.isFrozen(value)) { Object.freeze(value); for (const nested of Object.values(value)) deepFreeze(nested); } return value; };\nexport const releaseManifest = deepFreeze(${JSON.stringify(manifest)});\n${runtimeSource.trimStart()}`;
+  const manifest = deepFreeze({
+    version: 3 as const,
+    rendererId: RENDERER_ID,
+    releaseId,
+    integrityPolicy: {
+      enforcement: "trusted-loader-required" as const,
+      algorithms: ["sha256", "sha384"] as const,
+    },
+    targetOrigin,
+    plans: canonicalPlans,
+  });
+  const code = renderReleaseModule(JSON.stringify(manifest));
+  if (Buffer.byteLength(code) > MAX_RELEASE_BYTES) {
+    throw new Error("compiled release exceeds the 64 KiB artifact boundary");
+  }
   const contentDigest = createHash("sha256").update(code).digest();
   const integrityDigest = createHash("sha384").update(code).digest("base64");
   return {
     code,
     contentHash: contentDigest.toString("hex"),
     integrity: `sha384-${integrityDigest}`,
+    integrityRequired: true,
     allowedOrigin: targetOrigin,
     manifest,
   };
+}
+
+/**
+ * Verification boundary for the trusted installer/loader. Generated modules cannot
+ * securely hash bytes that have already begun evaluating, so callers must invoke
+ * this check before evaluation and reject a false result.
+ */
+export function verifyWebMcpReleaseBytes(
+  code: string | Uint8Array,
+  metadata: Pick<CompiledRelease, "contentHash" | "integrity" | "integrityRequired">,
+): boolean {
+  if (metadata.integrityRequired !== true) return false;
+  const bytes = typeof code === "string" ? Buffer.from(code) : code;
+  const contentHash = createHash("sha256").update(bytes).digest("hex");
+  const integrity = `sha384-${createHash("sha384").update(bytes).digest("base64")}`;
+  return contentHash === metadata.contentHash && integrity === metadata.integrity;
 }

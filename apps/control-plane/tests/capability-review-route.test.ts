@@ -4,6 +4,8 @@ import { POST } from "../app/api/capabilities/[capabilityId]/review/route.ts";
 import { authenticate, issueSession } from "../src/auth.ts";
 import { InMemoryControlPlaneRepository } from "../../../packages/database/src/control-plane.ts";
 import { setControlPlaneRepositoryForTest } from "../../../packages/database/src/factory.ts";
+import { compileWebMcpRelease } from "../../../packages/compiler/src/compiler.ts";
+import { acmeCapabilityEvidence, acmeCapabilityPlans } from "../../acme-support/src/capability-plans.ts";
 
 const owner = authenticate("owner@example.test", "fixture-password")!;
 const editor = authenticate("editor@example.test", "fixture-password")!;
@@ -22,14 +24,14 @@ async function fixture(repository: InMemoryControlPlaneRepository) {
     inputHash: "input"
   });
   await repository.claimAnalysis("worker", 60_000);
+  const plans = acmeCapabilityPlans("https://acme.example")
+    .filter((plan) => plan.tool.name !== "get_order_status");
+  const release = compileWebMcpRelease(plans);
   await repository.completeAnalysis("worker", run.id, {
-    capabilities: [
-      { stableName: "find_order", riskTier: "R0", status: "proposed" },
-      { stableName: "create_support_ticket", riskTier: "R1", status: "proposed" },
-      { stableName: "delete_account", riskTier: "R3", status: "blocked" }
-    ],
-    evidence: [],
-    release: { code: "export {};", contentHash: "candidate", allowedOrigin: "https://acme.example" }
+    capabilities: plans.map((plan) => ({ plan, status: "proposed" })),
+    evidence: acmeCapabilityEvidence().filter(({ reference }) =>
+      plans.some((plan) => plan.evidence.some((item) => item.reference === reference))),
+    release
   });
   return repository.listCapabilities(owner, project.id);
 }
@@ -68,12 +70,11 @@ test("review loads risk from persisted capability and advances an optimistic ver
   assert.equal((await stale.json()).code, "VERSION_CONFLICT");
 });
 
-test("R1 requires owner, R3 remains blocked, and caller-supplied risk is rejected", async () => {
+test("R1 requires owner and caller-supplied risk is rejected", async () => {
   const repository = new InMemoryControlPlaneRepository();
   setControlPlaneRepositoryForTest(repository);
   const capabilities = await fixture(repository);
   const ticket = capabilities.find((item) => item.stableName === "create_support_ticket")!;
-  const blocked = capabilities.find((item) => item.stableName === "delete_account")!;
 
   const editorResponse = await POST(
     reviewRequest(ticket.id, editor, { action: "approve", expectedVersion: 1 }),
@@ -81,13 +82,6 @@ test("R1 requires owner, R3 remains blocked, and caller-supplied risk is rejecte
   );
   assert.equal(editorResponse.status, 403);
   assert.equal((await editorResponse.json()).code, "OWNER_APPROVAL_REQUIRED");
-
-  const r3 = await POST(
-    reviewRequest(blocked.id, owner, { action: "approve", expectedVersion: 1 }),
-    { params: Promise.resolve({ capabilityId: blocked.id }) }
-  );
-  assert.equal(r3.status, 409);
-  assert.equal((await r3.json()).code, "HIGH_RISK_ACTION");
 
   const forgedRisk = await POST(
     reviewRequest(ticket.id, owner, { action: "approve", expectedVersion: 1, riskTier: "R0" }),

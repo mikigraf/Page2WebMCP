@@ -5,6 +5,21 @@ import type { CapabilityPlan } from "../../capability-ir/src/plan.ts";
 import { compileWebMcpRelease } from "./compiler.ts";
 
 const REGISTRY = Symbol.for("page2webmcp.release.registry.v1");
+let harnessFetch: typeof fetch = async () => { throw new Error("fetch harness is not configured"); };
+type ConfirmationRequest = {
+  toolName: string;
+  input: Record<string, unknown>;
+  idempotencyKey: string;
+  signal: AbortSignal;
+};
+type ConfirmationHook = (request: ConfirmationRequest) => boolean | Promise<boolean>;
+let harnessConfirm: ConfirmationHook | undefined;
+
+const capturedHarnessFetch: typeof fetch = (input, init) => harnessFetch(input, init);
+const capturedHarnessConfirmation = (request: ConfirmationRequest) => {
+  if (!harnessConfirm) throw new Error("confirmation harness is not configured");
+  return harnessConfirm(request);
+};
 
 type GeneratedTool = {
   name: string;
@@ -16,7 +31,7 @@ type GeneratedArtifact = {
   autoRegistration: Promise<{ supported: boolean; reason?: string; alreadyRegistered?: boolean }>;
   releaseManifest: { targetOrigin: string; plans: CapabilityPlan[] };
   registerPage2WebMCPTools: (bridge?: {
-    confirm?: (request: { toolName: string; input: Record<string, unknown>; idempotencyKey: string; signal: AbortSignal }) => boolean | Promise<boolean>;
+    confirm?: ConfirmationHook;
     onDiagnostic?: (event: { phase: "registration" | "execution"; code: string }) => void;
   }) => Promise<{ supported: boolean; reason?: string; alreadyRegistered?: boolean }>;
   unregisterPage2WebMCPTools: () => void;
@@ -32,11 +47,19 @@ async function loadArtifact(
 ): Promise<{ artifact: GeneratedArtifact; tools: GeneratedTool[]; registeredSignals: AbortSignal[] }> {
   const tools: GeneratedTool[] = [];
   const registeredSignals: AbortSignal[] = [];
+  harnessFetch = async () => { throw new Error("fetch harness is not configured"); };
+  harnessConfirm = undefined;
   delete (globalThis as Record<symbol, unknown>)[REGISTRY];
   const windowEvents = new EventTarget();
   Object.defineProperty(globalThis, "window", {
     configurable: true,
     value: Object.assign(windowEvents, { location: { origin } }),
+  });
+  Object.defineProperty(globalThis, "fetch", { configurable: true, writable: true, value: capturedHarnessFetch });
+  Object.defineProperty(globalThis, "__page2webmcpConfirmSupportTicket", {
+    configurable: true,
+    writable: true,
+    value: capturedHarnessConfirmation,
   });
   Object.defineProperty(globalThis, "document", { configurable: true, value: { modelContext: {
     registerTool: async (tool: GeneratedTool, options: { signal: AbortSignal }) => {
@@ -58,7 +81,8 @@ async function loadArtifact(
 }
 
 async function registerWithFetch(artifact: GeneratedArtifact, fetchImpl: typeof fetch, bridge: Parameters<GeneratedArtifact["registerPage2WebMCPTools"]>[0] = {}) {
-  globalThis.fetch = fetchImpl;
+  harnessFetch = fetchImpl;
+  harnessConfirm = bridge.confirm;
   return artifact.registerPage2WebMCPTools(bridge);
 }
 
@@ -407,7 +431,11 @@ test("concurrent registration shares one generation and unregister during regist
   assert.equal(concurrent.tools.length, 1);
   concurrent.artifact.unregisterPage2WebMCPTools();
   releaseFirst();
-  await Promise.all([first, second]);
+  const cancelled = await Promise.all([first, second]);
+  assert.deepEqual(cancelled, [
+    { supported: false, reason: "REGISTRATION_CANCELLED" },
+    { supported: false, reason: "REGISTRATION_CANCELLED" },
+  ]);
   assert.equal(concurrent.tools.length, 0);
 
   await registerWithFetch(concurrent.artifact, async () => Response.json([]));
@@ -449,19 +477,17 @@ test("generated mutation fails closed without confirmation and sends bound evide
 });
 
 test("host confirmation bridge cannot replace fetch execution semantics", async () => {
-  const originalFetch = globalThis.fetch;
   let platformCalls = 0;
   let injectedCalls = 0;
-  globalThis.fetch = async () => { platformCalls += 1; return Response.json([]); };
-  try {
-    const { artifact, tools } = await loadArtifact("https://acme.example");
-    await artifact.registerPage2WebMCPTools({ fetch: async () => { injectedCalls += 1; return Response.json([]); } } as unknown as Parameters<GeneratedArtifact["registerPage2WebMCPTools"]>[0]);
-    await findOrderTool(tools).execute({ query: "ORD-4812" }, { signal: new AbortController().signal });
-    assert.equal(platformCalls, 1);
-    assert.equal(injectedCalls, 0);
-  } finally {
-    globalThis.fetch = originalFetch;
-  }
+  const { artifact, tools } = await loadArtifact("https://acme.example");
+  await registerWithFetch(
+    artifact,
+    async () => { platformCalls += 1; return Response.json([]); },
+    { fetch: async () => { injectedCalls += 1; return Response.json([]); } } as unknown as Parameters<GeneratedArtifact["registerPage2WebMCPTools"]>[0],
+  );
+  await findOrderTool(tools).execute({ query: "ORD-4812" }, { signal: new AbortController().signal });
+  assert.equal(platformCalls, 1);
+  assert.equal(injectedCalls, 0);
 });
 
 test("generated diagnostics expose only stable phase and code", async () => {

@@ -1,9 +1,15 @@
 import { createHash, randomUUID } from "node:crypto";
 import pg, { type PoolClient, type QueryResultRow } from "pg";
 import {
+  canonicalizeCapabilityPlans,
+  type CapabilityPlan,
+} from "../../capability-ir/src/plan.ts";
+import {
+  capabilityPlanDigest,
   capabilityStateDigest,
   RepositoryError,
   type AnalysisResult,
+  type AnalysisEvidence,
   type AnalysisRunRecord,
   type AuditEventRecord,
   type CandidateRelease,
@@ -317,6 +323,15 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
   async completeAnalysis(workerId: string, runId: string, result: AnalysisResult): Promise<AnalysisRunRecord> {
     if (result.capabilities.length > MAX_CAPABILITIES || result.evidence.length > MAX_EVIDENCE
       || Buffer.byteLength(result.release.code) > MAX_RELEASE_BYTES) throw new RepositoryError("INVALID_STATE");
+    let canonicalPlans: readonly CapabilityPlan[];
+    try {
+      canonicalPlans = canonicalizeCapabilityPlans(result.capabilities.map(({ plan }) => plan));
+    } catch {
+      throw new RepositoryError("INVALID_STATE");
+    }
+    const sourcePlans = plansFromManifest(result.release.manifest);
+    if (!sourcePlans || !equalPlanSets(sourcePlans, canonicalPlans)) throw new RepositoryError("INVALID_STATE");
+    const statuses = new Map(result.capabilities.map(({ plan, status }) => [plan.tool.name, status]));
     return this.#transaction({ kind: "worker" }, async (client) => {
       const job = await client.query(
         "select j.organization_id, ar.project_id from private.analysis_jobs j " +
@@ -328,23 +343,38 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
       if (!job.rows[0]) throw new RepositoryError("LEASE_LOST");
       const organizationId = String(job.rows[0].organization_id);
       const projectId = String(job.rows[0].project_id);
-      for (const evidence of result.evidence) {
-        const source = evidence.source === "openapi" || evidence.source === "source" || evidence.source === "runtime"
-          ? evidence.source
-          : "runtime";
+      const normalizedEvidence = result.evidence.map((item) => normalizeEvidence(
+        item,
+        organizationId,
+        projectId,
+        runId,
+      ));
+      if (new Set(normalizedEvidence.map(({ reference }) => reference)).size !== normalizedEvidence.length
+        || normalizedEvidence.reduce((total, item) => total + Buffer.byteLength(item.content), 0) > MAX_RELEASE_BYTES) {
+        throw new RepositoryError("INVALID_STATE");
+      }
+      if (!evidenceResolves(normalizedEvidence, canonicalPlans,
+        organizationId, projectId, runId, new Date())) {
+        throw new RepositoryError("INVALID_STATE");
+      }
+      for (const evidence of normalizedEvidence) {
         await client.query(
           "insert into public.analysis_evidence " +
-          "(organization_id, project_id, analysis_run_id, source, payload) values ($1, $2, $3, $4, $5::jsonb)",
-          [organizationId, projectId, runId, source, JSON.stringify(evidence)]
+          "(organization_id, project_id, analysis_run_id, source, payload, content, reference, expires_at) " +
+          "values ($1, $2, $3, $4, $5::jsonb, $6, $7, $8::timestamptz)",
+          [organizationId, projectId, runId, evidence.source, JSON.stringify(evidence),
+            evidence.content, evidence.reference, evidence.expiresAt]
         );
       }
-      for (const capability of result.capabilities) {
+      for (const plan of canonicalPlans) {
+        const status = statuses.get(plan.tool.name) ?? "proposed";
+        const planDigest = capabilityPlanDigest(plan);
         await client.query(
           "insert into public.capabilities " +
-          "(organization_id, project_id, analysis_run_id, stable_name, risk_tier, status, version) " +
-          "values ($1, $2, $3, $4, $5, $6, 1)",
-          [organizationId, projectId, runId, capability.stableName, capability.riskTier,
-            capability.riskTier === "R3" ? "blocked" : capability.status]
+          "(organization_id, project_id, analysis_run_id, stable_name, risk_tier, status, plan, plan_digest, " +
+          "reviewed_plan_digest, version) values ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, 1)",
+          [organizationId, projectId, runId, plan.tool.name, plan.effects.riskTier, status,
+            JSON.stringify(plan), planDigest, plan.effects.riskTier === "R0" || status === "blocked" ? planDigest : null]
         );
       }
       const releaseHash = createHash("sha256").update(Buffer.from(result.release.code)).digest("hex");
@@ -397,20 +427,21 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
         return undefined;
       }
       const capabilities = await client.query(
-        "select stable_name, risk_tier, status from public.capabilities " +
+        "select plan, status from public.capabilities " +
         "where analysis_run_id = $1 and organization_id = $2 order by stable_name limit $3",
         [runId, actor.organizationId, MAX_CAPABILITIES]
       );
       const evidence = await client.query(
-        "select payload from public.analysis_evidence where analysis_run_id = $1 and organization_id = $2 " +
+        "select id, organization_id, project_id, analysis_run_id, source, content, reference, expires_at " +
+        "from public.analysis_evidence where analysis_run_id = $1 and organization_id = $2 " +
         "and expires_at > now() order by created_at, id limit $3",
         [runId, actor.organizationId, MAX_EVIDENCE]
       );
       const stored = run.rows[0].result as { draftPullRequest?: AnalysisResult["draftPullRequest"] } | null;
       return {
-        capabilities: capabilities.rows.map((row) => ({ stableName: String(row.stable_name),
-          riskTier: row.risk_tier as CapabilityRecord["riskTier"], status: row.status as CapabilityRecord["status"] })),
-        evidence: evidence.rows.map((row) => row.payload as Record<string, unknown>),
+        capabilities: capabilities.rows.map((row) => ({ plan: row.plan as CapabilityPlan,
+          status: row.status as CapabilityRecord["status"] })),
+        evidence: evidence.rows.map(mapEvidence),
         release: { code: String(run.rows[0].release_code), contentHash: String(run.rows[0].release_hash),
           allowedOrigin: String(run.rows[0].allowed_origin), manifest: run.rows[0].release_manifest },
         draftPullRequest: stored?.draftPullRequest
@@ -422,7 +453,8 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
     return this.#transaction({ kind: "app", actor }, async (client) => {
       await this.#project(client, actor, projectId);
       const result = await client.query(
-        "select id, organization_id, project_id, analysis_run_id, stable_name, risk_tier, status, version " +
+        "select id, organization_id, project_id, analysis_run_id, stable_name, risk_tier, status, plan, " +
+        "plan_digest, reviewed_plan_digest, version " +
         "from public.capabilities where project_id = $1 and organization_id = $2 order by stable_name, id limit $3",
         [projectId, actor.organizationId, MAX_CAPABILITIES]
       );
@@ -432,7 +464,8 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
 
   async #analysisCapabilities(db: Db, actor: RepositoryActor, runId: string, lock: boolean): Promise<CapabilityRecord[]> {
     const result = await db.query(
-      "select id, organization_id, project_id, analysis_run_id, stable_name, risk_tier, status, version " +
+      "select id, organization_id, project_id, analysis_run_id, stable_name, risk_tier, status, plan, " +
+      "plan_digest, reviewed_plan_digest, version " +
       "from public.capabilities where analysis_run_id = $1 and organization_id = $2 " +
       "order by stable_name, id limit $3" + (lock ? " for update" : ""),
       [runId, actor.organizationId, MAX_CAPABILITIES]
@@ -451,26 +484,44 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
     if (actor.role === "viewer") throw new RepositoryError("FORBIDDEN");
     return this.#transaction({ kind: "app", actor }, async (client) => {
       const result = await client.query(
-        "select id, organization_id, project_id, analysis_run_id, stable_name, risk_tier, status, version " +
+        "select id, organization_id, project_id, analysis_run_id, stable_name, risk_tier, status, plan, " +
+        "plan_digest, reviewed_plan_digest, version " +
         "from public.capabilities where id = $1 and organization_id = $2 for update",
         [capabilityId, actor.organizationId]
       );
       if (!result.rows[0]) throw new RepositoryError("NOT_FOUND");
       const capability = mapCapability(result.rows[0]);
       if (capability.version !== input.expectedVersion) throw new RepositoryError("VERSION_CONFLICT");
-      if (capability.riskTier === "R3") throw new RepositoryError("HIGH_RISK_ACTION");
       if (input.action === "approve" && capability.riskTier !== "R0" && actor.role !== "owner") {
         throw new RepositoryError("OWNER_APPROVAL_REQUIRED");
+      }
+      if (input.action === "approve") {
+        if (!capabilityPlanBindingValid(capability)) {
+          throw new RepositoryError("RELEASE_GATE_FAILED", ["CAPABILITY_PLAN_MISMATCH"]);
+        }
+        const evidence = await client.query(
+          "select id, organization_id, project_id, analysis_run_id, source, content, reference, expires_at " +
+          "from public.analysis_evidence where organization_id = $1 and project_id = $2 and analysis_run_id = $3 " +
+          "and expires_at > now() order by reference",
+          [actor.organizationId, capability.projectId, capability.analysisRunId]
+        );
+        if (!evidenceResolves(evidence.rows.map(mapEvidence), [capability.plan], actor.organizationId,
+          capability.projectId, capability.analysisRunId, new Date())) {
+          throw new RepositoryError("RELEASE_GATE_FAILED", ["EVIDENCE_MISSING_OR_EXPIRED"]);
+        }
       }
       const nextStatus = input.action === "approve" ? "reviewed" : "blocked";
       await client.query(
         "insert into public.capability_reviews " +
-        "(organization_id, project_id, capability_id, actor_id, action, capability_version) values ($1,$2,$3,$4,$5,$6)",
-        [actor.organizationId, capability.projectId, capability.id, actor.id, input.action, input.expectedVersion]
+        "(organization_id, project_id, capability_id, actor_id, action, capability_version, plan_digest) " +
+        "values ($1,$2,$3,$4,$5,$6,$7)",
+        [actor.organizationId, capability.projectId, capability.id, actor.id, input.action,
+          input.expectedVersion, capability.planDigest]
       );
       const updated = await client.query(
-        "update public.capabilities set status = $2, version = version + 1 where id = $1 and version = $3 " +
-        "returning id, organization_id, project_id, analysis_run_id, stable_name, risk_tier, status, version",
+        "update public.capabilities set status = $2, reviewed_plan_digest = plan_digest, version = version + 1 " +
+        "where id = $1 and version = $3 returning id, organization_id, project_id, analysis_run_id, stable_name, " +
+        "risk_tier, status, plan, plan_digest, reviewed_plan_digest, version",
         [capability.id, nextStatus, input.expectedVersion]
       );
       if (!updated.rows[0]) throw new RepositoryError("VERSION_CONFLICT");
@@ -491,6 +542,9 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
       const run = await this.#analysis(client, actor, input.analysisRunId);
       if (run.projectId !== projectId || run.status !== "succeeded") throw new RepositoryError("INVALID_STATE");
       const capabilities = await this.#analysisCapabilities(client, actor, run.id, true);
+      if (capabilities.some((capability) => !capabilityPlanBindingValid(capability))) {
+        throw new RepositoryError("RELEASE_GATE_FAILED", ["CAPABILITY_PLAN_MISMATCH"]);
+      }
       if (capabilityStateDigest(capabilities) !== input.capabilityStateDigest) {
         throw new RepositoryError("RELEASE_GATE_FAILED", ["CAPABILITIES_CHANGED"]);
       }
@@ -500,6 +554,21 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
       if (candidateBytes.byteLength > MAX_RELEASE_BYTES || candidateContentHash !== input.candidate.contentHash
         || candidateManifest === "__INVALID_JSON__" || Buffer.byteLength(candidateManifest) > MAX_RELEASE_BYTES) {
         throw new RepositoryError("RELEASE_GATE_FAILED", ["CANDIDATE_HASH_MISMATCH"]);
+      }
+      const candidatePlans = plansFromManifest(input.candidate.manifest);
+      const selectedPlans = capabilities.filter(({ status }) => status !== "blocked").map(({ plan }) => plan);
+      if (!candidatePlans || !equalPlanSets(candidatePlans, selectedPlans)) {
+        throw new RepositoryError("RELEASE_GATE_FAILED", ["CAPABILITY_PLAN_MISMATCH"]);
+      }
+      const currentEvidence = await client.query(
+        "select id, organization_id, project_id, analysis_run_id, source, content, reference, expires_at " +
+        "from public.analysis_evidence where organization_id = $1 and project_id = $2 and analysis_run_id = $3 " +
+        "and expires_at > now() order by reference",
+        [actor.organizationId, projectId, run.id]
+      );
+      if (!evidenceResolves(currentEvidence.rows.map(mapEvidence), candidatePlans,
+        actor.organizationId, projectId, run.id, new Date())) {
+        throw new RepositoryError("RELEASE_GATE_FAILED", ["EVIDENCE_MISSING_OR_EXPIRED"]);
       }
       const published = await client.query(
         "select r.id, r.organization_id, r.project_id, r.analysis_run_id, r.capability_state_digest, " +
@@ -558,13 +627,21 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
       const run = await this.#analysis(client, actor, input.analysisRunId);
       if (run.projectId !== input.projectId || run.status !== "succeeded") throw new RepositoryError("INVALID_STATE");
       const capabilities = await this.#analysisCapabilities(client, actor, run.id, true);
+      if (capabilities.some((capability) => !capabilityPlanBindingValid(capability))) {
+        throw new RepositoryError("RELEASE_GATE_FAILED", ["CAPABILITY_PLAN_MISMATCH"]);
+      }
       if (capabilityStateDigest(capabilities) !== input.capabilityStateDigest) {
         throw new RepositoryError("RELEASE_GATE_FAILED", ["CAPABILITIES_CHANGED"]);
       }
       const reviewFailures = capabilities.flatMap((capability) => {
-        if (capability.riskTier === "R3" && capability.status !== "blocked") return ["HIGH_RISK_ACTION"];
         if ((capability.riskTier === "R1" || capability.riskTier === "R2")
-          && capability.status === "proposed") return ["REVIEW_REQUIRED"];
+          && capability.status !== "blocked"
+          && (capability.status !== "reviewed" || capability.reviewedPlanDigest !== capability.planDigest)) {
+          return ["REVIEW_REQUIRED"];
+        }
+        if (capability.status !== "blocked" && capability.reviewedPlanDigest !== capability.planDigest) {
+          return ["CAPABILITY_PLAN_MISMATCH"];
+        }
         return [];
       });
       if (reviewFailures.length > 0) throw new RepositoryError("RELEASE_GATE_FAILED", [...new Set(reviewFailures)]);
@@ -582,11 +659,18 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
         throw new RepositoryError("RELEASE_GATE_FAILED", ["CANDIDATE_CHANGED"]);
       }
       const verifiedCandidate = mapVerificationCandidate(verification.rows[0]);
+      const candidatePlans = plansFromManifest(verifiedCandidate.manifest);
+      if (!candidatePlans
+        || !equalPlanSets(candidatePlans, capabilities.filter(({ status }) => status !== "blocked").map(({ plan }) => plan))) {
+        throw new RepositoryError("RELEASE_GATE_FAILED", ["CAPABILITY_PLAN_MISMATCH"]);
+      }
       const evidence = await client.query(
-        "select private.lock_current_analysis_evidence($1, $2, $3) as evidence_present",
+        "select id, organization_id, project_id, analysis_run_id, source, content, reference, expires_at " +
+        "from private.lock_current_analysis_evidence_rows($1, $2, $3)",
         [actor.organizationId, input.projectId, input.analysisRunId]
       );
-      if (!evidence.rows[0]?.evidence_present) {
+      if (!evidenceResolves(evidence.rows.map(mapEvidence), candidatePlans, actor.organizationId,
+        input.projectId, input.analysisRunId, new Date())) {
         throw new RepositoryError("RELEASE_GATE_FAILED", ["EVIDENCE_MISSING_OR_EXPIRED"]);
       }
       const existing = await client.query(
@@ -709,7 +793,23 @@ function mapCapability(row: QueryResultRow): CapabilityRecord {
   return { id: String(row.id), organizationId: String(row.organization_id), projectId: String(row.project_id),
     analysisRunId: String(row.analysis_run_id), stableName: String(row.stable_name),
     riskTier: row.risk_tier as CapabilityRecord["riskTier"], status: row.status as CapabilityRecord["status"],
+    plan: row.plan as CapabilityPlan, planDigest: String(row.plan_digest),
+    reviewedPlanDigest: row.reviewed_plan_digest === null || row.reviewed_plan_digest === undefined
+      ? undefined : String(row.reviewed_plan_digest),
     version: Number(row.version) };
+}
+
+function mapEvidence(row: QueryResultRow): AnalysisEvidence {
+  return {
+    id: String(row.id),
+    organizationId: String(row.organization_id),
+    projectId: String(row.project_id),
+    analysisRunId: String(row.analysis_run_id),
+    source: row.source as AnalysisEvidence["source"],
+    content: String(row.content),
+    reference: String(row.reference),
+    expiresAt: iso(row.expires_at),
+  };
 }
 
 function mapVerification(row: QueryResultRow): VerificationRecord {
@@ -754,12 +854,94 @@ function candidateMatches(candidate: CandidateRelease, stored: CandidateRelease)
     && canonicalJson(candidate.manifest ?? {}) === canonicalJson(stored.manifest ?? {});
 }
 
+function plansFromManifest(manifest: unknown): readonly CapabilityPlan[] | undefined {
+  if (!manifest || typeof manifest !== "object" || !("plans" in manifest)
+    || !Array.isArray((manifest as { plans?: unknown }).plans)) return undefined;
+  try {
+    return canonicalizeCapabilityPlans((manifest as { plans: CapabilityPlan[] }).plans);
+  } catch {
+    return undefined;
+  }
+}
+
+function equalPlanSets(left: readonly CapabilityPlan[], right: readonly CapabilityPlan[]): boolean {
+  if (left.length !== right.length) return false;
+  const leftDigests = left.map((plan) => `${plan.tool.name}:${capabilityPlanDigest(plan)}`).sort(compareStrings);
+  const rightDigests = right.map((plan) => `${plan.tool.name}:${capabilityPlanDigest(plan)}`).sort(compareStrings);
+  return leftDigests.every((value, index) => value === rightDigests[index]);
+}
+
+function capabilityPlanBindingValid(capability: CapabilityRecord): boolean {
+  try {
+    return capability.stableName === capability.plan.tool.name
+      && capability.riskTier === capability.plan.effects.riskTier
+      && capability.planDigest === capabilityPlanDigest(capability.plan);
+  } catch {
+    return false;
+  }
+}
+
+function normalizeEvidence(
+  evidence: AnalysisEvidence,
+  organizationId: string,
+  projectId: string,
+  analysisRunId: string,
+): Required<AnalysisEvidence> {
+  const now = new Date();
+  if (!evidence || typeof evidence !== "object"
+    || !["openapi", "github", "runtime", "owner_review", "source"].includes(evidence.source)
+    || typeof evidence.content !== "string" || evidence.content.length === 0
+    || Buffer.byteLength(evidence.content) > MAX_RELEASE_BYTES
+    || evidence.organizationId !== undefined && evidence.organizationId !== organizationId
+    || evidence.projectId !== undefined && evidence.projectId !== projectId
+    || evidence.analysisRunId !== undefined && evidence.analysisRunId !== analysisRunId) {
+    throw new RepositoryError("INVALID_STATE");
+  }
+  const reference = `urn:sha256:${createHash("sha256").update(evidence.content).digest("hex")}`;
+  const expiresAt = evidence.expiresAt ?? new Date(now.getTime() + 7 * 24 * 60 * 60 * 1_000).toISOString();
+  if (evidence.reference !== reference || !Number.isFinite(Date.parse(expiresAt)) || new Date(expiresAt) <= now) {
+    throw new RepositoryError("INVALID_STATE");
+  }
+  return {
+    id: evidence.id ?? randomUUID(),
+    organizationId,
+    projectId,
+    analysisRunId,
+    source: evidence.source,
+    content: evidence.content,
+    reference,
+    expiresAt: new Date(expiresAt).toISOString(),
+  };
+}
+
+function evidenceResolves(
+  evidence: readonly AnalysisEvidence[],
+  plans: readonly CapabilityPlan[],
+  organizationId: string,
+  projectId: string,
+  analysisRunId: string,
+  now: Date,
+): boolean {
+  const byReference = new Map<string, AnalysisEvidence>();
+  for (const item of evidence) {
+    if (item.organizationId !== organizationId || item.projectId !== projectId
+      || item.analysisRunId !== analysisRunId || item.expiresAt === undefined || new Date(item.expiresAt) <= now
+      || `urn:sha256:${createHash("sha256").update(item.content).digest("hex")}` !== item.reference
+      || byReference.has(item.reference)) return false;
+    byReference.set(item.reference, item);
+  }
+  return plans.every((plan) => plan.evidence.every(({ source, reference }) => {
+    const resolved = byReference.get(reference);
+    return resolved?.source === source;
+  }));
+}
+
 function canonicalJson(value: unknown): string {
   const normalize = (item: unknown): unknown => {
     if (Array.isArray(item)) return item.map(normalize);
     if (item !== null && typeof item === "object") {
       const record = item as Record<string, unknown>;
-      return Object.fromEntries(Object.keys(record).sort().map((key) => [key, normalize(record[key])]));
+      return Object.fromEntries(Object.keys(record).sort(compareStrings).map((key) => [key, normalize(record[key])]));
     }
     return item;
   };
@@ -768,6 +950,10 @@ function canonicalJson(value: unknown): string {
   } catch {
     return "__INVALID_JSON__";
   }
+}
+
+function compareStrings(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 function mapPostgresError(error: unknown): unknown {

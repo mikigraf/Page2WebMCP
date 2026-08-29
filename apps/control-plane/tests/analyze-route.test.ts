@@ -60,7 +60,6 @@ for (const sourceType of ["website", "openapi", "github"] as const) {
     } else {
       assert.deepEqual(body.capabilities.map((item: { stableName: string; status: string }) => [item.stableName, item.status]), [
         ["create_support_ticket", "proposed"],
-        ["delete_account", "blocked"],
         ["find_order", "proposed"],
         ["get_order_status", "proposed"]
       ]);

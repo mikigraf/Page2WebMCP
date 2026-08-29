@@ -1,8 +1,9 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import { compileWebMcpRelease } from "../../../packages/compiler/src/compiler.ts";
-import { CapabilityPlanSchema } from "../../../packages/capability-ir/src/plan.ts";
+import { CapabilityPlanSchema, type CapabilityPlan } from "../../../packages/capability-ir/src/plan.ts";
 import {
+  capabilityPlanDigest,
   capabilityStateDigest,
   type AnalysisResult,
   type CandidateRelease,
@@ -17,7 +18,12 @@ import { ApiError } from "./api.ts";
 
 const ManifestSchema = z.object({
   version: z.literal(3),
+  rendererId: z.string().regex(/^[a-f0-9]{64}$/),
   releaseId: z.string().regex(/^[a-f0-9]{64}$/),
+  integrityPolicy: z.object({
+    enforcement: z.literal("trusted-loader-required"),
+    algorithms: z.tuple([z.literal("sha256"), z.literal("sha384")])
+  }).strict(),
   targetOrigin: z.string().url(),
   plans: z.array(CapabilityPlanSchema).min(1).max(100)
 }).strict();
@@ -35,7 +41,7 @@ export async function publishPersistedRelease(
   if (run.projectId !== project.id || run.status !== "succeeded") throw new ApiError("INVALID_STATE", 409);
   const result = await repository.getAnalysisResult(actor, run.id);
   if (!result) throw new ApiError("INVALID_STATE", 409);
-  assertCurrentEvidence(result);
+  assertCurrentEvidence(result, actor.organizationId, project.id, run.id);
   const capabilities = await repository.listAnalysisCapabilities(actor, run.id);
 
   const pendingReview = capabilities.some((capability) =>
@@ -43,10 +49,6 @@ export async function publishPersistedRelease(
       && capability.status === "proposed"
   );
   if (pendingReview) throw new ApiError("REVIEW_REQUIRED", 409);
-  if (capabilities.some((capability) => capability.riskTier === "R3" && capability.status !== "blocked")) {
-    throw new ApiError("HIGH_RISK_ACTION", 409);
-  }
-
   const verificationRequest = deriveVerification(analysisRunId, project.url, result, capabilities);
   const verification = await repository.saveVerification(actor, project.id, verificationRequest);
   const inputHash = createHash("sha256")
@@ -80,7 +82,7 @@ export async function verifyPersistedRelease(
   if (run.projectId !== project.id || run.status !== "succeeded") throw new ApiError("INVALID_STATE", 409);
   const result = await repository.getAnalysisResult(actor, run.id);
   if (!result) throw new ApiError("INVALID_STATE", 409);
-  assertCurrentEvidence(result);
+  assertCurrentEvidence(result, actor.organizationId, project.id, run.id);
   const capabilities = await repository.listAnalysisCapabilities(actor, run.id);
   return repository.saveVerification(
     actor,
@@ -97,16 +99,11 @@ export function deriveVerification(
 ): VerificationRequest {
   const parsedSourceManifest = ManifestSchema.safeParse(result.release.manifest);
   const targetOrigin = safeOrigin(projectUrl);
-  const expectedNames = capabilities
-    .filter((capability) => capability.status !== "blocked")
-    .map((capability) => capability.stableName)
-    .sort();
-  const sourceExpectedNames = capabilities
-    .filter((capability) => capability.riskTier !== "R3")
-    .map((capability) => capability.stableName)
-    .sort();
+  const selectedCapabilities = capabilities.filter((capability) => capability.status !== "blocked");
+  const expectedNames = selectedCapabilities.map((capability) => capability.stableName).sort(compareStrings);
+  const sourceExpectedNames = capabilities.map((capability) => capability.stableName).sort(compareStrings);
   const sourceManifestNames = parsedSourceManifest.success
-    ? parsedSourceManifest.data.plans.map((plan) => plan.tool.name).sort()
+    ? parsedSourceManifest.data.plans.map((plan) => plan.tool.name).sort(compareStrings)
     : [];
   const uniqueSourceNames = new Set(sourceManifestNames);
   let candidate: CandidateRelease = result.release;
@@ -115,7 +112,8 @@ export function deriveVerification(
     && result.release.allowedOrigin === targetOrigin
     && parsedSourceManifest.data.targetOrigin === targetOrigin
     && uniqueSourceNames.size === sourceManifestNames.length
-    && equalStrings(sourceExpectedNames, sourceManifestNames)) {
+    && equalStrings(sourceExpectedNames, sourceManifestNames)
+    && plansMatchCapabilities(parsedSourceManifest.data.plans, capabilities)) {
     try {
       const canonicalSource = compileManifest(parsedSourceManifest.data);
       if (canonicalSource.code === result.release.code
@@ -137,11 +135,13 @@ export function deriveVerification(
 
   const parsedManifest = ManifestSchema.safeParse(candidate.manifest);
   const digest = createHash("sha256").update(candidate.code).digest("hex");
-  const manifestNames = parsedManifest.success ? parsedManifest.data.plans.map((plan) => plan.tool.name).sort() : [];
+  const manifestNames = parsedManifest.success ? parsedManifest.data.plans.map((plan) => plan.tool.name).sort(compareStrings) : [];
   const uniqueManifestNames = new Set(manifestNames);
   const exactSelection = expectedNames.length > 0
     && uniqueManifestNames.size === manifestNames.length
-    && equalStrings(expectedNames, manifestNames);
+    && equalStrings(expectedNames, manifestNames)
+    && parsedManifest.success
+    && plansMatchCapabilities(parsedManifest.data.plans, selectedCapabilities);
   const schema = parsedManifest.success
     && digest === candidate.contentHash
     && exactSelection;
@@ -203,10 +203,48 @@ function equalStrings(left: string[], right: string[]): boolean {
   return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
-function assertCurrentEvidence(result: AnalysisResult): void {
-  // Persistence omits expired evidence, so an empty exact-run set is never
-  // sufficient to create or reuse a release verification.
-  if (result.evidence.length === 0) {
+function plansMatchCapabilities(plans: CapabilityPlan[], capabilities: CapabilityRecord[]): boolean {
+  if (plans.length !== capabilities.length) return false;
+  const expected = capabilities.map((capability) => {
+    if (capability.stableName !== capability.plan.tool.name
+      || capability.riskTier !== capability.plan.effects.riskTier
+      || capability.planDigest !== capabilityPlanDigest(capability.plan)) return undefined;
+    return `${capability.stableName}:${capability.planDigest}`;
+  }).sort(compareOptionalStrings);
+  const actual = plans.map((plan) => `${plan.tool.name}:${capabilityPlanDigest(plan)}`).sort(compareStrings);
+  return expected.every((value, index) => value !== undefined && value === actual[index]);
+}
+
+function assertCurrentEvidence(
+  result: AnalysisResult,
+  organizationId: string,
+  projectId: string,
+  analysisRunId: string,
+): void {
+  const manifest = ManifestSchema.safeParse(result.release.manifest);
+  const referenced = manifest.success
+    ? manifest.data.plans.flatMap((plan) => plan.evidence.map(({ source, reference }) => ({ source, reference })))
+    : [];
+  const current = new Map(result.evidence.map((item) => [item.reference, item]));
+  const resolved = manifest.success && referenced.length > 0 && referenced.every(({ source, reference }) => {
+    const evidence = current.get(reference);
+    if (!evidence || evidence.source !== source || evidence.organizationId !== organizationId
+      || evidence.projectId !== projectId || evidence.analysisRunId !== analysisRunId
+      || evidence.expiresAt === undefined || new Date(evidence.expiresAt) <= new Date()) return false;
+    const digest = createHash("sha256").update(evidence.content).digest("hex");
+    return reference === `urn:sha256:${digest}`;
+  });
+  if (!resolved) {
     throw new ApiError("RELEASE_GATE_FAILED", 409, false, ["EVIDENCE_MISSING_OR_EXPIRED"]);
   }
+}
+
+function compareStrings(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function compareOptionalStrings(left: string | undefined, right: string | undefined): number {
+  if (left === undefined) return right === undefined ? 0 : -1;
+  if (right === undefined) return 1;
+  return compareStrings(left, right);
 }
