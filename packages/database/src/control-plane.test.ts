@@ -242,7 +242,7 @@ test("eligible publication is content addressed and idempotent", async () => {
   assert.equal(duplicate.id, release.id);
   assert.equal(release.capabilityStateDigest, capabilityState);
   assert.match(release.contentHash, /^[0-9a-f]{64}$/);
-  assert.match(release.sri, /^sha256-/);
+  assert.match(release.sri, /^sha384-/);
   assert.equal((await repository.getReleaseArtifact(release.contentHash)).code, "export const fixture = true;");
   await assert.rejects(repository.saveVerification(owner, project.id, {
     ...verificationInput,

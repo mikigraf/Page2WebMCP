@@ -4,6 +4,7 @@ import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import pg from "pg";
 import { compileWebMcpRelease } from "../../compiler/src/compiler.ts";
+import { acmeCapabilityPlans } from "../../../apps/acme-support/src/capability-plans.ts";
 import { createPostgresRepository } from "./postgres.ts";
 import {
   capabilityStateDigest,
@@ -414,18 +415,10 @@ test("Postgres preserves the worker candidate across capability changes and publ
     organizationId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
     role: "owner"
   };
-  const source = compileWebMcpRelease([
-    { name: "find_order", description: "find order", readOnly: true },
-    {
-      name: "create_support_ticket",
-      description: "create support ticket",
-      readOnly: false,
-      requiresConfirmation: true
-    }
-  ], "https://acme.example");
-  const subset = compileWebMcpRelease([
-    { name: "find_order", description: "find order", readOnly: true }
-  ], "https://acme.example");
+  const fixturePlans = acmeCapabilityPlans("https://acme.example")
+    .filter((plan) => plan.tool.name !== "get_order_status");
+  const source = compileWebMcpRelease(fixturePlans);
+  const subset = compileWebMcpRelease(fixturePlans.filter((plan) => plan.tool.name === "find_order"));
 
   try {
     const project = await repository.createProject(actor, {

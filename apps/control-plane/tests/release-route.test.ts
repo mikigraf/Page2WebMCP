@@ -6,6 +6,7 @@ import { GET as getArtifact } from "../app/api/releases/[artifact]/route.ts";
 import { POST as publish } from "../app/api/projects/[projectId]/releases/route.ts";
 import { authenticate, issueSession } from "../src/auth.ts";
 import { compileWebMcpRelease } from "../../../packages/compiler/src/compiler.ts";
+import { acmeCapabilityPlans } from "../../acme-support/src/capability-plans.ts";
 import {
   InMemoryControlPlaneRepository,
   type AnalysisResult,
@@ -22,10 +23,8 @@ async function fixture(
   repository: InMemoryControlPlaneRepository,
   evidence: AnalysisResult["evidence"] = [{ source: "openapi", operation: "findOrder" }]
 ) {
-  const candidate = compileWebMcpRelease([
-    { name: "find_order", description: "find order", readOnly: true },
-    { name: "create_support_ticket", description: "create support ticket", readOnly: false, requiresConfirmation: true }
-  ], "https://acme.example");
+  const candidate = compileWebMcpRelease(acmeCapabilityPlans("https://acme.example")
+    .filter((plan) => plan.tool.name !== "get_order_status"));
   const project = await repository.createProject(owner, {
     name: "Acme",
     sourceType: "website",
@@ -178,12 +177,11 @@ test("publication cannot reuse verification after its exact-run evidence expires
 test("publication rejects a worker artifact that downgrades vetted untrusted content", async () => {
   const repository = new InMemoryControlPlaneRepository();
   setControlPlaneRepositoryForTest(repository);
-  const canonical = compileWebMcpRelease([{
-    name: "get_order_status",
-    description: "get order status",
-    readOnly: true
-  }], "https://acme.example");
-  const code = canonical.code.replaceAll('"untrustedContent":true', '"untrustedContent":false');
+  const canonical = compileWebMcpRelease(acmeCapabilityPlans("https://acme.example")
+    .filter((plan) => plan.tool.name === "get_order_status"));
+  const code = canonical.code.replaceAll('"untrusted":true', '"untrusted":false');
+  const downgradedManifest = structuredClone(canonical.manifest);
+  downgradedManifest.plans[0]!.annotations.untrusted = false;
   const project = await repository.createProject(owner, {
     name: "Acme",
     sourceType: "website",
@@ -204,16 +202,7 @@ test("publication rejects a worker artifact that downgrades vetted untrusted con
       code,
       contentHash: createHash("sha256").update(code).digest("hex"),
       allowedOrigin: "https://acme.example",
-      manifest: {
-        version: 2,
-        allowedOrigin: "https://acme.example",
-        tools: [{
-          name: "get_order_status",
-          readOnly: true,
-          untrustedContent: false,
-          requiresConfirmation: false
-        }]
-      }
+      manifest: downgradedManifest
     }
   });
 
@@ -249,7 +238,7 @@ test("publication derives verification from persisted state and requires R1 revi
   const body = await published.json();
   assert.equal(body.release.status, "published");
   assert.match(body.release.url, /^\/api\/releases\/[0-9a-f]{64}\.js$/);
-  assert.match(body.release.sri, /^sha256-/);
+  assert.match(body.release.sri, /^sha384-/);
 
   const duplicate = await publish(
     request(project.id, run.id, "publish-after-review"),
@@ -325,9 +314,8 @@ test("blocking a proposed capability publishes the deterministic reviewed subset
   );
   assert.equal(response.status, 201, JSON.stringify(await response.clone().json()));
   const release = (await response.json()).release;
-  const expected = compileWebMcpRelease([
-    { name: "find_order", description: "find order", readOnly: true, requiresConfirmation: false }
-  ], "https://acme.example");
+  const expected = compileWebMcpRelease(acmeCapabilityPlans("https://acme.example")
+    .filter((plan) => plan.tool.name === "find_order"));
   assert.equal(release.contentHash, expected.contentHash);
 
   const artifact = await getArtifact(

@@ -18,9 +18,10 @@ export async function GET(
     const release = await getControlPlaneRepository().getReleaseArtifact(contentHash);
     const bytes = Buffer.from(release.code);
     const digest = createHash("sha256").update(bytes).digest();
+    const integrity = createHash("sha384").update(bytes).digest("base64");
     if (digest.toString("hex") !== contentHash
       || release.contentHash !== contentHash
-      || release.sri !== `sha256-${digest.toString("base64")}`) {
+      || release.sri !== `sha384-${integrity}`) {
       throw new ApiError("ARTIFACT_INTEGRITY_FAILED", 500);
     }
     const etag = `"${release.contentHash}"`;

@@ -143,8 +143,9 @@ test("PostgreSQL route lifecycle is completed by a separately launched durable w
     await assertResponseStatus(artifactResponse, 200);
     const artifact = await artifactResponse.text();
     const digest = createHash("sha256").update(Buffer.from(artifact)).digest();
+    const integrity = createHash("sha384").update(Buffer.from(artifact)).digest("base64");
     assert.equal(digest.toString("hex"), published.release.contentHash);
-    assert.equal(`sha256-${digest.toString("base64")}`, published.release.sri);
+    assert.equal(`sha384-${integrity}`, published.release.sri);
     assert.equal(artifactResponse.headers.get("x-page2webmcp-integrity"), published.release.sri);
     assert.equal(artifactResponse.headers.get("access-control-allow-origin"), "https://acme.example");
     assert.match(artifact, /registerPage2WebMCPTools/);

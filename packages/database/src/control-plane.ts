@@ -623,7 +623,7 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
       analysisRunId: verification.analysisRunId,
       capabilityStateDigest: input.capabilityStateDigest,
       contentHash,
-      sri: `sha256-${createHash("sha256").update(codeBytes).digest("base64")}`,
+      sri: `sha384-${createHash("sha384").update(codeBytes).digest("base64")}`,
       code: candidate.code,
       allowedOrigin: candidate.allowedOrigin,
       manifest: candidate.manifest,

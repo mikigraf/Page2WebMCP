@@ -11,7 +11,7 @@ test("autonomous fixture workflow derives safe tools and blocks high-risk action
   assert.match(result.release.code, /find_order/);
   assert.doesNotMatch(result.release.code, /delete_account/);
   assert.equal(
-    result.release.manifest.tools.find((tool) => tool.name === "get_order_status")?.untrustedContent,
+    result.release.manifest.plans.find((plan) => plan.tool.name === "get_order_status")?.annotations.untrusted,
     true
   );
   assert.equal(result.evidence.some((item) => JSON.stringify(item).includes("fixture-password")), false);

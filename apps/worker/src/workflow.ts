@@ -1,4 +1,5 @@
 import { AcmeSupport } from "../../acme-support/src/app";
+import { acmeCapabilityPlans } from "../../acme-support/src/capability-plans.ts";
 import { Capability, createCapability } from "../../../packages/capability-ir/src/status.ts";
 import { compileWebMcpRelease, CompiledRelease } from "../../../packages/compiler/src/compiler.ts";
 import { sanitizeEvidence } from "../../../packages/security/src/security.ts";
@@ -19,11 +20,11 @@ export function runFixtureWorkflow(app: AcmeSupport, origin: string): WorkflowRe
   const openApi = compileOpenApi(document);
   const capabilities = capabilitySpecs.map(([name, risk, readOnly]) => createCapability(name, risk, readOnly));
   const evidence = Object.entries(document.paths).map(([path, operations]) => sanitizeEvidence({ source: "openapi", path, operations }));
-  const release = compileWebMcpRelease(capabilities.filter((capability) => capability.status !== "blocked").map((capability) => ({
-    name: capability.identity.name,
-    description: capability.identity.name.replaceAll("_", " "),
-    readOnly: capability.safety.readOnly
-  })), origin);
+  const executableNames = new Set(capabilities
+    .filter((capability) => capability.status !== "blocked")
+    .map((capability) => capability.identity.name));
+  const release = compileWebMcpRelease(acmeCapabilityPlans(origin)
+    .filter((plan) => executableNames.has(plan.tool.name)));
   return { capabilities, evidence: [...evidence, { source: "openapi", diagnostics: openApi.diagnostics }], release };
 }
 

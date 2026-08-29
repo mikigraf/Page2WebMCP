@@ -9,6 +9,7 @@ import type {
 } from "../../../packages/database/src/control-plane.ts";
 import { getObservability } from "../../../packages/observability/src/server.ts";
 import { runFixtureSourceHardening, runFixtureWorkflow } from "./workflow.ts";
+import { acmeCapabilityPlans } from "../../acme-support/src/capability-plans.ts";
 
 const LEASE_MS = 60_000;
 const HEARTBEAT_MS = 15_000;
@@ -83,7 +84,7 @@ function buildResult(source: ClaimedAnalysisRunRecord): AnalysisResult {
   if (source.sourceType === "github") {
     const draftPullRequest = runFixtureSourceHardening();
     const origin = fixtureOrigin();
-    const release = compileWebMcpRelease([], origin);
+    const release = compileWebMcpRelease(acmeCapabilityPlans(origin).slice(0, 1));
     return {
       capabilities: [],
       evidence: [{ source: "source", draft: true, changedFiles: draftPullRequest.files?.length ?? 0 }],

@@ -612,7 +612,7 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
       if (contentHash !== input.candidateContentHash) {
         throw new RepositoryError("RELEASE_GATE_FAILED", ["CANDIDATE_CHANGED"]);
       }
-      const sri = "sha256-" + createHash("sha256").update(bytes).digest("base64");
+      const sri = "sha384-" + createHash("sha384").update(bytes).digest("base64");
       const release = await client.query(
         "insert into public.releases " +
         "(id, organization_id, project_id, analysis_run_id, capability_state_digest, content_hash, sri, code, allowed_origin, manifest, status) " +
