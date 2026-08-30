@@ -30,6 +30,8 @@ test("workflow migration is additive, complete, bounded, and keeps legacy synchr
   assert.match(sql, /create trigger enforce_workflow_task_phase/);
   assert.match(sql, /illegal workflow run phase transition/);
   assert.match(sql, /workflow task phase requires succeeded predecessor/);
+  assert.match(sql, /illegal initial workflow run state/);
+  assert.match(sql, /illegal initial workflow task state/);
   assert.match(sql, /only private\.analysis_jobs projects legacy analysis state/);
   assert.doesNotMatch(sql, /trigger\s+sync_analysis_job_state\s+on\s+private\.workflow_tasks/i);
   assert.doesNotMatch(sql, /\b(prompt|screenshot|credential|secret_value|raw_dom)\b\s+(?:text|jsonb|bytea)/i);

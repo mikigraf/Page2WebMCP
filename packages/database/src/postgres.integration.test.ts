@@ -308,6 +308,77 @@ test("Postgres phased workflow matches in-memory transitions, lease generations,
         assert.equal(outcome.reason.code, "23514");
       }
     }
+    const initialProject = await repository.createProject(actor, {
+      name: "Postgres illegal initial state",
+      sourceType: "openapi",
+      url: "https://initial-state.widgets.example/openapi.json",
+      idempotencyKey: "postgres-initial-state-project",
+      inputHash: "postgres-initial-state-project",
+    });
+    const [initialSnapshot] = await repository.listSourceSnapshots(actor, initialProject.id);
+    assert.ok(initialSnapshot);
+    const invalidInitialRuns: PromiseSettledResult<void>[] = [];
+    for (const role of ["page2webmcp_app", "page2webmcp_worker"] as const) {
+      for (const [status, version, nextSequence, cancelRequestedAt] of [
+        ["running", 0, 1, null],
+        ["queued", 1, 1, null],
+        ["queued", 0, 2, null],
+        ["queued", 0, 1, new Date()],
+      ] as const) {
+        const [outcome] = await Promise.allSettled([directScopedWrite(
+          role,
+          "insert into public.workflow_runs " +
+          "(organization_id, project_id, source_snapshot_id, status, current_phase, input_hash, version, " +
+          "next_event_sequence, cancel_requested_at) values ($1, $2, $3, $4, 'preflight', $5, $6, $7, $8)",
+          [actor.organizationId, initialProject.id, initialSnapshot.id, status, "f".repeat(64),
+            version, nextSequence, cancelRequestedAt],
+        )]);
+        invalidInitialRuns.push(outcome);
+      }
+    }
+    for (const outcome of invalidInitialRuns) {
+      assert.equal(outcome.status, "rejected");
+      if (outcome.status === "rejected") {
+        assert.ok(outcome.reason instanceof pg.DatabaseError);
+        assert.equal(outcome.reason.code, "23514");
+      }
+    }
+
+    const legacyProject = await repository.createProject(actor, {
+      name: "Postgres illegal legacy task state",
+      sourceType: "openapi",
+      url: "https://legacy-state.widgets.example/openapi.json",
+      idempotencyKey: "postgres-legacy-state-project",
+      inputHash: "postgres-legacy-state-project",
+    });
+    const legacyAnalysis = await repository.enqueueAnalysis(actor, {
+      projectId: legacyProject.id,
+      idempotencyKey: "postgres-legacy-state-analysis",
+      inputHash: "postgres-legacy-state-analysis",
+    });
+    const legacyWorkflow = await repository.getWorkflowRun(actor, legacyAnalysis.id);
+    await admin.query("delete from private.workflow_tasks where workflow_run_id = $1", [legacyWorkflow.id]);
+    const invalidLegacyTasks = await Promise.allSettled(
+      (["page2webmcp_app", "page2webmcp_worker"] as const).map((role) => directScopedWrite(
+        role,
+        "insert into private.workflow_tasks " +
+        "(organization_id, project_id, workflow_run_id, phase, status, idempotency_key, input_hash, " +
+        "lease_generation, attempts) values ($1, $2, $3, 'analysis', 'succeeded', $4, $5, 3, 3)",
+        [actor.organizationId, legacyProject.id, legacyWorkflow.id, `wft_${"9".repeat(64)}`, legacyWorkflow.inputHash],
+      )),
+    );
+    for (const outcome of invalidLegacyTasks) {
+      assert.equal(outcome.status, "rejected");
+      if (outcome.status === "rejected") {
+        assert.ok(outcome.reason instanceof pg.DatabaseError);
+        assert.equal(outcome.reason.code, "23514");
+      }
+    }
+    await repository.cancelWorkflow(actor, {
+      runId: legacyWorkflow.id,
+      idempotencyKey: "postgres-cancel-legacy-state",
+      inputHash: "postgres-cancel-legacy-state",
+    });
     const [left, right] = await Promise.all([
       repository.claimWorkflowTask("postgres-workflow-a"),
       repository.claimWorkflowTask("postgres-workflow-b"),

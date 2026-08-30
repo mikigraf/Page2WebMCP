@@ -333,6 +333,14 @@ begin
       or (new.analysis_run_id is not null and new.current_phase <> 'analysis') then
       raise exception 'illegal initial workflow run phase %', new.current_phase using errcode = '23514';
     end if;
+    if new.status <> 'queued'
+      or new.version <> 0
+      or new.next_event_sequence <> 1
+      or new.cancel_requested_at is not null
+      or new.cancelled_at is not null
+      or new.error_code is not null then
+      raise exception 'illegal initial workflow run state' using errcode = '23514';
+    end if;
     return new;
   end if;
   if old.current_phase <> new.current_phase then
@@ -375,14 +383,30 @@ begin
   if target_run.id is null then
     raise exception 'workflow task run not found' using errcode = '23503';
   end if;
+  if new.status <> 'queued'
+    or new.output_hash is not null
+    or new.checkpoint_reference is not null
+    or new.output_reference is not null
+    or new.wait_key_hash is not null
+    or new.wait_reason is not null
+    or new.wait_expires_at is not null
+    or new.resumed_at is not null
+    or new.cancel_requested_at is not null
+    or new.cancelled_at is not null
+    or new.lease_generation <> 0
+    or new.lease_owner is not null
+    or new.lease_expires_at is not null
+    or new.attempts <> 0
+    or new.retry_classification is not null
+    or new.error_code is not null
+    or new.reconciled_at is not null then
+    raise exception 'illegal initial workflow task state' using errcode = '23514';
+  end if;
   if target_run.analysis_run_id is not null then
     if new.phase <> 'analysis' or target_run.current_phase <> 'analysis' then
       raise exception 'legacy analysis workflow requires analysis task' using errcode = '23514';
     end if;
     return new;
-  end if;
-  if new.status <> 'queued' then
-    raise exception 'generic workflow task must start queued' using errcode = '23514';
   end if;
   if new.phase = 'preflight' then
     if target_run.current_phase <> 'preflight' or exists (
@@ -450,17 +474,9 @@ create trigger enforce_workflow_run_transition
 before update on public.workflow_runs
 for each row execute function private.enforce_workflow_run_transition();
 
-create trigger enforce_workflow_run_phase
-before insert or update on public.workflow_runs
-for each row execute function private.enforce_workflow_run_phase();
-
 create trigger enforce_workflow_task_transition
 before update on private.workflow_tasks
 for each row execute function private.enforce_workflow_task_transition();
-
-create trigger enforce_workflow_task_phase
-before insert or update on private.workflow_tasks
-for each row execute function private.enforce_workflow_task_phase();
 
 create or replace function private.append_workflow_event(
   target_workflow_run_id uuid,
@@ -603,6 +619,17 @@ select capability.organization_id, capability.project_id, capability.analysis_ru
 from public.capabilities capability
 join private.workflow_tasks task
   on task.workflow_run_id = capability.analysis_run_id and task.phase = 'analysis';
+
+-- Compatibility rows above mirror legacy jobs that may already be terminal,
+-- leased, cancelled, or retried. Enforce the runtime-only initial-state
+-- contract after that one-time backfill has completed.
+create trigger enforce_workflow_run_phase
+before insert or update on public.workflow_runs
+for each row execute function private.enforce_workflow_run_phase();
+
+create trigger enforce_workflow_task_phase
+before insert or update on private.workflow_tasks
+for each row execute function private.enforce_workflow_task_phase();
 
 alter table public.project_sources enable row level security;
 alter table public.project_sources force row level security;
