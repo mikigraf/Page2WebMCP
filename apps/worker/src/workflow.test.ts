@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createHash } from "node:crypto";
-import { createOpenApiAnalysisAdapter } from "./workflow.ts";
+import { createOpenApiAnalysisAdapter, createWebsiteAnalysisAdapter } from "./workflow.ts";
+import { browserUseCloudV4PolicyDigest } from "../../../packages/providers/src/browser-use-v4.ts";
+import type { WebsiteObservationInput } from "../../../packages/providers/src/website-evidence.ts";
 
 test("OpenAPI worker adapter binds exact source bytes to generic canonical plans without leaking examples", async () => {
   const secret = "sk-live-never-persist";
@@ -83,4 +85,135 @@ test("OpenAPI worker adapter fails closed for other source types and returns exa
       transport: { request: async () => { throw new Error("must not fetch"); } },
     },
   }), /OPENAPI_VERIFICATION_CONTEXT_REQUIRED/);
+});
+
+const websiteOrigin = "https://widgets.example";
+const publicAddress = "93.184.216.34";
+const websiteNow = new Date("2026-08-30T12:00:00.000Z");
+const ownershipToken = "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD";
+const ownershipExpiry = "2026-08-30T12:05:00.000Z";
+const browserExpiry = "2026-08-30T12:10:00.000Z";
+
+function bytes(value: string): AsyncIterable<Uint8Array> {
+  return { async *[Symbol.asyncIterator]() { yield new TextEncoder().encode(value); } };
+}
+
+function websiteObservations(): WebsiteObservationInput {
+  return {
+    navigations: [{ sequence: 1, url: `${websiteOrigin}/catalog`, origin: websiteOrigin }],
+    semanticTargets: [],
+    network: [{
+      logicalAction: "list_widgets", title: "List widgets", description: "List public widgets.",
+      method: "GET", pathTemplate: "/api/widgets", status: 200, contentType: "application/json",
+      authentication: "public", effect: "read", inputs: [],
+      outputs: [{ field: "label", path: "label", maxLength: 200 }],
+    }],
+    forms: [], dom: [], authSignals: [], blockedMutations: [],
+    stateTransitions: [{ sequence: 1, from: "preflight", to: "public_observation" }],
+  };
+}
+
+function websiteConfiguration(events: string[], observe: (phase: "public" | "authenticated", signal: AbortSignal) => Promise<{ observations: WebsiteObservationInput; requiresAuthentication: boolean }>) {
+  const resolver = {
+    resolve: async () => [publicAddress],
+    resolveTxt: async () => [[`page2webmcp-verification=${ownershipToken};origin=${websiteOrigin};expires=${ownershipExpiry}`]],
+  };
+  const transport = {
+    request: async ({ url }: { url: string }) => ({
+      status: 200, url, connectedAddress: publicAddress,
+      headers: { "content-type": "text/html", "content-security-policy": "script-src https://scripts.page2webmcp.example" },
+      body: bytes("<!doctype html><title>Widgets</title>"),
+    }),
+  };
+  return {
+    clock: () => websiteNow,
+    hostedScriptOrigin: "https://scripts.page2webmcp.example",
+    provider: { hostedScriptOrigin: "https://scripts.page2webmcp.example", resolver, transport, timeoutMs: 1_000 },
+    ownership: {
+      challenges: { load: async () => ({ method: "dns_txt" as const, targetOrigin: websiteOrigin, token: ownershipToken, expiresAt: ownershipExpiry }) },
+      replayStore: { consume: async () => true },
+    },
+    browser: {
+      expiresAt: browserExpiry,
+      proxyPolicyReference: { reference: "secretref:deny-proxy", expiresAt: browserExpiry },
+      controls: {
+        clock: () => websiteNow,
+        leases: { claim: async () => ({ leaseId: "lease-worker" }), release: async () => { events.push("release"); } },
+        secretReferences: {
+          put: async ({ purpose, expiresAt }: { purpose: string; expiresAt: string }) => ({ reference: `secretref:${purpose}`, expiresAt }),
+          revoke: async () => undefined,
+        },
+        transport: {
+          start: async (request: Parameters<typeof browserUseCloudV4PolicyDigest>[0]) => ({
+            providerSessionId: "provider-worker", liveUrl: "https://live.invalid/secret", cdpUrl: "wss://cdp.invalid/secret",
+            appliedPolicyDigest: browserUseCloudV4PolicyDigest(request),
+          }),
+          stop: async (_id: string, reason: string) => { events.push(`stop:${reason}`); },
+          reconcile: async () => { events.push("reconcile"); },
+        },
+      },
+    },
+    authentication: {
+      store: {
+        open: async () => ({ handoffId: "handoff-worker" }),
+        wait: async () => ({ authenticatedOrigin: websiteOrigin, observedAt: "2026-08-30T12:01:00.000Z", signals: ["account_control"] }),
+        close: async (_id: string, outcome: string) => { events.push(`auth:${outcome}`); },
+      },
+    },
+    explorer: { observe: async ({ phase, firewall, signal }: { phase: "public" | "authenticated"; firewall: ReturnType<typeof import("../../../packages/security/src/security.ts")["createDiscoveryFirewall"]>; signal: AbortSignal }) => {
+      assert.deepEqual(firewall.decide({ method: "POST", url: `${websiteOrigin}/api/widgets`, kind: "subresource" }), { allow: false, code: "MUTATION_BLOCKED" });
+      return observe(phase, signal);
+    } },
+    evidenceStore: { put: async ({ reference }: { reference: string }) => ({ reference }) },
+  };
+}
+
+test("website worker runs hermetic preflight/ownership/browser/evidence proposal and compiles exact plans", async () => {
+  const events: string[] = [];
+  const adapter = createWebsiteAnalysisAdapter(websiteConfiguration(events, async () => ({ observations: websiteObservations(), requiresAuthentication: false })));
+  const result = await adapter({
+    sourceType: "website", sourceUrl: `${websiteOrigin}/`,
+    organizationId: "org-1", projectId: "project-1", id: "run-1",
+  }, new AbortController().signal);
+  assert.deepEqual(result.capabilities.map(({ plan }) => [plan.tool.name, plan.request.adapter]), [["list_widgets", "json_api"]]);
+  assert.ok(result.release);
+  assert.equal(result.release?.allowedOrigin, websiteOrigin);
+  assert.deepEqual(result.evidence.map(({ source }) => source), ["owner_review", "runtime", "source"]);
+  assert.equal(result.evidence[0]!.expiresAt, undefined);
+  assert.deepEqual(result.diagnostics, []);
+  assert.equal(JSON.stringify(result).includes(ownershipToken), false);
+  assert.equal(JSON.stringify(result).includes("live.invalid"), false);
+  assert.deepEqual(events, ["stop:completed", "reconcile", "release"]);
+});
+
+test("website worker performs durable auth resume once and cleans provider state after explorer failure", async () => {
+  const events: string[] = [];
+  const phases: string[] = [];
+  const adapter = createWebsiteAnalysisAdapter(websiteConfiguration(events, async (phase) => {
+    phases.push(phase);
+    if (phase === "public") return { observations: { ...websiteObservations(), network: [] }, requiresAuthentication: true };
+    return { observations: { ...websiteObservations(), network: websiteObservations().network.map((item) => ({ ...item, authentication: "same_origin_cookie" as const })) }, requiresAuthentication: false };
+  }));
+  const result = await adapter({
+    sourceType: "website", sourceUrl: `${websiteOrigin}/`,
+    organizationId: "org-1", projectId: "project-1", id: "run-auth",
+  }, new AbortController().signal);
+  assert.deepEqual(phases, ["public", "authenticated"]);
+  assert.equal(result.capabilities[0]!.plan.authentication.mode, "same_origin_cookie");
+  assert.deepEqual(events, ["auth:completed", "stop:completed", "reconcile", "release"]);
+
+  const failedEvents: string[] = [];
+  const failed = createWebsiteAnalysisAdapter(websiteConfiguration(failedEvents, async () => { throw new Error("EXPLORER_CRASHED"); }));
+  await assert.rejects(failed({
+    sourceType: "website", sourceUrl: `${websiteOrigin}/`,
+    organizationId: "org-1", projectId: "project-1", id: "run-failed",
+  }, new AbortController().signal), /EXPLORER_CRASHED/);
+  assert.deepEqual(failedEvents, ["stop:failed", "reconcile", "release"]);
+});
+
+test("website worker construction and source ownership fail closed without every external control", async () => {
+  assert.throws(() => createWebsiteAnalysisAdapter({} as ReturnType<typeof websiteConfiguration>), /WEBSITE_ANALYSIS_CONTROLS_REQUIRED/);
+  const adapter = createWebsiteAnalysisAdapter(websiteConfiguration([], async () => ({ observations: websiteObservations(), requiresAuthentication: false })));
+  await assert.rejects(adapter({ sourceType: "openapi", sourceUrl: `${websiteOrigin}/` }, new AbortController().signal), /SOURCE_TYPE_UNSUPPORTED/);
+  await assert.rejects(adapter({ sourceType: "website", sourceUrl: `${websiteOrigin}/` }, new AbortController().signal), /WEBSITE_SOURCE_OWNERSHIP_REQUIRED/);
 });

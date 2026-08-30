@@ -82,12 +82,21 @@ export function validateRedirectChain(targets: string[]): { ok: boolean; code?: 
 export function createDiscoveryFirewall(origins: string[]) {
   const allowed = new Set(origins);
   return {
-    decide(request: { method: string; url: string }): { allow: boolean; code?: string } {
+    decide(request: {
+      method: string;
+      url: string;
+      kind?: "document" | "subresource" | "download" | "upload" | "tool";
+      tool?: string;
+      pageText?: string;
+    }): { allow: boolean; code?: string } {
       const target = validateTargetUrl(request.url);
       if (!target.ok) return { allow: false, code: target.code };
       let origin: string;
       try { origin = new URL(request.url).origin; } catch { return { allow: false, code: "INVALID_URL" }; }
       if (!allowed.has(origin)) return { allow: false, code: "ORIGIN_BLOCKED" };
+      if (request.kind === "download") return { allow: false, code: "DOWNLOAD_BLOCKED" };
+      if (request.kind === "upload") return { allow: false, code: "UPLOAD_BLOCKED" };
+      if (request.kind === "tool") return { allow: false, code: "TOOL_BLOCKED" };
       if (!["GET", "HEAD"].includes(request.method)) return { allow: false, code: "MUTATION_BLOCKED" };
       return { allow: true };
     }
