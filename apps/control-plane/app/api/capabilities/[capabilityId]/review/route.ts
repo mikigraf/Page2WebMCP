@@ -34,7 +34,8 @@ export async function POST(
       event: "capability_reviewed",
       outcome: "success",
       requestId,
-      properties: { review_action: input.action, risk_tier: capability.riskTier, duration_ms: Date.now() - startedAt }
+      properties: { actor_id: actor.id, organization_id: actor.organizationId,
+        review_action: input.action, risk_tier: capability.riskTier, duration_ms: Date.now() - startedAt }
     });
     return successResponse({ capability }, requestId);
   } catch (error) {

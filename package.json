@@ -17,6 +17,7 @@
     "security:policy": "node scripts/check-source.mjs",
     "typecheck": "tsc --project tsconfig.base.json --noEmit",
     "test": "tsx --test test-support/**/*.test.ts apps/**/*.test.ts packages/**/*.test.ts",
+    "test:golden": "tsx --test packages/evals/src/golden.test.ts",
     "test:e2e": "tsx --test e2e/**/*.test.ts && playwright test",
     "test:e2e:production": "pnpm build && pnpm test:e2e:production:built",
     "test:e2e:production:built": "tsx --test e2e/**/*.test.ts && PAGE2WEBMCP_E2E_PRODUCTION=true playwright test",
@@ -27,14 +28,15 @@
     "dev": "node --env-file-if-exists=.env.local scripts/dev.mjs",
     "worker": "node --env-file-if-exists=.env.local .dist/worker/apps/worker/src/main.js",
     "build:worker": "tsc --project tsconfig.worker.json",
-    "build": "pnpm --filter @page2webmcp/acme-support build && pnpm --filter @page2webmcp/control-plane build && pnpm build:worker"
+    "build": "pnpm --filter @page2webmcp/acme-support build && pnpm --filter @page2webmcp/control-plane build && pnpm build:worker",
+    "release:readiness": "tsx scripts/check-release-readiness.ts --hermetic"
   },
   "devDependencies": {
-    "@playwright/test": "^1.62.1",
+    "@playwright/test": "1.62.1",
     "@types/node": "24.13.3",
     "@types/pg": "8.23.1",
-    "@types/react": "^19.2.18",
-    "@types/react-dom": "^19.2.5",
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.5",
     "eslint": "9.39.5",
     "eslint-config-next": "16.3.3",
     "tsx": "4.23.12"
@@ -47,13 +49,13 @@
     "@redocly/openapi-core": "2.45.0",
     "@supabase/ssr": "0.12.5",
     "@supabase/supabase-js": "2.112.4",
-    "next": "^16.3.3",
+    "next": "16.3.3",
     "pg": "8.23.0",
     "posthog-node": "5.51.4",
-    "react": "^19.2.8",
-    "react-dom": "^19.2.8",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
     "typescript": "5.9.2",
     "yaml": "2.9.0",
-    "zod": "^4.5.2"
+    "zod": "4.5.2"
   }
 }

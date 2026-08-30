@@ -55,7 +55,8 @@ export async function POST(request: Request) {
       event: "project_created",
       outcome: "success",
       requestId,
-      properties: { source_type: project.sourceType, duration_ms: Date.now() - startedAt }
+      properties: { actor_id: actor.id, organization_id: actor.organizationId,
+        source_type: project.sourceType, duration_ms: Date.now() - startedAt }
     });
     return successResponse(project, requestId, 201);
   } catch (error) {

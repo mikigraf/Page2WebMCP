@@ -20,7 +20,9 @@ import {
   type WaitWorkflowTaskInput,
   type WorkflowCapabilityPlanLink,
   type WorkflowEventRecord,
+  type WorkflowEventPayload,
   type WorkflowEventType,
+  type WorkflowTaskEventInput,
   type WorkflowEvidenceLink,
   type WorkflowRepository,
   type WorkflowRunRecord,
@@ -577,6 +579,7 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
     type: WorkflowEventType,
     taskId?: string,
     code?: string,
+    payload?: WorkflowEventPayload,
   ): WorkflowRunRecord {
     const existing = this.#workflowRuns.get(runId);
     if (!existing) throw new RepositoryError("INVALID_STATE");
@@ -594,6 +597,7 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
       version,
       type,
       ...(code ? { code } : {}),
+      ...(payload && Object.keys(payload).length > 0 ? { payload } : {}),
       createdAt: this.#now(),
     });
     this.#workflowEvents.set(runId, events);
@@ -950,6 +954,21 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
 
   async assertWorkflowTaskLease(workerId: string, taskId: string, leaseGeneration: number): Promise<void> {
     this.#assertWorkflowLease(workerId, this.#workflowTask(taskId), leaseGeneration);
+  }
+
+  async recordWorkflowTaskEvent(
+    workerId: string,
+    taskId: string,
+    leaseGeneration: number,
+    input: WorkflowTaskEventInput,
+  ): Promise<WorkflowEventRecord> {
+    const task = this.#workflowTask(taskId);
+    this.#assertWorkflowLease(workerId, task, leaseGeneration);
+    const payload = normalizeWorkflowTaskEvent(input);
+    this.#appendWorkflowEvent(task.workflowRunId, input.type, task.id, undefined, payload);
+    const event = this.#workflowEvents.get(task.workflowRunId)?.at(-1);
+    if (!event) throw new RepositoryError("INVALID_STATE");
+    return copy(event);
   }
 
   async getWorkflowExecutionMaterial(
@@ -2080,6 +2099,35 @@ function stableHash(value: string): string {
     throw new RepositoryError("INVALID_STATE");
   }
   return /^[0-9a-f]{64}$/.test(value) ? value : createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+function normalizeWorkflowTaskEvent(input: WorkflowTaskEventInput): WorkflowEventPayload {
+  if (!input || typeof input !== "object" || ![
+    "task.side_effect_started", "task.side_effect_completed", "task.side_effect_failed",
+  ].includes(input.type) || !input.payload || typeof input.payload !== "object") {
+    throw new RepositoryError("INVALID_STATE");
+  }
+  const payload = input.payload;
+  const allowed = input.type === "task.side_effect_started"
+    ? ["inputHash", "operation"]
+    : input.type === "task.side_effect_completed"
+      ? ["costMicros", "durationMs", "inputHash", "operation", "outputHash", "version"]
+      : ["durationMs", "inputHash", "operation", "outcome"];
+  if (Object.keys(payload).some((key) => !allowed.includes(key))
+    || typeof payload.operation !== "string" || !/^[a-z][a-z0-9._:-]{0,127}$/.test(payload.operation)
+    || typeof payload.inputHash !== "string" || !/^[0-9a-f]{64}$/.test(payload.inputHash)
+    || input.type !== "task.side_effect_started" && (!Number.isSafeInteger(payload.durationMs)
+      || payload.durationMs! < 0 || payload.durationMs! > 3_600_000)
+    || input.type === "task.side_effect_completed" && (typeof payload.outputHash !== "string"
+      || !/^[0-9a-f]{64}$/.test(payload.outputHash))
+    || payload.version !== undefined && (typeof payload.version !== "string"
+      || !/^[A-Za-z0-9][A-Za-z0-9._/-]{0,79}$/.test(payload.version))
+    || payload.costMicros !== undefined && (!Number.isSafeInteger(payload.costMicros)
+      || payload.costMicros < 0 || payload.costMicros > 1_000_000_000)
+    || input.type === "task.side_effect_failed" && payload.outcome !== "failure") {
+    throw new RepositoryError("INVALID_STATE");
+  }
+  return copy(payload);
 }
 
 function workflowTaskIdempotencyKey(runId: string, phase: WorkflowTaskRecord["phase"], inputHash: string): string {

@@ -34,7 +34,8 @@ export async function POST(request: Request) {
       operation: "verify",
       outcome: verification.eligible ? "success" : "failure",
       requestId,
-      properties: { duration_ms: Date.now() - startedAt }
+      properties: { actor_id: actor.id, organization_id: actor.organizationId,
+        duration_ms: Date.now() - startedAt }
     });
     return successResponse({ verification }, requestId);
   } catch (error) {

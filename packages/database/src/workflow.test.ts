@@ -761,3 +761,91 @@ test("controller binds every side effect to the exact worker lease and workflow 
     leaseGeneration: 1,
   });
 });
+
+test("controller durably records redacted correlated side-effect start and terminal events", async () => {
+  const repository = new InMemoryControlPlaneRepository();
+  const project = await createProject(repository, ownerA, "side-effect-observability");
+  const run = await repository.startWorkflow(ownerA, {
+    projectId: project.id,
+    idempotencyKey: "workflow-side-effect-observability",
+    inputHash: "workflow-side-effect-observability",
+  });
+  const inputHash = "1".repeat(64);
+  const outputHash = "2".repeat(64);
+  const controller = new WorkflowController(repository, {
+    handlers: { preflight: async ({ sideEffect }) => ({
+      outputReference: (await sideEffect("github.snapshot.read", inputHash)).outputReference,
+    }) },
+    sideEffects: { "github.snapshot.read": {
+      lookup: async () => undefined,
+      execute: async () => ({
+        outputReference: `urn:sha256:${outputHash}`,
+        outputHash,
+        version: "github-api-2022-11-28",
+        costMicros: 17,
+      }),
+      reconcile: async () => undefined,
+      cleanup: async () => undefined,
+    } },
+  });
+
+  await controller.runNext("worker-side-effect-observability");
+  const sideEffects = (await repository.listWorkflowEvents(ownerA, run.id))
+    .filter(({ type }) => type.startsWith("task.side_effect_"));
+  assert.deepEqual(sideEffects.map(({ type, payload }) => ({ type, payload })), [
+    {
+      type: "task.side_effect_started",
+      payload: { operation: "github.snapshot.read", inputHash },
+    },
+    {
+      type: "task.side_effect_completed",
+      payload: {
+        operation: "github.snapshot.read",
+        inputHash,
+        outputHash,
+        version: "github-api-2022-11-28",
+        costMicros: 17,
+        durationMs: sideEffects[1]?.payload?.durationMs,
+      },
+    },
+  ]);
+  assert.equal(typeof sideEffects[1]?.payload?.durationMs, "number");
+  assert.equal(sideEffects.every(({ workflowRunId, taskId }) => workflowRunId === run.id && Boolean(taskId)), true);
+  await repository.cancelWorkflow(ownerA, {
+    runId: run.id,
+    idempotencyKey: "cancel-side-effect-observability",
+    inputHash: "cancel-side-effect-observability",
+  });
+
+  const failedProject = await createProject(repository, ownerA, "side-effect-observability-failed");
+  const failedRun = await repository.startWorkflow(ownerA, {
+    projectId: failedProject.id,
+    idempotencyKey: "workflow-side-effect-observability-failed",
+    inputHash: "workflow-side-effect-observability-failed",
+  });
+  const failedController = new WorkflowController(repository, {
+    handlers: { preflight: async ({ sideEffect }) => {
+      await sideEffect("browser.observe", "3".repeat(64));
+      return {};
+    } },
+    sideEffects: { "browser.observe": {
+      lookup: async () => undefined,
+      execute: async () => { throw new Error("Bearer secret-token user@example.test"); },
+      reconcile: async () => undefined,
+      cleanup: async () => undefined,
+    } },
+  });
+  await assert.rejects(
+    failedController.runNext("worker-side-effect-observability-failed"),
+    /secret-token/,
+  );
+  const failedEvents = await repository.listWorkflowEvents(ownerA, failedRun.id);
+  const failedSideEffect = failedEvents.find(({ type }) => type === "task.side_effect_failed");
+  assert.deepEqual(failedSideEffect?.payload, {
+    operation: "browser.observe",
+    inputHash: "3".repeat(64),
+    durationMs: failedSideEffect?.payload?.durationMs,
+    outcome: "failure",
+  });
+  assert.doesNotMatch(JSON.stringify(failedEvents), /secret-token|example\.test|Bearer/i);
+});

@@ -12,6 +12,7 @@ import {
   configuredPublicOrigin,
   verifyInstalledRelease,
 } from "../../../../../../../src/releases.ts";
+import { recordLifecycle, recordLifecycleFailure } from "../../../../../../../src/telemetry.ts";
 
 const ParamsSchema = z.object({ projectId: z.string().uuid(), releaseId: z.string().uuid() }).strict();
 const InputSchema = z.object({
@@ -25,6 +26,7 @@ export async function POST(
   context: { params: Promise<{ projectId: string; releaseId: string }> },
 ) {
   const requestId = createRequestId();
+  const startedAt = Date.now();
   try {
     const repository = getControlPlaneRepository();
     const actor = await requireMutationActor(request, repository);
@@ -44,8 +46,17 @@ export async function POST(
       configuredPublicOrigin(request),
       request.signal,
     );
+    await recordLifecycle({
+      event: "installation_verified",
+      outcome: installation.status === "verified" ? "success" : "failure",
+      requestId,
+      properties: { actor_id: actor.id, organization_id: actor.organizationId,
+        duration_ms: Date.now() - startedAt }
+    });
     return successResponse({ installation }, requestId);
   } catch (error) {
-    return errorResponse(error, requestId, request);
+    const response = errorResponse(error, requestId, request);
+    await recordLifecycleFailure({ event: "installation_verified", requestId, startedAt }, error, response.status);
+    return response;
   }
 }

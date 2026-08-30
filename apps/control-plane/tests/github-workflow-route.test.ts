@@ -87,5 +87,15 @@ test("GitHub workflow API starts only the exact reviewed analysis and exposes du
   const current = await status.json();
   assert.equal(current.workflow.reviewedAnalysisRunId, analysis.id);
   assert.deepEqual(current.tasks.map(({ phase }: { phase: string }) => phase), ["preflight"]);
+  assert.deepEqual(current.events.map(({ type }: { type: string }) => type), ["workflow.created", "task.created"]);
+  assert.deepEqual(current.capabilities.map(({ stableName }: { stableName: string }) => stableName), ["post_api_widgets"]);
+  assert.equal(current.capabilityReviews[0].request.adapter, "json_api");
+  assert.equal(current.capabilityReviews[0].risk.confirmation, "always");
+  assert.deepEqual(current.presentation, {
+    state: "queued",
+    productionReady: false,
+    actions: [{ id: "refresh", enabled: true }, { id: "cancel", enabled: true }],
+    diagnostics: [],
+  });
   assert.equal(current.outcome, "tested_patch_draft_pull_request_pending");
 });

@@ -111,15 +111,21 @@ async function loadPostHog(): Promise<Pick<ObservabilityVendor, "event"> | undef
 }
 
 export async function flushPostHogEvent(
-  client: Pick<PostHogClient, "capture" | "flush">,
+  client: Pick<PostHogClient, "capture">,
   record: VendorRecord
 ): Promise<void> {
+  const actorId = typeof record.properties.actor_id === "string"
+    ? record.properties.actor_id
+    : record.requestId;
+  const organizationId = typeof record.properties.organization_id === "string"
+    ? record.properties.organization_id
+    : undefined;
   client.capture({
-    distinctId: "page2webmcp-server",
+    distinctId: actorId,
     event: record.event,
+    ...(organizationId ? { groups: { organization: organizationId } } : {}),
     properties: { ...record.properties, $process_person_profile: false }
   });
-  await client.flush();
 }
 
 async function importVendor<T>(specifier: string): Promise<T> {
@@ -140,7 +146,12 @@ type LangfuseTracing = {
 };
 
 type PostHogClient = {
-  capture(input: { distinctId: string; event: string; properties: Record<string, string | number | boolean> }): void;
+  capture(input: {
+    distinctId: string;
+    event: string;
+    groups?: Record<string, string>;
+    properties: Record<string, string | number | boolean>;
+  }): void;
   flush(): Promise<void>;
   shutdown?(): Promise<void>;
 };

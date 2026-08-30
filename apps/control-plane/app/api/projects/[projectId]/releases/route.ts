@@ -44,7 +44,8 @@ export async function POST(
       operation: "publish",
       outcome: "success",
       requestId,
-      properties: { release_result: "published", duration_ms: Date.now() - startedAt }
+      properties: { actor_id: actor.id, organization_id: actor.organizationId,
+        release_result: "published", duration_ms: Date.now() - startedAt }
     });
     return successResponse({ release }, requestId, 201);
   } catch (error) {

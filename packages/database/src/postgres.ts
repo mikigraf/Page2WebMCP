@@ -56,6 +56,7 @@ import {
   type WorkflowEvidenceLink,
   type WorkflowRunRecord,
   type WorkflowTaskCompletion,
+  type WorkflowTaskEventInput,
   type WorkflowTaskRecord,
 } from "./workflow.ts";
 
@@ -580,7 +581,7 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
       await this.#workflowRun(client, actor, runId);
       const result = await client.query(
         "select id, organization_id, project_id, workflow_run_id, task_id, sequence, version, " +
-        "event_type, code, created_at from public.workflow_events where workflow_run_id = $1 " +
+        "event_type, code, payload, created_at from public.workflow_events where workflow_run_id = $1 " +
         "and organization_id = $2 order by sequence limit 1000",
         [runId, actor.organizationId]
       );
@@ -671,6 +672,30 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
   async assertWorkflowTaskLease(workerId: string, taskId: string, leaseGeneration: number): Promise<void> {
     await this.#transaction({ kind: "worker" }, async (client) => {
       await this.#assertWorkerWorkflowLease(client, workerId, taskId, leaseGeneration);
+    });
+  }
+
+  async recordWorkflowTaskEvent(
+    workerId: string,
+    taskId: string,
+    leaseGeneration: number,
+    input: WorkflowTaskEventInput,
+  ): Promise<WorkflowEventRecord> {
+    const payload = workflowTaskEventPayload(input);
+    return this.#transaction({ kind: "worker" }, async (client) => {
+      await this.#assertWorkerWorkflowLease(client, workerId, taskId, leaseGeneration);
+      await client.query(
+        "select set_config('page2webmcp.workflow_task_id', $1, true), " +
+        "set_config('page2webmcp.worker_id', $2, true), " +
+        "set_config('page2webmcp.lease_generation', $3, true)",
+        [taskId, workerId, String(leaseGeneration)],
+      );
+      const event = await client.query(
+        "select (private.append_workflow_task_event($1, $2, $3::jsonb)).*",
+        [taskId, input.type, JSON.stringify(payload)],
+      );
+      if (!event.rows[0]) throw new RepositoryError("INVALID_STATE");
+      return mapWorkflowEvent(event.rows[0]);
     });
   }
 
@@ -2058,11 +2083,16 @@ function mapWorkflowTask(row: QueryResultRow): WorkflowTaskRecord {
 }
 
 function mapWorkflowEvent(row: QueryResultRow): WorkflowEventRecord {
+  const payload = row.payload && typeof row.payload === "object" && !Array.isArray(row.payload)
+    ? row.payload as WorkflowEventRecord["payload"]
+    : undefined;
   return {
     id: String(row.id), organizationId: String(row.organization_id), projectId: String(row.project_id),
     workflowRunId: String(row.workflow_run_id), ...(row.task_id ? { taskId: String(row.task_id) } : {}),
     sequence: Number(row.sequence), version: Number(row.version), type: row.event_type as WorkflowEventRecord["type"],
-    ...(row.code ? { code: String(row.code) } : {}), createdAt: iso(row.created_at),
+    ...(row.code ? { code: String(row.code) } : {}),
+    ...(payload && Object.keys(payload).length > 0 ? { payload } : {}),
+    createdAt: iso(row.created_at),
   };
 }
 
@@ -2260,6 +2290,33 @@ function stableHash(value: string): string {
   return /^[0-9a-f]{64}$/.test(value)
     ? value
     : createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+function workflowTaskEventPayload(input: WorkflowTaskEventInput): WorkflowTaskEventInput["payload"] {
+  const payload = input?.payload;
+  const allowed = input?.type === "task.side_effect_started"
+    ? ["inputHash", "operation"]
+    : input?.type === "task.side_effect_completed"
+      ? ["costMicros", "durationMs", "inputHash", "operation", "outputHash", "version"]
+      : input?.type === "task.side_effect_failed"
+        ? ["durationMs", "inputHash", "operation", "outcome"]
+        : [];
+  if (!payload || typeof payload !== "object" || allowed.length === 0
+    || Object.keys(payload).some((key) => !allowed.includes(key))
+    || typeof payload.operation !== "string" || !/^[a-z][a-z0-9._:-]{0,127}$/.test(payload.operation)
+    || typeof payload.inputHash !== "string" || !/^[0-9a-f]{64}$/.test(payload.inputHash)
+    || input.type !== "task.side_effect_started" && (!Number.isSafeInteger(payload.durationMs)
+      || payload.durationMs! < 0 || payload.durationMs! > 3_600_000)
+    || input.type === "task.side_effect_completed" && (typeof payload.outputHash !== "string"
+      || !/^[0-9a-f]{64}$/.test(payload.outputHash))
+    || payload.version !== undefined && (typeof payload.version !== "string"
+      || !/^[A-Za-z0-9][A-Za-z0-9._/-]{0,79}$/.test(payload.version))
+    || payload.costMicros !== undefined && (!Number.isSafeInteger(payload.costMicros)
+      || payload.costMicros < 0 || payload.costMicros > 1_000_000_000)
+    || input.type === "task.side_effect_failed" && payload.outcome !== "failure") {
+    throw new RepositoryError("INVALID_STATE");
+  }
+  return payload;
 }
 
 function workflowTaskIdempotencyKey(runId: string, phase: WorkflowTaskRecord["phase"], inputHash: string): string {

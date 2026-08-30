@@ -24,6 +24,14 @@ test("auth/project UI exposes actionable SSR states without trusting browser rol
   assert.match(entry, /currentCsrfToken/);
   assert.match(entry, /anonymousCsrfRoutes/);
   assert.match(entry, /Create tested patch and draft PR/);
+  assert.match(entry, /Exact reviewed capability/);
+  assert.match(entry, /Plan digest/);
+  assert.match(entry, /Input schema/);
+  assert.match(entry, /Required scopes/);
+  assert.match(entry, /Verify exact candidate/);
+  assert.match(entry, /Copy trusted-loader script/);
+  assert.match(entry, /Check installed target/);
+  assert.match(entry, /Self-hosted artifact URL/);
   assert.match(entry, /nothing was merged or installed/i);
   assert.match(entry, /\/api\/workflow-runs\//);
   assert.doesNotMatch(entry, /sourceType === "github"\}>Publish immutable release/);

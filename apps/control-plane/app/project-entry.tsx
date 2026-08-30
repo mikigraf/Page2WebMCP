@@ -1,6 +1,8 @@
 "use client";
 
 import { FormEvent, useEffect, useState } from "react";
+import type { CapabilityPlan } from "../../../packages/capability-ir/src/plan.ts";
+import { capabilityReviewPresentation } from "../src/workflow-presentation.ts";
 import {
   clearClientWorkflow,
   clearWorkflow as clearStoredWorkflow,
@@ -18,6 +20,8 @@ type Capability = {
   riskTier: "R0" | "R1" | "R2" | "R3";
   status: "proposed" | "reviewed" | "verified" | "blocked";
   version: number;
+  plan: CapabilityPlan;
+  planDigest: string;
 };
 type ApiFailure = { code?: string };
 type AnalysisStatus = {
@@ -34,6 +38,16 @@ type ProjectSummary = {
   sourceType: SourceType;
   url: string;
   status: string;
+};
+type ReleaseResult = {
+  id: string;
+  url: string;
+  installation: {
+    artifactUrl: string;
+    downloadUrl: string;
+    moduleScriptTag: string;
+    selfHost: { required: boolean; guidance: string };
+  };
 };
 
 const DEFAULT_URLS: Record<SourceType, string> = {
@@ -63,6 +77,9 @@ export function ProjectEntry({ authState }: Readonly<{ authState?: "verified" | 
   const [projectId, setProjectId] = useState<string>();
   const [analysisRunId, setAnalysisRunId] = useState<string>();
   const [releaseUrl, setReleaseUrl] = useState<string>();
+  const [release, setRelease] = useState<ReleaseResult>();
+  const [verificationEligible, setVerificationEligible] = useState<boolean>();
+  const [selfHostedUrl, setSelfHostedUrl] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [signedInRole, setSignedInRole] = useState("");
@@ -450,7 +467,7 @@ export function ProjectEntry({ authState }: Readonly<{ authState?: "verified" | 
         setMessage("Tested patch and draft pull request/check/preview reconciled; no merge or installation was performed");
         return;
       }
-      const published = await postIdempotent<{ release?: { url: string } } & ApiFailure>(
+      const published = await postIdempotent<{ release?: ReleaseResult } & ApiFailure>(
         `/api/projects/${encodeURIComponent(projectId)}/releases`,
         { analysisRunId },
         `publish:${projectId}:${analysisRunId}`
@@ -459,6 +476,7 @@ export function ProjectEntry({ authState }: Readonly<{ authState?: "verified" | 
         throw new Error(published.body.code ?? "RELEASE_FAILED");
       }
       setReleaseUrl(published.body.release.url);
+      setRelease(published.body.release);
       persistWorkflow({ sourceType, url, projectId, analysisRunId, releaseUrl: published.body.release.url });
       setMessage("Immutable release published");
     } catch (error) {
@@ -466,6 +484,53 @@ export function ProjectEntry({ authState }: Readonly<{ authState?: "verified" | 
     } finally {
       setBusy(false);
     }
+  }
+
+  async function verifyExactCandidate() {
+    if (!projectId || !analysisRunId) return;
+    setBusy(true);
+    try {
+      const { response, body } = await requestJson<{ verification?: { eligible: boolean } } & ApiFailure>(
+        "/api/capabilities/verify",
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ projectId, analysisRunId })
+        }
+      );
+      if (!response.ok || !body.verification) throw new Error(body.code ?? "VERIFICATION_FAILED");
+      setVerificationEligible(body.verification.eligible);
+      setMessage(body.verification.eligible ? "Exact candidate verified" : "Verification checks failed; publication remains blocked");
+    } catch (error) {
+      setVerificationEligible(false);
+      setMessage(`Verification failed: ${errorCode(error)}`);
+    } finally { setBusy(false); }
+  }
+
+  async function copyTrustedLoaderScript() {
+    if (!release) return;
+    try {
+      await navigator.clipboard.writeText(release.installation.moduleScriptTag);
+      setMessage("Trusted-loader script copied");
+    } catch { setMessage("Copy failed: CLIPBOARD_UNAVAILABLE"); }
+  }
+
+  async function checkInstalledTarget() {
+    if (!projectId || !release) return;
+    setBusy(true);
+    try {
+      const pageUrl = new URL(url).origin;
+      const { response, body } = await postIdempotent<{ installation?: { status: string } } & ApiFailure>(
+        `/api/projects/${encodeURIComponent(projectId)}/releases/${encodeURIComponent(release.id)}/installation`,
+        { pageUrl, ...(selfHostedUrl ? { selfHostedUrl } : {}) },
+        `installation:${release.id}:${pageUrl}:${selfHostedUrl}`
+      );
+      if (!response.ok || !body.installation) throw new Error(body.code ?? "INSTALLATION_CHECK_FAILED");
+      setMessage(body.installation.status === "verified"
+        ? "Installed target verified without route interception"
+        : `Installation state: ${body.installation.status}`);
+    } catch (error) { setMessage(`Installed-target check failed: ${errorCode(error)}`); }
+    finally { setBusy(false); }
   }
 
   function selectSource(next: SourceType) {
@@ -490,6 +555,8 @@ export function ProjectEntry({ authState }: Readonly<{ authState?: "verified" | 
     setWorkflowRunId(undefined);
     setGitHubOutcome(undefined);
     setReleaseUrl(undefined);
+    setRelease(undefined);
+    setVerificationEligible(undefined);
   }
 
   return <section aria-labelledby="project-entry-heading">
@@ -524,16 +591,38 @@ export function ProjectEntry({ authState }: Readonly<{ authState?: "verified" | 
     </form>
     <button type="button" onClick={analyze} disabled={busy || !projectId}>{analysisRunId ? "Resume analysis" : `Analyze ${sourceType}`}</button>
     {message && <p role="status">{message}</p>}
-    {capabilities.length > 0 && <ul aria-label="Capabilities">{capabilities.map((capability) =>
-      <li key={capability.id}><code>{capability.stableName}</code>: {capability.status} {capability.status !== "blocked" && <>
+    {capabilities.length > 0 && <ul aria-label="Capabilities">{capabilities.map((capability) => {
+      const exact = capabilityReviewPresentation(capability);
+      return <li key={capability.id}><details><summary>Exact reviewed capability <code>{capability.stableName}</code>: {capability.status}</summary>
+        <dl>
+          <dt>Plan digest</dt><dd><code>{exact.planDigest}</code> (version {exact.version})</dd>
+          <dt>Risk and effects</dt><dd>{exact.risk.tier}; {exact.risk.effect}; {exact.risk.confirmation}; {exact.risk.reversible ? "reversible" : "not reversible"}; {exact.risk.summary}</dd>
+          <dt>Authentication</dt><dd>{exact.authentication.mode}; CSRF {exact.authentication.csrf ? "reviewed" : "not applicable"}</dd>
+          <dt>Required scopes</dt><dd>{exact.authentication.requiredScopes.join(", ") || "none"}</dd>
+          <dt>Request plan</dt><dd>{exact.request.adapter}; {exact.request.method}; <code>{exact.request.target}</code>; {exact.request.idempotency}</dd>
+          <dt>Input schema</dt><dd><code>{JSON.stringify(exact.schemas.input)}</code></dd>
+          <dt>Output schema</dt><dd><code>{JSON.stringify(exact.schemas.output)}</code></dd>
+          <dt>Evidence provenance</dt><dd>{exact.provenance.map(({ source, reference }) =>
+            <code key={`${source}:${reference}`}>{source}: {reference} </code>)}</dd>
+        </dl></details> {capability.status !== "blocked" && <>
         <button type="button" disabled={busy} onClick={() => review(capability, "approve")}>Approve {capability.stableName}</button>
         <button type="button" disabled={busy} onClick={() => review(capability, "block")}>Block {capability.stableName}</button>
-      </>}</li>
-    )}</ul>}
+      </>}</li>;
+    })}</ul>}
+    {sourceType !== "github" && <button type="button" onClick={verifyExactCandidate} disabled={busy || !analysisRunId}>Verify exact candidate</button>}
+    {verificationEligible === false && <p>Verification is not eligible; publish and install remain blocked.</p>}
     <button type="button" onClick={publish} disabled={busy || !analysisRunId}>
       {sourceType === "github" ? (workflowRunId ? "Resume tested patch workflow" : "Create tested patch and draft PR") : "Publish immutable release"}
     </button>
     {releaseUrl && <a href={releaseUrl}>Download immutable release</a>}
+    {release && <section aria-label="Installation">
+      <button type="button" disabled={busy} onClick={copyTrustedLoaderScript}>Copy trusted-loader script</button>{" "}
+      <a href={release.installation.downloadUrl}>Download exact artifact bytes</a>
+      <p>{release.installation.selfHost.guidance}</p>
+      <label>Self-hosted artifact URL <input type="url" value={selfHostedUrl}
+        onChange={(event) => setSelfHostedUrl(event.target.value)} /></label>
+      <button type="button" disabled={busy} onClick={checkInstalledTarget}>Check installed target</button>
+    </section>}
     {githubOutcome === "tested_patch_draft_pull_request_pending" && <p>GitHub workflow pending; no draft pull request is claimed yet</p>}
     {githubOutcome === "tested_patch_draft_pull_request_check_preview_reconciled" &&
       <p>Tested patch, draft pull request, check, and preview reconciled. Nothing was merged or installed.</p>}

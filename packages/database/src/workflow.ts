@@ -142,7 +142,20 @@ export type WorkflowEventType =
   | "task.waiting"
   | "task.resumed"
   | "task.cancelled"
-  | "task.reconciled";
+  | "task.reconciled"
+  | "task.side_effect_started"
+  | "task.side_effect_completed"
+  | "task.side_effect_failed";
+
+export type WorkflowEventPayload = Readonly<{
+  operation?: string;
+  inputHash?: string;
+  outputHash?: string;
+  durationMs?: number;
+  version?: string;
+  costMicros?: number;
+  outcome?: "failure";
+}>;
 
 export type WorkflowEventRecord = Readonly<{
   id: string;
@@ -154,7 +167,14 @@ export type WorkflowEventRecord = Readonly<{
   version: number;
   type: WorkflowEventType;
   code?: string;
+  payload?: WorkflowEventPayload;
   createdAt: string;
+}>;
+
+export type WorkflowTaskEventInput = Readonly<{
+  type: Extract<WorkflowEventType,
+    "task.side_effect_started" | "task.side_effect_completed" | "task.side_effect_failed">;
+  payload: WorkflowEventPayload;
 }>;
 
 export type WorkflowEvidenceLink = Readonly<{
@@ -230,6 +250,12 @@ export interface WorkflowRepository {
   listWorkflowCapabilityPlans(actor: WorkflowActor, runId: string): Promise<WorkflowCapabilityPlanLink[]>;
   claimWorkflowTask(workerId: string): Promise<ClaimedWorkflowTaskRecord | undefined>;
   assertWorkflowTaskLease(workerId: string, taskId: string, leaseGeneration: number): Promise<void>;
+  recordWorkflowTaskEvent(
+    workerId: string,
+    taskId: string,
+    leaseGeneration: number,
+    input: WorkflowTaskEventInput,
+  ): Promise<WorkflowEventRecord>;
   heartbeatWorkflowTask(workerId: string, taskId: string, leaseGeneration: number): Promise<WorkflowTaskRecord>;
   completeWorkflowTask(
     workerId: string,
@@ -274,6 +300,8 @@ export function workflowRetryDelayMs(
 export type WorkflowSideEffectResult = Readonly<{
   outputReference: string;
   outputHash: string;
+  version?: string;
+  costMicros?: number;
 }>;
 
 export type WorkflowSideEffectRequest = Readonly<{
@@ -343,7 +371,12 @@ function validatePhaseFailure(failure: WorkflowPhaseFailure): WorkflowPhaseFailu
 function validateSideEffectResult(result: WorkflowSideEffectResult | undefined): WorkflowSideEffectResult | undefined {
   if (!result) return undefined;
   if (!/^urn:sha256:[0-9a-f]{64}$/.test(result.outputReference)
-    || !/^[0-9a-f]{64}$/.test(result.outputHash)) throw new Error("WORKFLOW_SIDE_EFFECT_RESULT_INVALID");
+    || !/^[0-9a-f]{64}$/.test(result.outputHash)
+    || result.version !== undefined && !/^[A-Za-z0-9][A-Za-z0-9._/-]{0,79}$/.test(result.version)
+    || result.costMicros !== undefined && (!Number.isSafeInteger(result.costMicros)
+      || result.costMicros < 0 || result.costMicros > 1_000_000_000)) {
+    throw new Error("WORKFLOW_SIDE_EFFECT_RESULT_INVALID");
+  }
   return result;
 }
 
@@ -393,11 +426,15 @@ export class WorkflowController {
     const used = new Map<string, Readonly<{ port: WorkflowSideEffectPort; request: WorkflowSideEffectRequest }>>();
     const results = new Map<string, WorkflowSideEffectResult>();
     const sideEffect = async (kind: string, inputHash: string): Promise<WorkflowSideEffectResult> => {
+      if (!/^[a-z][a-z0-9._:-]{0,127}$/.test(kind)) throw new Error("WORKFLOW_SIDE_EFFECT_KIND_INVALID");
       const port = this.configuration.sideEffects[kind];
       if (!port) throw new Error("WORKFLOW_SIDE_EFFECT_PORT_REQUIRED");
       await this.repository.assertWorkflowTaskLease(workerId, task.id, task.leaseGeneration);
       if (lifecycle.signal.aborted) throw heartbeatFailure ?? new Error("WORKFLOW_CANCELLED");
-      const digest = createHash("sha256").update(`${task.id}\0${kind}\0${inputHash}`, "utf8").digest("hex");
+      const normalizedInputHash = /^[0-9a-f]{64}$/.test(inputHash)
+        ? inputHash
+        : createHash("sha256").update(inputHash, "utf8").digest("hex");
+      const digest = createHash("sha256").update(`${task.id}\0${kind}\0${normalizedInputHash}`, "utf8").digest("hex");
       const idempotencyKey = `wfx_${digest}`;
       const cached = results.get(idempotencyKey);
       if (cached) return cached;
@@ -409,22 +446,51 @@ export class WorkflowController {
         leaseGeneration: task.leaseGeneration,
         idempotencyKey,
         kind,
-        inputHash,
+        inputHash: normalizedInputHash,
         signal: lifecycle.signal,
       };
       used.set(idempotencyKey, { port, request });
-      let result = validateSideEffectResult(await port.lookup(request));
-      if (!result) {
-        try {
-          result = validateSideEffectResult(await port.execute(request));
-        } catch (error) {
-          result = validateSideEffectResult(await port.reconcile(request));
-          if (!result) throw error;
+      const startedAt = Date.now();
+      await this.repository.recordWorkflowTaskEvent(workerId, task.id, task.leaseGeneration, {
+        type: "task.side_effect_started",
+        payload: { operation: kind, inputHash: normalizedInputHash },
+      });
+      try {
+        let result = validateSideEffectResult(await port.lookup(request));
+        if (!result) {
+          try {
+            result = validateSideEffectResult(await port.execute(request));
+          } catch (error) {
+            result = validateSideEffectResult(await port.reconcile(request));
+            if (!result) throw error;
+          }
         }
+        if (!result) throw new Error("WORKFLOW_SIDE_EFFECT_RESULT_INVALID");
+        await this.repository.recordWorkflowTaskEvent(workerId, task.id, task.leaseGeneration, {
+          type: "task.side_effect_completed",
+          payload: {
+            operation: kind,
+            inputHash: normalizedInputHash,
+            outputHash: result.outputHash,
+            durationMs: Math.max(0, Date.now() - startedAt),
+            ...(result.version === undefined ? {} : { version: result.version }),
+            ...(result.costMicros === undefined ? {} : { costMicros: result.costMicros }),
+          },
+        });
+        results.set(idempotencyKey, result);
+        return result;
+      } catch (error) {
+        await this.repository.recordWorkflowTaskEvent(workerId, task.id, task.leaseGeneration, {
+          type: "task.side_effect_failed",
+          payload: {
+            operation: kind,
+            inputHash: normalizedInputHash,
+            durationMs: Math.max(0, Date.now() - startedAt),
+            outcome: "failure",
+          },
+        });
+        throw error;
       }
-      if (!result) throw new Error("WORKFLOW_SIDE_EFFECT_RESULT_INVALID");
-      results.set(idempotencyKey, result);
-      return result;
     };
     try {
       let output: Awaited<ReturnType<WorkflowPhaseHandler>>;

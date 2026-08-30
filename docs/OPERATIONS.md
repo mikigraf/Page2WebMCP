@@ -2,9 +2,9 @@
 
 ## Supported envelope
 
-This repository supports only the committed Acme fixture adapters: one website source, one OpenAPI document, and one GitHub repository. `PAGE2WEBMCP_PROVIDER_MODE=live` is rejected because no production live-provider implementation exists. Keep that boundary explicit; do not configure placeholder Browser Use, GitHub App, queue, Redis, or deployment credentials.
+The canonical production paths are HTTPS website discovery, bounded OpenAPI extraction, and repository-scoped GitHub App analysis. Each path has an explicit provider boundary and fails closed when its credentials, egress controls, ownership/auth handoff, or trusted verification controls are absent. Hermetic adapters are test-only and never constitute a live deployment success.
 
-Acme Support is a deterministic fake target with in-memory sessions, confirmations, idempotency records, and tickets. It is intentionally single-process, disposable, and unsuitable for horizontal scaling or customer traffic. Run exactly one Acme process only when exercising the committed fixture workflows; do not treat it as a production service.
+The legacy Acme application is retained only for isolated compatibility tests. It is not a production provider, compiler branch, registration requirement, or supported customer installation path.
 
 ## Toolchain and local setup
 
@@ -40,10 +40,10 @@ Production startup validates configuration before serving requests:
 - `PAGE2WEBMCP_OWNER_PASSWORD` and `PAGE2WEBMCP_EDITOR_PASSWORD`: distinct deployment-managed values of at least 32 characters; committed fixture passwords are never accepted in production.
 - `PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN`: the exact externally visible HTTPS control-plane origin, with no credentials, path, query, or fragment; mutation origin checks do not trust forwarding headers.
 - `PAGE2WEBMCP_STORAGE_MODE=postgres` and `DATABASE_URL`: required durable storage.
-- `PAGE2WEBMCP_PROVIDER_MODE=local`: the only supported provider mode.
-- `PAGE2WEBMCP_FIXTURE_APP_URL`: exact HTTPS origin, with no credentials, query, or fragment.
-- `PAGE2WEBMCP_FIXTURE_GITHUB_URL`: exact HTTPS GitHub fixture URL.
-- `PAGE2WEBMCP_ACME_PUBLIC_ORIGIN`: the exact public origin used by Acme's fixture artifact; it is never derived from forwarding headers.
+- `PAGE2WEBMCP_PROVIDER_MODE`: an explicitly configured `website`, `openapi`, or `github` adapter; no default exists.
+- Provider-specific HTTPS origins, allowlists, pinned API/model versions, credentials, and deny-by-default egress controls required by that adapter.
+- `PAGE2WEBMCP_RELEASE_VERIFIER_ORIGIN` and `PAGE2WEBMCP_RELEASE_VERIFIER_TOKEN`: the isolated, unintercepted trusted-loader/native-WebMCP verification boundary.
+- `PAGE2WEBMCP_PUBLIC_ORIGIN`: the exact HTTPS origin used for immutable content-addressed artifact URLs.
 
 Never set `PAGE2WEBMCP_ALLOW_EPHEMERAL_STORAGE=true` in a real deployment. It exists only so production-mode browser tests can exercise the fixture without an external database.
 
@@ -107,7 +107,9 @@ POSTHOG_API_KEY=<secret-manager-value>
 POSTHOG_HOST=<approved-posthog-host>
 ```
 
-Langfuse receives sampled workflow traces (all failures/security denials and a deterministic 20% of successes). PostHog receives the five existing lifecycle events with person profiles, autocapture, and session replay disabled. Export has a 250 ms bound and fails open. Configure vendor-side retention, residency, and access controls before enabling it.
+The PostgreSQL workflow event stream remains authoritative. Langfuse receives redacted workflow/task/side-effect observations in sequence-bounded batches with workflow/task parentage, hashes, versions, latency, bounded cost, and outcome; vendor failure never changes workflow state. PostHog receives only the documented creation → analysis → review → verification → publication → installation funnel, grouped by pseudonymous actor and organization UUIDs. Person profiles, autocapture, and session replay are disabled, and the SDK batches rather than flushing each event. Configure vendor-side retention, residency, and access controls before enabling it.
+
+Run `pnpm test:golden` and `pnpm release:readiness` for every promotion. The hermetic readiness result always reports `liveSuccess: false`; `--live` fails closed unless durable storage and live verification controls are present. Follow [Task 9 recovery](./runbooks/task-9-recovery.md) for incident checks.
 
 ## Recovery and debugging
 

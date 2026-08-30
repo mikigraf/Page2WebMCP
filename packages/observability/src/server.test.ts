@@ -24,18 +24,35 @@ test("Langfuse processor filters unrelated spans while allowing only facade mark
   assert.equal(filter({ otelSpan: span("page2webmcp.analysis", "third-party-sdk") }), false);
 });
 
-test("PostHog lifecycle events are flushed before a request export completes", async () => {
-  const calls: string[] = [];
+test("PostHog lifecycle events use pseudonymous actor and organization grouping without per-event flushes", async () => {
+  const calls: Array<Record<string, unknown>> = [];
   await flushPostHogEvent({
-    capture: (input) => { calls.push(`capture:${input.event}`); },
-    flush: async () => { calls.push("flush"); }
+    capture: (input) => { calls.push(input); }
   }, {
     event: "project_created",
     outcome: "success",
     requestId: "request-posthog",
-    properties: { outcome: "success", request_id: "request-posthog", schema_version: 1 }
+    properties: {
+      actor_id: "0cb50a64-a624-4f65-8f0c-a3847101ad83",
+      organization_id: "db4c403c-0d99-442e-ac3a-66b574160699",
+      outcome: "success",
+      request_id: "request-posthog",
+      schema_version: 1
+    }
   });
-  assert.deepEqual(calls, ["capture:project_created", "flush"]);
+  assert.deepEqual(calls, [{
+    distinctId: "0cb50a64-a624-4f65-8f0c-a3847101ad83",
+    event: "project_created",
+    groups: { organization: "db4c403c-0d99-442e-ac3a-66b574160699" },
+    properties: {
+      actor_id: "0cb50a64-a624-4f65-8f0c-a3847101ad83",
+      organization_id: "db4c403c-0d99-442e-ac3a-66b574160699",
+      outcome: "success",
+      request_id: "request-posthog",
+      schema_version: 1,
+      $process_person_profile: false
+    }
+  }]);
 });
 
 function span(name: string, scope: string) {
