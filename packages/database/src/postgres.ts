@@ -910,16 +910,16 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
         );
         if (exists.rows[0]) continue;
         const inputHash = task.outputHash ?? task.inputHash;
+        await client.query(
+          "update public.workflow_runs set status = 'queued', current_phase = $2, updated_at = now() where id = $1",
+          [run.id, nextPhase]
+        );
         const created = await client.query(
           "insert into private.workflow_tasks " +
           "(organization_id, project_id, workflow_run_id, phase, status, idempotency_key, input_hash, reconciled_at) " +
           "values ($1, $2, $3, $4, 'queued', $5, $6, now()) returning id",
           [run.organizationId, run.projectId, run.id, nextPhase,
             workflowTaskIdempotencyKey(run.id, nextPhase, inputHash), inputHash]
-        );
-        await client.query(
-          "update public.workflow_runs set status = 'queued', current_phase = $2, updated_at = now() where id = $1",
-          [run.id, nextPhase]
         );
         await client.query("select private.append_workflow_event($1, $2, 'task.created', null)", [run.id, created.rows[0].id]);
         await client.query("select private.append_workflow_event($1, null, 'workflow.reconciled', null)", [run.id]);

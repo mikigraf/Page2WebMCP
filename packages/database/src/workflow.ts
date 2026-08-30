@@ -290,12 +290,45 @@ export type WorkflowPhaseHandler = (context: Readonly<{
   task: ClaimedWorkflowTaskRecord;
   signal: AbortSignal;
   sideEffect(kind: string, inputHash: string): Promise<WorkflowSideEffectResult>;
-}>) => Promise<Readonly<{ checkpointReference?: string; outputReference?: string }>>;
+}>) => Promise<WorkflowPhaseResult>;
+
+export type WorkflowPhaseFailure = Readonly<{
+  errorCode: string;
+  classification: WorkflowRetryClassification;
+  retryAfterMs?: number;
+}>;
+
+export type WorkflowPhaseResult = Readonly<{
+  checkpointReference?: string;
+  outputReference?: string;
+  failure?: undefined;
+}> | Readonly<{
+  checkpointReference?: undefined;
+  outputReference?: undefined;
+  failure: WorkflowPhaseFailure;
+}>;
 
 function errorCode(error: unknown): string {
   return error instanceof Error && /^[A-Z][A-Z0-9_]{0,63}$/.test(error.message)
     ? error.message
     : "WORKFLOW_PHASE_FAILED";
+}
+
+function errorClassification(error: unknown): WorkflowRetryClassification {
+  const code = errorCode(error);
+  return /(?:CONFIGURATION|VALIDATION|_INVALID|_REQUIRED|_UNSUPPORTED|_POLICY)/.test(code)
+    ? "permanent"
+    : "transient";
+}
+
+function validatePhaseFailure(failure: WorkflowPhaseFailure): WorkflowPhaseFailure {
+  if (!/^[A-Z][A-Z0-9_]{0,63}$/.test(failure.errorCode)
+    || !["transient", "rate_limited", "permanent"].includes(failure.classification)
+    || failure.retryAfterMs !== undefined && (!Number.isFinite(failure.retryAfterMs) || failure.retryAfterMs < 0)
+    || failure.retryAfterMs !== undefined && failure.classification !== "rate_limited") {
+    throw new Error("WORKFLOW_PHASE_FAILURE_INVALID");
+  }
+  return failure;
 }
 
 function validateSideEffectResult(result: WorkflowSideEffectResult | undefined): WorkflowSideEffectResult | undefined {
@@ -385,6 +418,16 @@ export class WorkflowController {
       }
       if (heartbeatFailure) throw heartbeatFailure;
       if (signal.aborted) throw new Error("WORKFLOW_CANCELLED");
+      if (output.failure) {
+        const failure = validatePhaseFailure(output.failure);
+        return await this.repository.failWorkflowTask(workerId, task.id, task.leaseGeneration, {
+          idempotencyKey: `controller-fail-${task.id}-${task.leaseGeneration}`,
+          inputHash: createHash("sha256").update(JSON.stringify(failure), "utf8").digest("hex"),
+          errorCode: failure.errorCode,
+          classification: failure.classification,
+          ...(failure.retryAfterMs === undefined ? {} : { retryAfterMs: failure.retryAfterMs }),
+        });
+      }
       const completion = await this.repository.completeWorkflowTask(workerId, task.id, task.leaseGeneration, {
         idempotencyKey: `controller-complete-${task.id}-${task.leaseGeneration}`,
         inputHash: createHash("sha256").update(JSON.stringify(output), "utf8").digest("hex"),
@@ -398,7 +441,7 @@ export class WorkflowController {
             idempotencyKey: `controller-fail-${task.id}-${task.leaseGeneration}`,
             inputHash: errorCode(error),
             errorCode: errorCode(error),
-            classification: "transient",
+            classification: errorClassification(error),
           });
         } catch {
           // Lease loss/cancellation is authoritative; keep the original error.

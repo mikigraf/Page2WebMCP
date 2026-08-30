@@ -970,6 +970,19 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
       this.#appendWorkflowEvent(run.id, "workflow.reconciled");
       repaired += 1;
     }
+    for (const task of [...this.#workflowTasks.values()]) {
+      if (task.phase === "analysis" || task.status !== "succeeded") continue;
+      const run = this.#workflowRuns.get(task.workflowRunId);
+      if (!run || run.cancelRequestedAt || !["queued", "running", "waiting"].includes(run.status)) continue;
+      const nextPhase = workflowPhase(task.phase).next;
+      if (!nextPhase || run.currentPhase !== nextPhase
+        || [...this.#workflowTasks.values()].some((candidate) => candidate.workflowRunId === run.id
+          && candidate.phase === nextPhase)) continue;
+      const nextTask = this.#createWorkflowTask(run, nextPhase, task.outputHash ?? task.inputHash);
+      this.#workflowTasks.set(nextTask.id, { ...nextTask, reconciledAt: now.toISOString() });
+      this.#appendWorkflowEvent(run.id, "workflow.reconciled");
+      repaired += 1;
+    }
     return repaired;
   }
 

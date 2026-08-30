@@ -297,6 +297,115 @@ create table private.workflow_commands (
     references private.workflow_tasks(id, workflow_run_id)
 );
 
+create function private.workflow_next_phase(target_phase text)
+returns text
+language sql
+immutable
+strict
+set search_path = pg_catalog
+as $$
+  select case target_phase
+    when 'preflight' then 'ownership'
+    when 'ownership' then 'browser_auth'
+    when 'browser_auth' then 'explore'
+    when 'explore' then 'propose'
+    when 'propose' then 'review_wait'
+    when 'review_wait' then 'controlled_mutation_verification'
+    when 'controlled_mutation_verification' then 'compile'
+    when 'compile' then 'candidate_verify'
+    when 'candidate_verify' then 'publish'
+    when 'publish' then 'install_verify'
+    else null
+  end
+$$;
+
+revoke all on function private.workflow_next_phase(text) from public;
+grant execute on function private.workflow_next_phase(text) to page2webmcp_app, page2webmcp_worker;
+
+create function private.enforce_workflow_run_phase()
+returns trigger
+language plpgsql
+set search_path = pg_catalog
+as $$
+begin
+  if tg_op = 'INSERT' then
+    if (new.analysis_run_id is null and new.current_phase <> 'preflight')
+      or (new.analysis_run_id is not null and new.current_phase <> 'analysis') then
+      raise exception 'illegal initial workflow run phase %', new.current_phase using errcode = '23514';
+    end if;
+    return new;
+  end if;
+  if old.current_phase <> new.current_phase then
+    if old.current_phase = 'analysis'
+      or private.workflow_next_phase(old.current_phase) is distinct from new.current_phase then
+      raise exception 'illegal workflow run phase transition % -> %', old.current_phase, new.current_phase
+        using errcode = '23514';
+    end if;
+    if not exists (
+      select 1 from private.workflow_tasks predecessor
+      where predecessor.workflow_run_id = old.id
+        and predecessor.phase = old.current_phase
+        and predecessor.status = 'succeeded'
+    ) then
+      raise exception 'workflow run phase requires succeeded predecessor %', old.current_phase using errcode = '23514';
+    end if;
+  end if;
+  return new;
+end
+$$;
+
+create function private.enforce_workflow_task_phase()
+returns trigger
+language plpgsql
+set search_path = pg_catalog
+as $$
+declare
+  target_run public.workflow_runs;
+  predecessor private.workflow_tasks;
+begin
+  if tg_op = 'UPDATE' then
+    if old.workflow_run_id <> new.workflow_run_id or old.organization_id <> new.organization_id
+      or old.project_id <> new.project_id or old.phase <> new.phase
+      or old.idempotency_key <> new.idempotency_key or old.input_hash <> new.input_hash then
+      raise exception 'workflow task phase identity is immutable' using errcode = '23514';
+    end if;
+    return new;
+  end if;
+  select * into target_run from public.workflow_runs where id = new.workflow_run_id;
+  if target_run.id is null then
+    raise exception 'workflow task run not found' using errcode = '23503';
+  end if;
+  if target_run.analysis_run_id is not null then
+    if new.phase <> 'analysis' or target_run.current_phase <> 'analysis' then
+      raise exception 'legacy analysis workflow requires analysis task' using errcode = '23514';
+    end if;
+    return new;
+  end if;
+  if new.status <> 'queued' then
+    raise exception 'generic workflow task must start queued' using errcode = '23514';
+  end if;
+  if new.phase = 'preflight' then
+    if target_run.current_phase <> 'preflight' or exists (
+      select 1 from private.workflow_tasks existing where existing.workflow_run_id = target_run.id
+    ) then
+      raise exception 'preflight must be the first workflow task' using errcode = '23514';
+    end if;
+    return new;
+  end if;
+  select * into predecessor
+  from private.workflow_tasks candidate
+  where candidate.workflow_run_id = target_run.id
+    and private.workflow_next_phase(candidate.phase) = new.phase
+  limit 1;
+  if predecessor.id is null or predecessor.status <> 'succeeded'
+    or target_run.current_phase <> new.phase
+    or predecessor.output_hash is distinct from new.input_hash then
+    raise exception 'workflow task phase requires succeeded predecessor %', new.phase using errcode = '23514';
+  end if;
+  return new;
+end
+$$;
+
 create or replace function private.enforce_workflow_run_transition()
 returns trigger
 language plpgsql
@@ -341,9 +450,17 @@ create trigger enforce_workflow_run_transition
 before update on public.workflow_runs
 for each row execute function private.enforce_workflow_run_transition();
 
+create trigger enforce_workflow_run_phase
+before insert or update on public.workflow_runs
+for each row execute function private.enforce_workflow_run_phase();
+
 create trigger enforce_workflow_task_transition
 before update on private.workflow_tasks
 for each row execute function private.enforce_workflow_task_transition();
+
+create trigger enforce_workflow_task_phase
+before insert or update on private.workflow_tasks
+for each row execute function private.enforce_workflow_task_phase();
 
 create or replace function private.append_workflow_event(
   target_workflow_run_id uuid,

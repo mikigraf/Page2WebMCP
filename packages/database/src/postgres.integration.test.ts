@@ -238,9 +238,11 @@ test("Postgres repository persists and recovers the fixture lifecycle", { skip: 
 });
 
 test("Postgres phased workflow matches in-memory transitions, lease generations, waits, and cancellation", {
-  skip: !connectionString,
+  skip: !connectionString || !adminConnectionString,
 }, async () => {
   const repository = createPostgresRepository({ connectionString: connectionString!, maxConnections: 4 });
+  const direct = new pg.Pool({ connectionString: connectionString!, max: 2 });
+  const admin = new pg.Pool({ connectionString: adminConnectionString!, max: 1 });
   const actor: RepositoryActor = {
     id: "11111111-1111-1111-1111-111111111111",
     organizationId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
@@ -265,6 +267,47 @@ test("Postgres phased workflow matches in-memory transitions, lease generations,
       { sequence: 1, type: "workflow.created" },
       { sequence: 2, type: "task.created" },
     ]);
+    const directScopedWrite = async (
+      role: "page2webmcp_app" | "page2webmcp_worker",
+      sql: string,
+      parameters: unknown[],
+    ) => {
+      const client = await direct.connect();
+      try {
+        await client.query("begin");
+        await client.query(`set local role ${role}`);
+        if (role === "page2webmcp_app") {
+          await client.query(
+            "select set_config('page2webmcp.organization_id', $1, true), " +
+            "set_config('page2webmcp.actor_id', $2, true), set_config('page2webmcp.access', 'member', true)",
+            [actor.organizationId, actor.id],
+          );
+        }
+        await client.query(sql, parameters);
+      } finally {
+        await client.query("rollback").catch(() => undefined);
+        client.release();
+      }
+    };
+    const invalidWrites = await Promise.allSettled(
+      (["page2webmcp_app", "page2webmcp_worker"] as const).flatMap((role) => [
+        directScopedWrite(role, "update public.workflow_runs set current_phase = 'publish' where id = $1", [run.id]),
+        directScopedWrite(
+          role,
+          "insert into private.workflow_tasks " +
+          "(organization_id, project_id, workflow_run_id, phase, status, idempotency_key, input_hash) " +
+          "values ($1, $2, $3, 'publish', 'queued', $4, $5)",
+          [actor.organizationId, project.id, run.id, `wft_${"e".repeat(64)}`, "e".repeat(64)],
+        ),
+      ]),
+    );
+    for (const outcome of invalidWrites) {
+      assert.equal(outcome.status, "rejected");
+      if (outcome.status === "rejected") {
+        assert.ok(outcome.reason instanceof pg.DatabaseError);
+        assert.equal(outcome.reason.code, "23514");
+      }
+    }
     const [left, right] = await Promise.all([
       repository.claimWorkflowTask("postgres-workflow-a"),
       repository.claimWorkflowTask("postgres-workflow-b"),
@@ -375,8 +418,41 @@ test("Postgres phased workflow matches in-memory transitions, lease generations,
       assert.equal(completeOutcome.reason.code, "CANCELLED");
     }
     assert.equal((await repository.getWorkflowRun(actor, completionRun.id)).status, "cancelled");
+
+    const repairProject = await repository.createProject(actor, {
+      name: "Postgres missing next repair",
+      sourceType: "openapi",
+      url: "https://repair.widgets.example/openapi.json",
+      idempotencyKey: "postgres-repair-project",
+      inputHash: "postgres-repair-project",
+    });
+    const repairRun = await repository.startWorkflow(actor, {
+      projectId: repairProject.id,
+      idempotencyKey: "postgres-repair-run",
+      inputHash: "postgres-repair-run",
+    });
+    const repairClaim = await repository.claimWorkflowTask("postgres-repair-worker");
+    assert.ok(repairClaim);
+    const repairCompletion = await repository.completeWorkflowTask(
+      "postgres-repair-worker", repairClaim.id, repairClaim.leaseGeneration, {
+        idempotencyKey: "postgres-repair-complete",
+        inputHash: "postgres-repair-complete",
+      },
+    );
+    assert.equal(repairCompletion.nextTask?.phase, "ownership");
+    await admin.query(
+      "delete from private.workflow_tasks where workflow_run_id = $1 and phase = 'ownership'",
+      [repairRun.id],
+    );
+    assert.equal(await repository.reconcileWorkflows("postgres-repair-reconciler"), 1);
+    assert.equal(await repository.reconcileWorkflows("postgres-repair-reconciler"), 0);
+    const repairedTasks = await repository.listWorkflowTasks(actor, repairRun.id);
+    assert.deepEqual(repairedTasks.map(({ phase }) => phase), ["preflight", "ownership"]);
+    assert.equal(repairedTasks[1]?.inputHash, repairCompletion.task.outputHash);
   } finally {
     await repository.close();
+    await direct.end();
+    await admin.end();
   }
 });
 

@@ -370,6 +370,40 @@ test("reconciliation idempotently requeues expired leases and phase registry has
   assert.equal((await repository.claimWorkflowTask("replacement-worker"))?.leaseGeneration, 2);
 });
 
+test("in-memory reconciliation repairs exactly one missing adjacent task with the completed output hash", async () => {
+  const now = new Date("2026-08-30T12:00:00.000Z");
+  let injectCompletionCrash = false;
+  let completionClockCalls = 0;
+  const repository = new InMemoryControlPlaneRepository(() => {
+    if (injectCompletionCrash && ++completionClockCalls === 5) throw new Error("SIMULATED_COMPLETION_CRASH");
+    return now;
+  });
+  const project = await createProject(repository, ownerA, "missing-next");
+  const run = await repository.startWorkflow(ownerA, {
+    projectId: project.id, idempotencyKey: "workflow-missing-next", inputHash: "workflow-missing-next",
+  });
+  const claimed = await repository.claimWorkflowTask("missing-next-worker");
+  assert.ok(claimed);
+  injectCompletionCrash = true;
+  await assert.rejects(repository.completeWorkflowTask(
+    "missing-next-worker", claimed.id, claimed.leaseGeneration, {
+      idempotencyKey: "complete-before-crash", inputHash: "complete-before-crash",
+      outputReference: `urn:sha256:${"d".repeat(64)}`,
+    },
+  ), /SIMULATED_COMPLETION_CRASH/);
+  injectCompletionCrash = false;
+
+  const [completed] = await repository.listWorkflowTasks(ownerA, run.id);
+  assert.equal(completed?.phase, "preflight");
+  assert.equal(completed?.status, "succeeded");
+  assert.ok(completed?.outputHash);
+  assert.equal(await repository.reconcileWorkflows("missing-next-reconciler"), 1);
+  assert.equal(await repository.reconcileWorkflows("missing-next-reconciler"), 0);
+  const tasks = await repository.listWorkflowTasks(ownerA, run.id);
+  assert.deepEqual(new Set(tasks.map(({ phase }) => phase)), new Set(["preflight", "ownership"]));
+  assert.equal(tasks.find(({ phase }) => phase === "ownership")?.inputHash, completed.outputHash);
+});
+
 test("a fresh controller resumes deterministically from every persisted phase boundary", async () => {
   const repository = new InMemoryControlPlaneRepository();
   const project = await createProject(repository, ownerA, "phase-restarts");
@@ -440,6 +474,56 @@ test("controller serializes heartbeats while a phase handler is active", async (
   assert.equal(maximumActiveHeartbeats, 1);
   assert.equal((await repository.listWorkflowEvents(ownerA, run.id))
     .filter(({ type }) => type === "task.heartbeat").length, 2);
+});
+
+test("controller treats deterministic configuration failures as permanent", async () => {
+  const repository = new InMemoryControlPlaneRepository();
+  const project = await createProject(repository, ownerA, "permanent-phase-failure");
+  const run = await repository.startWorkflow(ownerA, {
+    projectId: project.id,
+    idempotencyKey: "workflow-permanent-phase-failure",
+    inputHash: "workflow-permanent-phase-failure",
+  });
+  const controller = new WorkflowController(repository, {
+    handlers: {
+      preflight: async () => { throw new Error("WORKFLOW_PHASE_CONFIGURATION_INVALID"); },
+    },
+    sideEffects: {},
+  });
+  await assert.rejects(controller.runNext("permanent-failure-worker"), /WORKFLOW_PHASE_CONFIGURATION_INVALID/);
+  const [failed] = await repository.listWorkflowTasks(ownerA, run.id);
+  assert.equal(failed?.status, "failed");
+  assert.equal(failed?.retryClassification, "permanent");
+  assert.equal(failed?.attempts, 1);
+});
+
+test("controller preserves a typed rate-limit failure and bounds Retry-After", async () => {
+  const now = new Date("2026-08-30T12:00:00.000Z");
+  const repository = new InMemoryControlPlaneRepository(() => now, { random: () => 0 });
+  const project = await createProject(repository, ownerA, "rate-limited-phase");
+  const run = await repository.startWorkflow(ownerA, {
+    projectId: project.id,
+    idempotencyKey: "workflow-rate-limited-phase",
+    inputHash: "workflow-rate-limited-phase",
+  });
+  const controller = new WorkflowController(repository, {
+    handlers: {
+      preflight: async () => ({
+        checkpointReference: undefined,
+        failure: {
+          errorCode: "PROVIDER_RATE_LIMITED",
+          classification: "rate_limited" as const,
+          retryAfterMs: 900_000,
+        },
+      }),
+    },
+    sideEffects: {},
+  });
+  const failed = await controller.runNext("rate-limited-worker");
+  assert.equal(failed?.status, "queued");
+  assert.equal(failed?.retryClassification, "rate_limited");
+  assert.equal(failed?.availableAt, new Date(now.getTime() + 300_000).toISOString());
+  assert.equal((await repository.getWorkflowRun(ownerA, run.id)).status, "queued");
 });
 
 test("controller proves the lease before stable side effects, reconciles once, and always cleans up", async () => {
