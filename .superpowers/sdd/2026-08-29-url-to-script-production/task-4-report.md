@@ -169,3 +169,81 @@ No provenance or quarantine metadata was changed.
 - Mutation candidates are never executed or proposed during discovery. Controlled, reversible post-review mutation verification remains Task 8 work.
 - The five PostgreSQL/environment integrations were not runnable in this workspace. The new result shape uses the already-tested Task 3 `AnalysisResult` persistence contract, but no live Postgres run is claimed here.
 - Task 1's trusted-loader dependency remains: installation must verify artifact bytes/integrity before JavaScript evaluation.
+
+## Fix round 1 (Task 4 independent review)
+
+Implementation commit: `f3696d9 fix: enforce browser expiry and redact evidence URLs`
+
+### Review findings resolved
+
+- Browser Use session expiry is now a local runtime boundary, not provider metadata only. `withBrowserUseCloudV4Session` derives one deadline signal from the validated session TTL and caller cancellation, subtracts lease-acquisition time, races the entire session action against that boundary, and returns the precise `BROWSER_SESSION_EXPIRED` or `BROWSER_SESSION_ABORTED` code. The derived signal is supplied to provider startup and to the worker action.
+- Website orchestration now passes that session-bound signal through the public explorer, durable authentication wait, and authenticated explorer. Expiry marks the provider outcome cancelled while preserving reference revocation, provider stop/reconcile, and durable lease release.
+- Same-origin navigation, semantic-target, and form-action URLs are normalized before immutable evidence is serialized. URL credentials and wrong origins remain rejected, fragments are rejected as `WEBSITE_EVIDENCE_URL_FRAGMENT_BLOCKED`, auth-sensitive query parameters are removed, retained query pairs are code-point sorted, and the sorted names of removed parameters remain as non-secret provenance metadata.
+- A form whose action required redaction is not converted into an executable plan, because removing a reviewed static query component could change its semantics. It produces the explicit existing `UNSUPPORTED_WEBSITE_CANDIDATE` diagnostic with reason `redacted_form_action`.
+
+### Strict TDD RED evidence
+
+The expiry regressions were added before the deadline implementation:
+
+```text
+/usr/local/bin/node /Users/miki/Cloudsail-Development/runmill/node_modules/tsx/dist/cli.mjs --test --test-name-pattern='session expiry aborts|locally expires a stalled explorer' packages/providers/src/browser-use-v4.test.ts apps/worker/src/workflow.test.ts
+tests 2; pass 0; fail 2
+both stalled operations completed and produced "Missing expected rejection"
+```
+
+The URL regressions were added before URL normalization/redaction:
+
+```text
+/usr/local/bin/node /Users/miki/Cloudsail-Development/runmill/node_modules/tsx/dist/cli.mjs --test --test-name-pattern='OAuth callback|rejects URL fragments' packages/providers/src/website-evidence.test.ts
+tests 2; pass 0; fail 2
+OAuth code/state/login-return/form-state canaries remained verbatim; fragment observations produced "Missing expected rejection"
+```
+
+### GREEN and regression evidence
+
+Focused final fix run:
+
+```text
+/usr/local/bin/node /Users/miki/Cloudsail-Development/runmill/node_modules/tsx/dist/cli.mjs --test --test-name-pattern='session expiry aborts|locally expires a stalled explorer|OAuth callback|rejects URL fragments' packages/providers/src/browser-use-v4.test.ts apps/worker/src/workflow.test.ts packages/providers/src/website-evidence.test.ts
+tests 4; pass 4; fail 0; duration 830 ms
+```
+
+Affected Task 1-4 regression run:
+
+```text
+/usr/local/bin/node /Users/miki/Cloudsail-Development/runmill/node_modules/tsx/dist/cli.mjs --test packages/providers/src/website.test.ts packages/providers/src/browser-use-v4.test.ts packages/providers/src/website-evidence.test.ts packages/security/src/security.test.ts apps/worker/src/workflow.test.ts apps/worker/src/runner.test.ts packages/database/src/control-plane.test.ts packages/capability-ir/src/plan.test.ts packages/capability-ir/src/plan.adapters.test.ts packages/compiler/src/compiler.contract.test.ts packages/compiler/src/compiler.adapters.test.ts
+tests 110; pass 110; fail 0; skipped 0; duration 1047 ms
+```
+
+Full trusted suite on the implementation commit:
+
+```text
+/usr/local/bin/node /Users/miki/Cloudsail-Development/runmill/node_modules/tsx/dist/cli.mjs --test test-support/**/*.test.ts apps/**/*.test.ts packages/**/*.test.ts
+tests 268; pass 263; fail 0; skipped 5; duration 3169 ms
+```
+
+The five skips remain the environment-gated PostgreSQL/control-plane integration tests.
+
+Direct gates all exited 0 on the implementation commit:
+
+```text
+/usr/local/bin/node node_modules/typescript/bin/tsc --project tsconfig.base.json --noEmit --pretty false
+/usr/local/bin/node node_modules/eslint/bin/eslint.js . --max-warnings=0
+/usr/local/bin/node scripts/lint-source.mjs
+/usr/local/bin/node scripts/check-source.mjs
+git diff --check
+```
+
+The production fixture-name scan returned no matches (`rg` exit 1):
+
+```text
+rg -n 'Acme|acme|fixture' packages/providers/src/website.ts packages/providers/src/browser-use-v4.ts packages/providers/src/website-evidence.ts apps/worker/src/workflow.ts
+```
+
+### Fix-round self-review and limits
+
+- The expiry race rejects locally even when an explorer/action ignores cancellation; cooperative consumers also receive the derived signal so the underlying work stops. JavaScript cannot forcibly terminate arbitrary already-running application code, so production explorer/auth/provider ports must continue to honor their AbortSignal contracts.
+- Expiry and caller cancellation are normalized only from the local deadline's terminal state; ordinary explorer/provider errors retain their original precise code. Cleanup failures do not replace a primary expiry/cancellation failure.
+- URL redaction runs before canonical serialization and hashing, so immutable content, evidence digest, target origin, and later plan evidence reference all bind the exact normalized fact. No secret value is replaced with a value that could be mistaken for an executable reviewed parameter.
+- Redaction is deliberately keyed to auth/credential query names, including OAuth/OIDC/SAML/session/redirect variants. Unknown application-specific query values remain subject to the existing bounded evidence sanitizer and are not claimed to be universally classifiable as secrets.
+- No live Browser Use success is claimed, no fixture/default production branch was added, and no provenance or quarantine metadata was changed.
