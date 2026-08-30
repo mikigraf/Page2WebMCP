@@ -522,6 +522,7 @@ function accessibleName(root, element) {
 function semanticMatches(root, locator) {
   const matches = semanticElements(root).filter((element) => {
     if (locator.kind === "role") {
+      if (locator.element && elementTag(element) !== locator.element) return false;
       const role = element.getAttribute?.("role") || implicitRole(element);
       return role === locator.role && accessibleName(root, element) === locator.accessibleName;
     }
@@ -595,23 +596,14 @@ function nativeSetControl(element, value) {
   }
 }
 
-function assertSafeClickTarget(element) {
+function assertSafeClickTarget(element, locator) {
   const tag = elementTag(element);
-  if (tag === "a") {
-    const href = element.getAttribute?.("href");
-    let target;
-    try { target = new URL(href, globalThis.document?.baseURI || globalThis.window?.location?.href); } catch {
-      throw new Page2WebMCPError("STALE_PAGE");
-    }
-    if (target.origin !== releaseManifest.targetOrigin) throw new Page2WebMCPError("ORIGIN_MISMATCH");
+  if (tag !== locator.element || !["button", "input"].includes(tag) || element?.disabled === true) {
     throw new Page2WebMCPError("STALE_PAGE");
   }
-  if (tag === "button" && String(element.getAttribute?.("type") || "submit").toLowerCase() !== "button") {
-    throw new Page2WebMCPError("STALE_PAGE");
-  }
-  if (tag === "input" && String(element.type || element.getAttribute?.("type") || "").toLowerCase() !== "button") {
-    throw new Page2WebMCPError("STALE_PAGE");
-  }
+  const defaultType = tag === "button" ? "submit" : "text";
+  const type = String(element.type || element.getAttribute?.("type") || defaultType).toLowerCase();
+  if (type !== "button") throw new Page2WebMCPError("STALE_PAGE");
   if (element.getAttribute?.("formaction") || element.getAttribute?.("formtarget")) {
     throw new Page2WebMCPError("STALE_PAGE");
   }
@@ -642,11 +634,13 @@ function projectSemanticResponse(root, projection) {
   return projected;
 }
 
-async function waitForSemanticCondition(root, condition, snapshot, signal) {
+async function waitForSemanticCondition(root, scopeLocator, condition, conditionTarget, snapshot, signal) {
   while (true) {
     assertExecutionActive(signal);
     assertPageStable(snapshot);
-    if (semanticConditionState(root, condition)) return;
+    assertSameSemantic(snapshot.document, scopeLocator, root);
+    assertSameSemantic(root, condition.locator, conditionTarget);
+    if (readSemanticValue(root, condition) === condition.equals) return;
     if (typeof platformSetTimeout !== "function") throw new Page2WebMCPError("STALE_PAGE");
     await new Promise((resolve) => platformSetTimeout(resolve, 10));
   }
@@ -913,6 +907,8 @@ async function executeDomWithinDeadline(state, spec, input, signal) {
   }
   const actionTarget = spec.request.action.kind === "click"
     ? resolveSemantic(scope, spec.request.action.target) : undefined;
+  const conditionTarget = spec.request.action.kind === "click"
+    ? resolveSemantic(scope, spec.success.condition.locator) : undefined;
   if (spec.effects.kind === "mutation") await confirmMutation(state, spec, input, undefined, signal);
   assertPageStable(snapshot);
   assertSameSemantic(snapshot.document, spec.request.scope, scope);
@@ -926,14 +922,22 @@ async function executeDomWithinDeadline(state, spec, input, signal) {
   }
   if (actionTarget) {
     assertSameSemantic(scope, spec.request.action.target, actionTarget);
-    assertSafeClickTarget(actionTarget);
+    assertSameSemantic(scope, spec.success.condition.locator, conditionTarget);
+    assertSafeClickTarget(actionTarget, spec.request.action.target);
     if (typeof nativeClick !== "function") throw new Page2WebMCPError("STALE_PAGE");
     nativeClick.call(actionTarget);
   }
   if (spec.request.action.kind === "read") {
     if (!semanticConditionState(scope, spec.success.condition)) throw new Page2WebMCPError("STALE_PAGE");
   } else {
-    await waitForSemanticCondition(scope, spec.success.condition, snapshot, signal);
+    await waitForSemanticCondition(
+      scope,
+      spec.request.scope,
+      spec.success.condition,
+      conditionTarget,
+      snapshot,
+      signal,
+    );
   }
   assertSameSemantic(snapshot.document, spec.request.scope, scope);
   const projected = projectSemanticResponse(scope, spec.response.projection);

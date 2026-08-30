@@ -35,6 +35,11 @@ export type SemanticLocator =
   | { kind: "name"; element: SemanticElement; name: string }
   | { kind: "stable_attribute"; reviewed: true; element: SemanticElement; name: string; value: string };
 
+export type SemanticClickLocator =
+  | { kind: "role"; element: "button" | "input"; role: "button"; accessibleName: string }
+  | { kind: "name"; element: "button" | "input"; name: string }
+  | { kind: "stable_attribute"; reviewed: true; element: "button" | "input"; name: string; value: string };
+
 export type SemanticValue = {
   locator: SemanticLocator;
   read: "text" | "value" | "checked";
@@ -63,7 +68,7 @@ export type SemanticDomRequest = {
   adapter: "semantic_dom";
   scope: SemanticLocator;
   inputs: Record<string, { locator: SemanticLocator; optional: boolean }>;
-  action: { kind: "read" } | { kind: "click"; target: SemanticLocator };
+  action: { kind: "read" } | { kind: "click"; target: SemanticClickLocator };
 };
 
 export type JsonApiResponse = {
@@ -243,6 +248,27 @@ const SemanticLocatorSchema: z.ZodType<SemanticLocator> = z.discriminatedUnion("
   }).strict(),
 ]);
 
+const SemanticClickLocatorSchema: z.ZodType<SemanticClickLocator> = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("role"),
+    element: z.enum(["button", "input"]),
+    role: z.literal("button"),
+    accessibleName: z.string().trim().min(1).max(200),
+  }).strict(),
+  z.object({
+    kind: z.literal("name"),
+    element: z.enum(["button", "input"]),
+    name: z.string().regex(/^[A-Za-z_][A-Za-z0-9_.:-]{0,127}$/),
+  }).strict(),
+  z.object({
+    kind: z.literal("stable_attribute"),
+    reviewed: z.literal(true),
+    element: z.enum(["button", "input"]),
+    name: z.string().regex(/^data-[a-z][a-z0-9-]{0,63}$/),
+    value: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/),
+  }).strict(),
+]);
+
 const SemanticValueSchema: z.ZodType<SemanticValue> = z.object({
   locator: SemanticLocatorSchema,
   read: z.enum(["text", "value", "checked"]),
@@ -345,7 +371,7 @@ const CapabilityPlanStructureSchema = z.object({
       }).strict()),
       action: z.discriminatedUnion("kind", [
         z.object({ kind: z.literal("read") }).strict(),
-        z.object({ kind: z.literal("click"), target: SemanticLocatorSchema }).strict(),
+        z.object({ kind: z.literal("click"), target: SemanticClickLocatorSchema }).strict(),
       ]),
     }).strict(),
   ]),

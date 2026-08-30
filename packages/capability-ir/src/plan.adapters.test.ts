@@ -153,7 +153,7 @@ function domMutationPlan(): CapabilityPlan {
       },
       action: {
         kind: "click",
-        target: { kind: "role", role: "button", accessibleName: "Save draft" },
+        target: { kind: "role", element: "button", role: "button", accessibleName: "Save draft" },
       },
     },
     response: {
@@ -207,6 +207,23 @@ test("browser adapters reject arbitrary, positional, transient, and private loca
       request: { ...domMutationPlan().request, scope },
     } as unknown as CapabilityPlan]), /locator|attribute|selector|stable|invalid|unrecognized/i);
   }
+
+  assert.throws(() => canonicalizeCapabilityPlans([{
+    ...domMutationPlan(),
+    request: {
+      ...domMutationPlan().request,
+      action: {
+        kind: "click",
+        target: {
+          kind: "stable_attribute",
+          reviewed: true,
+          element: "div",
+          name: "data-catalog-action",
+          value: "save",
+        },
+      },
+    },
+  } as unknown as CapabilityPlan]), /button|input|invalid|option/i);
 });
 
 test("form adapters require an exact same-origin action and exact scalar optionality mappings", () => {

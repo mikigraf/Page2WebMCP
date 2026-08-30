@@ -181,7 +181,7 @@ function domMutationPlan(): CapabilityPlan {
       inputs: {
         label: { locator: { kind: "label", element: "input", label: "Draft name" }, optional: false },
       },
-      action: { kind: "click", target: { kind: "role", role: "button", accessibleName: "Save draft" } },
+      action: { kind: "click", target: { kind: "role", element: "button", role: "button", accessibleName: "Save draft" } },
     },
     response: {
       adapter: "semantic_dom",
@@ -428,6 +428,50 @@ test("semantic DOM bridge resolves stable scope and role/name targets, using nat
   }
 });
 
+test("semantic DOM mutations reject a generic scripted click target before side effects", async () => {
+  const fixture = new SemanticBrowserFixture().install({ confirm: async () => true });
+  const { scope, button, status } = appendDomEditor(fixture);
+  button.remove();
+  const genericTarget = fixture.element("div", { role: "button", "aria-label": "Save draft" });
+  let sideEffects = 0;
+  genericTarget.addEventListener("click", () => {
+    sideEffects += 1;
+    status.textContent = "saved";
+  });
+  scope.append(genericTarget);
+  try {
+    const artifact = await importRelease([domMutationPlan()]);
+    await artifact.autoRegistration;
+    await assert.rejects(
+      fixture.tools[0]!.execute({ label: "Unsafe" }, { signal: new AbortController().signal }),
+      { code: "STALE_PAGE" },
+    );
+    assert.equal(genericTarget.nativeClickCalls, 0);
+    assert.equal(sideEffects, 0);
+  } finally {
+    fixture.restore();
+  }
+});
+
+test("semantic DOM mutation reports a disappearing reviewed success target as stale immediately", async () => {
+  const fixture = new SemanticBrowserFixture().install({ confirm: async () => true });
+  const { button, status } = appendDomEditor(fixture);
+  button.addEventListener("click", () => status.remove());
+  try {
+    const artifact = await importRelease([domMutationPlan()]);
+    await artifact.autoRegistration;
+    const execution = fixture.tools[0]!.execute({ label: "Drifted" }, { signal: new AbortController().signal });
+    await assert.rejects(
+      Promise.race([execution, new Promise((resolve) => setTimeout(() => resolve("STALLED"), 100))]),
+      { code: "STALE_PAGE" },
+    );
+    assert.equal(button.nativeClickCalls, 1);
+  } finally {
+    fixture.events.dispatchEvent(new Event("pagehide"));
+    fixture.restore();
+  }
+});
+
 test("semantic and form target ambiguity, missing controls, and unexpected controls fail closed", async () => {
   const ambiguous = new SemanticBrowserFixture().install();
   for (let index = 0; index < 2; index += 1) {
@@ -630,7 +674,7 @@ test("wrong-origin form action and semantic output drift fail closed before retu
     await artifact.autoRegistration;
     await assert.rejects(
       wrongDom.tools[0]!.execute({ label: "Private" }, { signal: new AbortController().signal }),
-      { code: "ORIGIN_MISMATCH" },
+      { code: "STALE_PAGE" },
     );
     assert.equal(crossOriginClicks, 0);
   } finally {
