@@ -146,3 +146,90 @@ No provenance or quarantine metadata was changed. A representative three-plan ar
 - Website and GitHub live adapters remain unconfigured in this task and therefore fail closed rather than retaining the former fixture implementation.
 - `compileOpenApi` is the source-native API for already parsed/prevalidated in-memory documents. The production worker path always calls `validateOpenApiSource` first; callers that ingest provider bytes must do the same.
 - Task 1's trusted-loader dependency is unchanged: the generated artifact includes mandatory integrity/runtime identity metadata, but installation must verify bytes before JavaScript evaluation.
+
+## Fix round 1: diagnostic preservation and precision
+
+### Result and commit
+
+Implemented both Important findings from the independent Task 3 review in `59c5f5b` (`fix: preserve OpenAPI analysis diagnostics`).
+
+- `AnalysisResult` now requires a bounded `diagnostics` collection. The OpenAPI worker copies the compiler's exact diagnostics into that result; the in-memory repository and Postgres repository validate, normalize, persist, and recover them; the existing analysis-run GET API consequently exposes them to reviewers.
+- Diagnostic records reject unknown keys, invalid code/reason formats, control characters, duplicates, more than 1,000 records, operation keys above 2,048 UTF-16 code units, and collections above 64 KiB. Sorting uses code-point comparison and stored values are fresh normalized records.
+- New Postgres writes store diagnostics in the existing JSONB `analysis_runs.result` object. No schema migration is required. Pre-fix rows without the property recover as an empty list, while every newly constructed `AnalysisResult` must provide the field.
+- Canonical plan validation now uses `safeParse` and maps both semantic messages and structured Zod issue paths to the existing precise diagnostic classes for request body/parameter/schema/response/effect/authentication/origin violations. `MALFORMED_OPERATION` remains only the fail-closed fallback when no supported category applies.
+- The mixed-document integration regression uses the real OpenAPI provider/compiler/worker path plus the real in-memory persistence and GET API. It confirms one public operation is retained while the API returns the exact `SERVER_ADAPTER_REQUIRED` / `api_key_header` diagnostic for the excluded operation.
+- The Postgres lifecycle integration fixture now also asserts exact diagnostic round-trip when a database is available.
+
+### Files
+
+- `packages/openapi/src/compile.ts`
+- `packages/openapi/src/compile.test.ts`
+- `apps/worker/src/workflow.ts`
+- `packages/database/src/control-plane.ts`
+- `packages/database/src/control-plane.test.ts`
+- `packages/database/src/postgres.ts`
+- `packages/database/src/postgres.integration.test.ts`
+- `apps/control-plane/tests/analyze-route.test.ts`
+- `apps/control-plane/tests/capability-review-route.test.ts`
+- `apps/control-plane/tests/release-route.test.ts`
+- `apps/worker/src/runner.test.ts`
+
+### Strict TDD evidence
+
+I1 RED, before the workflow/result/repository changes:
+
+```text
+/usr/local/bin/node /Users/miki/Cloudsail-Development/runmill/node_modules/tsx/dist/cli.mjs --test --test-name-pattern='mixed OpenAPI analysis preserves' apps/control-plane/tests/analyze-route.test.ts
+tests 1; pass 0; fail 1
+actual body.result.diagnostics: undefined
+expected: [{ code: "SERVER_ADAPTER_REQUIRED", operationKey: "GET /private", reason: "api_key_header" }]
+```
+
+I2 RED, before replacing the generic parse catch:
+
+```text
+/usr/local/bin/node /Users/miki/Cloudsail-Development/runmill/node_modules/tsx/dist/cli.mjs --test --test-name-pattern='precise diagnostic when canonical' packages/openapi/src/compile.test.ts
+tests 1; pass 0; fail 1
+actual code: MALFORMED_OPERATION
+expected code: UNSUPPORTED_PARAMETER_SERIALIZATION
+```
+
+Focused GREEN after implementation:
+
+```text
+/usr/local/bin/node /Users/miki/Cloudsail-Development/runmill/node_modules/tsx/dist/cli.mjs --test --test-name-pattern='precise diagnostic when canonical|mixed OpenAPI analysis preserves' packages/openapi/src/compile.test.ts apps/control-plane/tests/analyze-route.test.ts
+tests 2; pass 2; fail 0; skipped 0; duration 959 ms
+```
+
+Affected GREEN:
+
+```text
+/usr/local/bin/node /Users/miki/Cloudsail-Development/runmill/node_modules/tsx/dist/cli.mjs --test packages/openapi/src/compile.test.ts apps/control-plane/tests/analyze-route.test.ts apps/worker/src/runner.test.ts packages/database/src/control-plane.test.ts apps/control-plane/tests/capability-review-route.test.ts apps/control-plane/tests/release-route.test.ts packages/database/src/postgres.integration.test.ts
+tests 67; pass 63; fail 0; skipped 4; duration 1016 ms
+```
+
+Final full trusted suite:
+
+```text
+/usr/local/bin/node /Users/miki/Cloudsail-Development/runmill/node_modules/tsx/dist/cli.mjs --test test-support/**/*.test.ts apps/**/*.test.ts packages/**/*.test.ts
+tests 239; pass 234; fail 0; skipped 5; duration 3396 ms
+```
+
+The five skips are the existing environment-gated PostgreSQL/control-plane integration tests.
+
+Direct gates all exited 0:
+
+```text
+/usr/local/bin/node node_modules/typescript/bin/tsc --project tsconfig.base.json --noEmit --pretty false
+/usr/local/bin/node node_modules/eslint/bin/eslint.js . --max-warnings=0
+/usr/local/bin/node scripts/lint-source.mjs
+/usr/local/bin/node scripts/check-source.mjs
+git diff --check
+```
+
+The production fixture-name scan returned no matches. No provenance/quarantine metadata changed.
+
+### Fix-round concerns
+
+- The four Postgres repository tests and one Postgres route/worker test remain environment-gated in this workspace. The Postgres implementation is typechecked and its integration fixture now asserts the new JSONB round-trip, but this run did not have a live database with which to execute it.
+- Diagnostic categories intentionally remain stable, non-sensitive codes plus bounded operation keys/reasons; raw Zod messages are used only inside the mapper and are never returned or persisted.
