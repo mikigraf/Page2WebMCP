@@ -237,6 +237,149 @@ test("Postgres repository persists and recovers the fixture lifecycle", { skip: 
   }
 });
 
+test("Postgres phased workflow matches in-memory transitions, lease generations, waits, and cancellation", {
+  skip: !connectionString,
+}, async () => {
+  const repository = createPostgresRepository({ connectionString: connectionString!, maxConnections: 4 });
+  const actor: RepositoryActor = {
+    id: "11111111-1111-1111-1111-111111111111",
+    organizationId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+    role: "owner",
+  };
+  try {
+    const project = await repository.createProject(actor, {
+      name: "Postgres phased workflow",
+      sourceType: "openapi",
+      url: "https://workflow.widgets.example/openapi.json",
+      idempotencyKey: "postgres-workflow-project",
+      inputHash: "postgres-workflow-project",
+    });
+    assert.equal((await repository.listProjectSources(actor, project.id)).length, 1);
+    assert.equal((await repository.listSourceSnapshots(actor, project.id)).length, 1);
+    const run = await repository.startWorkflow(actor, {
+      projectId: project.id,
+      idempotencyKey: "postgres-workflow-run",
+      inputHash: "postgres-workflow-run",
+    });
+    assert.deepEqual((await repository.listWorkflowEvents(actor, run.id)).map(({ sequence, type }) => ({ sequence, type })), [
+      { sequence: 1, type: "workflow.created" },
+      { sequence: 2, type: "task.created" },
+    ]);
+    const [left, right] = await Promise.all([
+      repository.claimWorkflowTask("postgres-workflow-a"),
+      repository.claimWorkflowTask("postgres-workflow-b"),
+    ]);
+    const claimed = left ?? right;
+    assert.ok(claimed);
+    assert.equal([left, right].filter(Boolean).length, 1);
+    await repository.completeWorkflowTask(claimed.leaseOwner, claimed.id, claimed.leaseGeneration, {
+      idempotencyKey: "postgres-complete-preflight",
+      inputHash: "postgres-complete-preflight",
+      outputReference: `urn:sha256:${"a".repeat(64)}`,
+    });
+    const ownership = await repository.claimWorkflowTask("postgres-workflow-owner");
+    assert.equal(ownership?.phase, "ownership");
+    assert.ok(ownership);
+    const waiting = await repository.waitWorkflowTask(
+      "postgres-workflow-owner", ownership.id, ownership.leaseGeneration, {
+        idempotencyKey: "postgres-wait-owner",
+        inputHash: "postgres-wait-owner",
+        reason: "ownership_proof",
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      },
+    );
+    assert.equal((await repository.getWorkflowRun(actor, run.id)).status, "waiting");
+    const resumed = await Promise.all([
+      repository.resumeWorkflowTask(actor, {
+        runId: run.id,
+        waitToken: waiting.waitToken,
+        idempotencyKey: "postgres-resume-owner",
+        inputHash: "postgres-resume-owner",
+      }),
+      repository.resumeWorkflowTask(actor, {
+        runId: run.id,
+        waitToken: waiting.waitToken,
+        idempotencyKey: "postgres-resume-owner",
+        inputHash: "postgres-resume-owner",
+      }),
+    ]);
+    assert.equal(resumed[0].status, "queued");
+    assert.equal(resumed[1].id, resumed[0].id);
+    assert.equal((await repository.cancelWorkflow(actor, {
+      runId: run.id,
+      idempotencyKey: "postgres-cancel-workflow",
+      inputHash: "postgres-cancel-workflow",
+    })).status, "cancelled");
+
+    const raceProject = await repository.createProject(actor, {
+      name: "Postgres cancellation race",
+      sourceType: "openapi",
+      url: "https://race.widgets.example/openapi.json",
+      idempotencyKey: "postgres-race-project",
+      inputHash: "postgres-race-project",
+    });
+    const raceRun = await repository.startWorkflow(actor, {
+      projectId: raceProject.id,
+      idempotencyKey: "postgres-race-run",
+      inputHash: "postgres-race-run",
+    });
+    const [claimOutcome, cancelOutcome] = await Promise.allSettled([
+      repository.claimWorkflowTask("postgres-race-worker"),
+      repository.cancelWorkflow(actor, {
+        runId: raceRun.id,
+        idempotencyKey: "postgres-race-cancel",
+        inputHash: "postgres-race-cancel",
+      }),
+    ]);
+    assert.equal(cancelOutcome.status, "fulfilled");
+    assert.equal((await repository.getWorkflowRun(actor, raceRun.id)).status, "cancelled");
+    if (claimOutcome.status === "fulfilled" && claimOutcome.value) {
+      await assert.rejects(repository.completeWorkflowTask(
+        "postgres-race-worker", claimOutcome.value.id, claimOutcome.value.leaseGeneration, {
+          idempotencyKey: "postgres-race-complete-after-cancel",
+          inputHash: "postgres-race-complete-after-cancel",
+        },
+      ), (error: unknown) => error instanceof RepositoryError && error.code === "CANCELLED");
+    }
+
+    const completionProject = await repository.createProject(actor, {
+      name: "Postgres completion cancellation race",
+      sourceType: "openapi",
+      url: "https://complete-race.widgets.example/openapi.json",
+      idempotencyKey: "postgres-complete-race-project",
+      inputHash: "postgres-complete-race-project",
+    });
+    const completionRun = await repository.startWorkflow(actor, {
+      projectId: completionProject.id,
+      idempotencyKey: "postgres-complete-race-run",
+      inputHash: "postgres-complete-race-run",
+    });
+    const completionTask = await repository.claimWorkflowTask("postgres-complete-race-worker");
+    assert.ok(completionTask);
+    const [completeOutcome, completionCancelOutcome] = await Promise.allSettled([
+      repository.completeWorkflowTask(
+        "postgres-complete-race-worker", completionTask.id, completionTask.leaseGeneration, {
+          idempotencyKey: "postgres-complete-race-complete",
+          inputHash: "postgres-complete-race-complete",
+        },
+      ),
+      repository.cancelWorkflow(actor, {
+        runId: completionRun.id,
+        idempotencyKey: "postgres-complete-race-cancel",
+        inputHash: "postgres-complete-race-cancel",
+      }),
+    ]);
+    assert.equal(completionCancelOutcome.status, "fulfilled");
+    if (completeOutcome.status === "rejected") {
+      assert.ok(completeOutcome.reason instanceof RepositoryError);
+      assert.equal(completeOutcome.reason.code, "CANCELLED");
+    }
+    assert.equal((await repository.getWorkflowRun(actor, completionRun.id)).status, "cancelled");
+  } finally {
+    await repository.close();
+  }
+});
+
 test("Postgres queue exhaustion and stale release gates match the in-memory contract", {
   skip: !connectionString || !adminConnectionString
 }, async () => {

@@ -47,9 +47,11 @@ export async function processNextAnalysis(
 
   let heartbeatFailure: unknown;
   const heartbeatController = new AbortController();
-  const heartbeat = maintainLease(repository, workerId, run.id, leaseMs, heartbeatMs, heartbeatController.signal, (error) => {
+  const heartbeat = maintainLease(
+    repository, workerId, run.id, run.leaseGeneration, leaseMs, heartbeatMs, heartbeatController.signal, (error) => {
     if (stableFailureCode(error) === "LEASE_LOST") heartbeatFailure = error;
-  });
+    },
+  );
 
   try {
     const analyze = options.analyze ?? testAnalysisAdapter;
@@ -60,7 +62,7 @@ export async function processNextAnalysis(
     heartbeatController.abort();
     await heartbeat;
     if (heartbeatFailure) throw heartbeatFailure;
-    const completed = await repository.completeAnalysis(workerId, run.id, result);
+    const completed = await repository.completeAnalysis(workerId, run.id, result, run.leaseGeneration);
     await recordAnalysisOutcome(run.id, "success", run.sourceType, undefined, startedAt, run.attempts);
     return completed;
   } catch (error) {
@@ -68,7 +70,9 @@ export async function processNextAnalysis(
     await heartbeat;
     const code = stableFailureCode(error);
     try {
-      const failed = await repository.failAnalysis(workerId, run.id, code, isRetryableFailure(code));
+      const failed = await repository.failAnalysis(
+        workerId, run.id, code, isRetryableFailure(code), run.leaseGeneration,
+      );
       await recordAnalysisOutcome(run.id, "failure", run.sourceType, code, startedAt, run.attempts);
       return failed;
     } catch (transitionError) {
@@ -138,6 +142,7 @@ async function maintainLease(
   repository: ControlPlaneRepository,
   workerId: string,
   runId: string,
+  leaseGeneration: number,
   leaseMs: number,
   heartbeatMs: number,
   signal: AbortSignal,
@@ -147,7 +152,7 @@ async function maintainLease(
     await abortableDelay(heartbeatMs, signal);
     if (signal.aborted) return;
     try {
-      await repository.heartbeatAnalysis(workerId, runId, leaseMs);
+      await repository.heartbeatAnalysis(workerId, runId, leaseMs, leaseGeneration);
     } catch (error) {
       onFailure(error);
       if (stableFailureCode(error) === "LEASE_LOST") return;

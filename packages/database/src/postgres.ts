@@ -28,6 +28,27 @@ import {
   type VerificationRecord,
   type VerificationRequest
 } from "./control-plane.ts";
+import {
+  WORKFLOW_DEFAULT_ACTIVE_TASK_QUOTA,
+  WORKFLOW_LEASE_MS,
+  workflowPhase,
+  workflowRetryDelayMs,
+  type CancelWorkflowInput,
+  type ClaimedWorkflowTaskRecord,
+  type CompleteWorkflowTaskInput,
+  type FailWorkflowTaskInput,
+  type ProjectSourceRecord,
+  type ResumeWorkflowTaskInput,
+  type SourceSnapshotRecord,
+  type StartWorkflowInput,
+  type WaitWorkflowTaskInput,
+  type WorkflowCapabilityPlanLink,
+  type WorkflowEventRecord,
+  type WorkflowEvidenceLink,
+  type WorkflowRunRecord,
+  type WorkflowTaskCompletion,
+  type WorkflowTaskRecord,
+} from "./workflow.ts";
 
 type PostgresOptions = {
   connectionString: string;
@@ -35,6 +56,8 @@ type PostgresOptions = {
   statementTimeoutMs?: number;
   pool?: pg.Pool;
   writeLog?: (line: string) => void;
+  random?: () => number;
+  activeTaskQuota?: number;
 };
 type Db = Pick<PoolClient, "query">;
 type ExecutionContext =
@@ -51,6 +74,8 @@ const MAX_RELEASE_BYTES = 64 * 1_024;
 export class PostgresControlPlaneRepository implements ControlPlaneRepository {
   readonly #pool: pg.Pool;
   readonly #statementTimeoutMs: number;
+  readonly #random: () => number;
+  readonly #activeTaskQuota: number;
 
   constructor(options: PostgresOptions) {
     this.#pool = options.pool ?? new pg.Pool({
@@ -69,6 +94,9 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
       schema_version: 1
     })));
     this.#statementTimeoutMs = Math.max(250, Math.min(options.statementTimeoutMs ?? 5_000, 30_000));
+    this.#random = options.random ?? Math.random;
+    this.#activeTaskQuota = Math.max(1, Math.min(options.activeTaskQuota
+      ?? WORKFLOW_DEFAULT_ACTIVE_TASK_QUOTA, 100));
   }
 
   async #transaction<T>(context: ExecutionContext, action: (client: PoolClient) => Promise<T>): Promise<T> {
@@ -127,7 +155,7 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
   async #reserveIdempotency(
     db: Db,
     actor: RepositoryActor,
-    operation: "project" | "analysis" | "release",
+    operation: "project" | "analysis" | "release" | "workflow",
     key: string,
     inputHash: string,
     proposedResultId: string
@@ -169,6 +197,17 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
         "values ($1, $2, $3, $4, $5, $6, 'created') " +
         "returning id, organization_id, created_by, name, source_type, source_url, status, created_at",
         [id, actor.organizationId, actor.id, input.name, input.sourceType, input.url]
+      );
+      const source = await client.query(
+        "insert into public.project_sources " +
+        "(organization_id, project_id, source_type, source_url, version, active) " +
+        "values ($1, $2, $3, $4, 1, true) returning id",
+        [actor.organizationId, id, input.sourceType, input.url]
+      );
+      await client.query(
+        "insert into public.source_snapshots " +
+        "(organization_id, project_id, project_source_id, source_identity_hash) values ($1, $2, $3, $4)",
+        [actor.organizationId, id, source.rows[0].id, stableHash(sourceIdentityMaterial(input.sourceType, input.url))]
       );
       await this.#audit(client, actor, "project.created", id);
       return mapProject(result.rows[0]);
@@ -213,6 +252,30 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
         "values ($1, $2, $3, $4)",
         [runId, actor.organizationId, project.sourceType, project.url]
       );
+      const snapshot = await client.query(
+        "select snapshot.id from public.source_snapshots snapshot " +
+        "join public.project_sources source on source.id = snapshot.project_source_id " +
+        "where source.project_id = $1 and source.organization_id = $2 and source.active " +
+        "order by snapshot.created_at desc, snapshot.id limit 1",
+        [project.id, actor.organizationId]
+      );
+      if (!snapshot.rows[0]) throw new RepositoryError("INVALID_STATE");
+      const workflowInputHash = stableHash(input.inputHash);
+      await client.query(
+        "insert into public.workflow_runs " +
+        "(id, organization_id, project_id, source_snapshot_id, analysis_run_id, status, current_phase, input_hash) " +
+        "values ($1, $2, $3, $4, $1, 'queued', 'analysis', $5)",
+        [runId, actor.organizationId, project.id, snapshot.rows[0].id, workflowInputHash]
+      );
+      const task = await client.query(
+        "insert into private.workflow_tasks " +
+        "(organization_id, project_id, workflow_run_id, phase, status, idempotency_key, input_hash) " +
+        "values ($1, $2, $3, 'analysis', 'queued', $4, $5) returning id",
+        [actor.organizationId, project.id, runId,
+          workflowTaskIdempotencyKey(runId, "analysis", workflowInputHash), workflowInputHash]
+      );
+      await client.query("select private.append_workflow_event($1, null, 'workflow.created', null)", [runId]);
+      await client.query("select private.append_workflow_event($1, $2, 'task.created', null)", [runId, task.rows[0].id]);
       await this.#audit(client, actor, "analysis.queued", runId);
       return mapAnalysis(result.rows[0]);
     });
@@ -248,6 +311,624 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
     return this.#transaction({ kind: "app", actor }, (client) => this.#analysis(client, actor, id));
   }
 
+  async #workflowRun(db: Db, actor: RepositoryActor, runId: string): Promise<WorkflowRunRecord> {
+    const result = await db.query(
+      "select id, organization_id, project_id, source_snapshot_id, analysis_run_id, status, current_phase, " +
+      "input_hash, version, cancel_requested_at, cancelled_at, error_code, created_at, updated_at " +
+      "from public.workflow_runs where id = $1 and organization_id = $2 limit 1",
+      [runId, actor.organizationId]
+    );
+    if (!result.rows[0]) throw new RepositoryError("NOT_FOUND");
+    return mapWorkflowRun(result.rows[0]);
+  }
+
+  async #workerWorkflowTask(db: Db, taskId: string, lock = false): Promise<WorkflowTaskRecord> {
+    const result = await db.query(
+      "select task.* from private.workflow_tasks task where task.id = $1" + (lock ? " for update" : "") + " limit 1",
+      [taskId]
+    );
+    if (!result.rows[0]) throw new RepositoryError("INVALID_STATE");
+    return mapWorkflowTask(result.rows[0]);
+  }
+
+  async #workerWorkflowRun(db: Db, runId: string, lock = false): Promise<WorkflowRunRecord> {
+    const result = await db.query(
+      "select * from public.workflow_runs where id = $1" + (lock ? " for update" : "") + " limit 1",
+      [runId]
+    );
+    if (!result.rows[0]) throw new RepositoryError("INVALID_STATE");
+    return mapWorkflowRun(result.rows[0]);
+  }
+
+  async #assertWorkerWorkflowLease(
+    db: Db,
+    workerId: string,
+    taskId: string,
+    leaseGeneration: number,
+  ): Promise<void> {
+    const result = await db.query(
+      "select task.status as task_status, task.lease_owner, task.lease_generation, " +
+      "task.lease_expires_at > now() as lease_current, run.cancel_requested_at, run.status as run_status " +
+      "from private.workflow_tasks task join public.workflow_runs run on run.id = task.workflow_run_id " +
+      "where task.id = $1 limit 1",
+      [taskId]
+    );
+    if (result.rows[0]?.cancel_requested_at || result.rows[0]?.run_status === "cancelled") {
+      throw new RepositoryError("CANCELLED");
+    }
+    if (!result.rows[0] || result.rows[0].task_status !== "running"
+      || String(result.rows[0].lease_owner) !== workerId
+      || Number(result.rows[0].lease_generation) !== leaseGeneration
+      || !result.rows[0].lease_current) throw new RepositoryError("LEASE_LOST");
+  }
+
+  async #workflowCommand(
+    db: Db,
+    runId: string,
+    scope: string,
+    key: string,
+    inputHash: string,
+  ): Promise<Record<string, unknown> | undefined> {
+    assertWorkflowCommand(scope, key);
+    const result = await db.query(
+      "select input_hash, result from private.workflow_commands " +
+      "where workflow_run_id = $1 and command_scope = $2 and idempotency_key = $3 limit 1",
+      [runId, scope, key]
+    );
+    if (!result.rows[0]) return undefined;
+    if (String(result.rows[0].input_hash) !== stableHash(inputHash)) {
+      throw new RepositoryError("IDEMPOTENCY_CONFLICT");
+    }
+    return result.rows[0].result as Record<string, unknown>;
+  }
+
+  async #recordWorkflowCommand(
+    db: Db,
+    runId: string,
+    taskId: string | undefined,
+    scope: string,
+    key: string,
+    inputHash: string,
+    result: Record<string, unknown>,
+  ): Promise<void> {
+    await db.query(
+      "insert into private.workflow_commands " +
+      "(workflow_run_id, task_id, command_scope, idempotency_key, input_hash, result) " +
+      "values ($1, $2, $3, $4, $5, $6::jsonb)",
+      [runId, taskId ?? null, scope, key, stableHash(inputHash), JSON.stringify(result)]
+    );
+  }
+
+  async listProjectSources(actor: RepositoryActor, projectId: string): Promise<ProjectSourceRecord[]> {
+    return this.#transaction({ kind: "app", actor }, async (client) => {
+      await this.#project(client, actor, projectId);
+      const result = await client.query(
+        "select id, organization_id, project_id, source_type, source_url, version, active, created_at " +
+        "from public.project_sources where project_id = $1 and organization_id = $2 order by version, id limit 100",
+        [projectId, actor.organizationId]
+      );
+      return result.rows.map(mapProjectSource);
+    });
+  }
+
+  async listSourceSnapshots(actor: RepositoryActor, projectId: string): Promise<SourceSnapshotRecord[]> {
+    return this.#transaction({ kind: "app", actor }, async (client) => {
+      await this.#project(client, actor, projectId);
+      const result = await client.query(
+        "select id, organization_id, project_id, project_source_id, source_identity_hash, " +
+        "artifact_reference, content_hash, created_at from public.source_snapshots " +
+        "where project_id = $1 and organization_id = $2 order by created_at, id limit 1000",
+        [projectId, actor.organizationId]
+      );
+      return result.rows.map(mapSourceSnapshot);
+    });
+  }
+
+  async startWorkflow(actor: RepositoryActor, input: StartWorkflowInput): Promise<WorkflowRunRecord> {
+    if (actor.role === "viewer") throw new RepositoryError("FORBIDDEN");
+    return this.#transaction({ kind: "app", actor }, async (client) => {
+      const project = await this.#project(client, actor, input.projectId);
+      const runId = randomUUID();
+      const replayId = await this.#reserveIdempotency(
+        client, actor, "workflow", input.idempotencyKey, input.inputHash, runId,
+      );
+      if (replayId) return this.#workflowRun(client, actor, replayId);
+      const snapshot = await client.query(
+        "select snapshot.id from public.source_snapshots snapshot " +
+        "join public.project_sources source on source.id = snapshot.project_source_id " +
+        "where source.project_id = $1 and source.organization_id = $2 and source.active " +
+        "order by snapshot.created_at desc, snapshot.id limit 1",
+        [project.id, actor.organizationId]
+      );
+      if (!snapshot.rows[0]) throw new RepositoryError("INVALID_STATE");
+      const inputHash = stableHash(input.inputHash);
+      const run = await client.query(
+        "insert into public.workflow_runs " +
+        "(id, organization_id, project_id, source_snapshot_id, status, current_phase, input_hash) " +
+        "values ($1, $2, $3, $4, 'queued', 'preflight', $5) returning *",
+        [runId, actor.organizationId, project.id, snapshot.rows[0].id, inputHash]
+      );
+      const task = await client.query(
+        "insert into private.workflow_tasks " +
+        "(organization_id, project_id, workflow_run_id, phase, status, idempotency_key, input_hash) " +
+        "values ($1, $2, $3, 'preflight', 'queued', $4, $5) returning id",
+        [actor.organizationId, project.id, runId, workflowTaskIdempotencyKey(runId, "preflight", inputHash), inputHash]
+      );
+      await client.query("select private.append_workflow_event($1, null, 'workflow.created', null)", [runId]);
+      await client.query("select private.append_workflow_event($1, $2, 'task.created', null)", [runId, task.rows[0].id]);
+      await client.query("update public.projects set status = 'analyzing' where id = $1", [project.id]);
+      await this.#audit(client, actor, "workflow.queued", runId);
+      return this.#workflowRun(client, actor, String(run.rows[0].id));
+    });
+  }
+
+  async getWorkflowRun(actor: RepositoryActor, runId: string): Promise<WorkflowRunRecord> {
+    return this.#transaction({ kind: "app", actor }, (client) => this.#workflowRun(client, actor, runId));
+  }
+
+  async listWorkflowTasks(actor: RepositoryActor, runId: string): Promise<WorkflowTaskRecord[]> {
+    return this.#transaction({ kind: "app", actor }, async (client) => {
+      await this.#workflowRun(client, actor, runId);
+      const result = await client.query(
+        "select task.* from private.workflow_tasks task where workflow_run_id = $1 " +
+        "and organization_id = $2 order by created_at, id limit 100",
+        [runId, actor.organizationId]
+      );
+      return result.rows.map(mapWorkflowTask);
+    });
+  }
+
+  async listWorkflowEvents(actor: RepositoryActor, runId: string): Promise<WorkflowEventRecord[]> {
+    return this.#transaction({ kind: "app", actor }, async (client) => {
+      await this.#workflowRun(client, actor, runId);
+      const result = await client.query(
+        "select id, organization_id, project_id, workflow_run_id, task_id, sequence, version, " +
+        "event_type, code, created_at from public.workflow_events where workflow_run_id = $1 " +
+        "and organization_id = $2 order by sequence limit 1000",
+        [runId, actor.organizationId]
+      );
+      return result.rows.map(mapWorkflowEvent);
+    });
+  }
+
+  async listWorkflowEvidence(actor: RepositoryActor, runId: string): Promise<WorkflowEvidenceLink[]> {
+    return this.#transaction({ kind: "app", actor }, async (client) => {
+      await this.#workflowRun(client, actor, runId);
+      const result = await client.query(
+        "select id, organization_id, project_id, workflow_run_id, task_id, evidence_id, reference, created_at " +
+        "from public.workflow_evidence where workflow_run_id = $1 and organization_id = $2 order by reference limit 1000",
+        [runId, actor.organizationId]
+      );
+      return result.rows.map(mapWorkflowEvidence);
+    });
+  }
+
+  async listWorkflowCapabilityPlans(actor: RepositoryActor, runId: string): Promise<WorkflowCapabilityPlanLink[]> {
+    return this.#transaction({ kind: "app", actor }, async (client) => {
+      await this.#workflowRun(client, actor, runId);
+      const result = await client.query(
+        "select id, organization_id, project_id, workflow_run_id, task_id, capability_id, plan_digest, created_at " +
+        "from public.capability_plans where workflow_run_id = $1 and organization_id = $2 order by plan_digest limit 1000",
+        [runId, actor.organizationId]
+      );
+      return result.rows.map(mapWorkflowCapabilityPlan);
+    });
+  }
+
+  async claimWorkflowTask(workerId: string): Promise<ClaimedWorkflowTaskRecord | undefined> {
+    assertWorkflowWorkerId(workerId);
+    return this.#transaction({ kind: "worker" }, async (client) => {
+      const candidate = await client.query(
+        "select task.id, task.organization_id, task.workflow_run_id from private.workflow_tasks task " +
+        "join public.workflow_runs run on run.id = task.workflow_run_id " +
+        "where task.phase <> 'analysis' and task.attempts < task.max_attempts " +
+        "and run.cancel_requested_at is null and run.status not in ('succeeded','failed','cancelled') " +
+        "and ((task.status = 'queued' and task.available_at <= now()) " +
+        "or (task.status = 'running' and task.lease_expires_at <= now())) " +
+        "and (select count(*) from private.workflow_tasks active where active.organization_id = task.organization_id " +
+        "and active.status = 'running' and active.lease_expires_at > now()) < $1 " +
+        "order by coalesce((select max(event.created_at) from public.workflow_events event " +
+        "where event.organization_id = task.organization_id and event.event_type = 'task.claimed'), '-infinity'), " +
+        "task.available_at, task.created_at, task.id limit 1",
+        [this.#activeTaskQuota]
+      );
+      if (!candidate.rows[0]) return undefined;
+      await client.query("select pg_advisory_xact_lock(hashtextextended($1, 0))", [String(candidate.rows[0].organization_id)]);
+      const runLock = await client.query(
+        "select id from public.workflow_runs where id = $1 and cancel_requested_at is null " +
+        "and status not in ('succeeded','failed','cancelled') for update",
+        [candidate.rows[0].workflow_run_id]
+      );
+      if (!runLock.rows[0]) return undefined;
+      const taskLock = await client.query(
+        "select id from private.workflow_tasks where id = $1 and attempts < max_attempts " +
+        "and ((status = 'queued' and available_at <= now()) " +
+        "or (status = 'running' and lease_expires_at <= now())) for update skip locked",
+        [candidate.rows[0].id]
+      );
+      if (!taskLock.rows[0]) return undefined;
+      const active = await client.query(
+        "select count(*)::integer as count from private.workflow_tasks where organization_id = $1 " +
+        "and status = 'running' and lease_expires_at > now()",
+        [candidate.rows[0].organization_id]
+      );
+      if (Number(active.rows[0]?.count) >= this.#activeTaskQuota) return undefined;
+      const claimed = await client.query(
+        "update private.workflow_tasks set status = 'running', attempts = attempts + 1, " +
+        "lease_generation = lease_generation + 1, lease_owner = $2, " +
+        "lease_expires_at = now() + ($3::integer * interval '1 millisecond'), error_code = null, updated_at = now() " +
+        "where id = $1 returning *",
+        [candidate.rows[0].id, workerId, WORKFLOW_LEASE_MS]
+      );
+      const task = mapWorkflowTask(claimed.rows[0]) as ClaimedWorkflowTaskRecord;
+      await client.query(
+        "update public.workflow_runs set status = 'running', current_phase = $2, error_code = null, updated_at = now() " +
+        "where id = $1 and cancel_requested_at is null",
+        [task.workflowRunId, task.phase]
+      );
+      await client.query("select private.append_workflow_event($1, $2, 'task.claimed', null)", [task.workflowRunId, task.id]);
+      return task;
+    });
+  }
+
+  async assertWorkflowTaskLease(workerId: string, taskId: string, leaseGeneration: number): Promise<void> {
+    await this.#transaction({ kind: "worker" }, async (client) => {
+      await this.#assertWorkerWorkflowLease(client, workerId, taskId, leaseGeneration);
+    });
+  }
+
+  async heartbeatWorkflowTask(
+    workerId: string,
+    taskId: string,
+    leaseGeneration: number,
+  ): Promise<WorkflowTaskRecord> {
+    return this.#transaction({ kind: "worker" }, async (client) => {
+      const cancelled = await client.query(
+        "select run.cancel_requested_at from private.workflow_tasks task join public.workflow_runs run " +
+        "on run.id = task.workflow_run_id where task.id = $1 for update of run",
+        [taskId]
+      );
+      if (cancelled.rows[0]?.cancel_requested_at) throw new RepositoryError("CANCELLED");
+      const result = await client.query(
+        "update private.workflow_tasks set lease_expires_at = now() + ($4::integer * interval '1 millisecond'), " +
+        "updated_at = now() where id = $1 and status = 'running' and lease_owner = $2 " +
+        "and lease_generation = $3 and lease_expires_at > now() returning *",
+        [taskId, workerId, leaseGeneration, WORKFLOW_LEASE_MS]
+      );
+      if (!result.rows[0]) throw new RepositoryError("LEASE_LOST");
+      const task = mapWorkflowTask(result.rows[0]);
+      await client.query("select private.append_workflow_event($1, $2, 'task.heartbeat', null)", [task.workflowRunId, task.id]);
+      return task;
+    });
+  }
+
+  async completeWorkflowTask(
+    workerId: string,
+    taskId: string,
+    leaseGeneration: number,
+    input: CompleteWorkflowTaskInput,
+  ): Promise<WorkflowTaskCompletion> {
+    validateWorkflowReference(input.checkpointReference);
+    validateWorkflowReference(input.outputReference);
+    return this.#transaction({ kind: "worker" }, async (client) => {
+      let task = await this.#workerWorkflowTask(client, taskId);
+      const run = await this.#workerWorkflowRun(client, task.workflowRunId, true);
+      task = await this.#workerWorkflowTask(client, taskId, true);
+      const scope = `complete:${taskId}`;
+      const replay = await this.#workflowCommand(client, task.workflowRunId, scope, input.idempotencyKey, input.inputHash);
+      if (replay) {
+        const replayTask = await this.#workerWorkflowTask(client, String(replay.taskId));
+        const replayRun = await this.#workerWorkflowRun(client, replayTask.workflowRunId);
+        const nextTask = replay.nextTaskId
+          ? await this.#workerWorkflowTask(client, String(replay.nextTaskId))
+          : undefined;
+        return { run: replayRun, task: replayTask, ...(nextTask ? { nextTask } : {}) };
+      }
+      if (run.cancelRequestedAt || run.status === "cancelled") throw new RepositoryError("CANCELLED");
+      await this.#assertWorkerWorkflowLease(client, workerId, task.id, leaseGeneration);
+      const outputHash = stableHash(canonicalJson({
+        checkpointReference: input.checkpointReference,
+        commandInputHash: stableHash(input.inputHash),
+        outputReference: input.outputReference,
+      }));
+      const completed = await client.query(
+        "update private.workflow_tasks set status = 'succeeded', output_hash = $2, " +
+        "checkpoint_reference = $3, output_reference = $4, lease_owner = null, lease_expires_at = null, " +
+        "retry_classification = null, error_code = null, updated_at = now() where id = $1 returning *",
+        [task.id, outputHash, input.checkpointReference ?? null, input.outputReference ?? null]
+      );
+      const completedTask = mapWorkflowTask(completed.rows[0]);
+      await client.query("select private.append_workflow_event($1, $2, 'task.completed', null)", [run.id, task.id]);
+      const nextPhase = task.phase === "analysis" ? undefined : workflowPhase(task.phase).next;
+      let nextTask: WorkflowTaskRecord | undefined;
+      if (nextPhase) {
+        await client.query(
+          "update public.workflow_runs set status = 'queued', current_phase = $2, error_code = null, updated_at = now() " +
+          "where id = $1",
+          [run.id, nextPhase]
+        );
+        const next = await client.query(
+          "insert into private.workflow_tasks " +
+          "(organization_id, project_id, workflow_run_id, phase, status, idempotency_key, input_hash) " +
+          "values ($1, $2, $3, $4, 'queued', $5, $6) on conflict (workflow_run_id, phase) do nothing returning *",
+          [run.organizationId, run.projectId, run.id, nextPhase,
+            workflowTaskIdempotencyKey(run.id, nextPhase, outputHash), outputHash]
+        );
+        if (!next.rows[0]) {
+          const existing = await client.query(
+            "select * from private.workflow_tasks where workflow_run_id = $1 and phase = $2 limit 1",
+            [run.id, nextPhase]
+          );
+          if (!existing.rows[0]) throw new RepositoryError("INVALID_STATE");
+          nextTask = mapWorkflowTask(existing.rows[0]);
+        } else {
+          nextTask = mapWorkflowTask(next.rows[0]);
+          await client.query("select private.append_workflow_event($1, $2, 'task.created', null)", [run.id, nextTask.id]);
+        }
+      } else {
+        await client.query(
+          "update public.workflow_runs set status = 'succeeded', error_code = null, updated_at = now() where id = $1",
+          [run.id]
+        );
+        await client.query("select private.append_workflow_event($1, null, 'workflow.completed', null)", [run.id]);
+        await client.query("update public.projects set status = 'analyzed' where id = $1", [run.projectId]);
+      }
+      await this.#recordWorkflowCommand(client, run.id, task.id, scope, input.idempotencyKey, input.inputHash, {
+        taskId: completedTask.id,
+        ...(nextTask ? { nextTaskId: nextTask.id } : {}),
+      });
+      return {
+        run: await this.#workerWorkflowRun(client, run.id),
+        task: completedTask,
+        ...(nextTask ? { nextTask } : {}),
+      };
+    });
+  }
+
+  async failWorkflowTask(
+    workerId: string,
+    taskId: string,
+    leaseGeneration: number,
+    input: FailWorkflowTaskInput,
+  ): Promise<WorkflowTaskRecord> {
+    validateWorkflowErrorCode(input.errorCode);
+    return this.#transaction({ kind: "worker" }, async (client) => {
+      let task = await this.#workerWorkflowTask(client, taskId);
+      const run = await this.#workerWorkflowRun(client, task.workflowRunId, true);
+      task = await this.#workerWorkflowTask(client, taskId, true);
+      const scope = `fail:${taskId}`;
+      const replay = await this.#workflowCommand(client, task.workflowRunId, scope, input.idempotencyKey, input.inputHash);
+      if (replay) return this.#workerWorkflowTask(client, String(replay.taskId));
+      if (run.cancelRequestedAt || run.status === "cancelled") throw new RepositoryError("CANCELLED");
+      await this.#assertWorkerWorkflowLease(client, workerId, task.id, leaseGeneration);
+      const terminal = input.classification === "permanent" || task.attempts >= task.maxAttempts;
+      const retryDelayMs = terminal ? 0 : workflowRetryDelayMs(
+        task.attempts,
+        input.classification === "rate_limited" ? input.retryAfterMs : undefined,
+        this.#random,
+      );
+      const result = await client.query(
+        "update private.workflow_tasks set status = $2, retry_classification = $3, error_code = $4, " +
+        "available_at = case when $2 = 'queued' then now() + ($5::integer * interval '1 millisecond') else available_at end, " +
+        "lease_owner = null, lease_expires_at = null, updated_at = now() where id = $1 returning *",
+        [task.id, terminal ? "failed" : "queued", input.classification, input.errorCode, retryDelayMs]
+      );
+      const failed = mapWorkflowTask(result.rows[0]);
+      await client.query(
+        "update public.workflow_runs set status = $2, error_code = $3, updated_at = now() where id = $1",
+        [run.id, terminal ? "failed" : "queued", input.errorCode]
+      );
+      await client.query(
+        "select private.append_workflow_event($1, $2, $3, $4)",
+        [run.id, task.id, terminal ? "task.failed" : "task.retry_scheduled", input.errorCode]
+      );
+      if (terminal) {
+        await client.query("select private.append_workflow_event($1, null, 'workflow.failed', $2)", [run.id, input.errorCode]);
+        await client.query("update public.projects set status = 'failed' where id = $1", [run.projectId]);
+      }
+      await this.#recordWorkflowCommand(client, run.id, task.id, scope, input.idempotencyKey, input.inputHash, {
+        taskId: failed.id,
+      });
+      return failed;
+    });
+  }
+
+  async waitWorkflowTask(
+    workerId: string,
+    taskId: string,
+    leaseGeneration: number,
+    input: WaitWorkflowTaskInput,
+  ): Promise<Readonly<{ task: WorkflowTaskRecord; waitToken: string }>> {
+    validateWorkflowWait(input.reason, input.expiresAt);
+    return this.#transaction({ kind: "worker" }, async (client) => {
+      let task = await this.#workerWorkflowTask(client, taskId);
+      const run = await this.#workerWorkflowRun(client, task.workflowRunId, true);
+      task = await this.#workerWorkflowTask(client, taskId, true);
+      if (run.cancelRequestedAt || run.status === "cancelled") throw new RepositoryError("CANCELLED");
+      await this.#assertWorkerWorkflowLease(client, workerId, task.id, leaseGeneration);
+      const waitToken = randomUUID().replaceAll("-", "");
+      const waiting = await client.query(
+        "update private.workflow_tasks set status = 'waiting', wait_key_hash = $2, wait_reason = $3, " +
+        "wait_expires_at = $4::timestamptz, lease_owner = null, lease_expires_at = null, updated_at = now() " +
+        "where id = $1 returning *",
+        [task.id, stableHash(waitToken), input.reason, input.expiresAt]
+      );
+      await client.query("update public.workflow_runs set status = 'waiting', updated_at = now() where id = $1", [run.id]);
+      await client.query("select private.append_workflow_event($1, $2, 'task.waiting', null)", [run.id, task.id]);
+      return { task: mapWorkflowTask(waiting.rows[0]), waitToken };
+    });
+  }
+
+  async resumeWorkflowTask(actor: RepositoryActor, input: ResumeWorkflowTaskInput): Promise<WorkflowTaskRecord> {
+    if (actor.role === "viewer") throw new RepositoryError("FORBIDDEN");
+    if (!/^[A-Za-z0-9_-]{32,128}$/.test(input.waitToken)) throw new RepositoryError("INVALID_STATE");
+    return this.#transaction({ kind: "app", actor }, async (client) => {
+      const scope = `resume:${input.runId}`;
+      const runResult = await client.query(
+        "select * from public.workflow_runs where id = $1 and organization_id = $2 for update",
+        [input.runId, actor.organizationId]
+      );
+      if (!runResult.rows[0]) throw new RepositoryError("NOT_FOUND");
+      const run = mapWorkflowRun(runResult.rows[0]);
+      const replay = await this.#workflowCommand(client, input.runId, scope, input.idempotencyKey, input.inputHash);
+      if (replay) {
+        const task = await client.query(
+          "select * from private.workflow_tasks where id = $1 and organization_id = $2 limit 1",
+          [String(replay.taskId), actor.organizationId]
+        );
+        if (!task.rows[0]) throw new RepositoryError("NOT_FOUND");
+        return mapWorkflowTask(task.rows[0]);
+      }
+      if (run.cancelRequestedAt || run.status === "cancelled") throw new RepositoryError("CANCELLED");
+      const taskResult = await client.query(
+        "select * from private.workflow_tasks where workflow_run_id = $1 and organization_id = $2 " +
+        "and wait_key_hash = $3 for update limit 1",
+        [run.id, actor.organizationId, stableHash(input.waitToken)]
+      );
+      if (!taskResult.rows[0]) throw new RepositoryError("INVALID_STATE");
+      const task = mapWorkflowTask(taskResult.rows[0]);
+      if (task.status !== "waiting") throw new RepositoryError("INVALID_STATE");
+      if (!task.waitExpiresAt || new Date(task.waitExpiresAt) <= new Date()) throw new RepositoryError("WAIT_EXPIRED");
+      const resumed = await client.query(
+        "update private.workflow_tasks set status = 'queued', resumed_at = now(), available_at = now(), updated_at = now() " +
+        "where id = $1 returning *",
+        [task.id]
+      );
+      await client.query("update public.workflow_runs set status = 'queued', updated_at = now() where id = $1", [run.id]);
+      await client.query("select private.append_workflow_event($1, $2, 'task.resumed', null)", [run.id, task.id]);
+      await this.#recordWorkflowCommand(client, run.id, task.id, scope, input.idempotencyKey, input.inputHash, {
+        taskId: task.id,
+      });
+      return mapWorkflowTask(resumed.rows[0]);
+    });
+  }
+
+  async cancelWorkflow(actor: RepositoryActor, input: CancelWorkflowInput): Promise<WorkflowRunRecord> {
+    if (actor.role === "viewer") throw new RepositoryError("FORBIDDEN");
+    return this.#transaction({ kind: "app", actor }, async (client) => {
+      const locked = await client.query(
+        "select * from public.workflow_runs where id = $1 and organization_id = $2 for update",
+        [input.runId, actor.organizationId]
+      );
+      if (!locked.rows[0]) throw new RepositoryError("NOT_FOUND");
+      const run = mapWorkflowRun(locked.rows[0]);
+      const scope = `cancel:${run.id}`;
+      const replay = await this.#workflowCommand(client, run.id, scope, input.idempotencyKey, input.inputHash);
+      if (replay) return this.#workerWorkflowRun(client, String(replay.runId));
+      if (["succeeded", "failed", "cancelled"].includes(run.status)) throw new RepositoryError("INVALID_STATE");
+      await client.query(
+        "update public.workflow_runs set cancel_requested_at = now(), updated_at = now() where id = $1",
+        [run.id]
+      );
+      await client.query("select private.append_workflow_event($1, null, 'workflow.cancel_requested', null)", [run.id]);
+      const cancelledTasks = await client.query(
+        "update private.workflow_tasks set status = 'cancelled', cancel_requested_at = now(), cancelled_at = now(), " +
+        "lease_owner = null, lease_expires_at = null, updated_at = now() where workflow_run_id = $1 " +
+        "and status in ('queued','running','waiting') returning id",
+        [run.id]
+      );
+      for (const task of cancelledTasks.rows) {
+        await client.query("select private.append_workflow_event($1, $2, 'task.cancelled', null)", [run.id, task.id]);
+      }
+      await client.query(
+        "update public.workflow_runs set status = 'cancelled', cancelled_at = now(), updated_at = now() where id = $1",
+        [run.id]
+      );
+      await client.query("select private.append_workflow_event($1, null, 'workflow.cancelled', null)", [run.id]);
+      if (run.analysisRunId) {
+        await client.query(
+          "update private.analysis_jobs set status = 'cancelled', lease_owner = null, lease_expires_at = null, " +
+          "updated_at = now() where analysis_run_id = $1 and status in ('queued','running')",
+          [run.analysisRunId]
+        );
+      }
+      await this.#recordWorkflowCommand(client, run.id, undefined, scope, input.idempotencyKey, input.inputHash, {
+        runId: run.id,
+      });
+      return this.#workerWorkflowRun(client, run.id);
+    });
+  }
+
+  async reconcileWorkflows(workerId: string): Promise<number> {
+    assertWorkflowWorkerId(workerId);
+    return this.#transaction({ kind: "worker" }, async (client) => {
+      let repaired = 0;
+      const expired = await client.query(
+        "select task.* from private.workflow_tasks task join public.workflow_runs run on run.id = task.workflow_run_id " +
+        "where task.phase <> 'analysis' and task.status = 'running' and task.lease_expires_at <= now() " +
+        "and run.cancel_requested_at is null and run.status not in ('succeeded','failed','cancelled') " +
+        "order by task.lease_expires_at, task.id limit 100"
+      );
+      for (const row of expired.rows) {
+        const task = mapWorkflowTask(row);
+        const runLock = await client.query(
+          "select id from public.workflow_runs where id = $1 and cancel_requested_at is null " +
+          "and status not in ('succeeded','failed','cancelled') for update",
+          [task.workflowRunId]
+        );
+        if (!runLock.rows[0]) continue;
+        const taskLock = await client.query(
+          "select id from private.workflow_tasks where id = $1 and status = 'running' " +
+          "and lease_expires_at <= now() for update skip locked",
+          [task.id]
+        );
+        if (!taskLock.rows[0]) continue;
+        const terminal = task.attempts >= task.maxAttempts;
+        await client.query(
+          "update private.workflow_tasks set status = $2, lease_owner = null, lease_expires_at = null, " +
+          "available_at = now(), reconciled_at = now(), error_code = case when $2 = 'failed' " +
+          "then 'ATTEMPTS_EXHAUSTED' else error_code end, updated_at = now() where id = $1",
+          [task.id, terminal ? "failed" : "queued"]
+        );
+        await client.query(
+          "update public.workflow_runs set status = $2, error_code = case when $2 = 'failed' " +
+          "then 'ATTEMPTS_EXHAUSTED' else error_code end, updated_at = now() where id = $1",
+          [task.workflowRunId, terminal ? "failed" : "queued"]
+        );
+        await client.query(
+          "select private.append_workflow_event($1, $2, 'task.reconciled', $3)",
+          [task.workflowRunId, task.id, terminal ? "ATTEMPTS_EXHAUSTED" : null]
+        );
+        await client.query("select private.append_workflow_event($1, null, 'workflow.reconciled', null)", [task.workflowRunId]);
+        repaired += 1;
+      }
+      const missing = await client.query(
+        "select task.* from private.workflow_tasks task join public.workflow_runs run on run.id = task.workflow_run_id " +
+        "where task.phase <> 'analysis' and task.status = 'succeeded' " +
+        "and run.status in ('queued','running','waiting') order by task.updated_at, task.id limit 100"
+      );
+      for (const row of missing.rows) {
+        const task = mapWorkflowTask(row);
+        if (task.phase === "analysis") continue;
+        const nextPhase = workflowPhase(task.phase).next;
+        if (!nextPhase) continue;
+        const run = await this.#workerWorkflowRun(client, task.workflowRunId, true);
+        if (run.cancelRequestedAt || ["succeeded", "failed", "cancelled"].includes(run.status)) continue;
+        const exists = await client.query(
+          "select id from private.workflow_tasks where workflow_run_id = $1 and phase = $2 limit 1",
+          [task.workflowRunId, nextPhase]
+        );
+        if (exists.rows[0]) continue;
+        const inputHash = task.outputHash ?? task.inputHash;
+        const created = await client.query(
+          "insert into private.workflow_tasks " +
+          "(organization_id, project_id, workflow_run_id, phase, status, idempotency_key, input_hash, reconciled_at) " +
+          "values ($1, $2, $3, $4, 'queued', $5, $6, now()) returning id",
+          [run.organizationId, run.projectId, run.id, nextPhase,
+            workflowTaskIdempotencyKey(run.id, nextPhase, inputHash), inputHash]
+        );
+        await client.query(
+          "update public.workflow_runs set status = 'queued', current_phase = $2, updated_at = now() where id = $1",
+          [run.id, nextPhase]
+        );
+        await client.query("select private.append_workflow_event($1, $2, 'task.created', null)", [run.id, created.rows[0].id]);
+        await client.query("select private.append_workflow_event($1, null, 'workflow.reconciled', null)", [run.id]);
+        repaired += 1;
+      }
+      return repaired;
+    });
+  }
+
   async #workerAnalysis(db: Db, id: string): Promise<AnalysisRunRecord> {
     const result = await db.query(
       "select ar.id, ar.organization_id, ar.project_id, ar.requested_by, ar.status, ar.attempts, " +
@@ -266,51 +947,126 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
       const exhausted = await client.query(
         "select analysis_run_id from private.analysis_jobs where status = 'running' " +
         "and lease_expires_at <= now() and attempts >= 3 order by lease_expires_at, analysis_run_id " +
-        "for update skip locked limit 100"
+        "limit 100"
       );
-      if (exhausted.rowCount) {
-        const exhaustedIds = exhausted.rows.map((row) => row.analysis_run_id);
+      for (const exhaustedJob of exhausted.rows) {
+        const exhaustedRunId = String(exhaustedJob.analysis_run_id);
+        const runLock = await client.query(
+          "select id from public.workflow_runs where id = $1 and cancel_requested_at is null " +
+          "and status = 'running' for update",
+          [exhaustedRunId]
+        );
+        if (!runLock.rows[0]) continue;
+        const jobLock = await client.query(
+          "select analysis_run_id from private.analysis_jobs where analysis_run_id = $1 and status = 'running' " +
+          "and lease_expires_at <= now() and attempts >= 3 for update skip locked",
+          [exhaustedRunId]
+        );
+        if (!jobLock.rows[0]) continue;
         await client.query(
-          "update public.analysis_runs set error_code = 'ATTEMPTS_EXHAUSTED', updated_at = now() " +
-          "where id = any($1::uuid[]) and status = 'running'",
-          [exhaustedIds]
+          "update public.analysis_runs set error_code = 'ATTEMPTS_EXHAUSTED', updated_at = now() where id = $1",
+          [exhaustedRunId]
         );
         await client.query(
           "update private.analysis_jobs set status = 'failed', lease_owner = null, lease_expires_at = null, " +
-          "updated_at = now() where analysis_run_id = any($1::uuid[]) and status = 'running'",
-          [exhaustedIds]
+          "updated_at = now() where analysis_run_id = $1",
+          [exhaustedRunId]
         );
+        const workflowTask = await client.query(
+          "update private.workflow_tasks set status = 'failed', error_code = 'ATTEMPTS_EXHAUSTED', " +
+          "lease_owner = null, lease_expires_at = null, updated_at = now() " +
+          "where workflow_run_id = $1 and phase = 'analysis' and status = 'running' returning id",
+          [exhaustedRunId]
+        );
+        if (workflowTask.rows[0]) {
+          await client.query(
+            "update public.workflow_runs set status = 'failed', error_code = 'ATTEMPTS_EXHAUSTED', updated_at = now() where id = $1",
+            [exhaustedRunId]
+          );
+          await client.query(
+            "select private.append_workflow_event($1, $2, 'task.failed', 'ATTEMPTS_EXHAUSTED')",
+            [exhaustedRunId, workflowTask.rows[0].id]
+          );
+          await client.query(
+            "select private.append_workflow_event($1, null, 'workflow.failed', 'ATTEMPTS_EXHAUSTED')",
+            [exhaustedRunId]
+          );
+        }
       }
       const candidate = await client.query(
-        "select analysis_run_id from private.analysis_jobs " +
-        "where ((status = 'queued' and available_at <= now()) or " +
-        "(status = 'running' and lease_expires_at <= now())) and attempts < 3 " +
-        "order by available_at, created_at, analysis_run_id for update skip locked limit 1"
+        "select job.analysis_run_id, job.organization_id from private.analysis_jobs job " +
+        "where ((job.status = 'queued' and job.available_at <= now()) or " +
+        "(job.status = 'running' and job.lease_expires_at <= now())) and job.attempts < 3 " +
+        "and (select count(*) from private.workflow_tasks active where active.organization_id = job.organization_id " +
+        "and active.status = 'running' and active.lease_expires_at > now()) < $1 " +
+        "order by coalesce((select max(event.created_at) from public.workflow_events event " +
+        "where event.organization_id = job.organization_id and event.event_type = 'task.claimed'), '-infinity'), " +
+        "job.available_at, job.created_at, job.analysis_run_id limit 1",
+        [this.#activeTaskQuota]
       );
       const runId = candidate.rows[0]?.analysis_run_id;
       if (!runId) return undefined;
+      await client.query("select pg_advisory_xact_lock(hashtextextended($1, 0))", [String(candidate.rows[0].organization_id)]);
+      const runLock = await client.query(
+        "select id from public.workflow_runs where id = $1 and cancel_requested_at is null " +
+        "and status not in ('succeeded','failed','cancelled') for update",
+        [runId]
+      );
+      if (!runLock.rows[0]) return undefined;
+      const jobLock = await client.query(
+        "select analysis_run_id from private.analysis_jobs where analysis_run_id = $1 and attempts < 3 " +
+        "and ((status = 'queued' and available_at <= now()) " +
+        "or (status = 'running' and lease_expires_at <= now())) for update skip locked",
+        [runId]
+      );
+      if (!jobLock.rows[0]) return undefined;
+      const active = await client.query(
+        "select count(*)::integer as count from private.workflow_tasks where organization_id = $1 " +
+        "and status = 'running' and lease_expires_at > now()",
+        [candidate.rows[0].organization_id]
+      );
+      if (Number(active.rows[0]?.count) >= this.#activeTaskQuota) return undefined;
       const boundedLease = Math.max(1_000, Math.min(leaseMs, 300_000));
       const job = await client.query(
         "update private.analysis_jobs set status = 'running', attempts = attempts + 1, lease_owner = $2, " +
         "lease_expires_at = now() + ($3::integer * interval '1 millisecond'), updated_at = now() " +
-        "where analysis_run_id = $1 returning lease_owner, lease_expires_at, source_type, source_url",
+        "where analysis_run_id = $1 returning attempts, lease_owner, lease_expires_at, source_type, source_url",
         [runId, workerId, boundedLease]
       );
+      const workflowTaskResult = await client.query(
+        "update private.workflow_tasks set status = 'running', attempts = $2, " +
+        "lease_generation = lease_generation + 1, lease_owner = $3, lease_expires_at = $4, " +
+        "error_code = null, updated_at = now() where workflow_run_id = $1 and phase = 'analysis' " +
+        "and status in ('queued','running') returning *",
+        [runId, Number(job.rows[0].attempts), workerId, job.rows[0].lease_expires_at]
+      );
+      if (!workflowTaskResult.rows[0]) throw new RepositoryError("INVALID_STATE");
+      const workflowTask = mapWorkflowTask(workflowTaskResult.rows[0]);
+      await client.query(
+        "update public.workflow_runs set status = 'running', current_phase = 'analysis', error_code = null, updated_at = now() " +
+        "where id = $1 and cancel_requested_at is null",
+        [runId]
+      );
+      await client.query("select private.append_workflow_event($1, $2, 'task.claimed', null)", [runId, workflowTask.id]);
       const result = await client.query(
         "select ar.id, ar.organization_id, ar.project_id, ar.requested_by, ar.status, ar.attempts, " +
         "ar.error_code, ar.created_at, ar.updated_at, $2::text as lease_owner, $3::timestamptz as lease_expires_at, " +
-        "$4::text as source_type, $5::text as source_url " +
+        "$4::text as source_type, $5::text as source_url, $6::uuid as workflow_task_id, " +
+        "$7::bigint as lease_generation " +
         "from public.analysis_runs ar where ar.id = $1 limit 1",
-        [runId, job.rows[0].lease_owner, job.rows[0].lease_expires_at, job.rows[0].source_type, job.rows[0].source_url]
+        [runId, job.rows[0].lease_owner, job.rows[0].lease_expires_at, job.rows[0].source_type,
+          job.rows[0].source_url, workflowTask.id, workflowTask.leaseGeneration]
       );
       if (!result.rows[0]) throw new RepositoryError("INVALID_STATE");
       return mapClaimedAnalysis(result.rows[0]);
     });
   }
 
-  async heartbeatAnalysis(workerId: string, runId: string, leaseMs: number): Promise<void> {
+  async heartbeatAnalysis(workerId: string, runId: string, leaseMs: number, leaseGeneration?: number): Promise<void> {
     const boundedLease = Math.max(1_000, Math.min(leaseMs, 300_000));
     await this.#transaction({ kind: "worker" }, async (client) => {
+      const workflow = await this.#workerWorkflowRun(client, runId, true);
+      if (workflow.cancelRequestedAt || workflow.status === "cancelled") throw new RepositoryError("CANCELLED");
       const result = await client.query(
         "update private.analysis_jobs set lease_expires_at = now() + ($3::integer * interval '1 millisecond'), " +
         "updated_at = now() where analysis_run_id = $1 and status = 'running' and lease_owner = $2 " +
@@ -318,10 +1074,24 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
         [runId, workerId, boundedLease]
       );
       if (!result.rows[0]) throw new RepositoryError("LEASE_LOST");
+      const task = await client.query(
+        "update private.workflow_tasks set lease_expires_at = now() + ($4::integer * interval '1 millisecond'), " +
+        "updated_at = now() where workflow_run_id = $1 and phase = 'analysis' and status = 'running' " +
+        "and lease_owner = $2 and lease_generation = coalesce($3, lease_generation) " +
+        "and lease_expires_at > now() returning id",
+        [runId, workerId, leaseGeneration ?? null, boundedLease]
+      );
+      if (!task.rows[0]) throw new RepositoryError("LEASE_LOST");
+      await client.query("select private.append_workflow_event($1, $2, 'task.heartbeat', null)", [runId, task.rows[0].id]);
     });
   }
 
-  async completeAnalysis(workerId: string, runId: string, result: AnalysisResult): Promise<AnalysisRunRecord> {
+  async completeAnalysis(
+    workerId: string,
+    runId: string,
+    result: AnalysisResult,
+    leaseGeneration?: number,
+  ): Promise<AnalysisRunRecord> {
     if (result.capabilities.length > MAX_CAPABILITIES || result.evidence.length > MAX_EVIDENCE
       || result.release !== undefined && Buffer.byteLength(result.release.code) > MAX_RELEASE_BYTES) {
       throw new RepositoryError("INVALID_STATE");
@@ -346,16 +1116,23 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
     }
     const statuses = new Map(result.capabilities.map(({ plan, status }) => [plan.tool.name, status]));
     return this.#transaction({ kind: "worker" }, async (client) => {
+      const workflow = await this.#workerWorkflowRun(client, runId, true);
+      if (workflow.cancelRequestedAt || workflow.status === "cancelled") throw new RepositoryError("CANCELLED");
       const job = await client.query(
-        "select j.organization_id, ar.project_id from private.analysis_jobs j " +
+        "select j.organization_id, ar.project_id, task.id as workflow_task_id, " +
+        "task.lease_generation as workflow_lease_generation from private.analysis_jobs j " +
         "join public.analysis_runs ar on ar.id = j.analysis_run_id and ar.organization_id = j.organization_id " +
+        "join private.workflow_tasks task on task.workflow_run_id = j.analysis_run_id and task.phase = 'analysis' " +
         "where j.analysis_run_id = $1 and j.status = 'running' and j.lease_owner = $2 " +
-        "and j.lease_expires_at > now() for update of j",
-        [runId, workerId]
+        "and j.lease_expires_at > now() and task.status = 'running' and task.lease_owner = $2 " +
+        "and task.lease_expires_at > now() and task.lease_generation = coalesce($3, task.lease_generation) " +
+        "for update of j, task",
+        [runId, workerId, leaseGeneration ?? null]
       );
       if (!job.rows[0]) throw new RepositoryError("LEASE_LOST");
       const organizationId = String(job.rows[0].organization_id);
       const projectId = String(job.rows[0].project_id);
+      const workflowTaskId = String(job.rows[0].workflow_task_id);
       const normalizedEvidence = result.evidence.map((item) => normalizeEvidence(
         item,
         organizationId,
@@ -370,25 +1147,30 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
         organizationId, projectId, runId, new Date())) {
         throw new RepositoryError("INVALID_STATE");
       }
+      const insertedEvidence: Array<{ id: string; reference: string }> = [];
       for (const evidence of normalizedEvidence) {
         await client.query(
           "insert into public.analysis_evidence " +
-          "(organization_id, project_id, analysis_run_id, source, payload, content, reference, expires_at) " +
-          "values ($1, $2, $3, $4, $5::jsonb, $6, $7, $8::timestamptz)",
-          [organizationId, projectId, runId, evidence.source, JSON.stringify(evidence),
+          "(id, organization_id, project_id, analysis_run_id, source, payload, content, reference, expires_at) " +
+          "values ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9::timestamptz)",
+          [evidence.id, organizationId, projectId, runId, evidence.source, JSON.stringify(evidence),
             evidence.content, evidence.reference, evidence.expiresAt]
         );
+        insertedEvidence.push({ id: evidence.id, reference: evidence.reference });
       }
+      const insertedCapabilities: Array<{ id: string; planDigest: string }> = [];
       for (const plan of canonicalPlans) {
         const status = statuses.get(plan.tool.name) ?? "proposed";
         const planDigest = capabilityPlanDigest(plan);
+        const capabilityId = randomUUID();
         await client.query(
           "insert into public.capabilities " +
-          "(organization_id, project_id, analysis_run_id, stable_name, risk_tier, status, plan, plan_digest, " +
-          "reviewed_plan_digest, version) values ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, 1)",
-          [organizationId, projectId, runId, plan.tool.name, plan.effects.riskTier, status,
+          "(id, organization_id, project_id, analysis_run_id, stable_name, risk_tier, status, plan, plan_digest, " +
+          "reviewed_plan_digest, version) values ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, 1)",
+          [capabilityId, organizationId, projectId, runId, plan.tool.name, plan.effects.riskTier, status,
             JSON.stringify(plan), planDigest, plan.effects.riskTier === "R0" || status === "blocked" ? planDigest : null]
         );
+        insertedCapabilities.push({ id: capabilityId, planDigest });
       }
       const releaseHash = result.release === undefined
         ? null
@@ -407,26 +1189,95 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
         [runId, workerId]
       );
       if (!completed.rows[0]) throw new RepositoryError("LEASE_LOST");
+      const outputHash = stableHash(canonicalJson({
+        diagnostics: normalizedDiagnostics,
+        evidence: insertedEvidence.map(({ reference }) => reference).sort(compareStrings),
+        plans: insertedCapabilities.map(({ planDigest }) => planDigest).sort(compareStrings),
+        release: releaseHash ?? undefined,
+      }));
+      await client.query(
+        "update private.workflow_tasks set status = 'succeeded', output_hash = $2, output_reference = $3, " +
+        "lease_owner = null, lease_expires_at = null, error_code = null, updated_at = now() " +
+        "where id = $1 and lease_generation = coalesce($4, lease_generation)",
+        [workflowTaskId, outputHash,
+          releaseHash ? `urn:sha256:${releaseHash}` : insertedEvidence[0]?.reference ?? null,
+          leaseGeneration ?? null]
+      );
+      for (const evidence of insertedEvidence) {
+        await client.query(
+          "insert into public.workflow_evidence " +
+          "(organization_id, project_id, workflow_run_id, task_id, evidence_id, reference) " +
+          "values ($1, $2, $3, $4, $5, $6)",
+          [organizationId, projectId, runId, workflowTaskId, evidence.id, evidence.reference]
+        );
+      }
+      for (const capability of insertedCapabilities) {
+        await client.query(
+          "insert into public.capability_plans " +
+          "(organization_id, project_id, workflow_run_id, task_id, capability_id, plan_digest) " +
+          "values ($1, $2, $3, $4, $5, $6)",
+          [organizationId, projectId, runId, workflowTaskId, capability.id, capability.planDigest]
+        );
+      }
+      await client.query(
+        "update public.workflow_runs set status = 'succeeded', error_code = null, updated_at = now() where id = $1",
+        [runId]
+      );
+      await client.query("select private.append_workflow_event($1, $2, 'task.completed', null)", [runId, workflowTaskId]);
+      await client.query("select private.append_workflow_event($1, null, 'workflow.completed', null)", [runId]);
       return this.#workerAnalysis(client, runId);
     });
   }
 
-  async failAnalysis(workerId: string, runId: string, code: string, retryable: boolean): Promise<AnalysisRunRecord> {
+  async failAnalysis(
+    workerId: string,
+    runId: string,
+    code: string,
+    retryable: boolean,
+    leaseGeneration?: number,
+  ): Promise<AnalysisRunRecord> {
     return this.#transaction({ kind: "worker" }, async (client) => {
+      const workflow = await this.#workerWorkflowRun(client, runId, true);
+      if (workflow.cancelRequestedAt || workflow.status === "cancelled") throw new RepositoryError("CANCELLED");
       const job = await client.query(
-        "select attempts from private.analysis_jobs where analysis_run_id = $1 and status = 'running' " +
-        "and lease_owner = $2 and lease_expires_at > now() for update",
-        [runId, workerId]
+        "select job.attempts, task.id as workflow_task_id from private.analysis_jobs job " +
+        "join private.workflow_tasks task on task.workflow_run_id = job.analysis_run_id and task.phase = 'analysis' " +
+        "where job.analysis_run_id = $1 and job.status = 'running' and job.lease_owner = $2 " +
+        "and job.lease_expires_at > now() and task.status = 'running' and task.lease_owner = $2 " +
+        "and task.lease_expires_at > now() and task.lease_generation = coalesce($3, task.lease_generation) " +
+        "for update of job, task",
+        [runId, workerId, leaseGeneration ?? null]
       );
       if (!job.rows[0]) throw new RepositoryError("LEASE_LOST");
       const terminal = !retryable || Number(job.rows[0].attempts) >= 3;
+      const workflowCode = normalizeWorkflowErrorCode(code);
+      const retryDelayMs = terminal ? 0 : workflowRetryDelayMs(Number(job.rows[0].attempts), undefined, this.#random);
       await client.query("update public.analysis_runs set error_code = $2, updated_at = now() where id = $1", [runId, code.slice(0, 128)]);
       await client.query(
         "update private.analysis_jobs set status = $2, " +
-        "available_at = case when $2 = 'queued' then now() + interval '1 second' else available_at end, " +
+        "available_at = case when $2 = 'queued' then now() + ($3::integer * interval '1 millisecond') else available_at end, " +
         "lease_owner = null, lease_expires_at = null, updated_at = now() where analysis_run_id = $1",
-        [runId, terminal ? "failed" : "queued"]
+        [runId, terminal ? "failed" : "queued", retryDelayMs]
       );
+      await client.query(
+        "update private.workflow_tasks set status = $2, retry_classification = $3, error_code = $4, " +
+        "available_at = case when $2 = 'queued' then now() + ($5::integer * interval '1 millisecond') else available_at end, " +
+        "lease_owner = null, lease_expires_at = null, updated_at = now() where id = $1",
+        [job.rows[0].workflow_task_id, terminal ? "failed" : "queued",
+          retryable ? "transient" : "permanent", workflowCode, retryDelayMs]
+      );
+      await client.query(
+        "update public.workflow_runs set status = $2, error_code = $3, updated_at = now() where id = $1",
+        [runId, terminal ? "failed" : "queued", workflowCode]
+      );
+      await client.query(
+        "select private.append_workflow_event($1, $2, $3, $4)",
+        [runId, job.rows[0].workflow_task_id,
+          terminal ? "task.failed" : "task.retry_scheduled", workflowCode]
+      );
+      if (terminal) {
+        await client.query("select private.append_workflow_event($1, null, 'workflow.failed', $2)", [runId, workflowCode]);
+      }
       return this.#workerAnalysis(client, runId);
     });
   }
@@ -782,7 +1633,10 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
   async reset(): Promise<void> {
     if (process.env.NODE_ENV !== "test") throw new RepositoryError("FORBIDDEN");
     await this.#pool.query(
-      "truncate public.audit_events, public.releases, public.verification_runs, public.capability_reviews, " +
+      "truncate public.installations, public.verification_checks, public.capability_plans, public.workflow_evidence, " +
+      "public.workflow_events, private.workflow_commands, private.workflow_tasks, public.workflow_runs, " +
+      "public.source_snapshots, public.project_sources, public.audit_events, public.releases, " +
+      "public.verification_runs, public.capability_reviews, " +
       "public.analysis_evidence, public.capabilities, private.analysis_jobs, private.idempotency_keys, " +
       "public.analysis_runs, public.projects restart identity cascade"
     );
@@ -814,7 +1668,94 @@ function mapClaimedAnalysis(row: QueryResultRow): ClaimedAnalysisRunRecord {
   return {
     ...mapAnalysis(row),
     sourceType: row.source_type as SourceType,
-    sourceUrl: String(row.source_url)
+    sourceUrl: String(row.source_url),
+    workflowTaskId: String(row.workflow_task_id),
+    leaseGeneration: Number(row.lease_generation),
+  };
+}
+
+function mapProjectSource(row: QueryResultRow): ProjectSourceRecord {
+  return {
+    id: String(row.id), organizationId: String(row.organization_id), projectId: String(row.project_id),
+    sourceType: row.source_type as ProjectSourceRecord["sourceType"], sourceUrl: String(row.source_url),
+    version: Number(row.version), active: Boolean(row.active), createdAt: iso(row.created_at),
+  };
+}
+
+function mapSourceSnapshot(row: QueryResultRow): SourceSnapshotRecord {
+  return {
+    id: String(row.id), organizationId: String(row.organization_id), projectId: String(row.project_id),
+    projectSourceId: String(row.project_source_id), sourceIdentityHash: String(row.source_identity_hash),
+    ...(row.artifact_reference ? { artifactReference: String(row.artifact_reference) } : {}),
+    ...(row.content_hash ? { contentHash: String(row.content_hash) } : {}),
+    createdAt: iso(row.created_at),
+  };
+}
+
+function mapWorkflowRun(row: QueryResultRow): WorkflowRunRecord {
+  return {
+    id: String(row.id), organizationId: String(row.organization_id), projectId: String(row.project_id),
+    sourceSnapshotId: String(row.source_snapshot_id),
+    ...(row.analysis_run_id ? { analysisRunId: String(row.analysis_run_id) } : {}),
+    status: row.status as WorkflowRunRecord["status"], currentPhase: row.current_phase as WorkflowRunRecord["currentPhase"],
+    inputHash: String(row.input_hash), version: Number(row.version),
+    ...(row.cancel_requested_at ? { cancelRequestedAt: iso(row.cancel_requested_at) } : {}),
+    ...(row.cancelled_at ? { cancelledAt: iso(row.cancelled_at) } : {}),
+    ...(row.error_code ? { errorCode: String(row.error_code) } : {}),
+    createdAt: iso(row.created_at), updatedAt: iso(row.updated_at),
+  };
+}
+
+function mapWorkflowTask(row: QueryResultRow): WorkflowTaskRecord {
+  return {
+    id: String(row.id), organizationId: String(row.organization_id), projectId: String(row.project_id),
+    workflowRunId: String(row.workflow_run_id), phase: row.phase as WorkflowTaskRecord["phase"],
+    status: row.status as WorkflowTaskRecord["status"], idempotencyKey: String(row.idempotency_key),
+    inputHash: String(row.input_hash),
+    ...(row.output_hash ? { outputHash: String(row.output_hash) } : {}),
+    ...(row.checkpoint_reference ? { checkpointReference: String(row.checkpoint_reference) } : {}),
+    ...(row.output_reference ? { outputReference: String(row.output_reference) } : {}),
+    ...(row.wait_key_hash ? { waitKeyHash: String(row.wait_key_hash) } : {}),
+    ...(row.wait_reason ? { waitReason: String(row.wait_reason) } : {}),
+    ...(row.wait_expires_at ? { waitExpiresAt: iso(row.wait_expires_at) } : {}),
+    ...(row.resumed_at ? { resumedAt: iso(row.resumed_at) } : {}),
+    ...(row.cancel_requested_at ? { cancelRequestedAt: iso(row.cancel_requested_at) } : {}),
+    ...(row.cancelled_at ? { cancelledAt: iso(row.cancelled_at) } : {}),
+    leaseGeneration: Number(row.lease_generation),
+    ...(row.lease_owner ? { leaseOwner: String(row.lease_owner) } : {}),
+    ...(row.lease_expires_at ? { leaseExpiresAt: iso(row.lease_expires_at) } : {}),
+    attempts: Number(row.attempts), maxAttempts: Number(row.max_attempts),
+    ...(row.retry_classification ? { retryClassification: row.retry_classification as WorkflowTaskRecord["retryClassification"] } : {}),
+    ...(row.error_code ? { errorCode: String(row.error_code) } : {}),
+    availableAt: iso(row.available_at),
+    ...(row.reconciled_at ? { reconciledAt: iso(row.reconciled_at) } : {}),
+    createdAt: iso(row.created_at), updatedAt: iso(row.updated_at),
+  };
+}
+
+function mapWorkflowEvent(row: QueryResultRow): WorkflowEventRecord {
+  return {
+    id: String(row.id), organizationId: String(row.organization_id), projectId: String(row.project_id),
+    workflowRunId: String(row.workflow_run_id), ...(row.task_id ? { taskId: String(row.task_id) } : {}),
+    sequence: Number(row.sequence), version: Number(row.version), type: row.event_type as WorkflowEventRecord["type"],
+    ...(row.code ? { code: String(row.code) } : {}), createdAt: iso(row.created_at),
+  };
+}
+
+function mapWorkflowEvidence(row: QueryResultRow): WorkflowEvidenceLink {
+  return {
+    id: String(row.id), organizationId: String(row.organization_id), projectId: String(row.project_id),
+    workflowRunId: String(row.workflow_run_id), taskId: String(row.task_id),
+    ...(row.evidence_id ? { evidenceId: String(row.evidence_id) } : {}),
+    reference: String(row.reference), createdAt: iso(row.created_at),
+  };
+}
+
+function mapWorkflowCapabilityPlan(row: QueryResultRow): WorkflowCapabilityPlanLink {
+  return {
+    id: String(row.id), organizationId: String(row.organization_id), projectId: String(row.project_id),
+    workflowRunId: String(row.workflow_run_id), taskId: String(row.task_id), capabilityId: String(row.capability_id),
+    planDigest: String(row.plan_digest), createdAt: iso(row.created_at),
   };
 }
 
@@ -981,6 +1922,51 @@ function canonicalJson(value: unknown): string {
   }
 }
 
+function stableHash(value: string): string {
+  return /^[0-9a-f]{64}$/.test(value)
+    ? value
+    : createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+function workflowTaskIdempotencyKey(runId: string, phase: WorkflowTaskRecord["phase"], inputHash: string): string {
+  const normalizedHash = stableHash(inputHash);
+  return `wft_${stableHash(`${runId.length}:${runId}:${phase.length}:${phase}:${normalizedHash}`)}`;
+}
+
+function sourceIdentityMaterial(sourceType: string, sourceUrl: string): string {
+  return `${Buffer.byteLength(sourceType)}:${sourceType}:${Buffer.byteLength(sourceUrl)}:${sourceUrl}`;
+}
+
+function assertWorkflowWorkerId(workerId: string): void {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(workerId)) throw new RepositoryError("INVALID_STATE");
+}
+
+function assertWorkflowCommand(scope: string, key: string): void {
+  if (!/^[a-z][a-z0-9_:-]{0,127}$/.test(scope)
+    || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/.test(key)) throw new RepositoryError("INVALID_STATE");
+}
+
+function validateWorkflowReference(reference: string | undefined): void {
+  if (reference !== undefined && !/^urn:sha256:[0-9a-f]{64}$/.test(reference)) {
+    throw new RepositoryError("INVALID_STATE");
+  }
+}
+
+function validateWorkflowErrorCode(code: string): void {
+  if (!/^[A-Z][A-Z0-9_]{0,63}$/.test(code)) throw new RepositoryError("INVALID_STATE");
+}
+
+function normalizeWorkflowErrorCode(code: string): string {
+  return /^[A-Z][A-Z0-9_]{0,63}$/.test(code) ? code : "ANALYSIS_FAILED";
+}
+
+function validateWorkflowWait(reason: string, expiresAt: string): void {
+  const expiry = Date.parse(expiresAt);
+  const now = Date.now();
+  if (!/^[a-z][a-z0-9_]{0,63}$/.test(reason) || !Number.isFinite(expiry)
+    || expiry <= now || expiry - now > 24 * 60 * 60 * 1_000) throw new RepositoryError("INVALID_STATE");
+}
+
 function compareStrings(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
 }
@@ -991,6 +1977,7 @@ function mapPostgresError(error: unknown): unknown {
   if (error.code === "42501") return new RepositoryError("FORBIDDEN");
   if (error.code === "23505") {
     if (error.constraint === "analysis_runs_one_active_per_project_idx") return new RepositoryError("INVALID_STATE");
+    if (error.constraint === "workflow_runs_one_active_per_project_idx") return new RepositoryError("INVALID_STATE");
     if (error.constraint === "capabilities_run_name_key") return new RepositoryError("INVALID_STATE");
     return new RepositoryError("VERSION_CONFLICT");
   }

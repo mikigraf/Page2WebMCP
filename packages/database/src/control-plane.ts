@@ -3,6 +3,30 @@ import {
   canonicalizeCapabilityPlans,
   type CapabilityPlan,
 } from "../../capability-ir/src/plan.ts";
+import {
+  WORKFLOW_DEFAULT_ACTIVE_TASK_QUOTA,
+  WORKFLOW_LEASE_MS,
+  WORKFLOW_MAX_ATTEMPTS,
+  workflowPhase,
+  workflowRetryDelayMs,
+  type CancelWorkflowInput,
+  type ClaimedWorkflowTaskRecord,
+  type CompleteWorkflowTaskInput,
+  type FailWorkflowTaskInput,
+  type ProjectSourceRecord,
+  type ResumeWorkflowTaskInput,
+  type SourceSnapshotRecord,
+  type StartWorkflowInput,
+  type WaitWorkflowTaskInput,
+  type WorkflowCapabilityPlanLink,
+  type WorkflowEventRecord,
+  type WorkflowEventType,
+  type WorkflowEvidenceLink,
+  type WorkflowRepository,
+  type WorkflowRunRecord,
+  type WorkflowTaskCompletion,
+  type WorkflowTaskRecord,
+} from "./workflow.ts";
 
 export type RepositoryRole = "owner" | "editor" | "viewer";
 export type RepositoryActor = { id: string; organizationId: string; role: RepositoryRole };
@@ -36,6 +60,8 @@ export type AnalysisRunRecord = {
 export type ClaimedAnalysisRunRecord = Readonly<AnalysisRunRecord & {
   sourceType: SourceType;
   sourceUrl: string;
+  workflowTaskId: string;
+  leaseGeneration: number;
 }>;
 
 export type CapabilityRecord = {
@@ -152,7 +178,9 @@ export type RepositoryErrorCode =
   | "HIGH_RISK_ACTION"
   | "RELEASE_GATE_FAILED"
   | "INVALID_STATE"
-  | "LEASE_LOST";
+  | "LEASE_LOST"
+  | "CANCELLED"
+  | "WAIT_EXPIRED";
 
 export class RepositoryError extends Error {
   constructor(readonly code: RepositoryErrorCode, readonly details?: string[]) {
@@ -161,16 +189,16 @@ export class RepositoryError extends Error {
   }
 }
 
-export interface ControlPlaneRepository {
+export interface ControlPlaneRepository extends WorkflowRepository {
   createProject(actor: RepositoryActor, input: CreateProjectRequest): Promise<ProjectRecord>;
   listProjects(actor: RepositoryActor): Promise<ProjectRecord[]>;
   getProject(actor: RepositoryActor, id: string): Promise<ProjectRecord>;
   enqueueAnalysis(actor: RepositoryActor, input: IdempotentRequest): Promise<AnalysisRunRecord>;
   getAnalysis(actor: RepositoryActor, id: string): Promise<AnalysisRunRecord>;
   claimAnalysis(workerId: string, leaseMs: number): Promise<ClaimedAnalysisRunRecord | undefined>;
-  heartbeatAnalysis(workerId: string, runId: string, leaseMs: number): Promise<void>;
-  completeAnalysis(workerId: string, runId: string, result: AnalysisResult): Promise<AnalysisRunRecord>;
-  failAnalysis(workerId: string, runId: string, code: string, retryable: boolean): Promise<AnalysisRunRecord>;
+  heartbeatAnalysis(workerId: string, runId: string, leaseMs: number, leaseGeneration?: number): Promise<void>;
+  completeAnalysis(workerId: string, runId: string, result: AnalysisResult, leaseGeneration?: number): Promise<AnalysisRunRecord>;
+  failAnalysis(workerId: string, runId: string, code: string, retryable: boolean, leaseGeneration?: number): Promise<AnalysisRunRecord>;
   getAnalysisResult(actor: RepositoryActor, runId: string): Promise<AnalysisResult | undefined>;
   listCapabilities(actor: RepositoryActor, projectId: string): Promise<CapabilityRecord[]>;
   listAnalysisCapabilities(actor: RepositoryActor, runId: string): Promise<CapabilityRecord[]>;
@@ -183,6 +211,20 @@ export interface ControlPlaneRepository {
 }
 
 type IdempotencyRecord = { inputHash: string; resultId: string; expiresAt: string };
+type WorkflowCommandRecord = Readonly<{ inputHash: string; result: unknown }>;
+type WaitTokenRecord = Readonly<{
+  workflowRunId: string;
+  taskId: string;
+  expiresAt: string;
+  consumedAt?: string;
+  resumeIdempotencyKey?: string;
+  resumeInputHash?: string;
+}>;
+
+type InMemoryRepositoryOptions = Readonly<{
+  random?: () => number;
+  activeTaskQuota?: number;
+}>;
 
 const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1_000;
 const MAX_PROJECTS = 500;
@@ -268,9 +310,23 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
   readonly #idempotency = new Map<string, IdempotencyRecord>();
   readonly #analysisAvailableAt = new Map<string, string>();
   readonly #analysisSources = new Map<string, Readonly<{ sourceType: SourceType; sourceUrl: string }>>();
+  readonly #projectSources = new Map<string, ProjectSourceRecord>();
+  readonly #sourceSnapshots = new Map<string, SourceSnapshotRecord>();
+  readonly #workflowRuns = new Map<string, WorkflowRunRecord>();
+  readonly #workflowTasks = new Map<string, WorkflowTaskRecord>();
+  readonly #workflowEvents = new Map<string, WorkflowEventRecord[]>();
+  readonly #workflowEvidence = new Map<string, WorkflowEvidenceLink[]>();
+  readonly #workflowCapabilityPlans = new Map<string, WorkflowCapabilityPlanLink[]>();
+  readonly #workflowCommands = new Map<string, WorkflowCommandRecord>();
+  readonly #waitTokens = new Map<string, WaitTokenRecord>();
+  readonly #organizationClaimOrder = new Map<string, number>();
   readonly #audit: AuditEventRecord[] = [];
+  #claimSequence = 0;
 
-  constructor(private readonly clock: () => Date = () => new Date()) {}
+  constructor(
+    private readonly clock: () => Date = () => new Date(),
+    private readonly workflowOptions: InMemoryRepositoryOptions = {},
+  ) {}
 
   #now(): string {
     return this.clock().toISOString();
@@ -293,7 +349,7 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
     });
   }
 
-  #idempotencyId(operation: "project" | "analysis" | "release", actor: RepositoryActor, key: string): string {
+  #idempotencyId(operation: "project" | "analysis" | "release" | "workflow", actor: RepositoryActor, key: string): string {
     return `${operation}:${actor.organizationId}:${actor.id}:${key}`;
   }
 
@@ -316,6 +372,132 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
     });
   }
 
+  #workflowRunForActor(actor: RepositoryActor, runId: string): WorkflowRunRecord {
+    const run = this.#workflowRuns.get(runId);
+    if (!run || run.organizationId !== actor.organizationId) throw new RepositoryError("NOT_FOUND");
+    return run;
+  }
+
+  #workflowTask(taskId: string): WorkflowTaskRecord {
+    const task = this.#workflowTasks.get(taskId);
+    if (!task) throw new RepositoryError("INVALID_STATE");
+    return task;
+  }
+
+  #appendWorkflowEvent(
+    runId: string,
+    type: WorkflowEventType,
+    taskId?: string,
+    code?: string,
+  ): WorkflowRunRecord {
+    const existing = this.#workflowRuns.get(runId);
+    if (!existing) throw new RepositoryError("INVALID_STATE");
+    const version = existing.version + 1;
+    const events = this.#workflowEvents.get(runId) ?? [];
+    const updated: WorkflowRunRecord = { ...existing, version, updatedAt: this.#now() };
+    this.#workflowRuns.set(runId, updated);
+    events.push({
+      id: randomUUID(),
+      organizationId: existing.organizationId,
+      projectId: existing.projectId,
+      workflowRunId: runId,
+      ...(taskId ? { taskId } : {}),
+      sequence: events.length + 1,
+      version,
+      type,
+      ...(code ? { code } : {}),
+      createdAt: this.#now(),
+    });
+    this.#workflowEvents.set(runId, events);
+    return updated;
+  }
+
+  #createWorkflowTask(run: WorkflowRunRecord, phase: WorkflowTaskRecord["phase"], inputHash: string): WorkflowTaskRecord {
+    const normalizedInputHash = stableHash(inputHash);
+    const existing = [...this.#workflowTasks.values()].find((task) => task.workflowRunId === run.id && task.phase === phase);
+    if (existing) return existing;
+    const now = this.#now();
+    const task: WorkflowTaskRecord = {
+      id: randomUUID(),
+      organizationId: run.organizationId,
+      projectId: run.projectId,
+      workflowRunId: run.id,
+      phase,
+      status: "queued",
+      idempotencyKey: workflowTaskIdempotencyKey(run.id, phase, normalizedInputHash),
+      inputHash: normalizedInputHash,
+      leaseGeneration: 0,
+      attempts: 0,
+      maxAttempts: WORKFLOW_MAX_ATTEMPTS,
+      availableAt: now,
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.#workflowTasks.set(task.id, task);
+    this.#appendWorkflowEvent(run.id, "task.created", task.id);
+    return task;
+  }
+
+  #createWorkflowRun(input: Readonly<{
+    id: string;
+    project: ProjectRecord;
+    sourceSnapshotId: string;
+    inputHash: string;
+    phase: WorkflowTaskRecord["phase"];
+    analysisRunId?: string;
+  }>): WorkflowRunRecord {
+    const now = this.#now();
+    const run: WorkflowRunRecord = {
+      id: input.id,
+      organizationId: input.project.organizationId,
+      projectId: input.project.id,
+      sourceSnapshotId: input.sourceSnapshotId,
+      ...(input.analysisRunId ? { analysisRunId: input.analysisRunId } : {}),
+      status: "queued",
+      currentPhase: input.phase,
+      inputHash: stableHash(input.inputHash),
+      version: 0,
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.#workflowRuns.set(run.id, run);
+    this.#workflowEvents.set(run.id, []);
+    this.#workflowEvidence.set(run.id, []);
+    this.#workflowCapabilityPlans.set(run.id, []);
+    this.#appendWorkflowEvent(run.id, "workflow.created");
+    this.#createWorkflowTask(this.#workflowRuns.get(run.id)!, input.phase, run.inputHash);
+    return this.#workflowRuns.get(run.id)!;
+  }
+
+  #activeSourceSnapshot(projectId: string): SourceSnapshotRecord {
+    const source = [...this.#projectSources.values()].find((candidate) => candidate.projectId === projectId && candidate.active);
+    const snapshot = source
+      ? [...this.#sourceSnapshots.values()].find((candidate) => candidate.projectSourceId === source.id)
+      : undefined;
+    if (!source || !snapshot) throw new RepositoryError("INVALID_STATE");
+    return snapshot;
+  }
+
+  #commandReplay<T>(scope: string, idempotencyKey: string, inputHash: string): T | undefined {
+    assertIdempotencyKey(idempotencyKey);
+    const normalizedHash = stableHash(inputHash);
+    const previous = this.#workflowCommands.get(`${scope}:${idempotencyKey}`);
+    if (!previous) return undefined;
+    if (previous.inputHash !== normalizedHash) throw new RepositoryError("IDEMPOTENCY_CONFLICT");
+    return copy(previous.result) as T;
+  }
+
+  #recordCommand(scope: string, idempotencyKey: string, inputHash: string, result: unknown): void {
+    this.#workflowCommands.set(`${scope}:${idempotencyKey}`, { inputHash: stableHash(inputHash), result: copy(result) });
+  }
+
+  #assertWorkflowLease(workerId: string, task: WorkflowTaskRecord, leaseGeneration: number): void {
+    const run = this.#workflowRuns.get(task.workflowRunId);
+    if (!run || run.cancelRequestedAt || run.status === "cancelled") throw new RepositoryError("CANCELLED");
+    if (task.status !== "running" || task.leaseOwner !== workerId || task.leaseGeneration !== leaseGeneration
+      || !task.leaseExpiresAt || new Date(task.leaseExpiresAt) <= this.clock()) throw new RepositoryError("LEASE_LOST");
+  }
+
   async createProject(actor: RepositoryActor, input: CreateProjectRequest): Promise<ProjectRecord> {
     if (actor.role === "viewer") throw new RepositoryError("FORBIDDEN");
     const idempotencyId = this.#idempotencyId("project", actor, input.idempotencyKey);
@@ -336,6 +518,26 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
       createdAt: this.#now()
     };
     this.#projects.set(project.id, project);
+    const projectSource: ProjectSourceRecord = {
+      id: randomUUID(),
+      organizationId: project.organizationId,
+      projectId: project.id,
+      sourceType: project.sourceType,
+      sourceUrl: project.url,
+      version: 1,
+      active: true,
+      createdAt: project.createdAt,
+    };
+    this.#projectSources.set(projectSource.id, projectSource);
+    const snapshot: SourceSnapshotRecord = {
+      id: randomUUID(),
+      organizationId: project.organizationId,
+      projectId: project.id,
+      projectSourceId: projectSource.id,
+      sourceIdentityHash: stableHash(sourceIdentityMaterial(project.sourceType, project.url)),
+      createdAt: project.createdAt,
+    };
+    this.#sourceSnapshots.set(snapshot.id, snapshot);
     this.#reserveIdempotency(idempotencyId, input.inputHash, project.id);
     this.#auditEvent(actor, "project.created", project.id);
     return copy(project);
@@ -382,6 +584,14 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
     this.#runs.set(run.id, run);
     this.#analysisAvailableAt.set(run.id, now);
     this.#analysisSources.set(run.id, { sourceType: project.sourceType, sourceUrl: project.url });
+    this.#createWorkflowRun({
+      id: run.id,
+      project,
+      sourceSnapshotId: this.#activeSourceSnapshot(project.id).id,
+      inputHash: input.inputHash,
+      phase: "analysis",
+      analysisRunId: run.id,
+    });
     this.#projects.set(project.id, { ...project, status: "analyzing" });
     this.#reserveIdempotency(idempotencyId, input.inputHash, run.id);
     this.#auditEvent(actor, "analysis.queued", run.id);
@@ -394,11 +604,393 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
     return copy(run);
   }
 
+  async listProjectSources(actor: RepositoryActor, projectId: string): Promise<ProjectSourceRecord[]> {
+    this.#assertProject(actor, projectId);
+    return [...this.#projectSources.values()]
+      .filter((source) => source.projectId === projectId)
+      .sort((left, right) => left.version - right.version || compareCodePoints(left.id, right.id))
+      .map(copy);
+  }
+
+  async listSourceSnapshots(actor: RepositoryActor, projectId: string): Promise<SourceSnapshotRecord[]> {
+    this.#assertProject(actor, projectId);
+    return [...this.#sourceSnapshots.values()]
+      .filter((snapshot) => snapshot.projectId === projectId)
+      .sort((left, right) => compareCodePoints(left.createdAt, right.createdAt) || compareCodePoints(left.id, right.id))
+      .map(copy);
+  }
+
+  async startWorkflow(actor: RepositoryActor, input: StartWorkflowInput): Promise<WorkflowRunRecord> {
+    if (actor.role === "viewer") throw new RepositoryError("FORBIDDEN");
+    const project = this.#assertProject(actor, input.projectId);
+    const idempotencyId = this.#idempotencyId("workflow", actor, input.idempotencyKey);
+    const previous = this.#idempotentReplay(idempotencyId, input.inputHash);
+    if (previous) return copy(this.#workflowRunForActor(actor, previous.resultId));
+    if ([...this.#workflowRuns.values()].some((run) => run.projectId === project.id
+      && ["queued", "running", "waiting"].includes(run.status))) throw new RepositoryError("INVALID_STATE");
+    const id = randomUUID();
+    const run = this.#createWorkflowRun({
+      id,
+      project,
+      sourceSnapshotId: this.#activeSourceSnapshot(project.id).id,
+      inputHash: input.inputHash,
+      phase: "preflight",
+    });
+    this.#projects.set(project.id, { ...project, status: "analyzing" });
+    this.#reserveIdempotency(idempotencyId, input.inputHash, id);
+    this.#auditEvent(actor, "workflow.queued", id);
+    return copy(run);
+  }
+
+  async getWorkflowRun(actor: RepositoryActor, runId: string): Promise<WorkflowRunRecord> {
+    return copy(this.#workflowRunForActor(actor, runId));
+  }
+
+  async listWorkflowTasks(actor: RepositoryActor, runId: string): Promise<WorkflowTaskRecord[]> {
+    this.#workflowRunForActor(actor, runId);
+    return [...this.#workflowTasks.values()].filter((task) => task.workflowRunId === runId)
+      .sort((left, right) => compareCodePoints(left.createdAt, right.createdAt) || compareCodePoints(left.id, right.id))
+      .map(copy);
+  }
+
+  async listWorkflowEvents(actor: RepositoryActor, runId: string): Promise<WorkflowEventRecord[]> {
+    this.#workflowRunForActor(actor, runId);
+    return (this.#workflowEvents.get(runId) ?? []).map(copy);
+  }
+
+  async listWorkflowEvidence(actor: RepositoryActor, runId: string): Promise<WorkflowEvidenceLink[]> {
+    this.#workflowRunForActor(actor, runId);
+    return (this.#workflowEvidence.get(runId) ?? []).map(copy);
+  }
+
+  async listWorkflowCapabilityPlans(actor: RepositoryActor, runId: string): Promise<WorkflowCapabilityPlanLink[]> {
+    this.#workflowRunForActor(actor, runId);
+    return (this.#workflowCapabilityPlans.get(runId) ?? []).map(copy);
+  }
+
+  async claimWorkflowTask(workerId: string): Promise<ClaimedWorkflowTaskRecord | undefined> {
+    assertWorkerId(workerId);
+    const now = this.clock();
+    const activeByOrganization = new Map<string, number>();
+    for (const task of this.#workflowTasks.values()) {
+      if (task.status === "running" && task.leaseExpiresAt
+        && new Date(task.leaseExpiresAt) > now) {
+        activeByOrganization.set(task.organizationId, (activeByOrganization.get(task.organizationId) ?? 0) + 1);
+      }
+    }
+    const quota = Math.max(1, Math.min(this.workflowOptions.activeTaskQuota
+      ?? WORKFLOW_DEFAULT_ACTIVE_TASK_QUOTA, 100));
+    const candidates = [...this.#workflowTasks.values()].filter((task) => {
+      if (task.phase === "analysis" || task.attempts >= task.maxAttempts) return false;
+      const run = this.#workflowRuns.get(task.workflowRunId);
+      if (!run || run.cancelRequestedAt || ["succeeded", "failed", "cancelled"].includes(run.status)) return false;
+      const available = task.status === "queued" && new Date(task.availableAt) <= now;
+      const expired = task.status === "running" && task.leaseExpiresAt !== undefined && new Date(task.leaseExpiresAt) <= now;
+      return (available || expired) && (activeByOrganization.get(task.organizationId) ?? 0) < quota;
+    }).sort((left, right) => {
+      const leftOrder = this.#organizationClaimOrder.get(left.organizationId) ?? 0;
+      const rightOrder = this.#organizationClaimOrder.get(right.organizationId) ?? 0;
+      return leftOrder - rightOrder
+        || compareCodePoints(left.availableAt, right.availableAt)
+        || compareCodePoints(left.createdAt, right.createdAt)
+        || compareCodePoints(left.id, right.id);
+    });
+    const candidate = candidates[0];
+    if (!candidate) return undefined;
+    const claimed: ClaimedWorkflowTaskRecord = {
+      ...candidate,
+      status: "running",
+      attempts: candidate.attempts + 1,
+      leaseGeneration: candidate.leaseGeneration + 1,
+      leaseOwner: workerId,
+      leaseExpiresAt: new Date(now.getTime() + WORKFLOW_LEASE_MS).toISOString(),
+      errorCode: undefined,
+      updatedAt: now.toISOString(),
+    };
+    this.#workflowTasks.set(claimed.id, claimed);
+    this.#organizationClaimOrder.set(claimed.organizationId, ++this.#claimSequence);
+    const run = this.#workflowRuns.get(claimed.workflowRunId);
+    if (!run) throw new RepositoryError("INVALID_STATE");
+    this.#workflowRuns.set(run.id, { ...run, status: "running", currentPhase: claimed.phase, updatedAt: now.toISOString() });
+    this.#appendWorkflowEvent(run.id, "task.claimed", claimed.id);
+    return copy(claimed);
+  }
+
+  async assertWorkflowTaskLease(workerId: string, taskId: string, leaseGeneration: number): Promise<void> {
+    this.#assertWorkflowLease(workerId, this.#workflowTask(taskId), leaseGeneration);
+  }
+
+  async heartbeatWorkflowTask(workerId: string, taskId: string, leaseGeneration: number): Promise<WorkflowTaskRecord> {
+    const task = this.#workflowTask(taskId);
+    this.#assertWorkflowLease(workerId, task, leaseGeneration);
+    const updated: WorkflowTaskRecord = {
+      ...task,
+      leaseExpiresAt: new Date(this.clock().getTime() + WORKFLOW_LEASE_MS).toISOString(),
+      updatedAt: this.#now(),
+    };
+    this.#workflowTasks.set(task.id, updated);
+    this.#appendWorkflowEvent(task.workflowRunId, "task.heartbeat", task.id);
+    return copy(updated);
+  }
+
+  async completeWorkflowTask(
+    workerId: string,
+    taskId: string,
+    leaseGeneration: number,
+    input: CompleteWorkflowTaskInput,
+  ): Promise<WorkflowTaskCompletion> {
+    const replay = this.#commandReplay<WorkflowTaskCompletion>(`complete:${taskId}`, input.idempotencyKey, input.inputHash);
+    if (replay) return replay;
+    validateWorkflowReference(input.checkpointReference);
+    validateWorkflowReference(input.outputReference);
+    const task = this.#workflowTask(taskId);
+    this.#assertWorkflowLease(workerId, task, leaseGeneration);
+    const run = this.#workflowRuns.get(task.workflowRunId);
+    if (!run) throw new RepositoryError("INVALID_STATE");
+    const outputHash = stableHash(canonicalJson({
+      checkpointReference: input.checkpointReference,
+      commandInputHash: stableHash(input.inputHash),
+      outputReference: input.outputReference,
+    }));
+    const now = this.#now();
+    const completedTask: WorkflowTaskRecord = {
+      ...task,
+      status: "succeeded",
+      outputHash,
+      ...(input.checkpointReference ? { checkpointReference: input.checkpointReference } : {}),
+      ...(input.outputReference ? { outputReference: input.outputReference } : {}),
+      leaseOwner: undefined,
+      leaseExpiresAt: undefined,
+      retryClassification: undefined,
+      errorCode: undefined,
+      updatedAt: now,
+    };
+    this.#workflowTasks.set(task.id, completedTask);
+    this.#appendWorkflowEvent(run.id, "task.completed", task.id);
+    const nextPhase = task.phase === "analysis" ? undefined : workflowPhase(task.phase).next;
+    let nextTask: WorkflowTaskRecord | undefined;
+    if (nextPhase) {
+      const current = this.#workflowRuns.get(run.id)!;
+      this.#workflowRuns.set(run.id, { ...current, status: "queued", currentPhase: nextPhase, errorCode: undefined, updatedAt: now });
+      nextTask = this.#createWorkflowTask(this.#workflowRuns.get(run.id)!, nextPhase, outputHash);
+    } else {
+      const current = this.#workflowRuns.get(run.id)!;
+      this.#workflowRuns.set(run.id, { ...current, status: "succeeded", currentPhase: task.phase, errorCode: undefined, updatedAt: now });
+      this.#appendWorkflowEvent(run.id, "workflow.completed");
+      const project = this.#projects.get(run.projectId);
+      if (project) this.#projects.set(project.id, { ...project, status: "analyzed" });
+    }
+    const result = { run: this.#workflowRuns.get(run.id)!, task: completedTask, ...(nextTask ? { nextTask } : {}) };
+    this.#recordCommand(`complete:${taskId}`, input.idempotencyKey, input.inputHash, result);
+    return copy(result);
+  }
+
+  async failWorkflowTask(
+    workerId: string,
+    taskId: string,
+    leaseGeneration: number,
+    input: FailWorkflowTaskInput,
+  ): Promise<WorkflowTaskRecord> {
+    const replay = this.#commandReplay<WorkflowTaskRecord>(`fail:${taskId}`, input.idempotencyKey, input.inputHash);
+    if (replay) return replay;
+    if (!/^[A-Z][A-Z0-9_]{0,63}$/.test(input.errorCode)) throw new RepositoryError("INVALID_STATE");
+    const task = this.#workflowTask(taskId);
+    this.#assertWorkflowLease(workerId, task, leaseGeneration);
+    const terminal = input.classification === "permanent" || task.attempts >= task.maxAttempts;
+    const now = this.clock();
+    const availableAt = terminal ? now.toISOString() : new Date(now.getTime() + workflowRetryDelayMs(
+      task.attempts,
+      input.classification === "rate_limited" ? input.retryAfterMs : undefined,
+      this.workflowOptions.random,
+    )).toISOString();
+    const failed: WorkflowTaskRecord = {
+      ...task,
+      status: terminal ? "failed" : "queued",
+      leaseOwner: undefined,
+      leaseExpiresAt: undefined,
+      retryClassification: input.classification,
+      errorCode: input.errorCode,
+      availableAt,
+      updatedAt: now.toISOString(),
+    };
+    this.#workflowTasks.set(task.id, failed);
+    const run = this.#workflowRuns.get(task.workflowRunId);
+    if (!run) throw new RepositoryError("INVALID_STATE");
+    this.#workflowRuns.set(run.id, {
+      ...run,
+      status: terminal ? "failed" : "queued",
+      errorCode: input.errorCode,
+      updatedAt: now.toISOString(),
+    });
+    this.#appendWorkflowEvent(run.id, terminal ? "task.failed" : "task.retry_scheduled", task.id, input.errorCode);
+    if (terminal) {
+      this.#appendWorkflowEvent(run.id, "workflow.failed", undefined, input.errorCode);
+      const project = this.#projects.get(run.projectId);
+      if (project) this.#projects.set(project.id, { ...project, status: "failed" });
+    }
+    this.#recordCommand(`fail:${taskId}`, input.idempotencyKey, input.inputHash, failed);
+    return copy(failed);
+  }
+
+  async waitWorkflowTask(
+    workerId: string,
+    taskId: string,
+    leaseGeneration: number,
+    input: WaitWorkflowTaskInput,
+  ): Promise<Readonly<{ task: WorkflowTaskRecord; waitToken: string }>> {
+    assertIdempotencyKey(input.idempotencyKey);
+    stableHash(input.inputHash);
+    if (!/^[a-z][a-z0-9_]{0,63}$/.test(input.reason)) throw new RepositoryError("INVALID_STATE");
+    const expiry = Date.parse(input.expiresAt);
+    if (!Number.isFinite(expiry) || expiry <= this.clock().getTime()
+      || expiry - this.clock().getTime() > 24 * 60 * 60 * 1_000) throw new RepositoryError("INVALID_STATE");
+    const task = this.#workflowTask(taskId);
+    this.#assertWorkflowLease(workerId, task, leaseGeneration);
+    const waitToken = randomUUID().replaceAll("-", "");
+    const waitKeyHash = stableHash(waitToken);
+    const now = this.#now();
+    const waiting: WorkflowTaskRecord = {
+      ...task,
+      status: "waiting",
+      waitKeyHash,
+      waitReason: input.reason,
+      waitExpiresAt: new Date(expiry).toISOString(),
+      leaseOwner: undefined,
+      leaseExpiresAt: undefined,
+      updatedAt: now,
+    };
+    this.#workflowTasks.set(task.id, waiting);
+    const run = this.#workflowRuns.get(task.workflowRunId);
+    if (!run) throw new RepositoryError("INVALID_STATE");
+    this.#workflowRuns.set(run.id, { ...run, status: "waiting", updatedAt: now });
+    this.#waitTokens.set(waitKeyHash, { workflowRunId: run.id, taskId: task.id, expiresAt: waiting.waitExpiresAt! });
+    this.#appendWorkflowEvent(run.id, "task.waiting", task.id);
+    return copy({ task: waiting, waitToken });
+  }
+
+  async resumeWorkflowTask(actor: RepositoryActor, input: ResumeWorkflowTaskInput): Promise<WorkflowTaskRecord> {
+    const run = this.#workflowRunForActor(actor, input.runId);
+    if (actor.role === "viewer") throw new RepositoryError("FORBIDDEN");
+    const replay = this.#commandReplay<WorkflowTaskRecord>(`resume:${run.id}`, input.idempotencyKey, input.inputHash);
+    if (replay) return replay;
+    if (!/^[A-Za-z0-9_-]{32,128}$/.test(input.waitToken)) throw new RepositoryError("INVALID_STATE");
+    const waitKeyHash = stableHash(input.waitToken);
+    const token = this.#waitTokens.get(waitKeyHash);
+    if (!token || token.workflowRunId !== run.id) throw new RepositoryError("NOT_FOUND");
+    if (new Date(token.expiresAt) <= this.clock()) throw new RepositoryError("WAIT_EXPIRED");
+    if (run.cancelRequestedAt || run.status === "cancelled") throw new RepositoryError("CANCELLED");
+    const task = this.#workflowTask(token.taskId);
+    if (task.status !== "waiting" || task.waitKeyHash !== waitKeyHash) throw new RepositoryError("INVALID_STATE");
+    const now = this.#now();
+    const resumed: WorkflowTaskRecord = {
+      ...task,
+      status: "queued",
+      resumedAt: now,
+      availableAt: now,
+      updatedAt: now,
+    };
+    this.#workflowTasks.set(task.id, resumed);
+    this.#waitTokens.set(waitKeyHash, {
+      ...token,
+      consumedAt: now,
+      resumeIdempotencyKey: input.idempotencyKey,
+      resumeInputHash: stableHash(input.inputHash),
+    });
+    this.#workflowRuns.set(run.id, { ...run, status: "queued", updatedAt: now });
+    this.#appendWorkflowEvent(run.id, "task.resumed", task.id);
+    this.#recordCommand(`resume:${run.id}`, input.idempotencyKey, input.inputHash, resumed);
+    return copy(resumed);
+  }
+
+  async cancelWorkflow(actor: RepositoryActor, input: CancelWorkflowInput): Promise<WorkflowRunRecord> {
+    if (actor.role === "viewer") throw new RepositoryError("FORBIDDEN");
+    const run = this.#workflowRunForActor(actor, input.runId);
+    const replay = this.#commandReplay<WorkflowRunRecord>(`cancel:${run.id}`, input.idempotencyKey, input.inputHash);
+    if (replay) return replay;
+    if (["succeeded", "failed", "cancelled"].includes(run.status)) throw new RepositoryError("INVALID_STATE");
+    const now = this.#now();
+    this.#workflowRuns.set(run.id, { ...run, cancelRequestedAt: now, updatedAt: now });
+    this.#appendWorkflowEvent(run.id, "workflow.cancel_requested");
+    for (const task of [...this.#workflowTasks.values()]
+      .filter((candidate) => candidate.workflowRunId === run.id && !["succeeded", "failed", "cancelled"].includes(candidate.status))) {
+      this.#workflowTasks.set(task.id, {
+        ...task,
+        status: "cancelled",
+        cancelRequestedAt: now,
+        cancelledAt: now,
+        leaseOwner: undefined,
+        leaseExpiresAt: undefined,
+        updatedAt: now,
+      });
+      this.#appendWorkflowEvent(run.id, "task.cancelled", task.id);
+    }
+    const requested = this.#workflowRuns.get(run.id)!;
+    const cancelled: WorkflowRunRecord = { ...requested, status: "cancelled", cancelledAt: now, updatedAt: now };
+    this.#workflowRuns.set(run.id, cancelled);
+    this.#appendWorkflowEvent(run.id, "workflow.cancelled");
+    const analysis = run.analysisRunId ? this.#runs.get(run.analysisRunId) : undefined;
+    if (analysis && ["queued", "running"].includes(analysis.status)) {
+      this.#runs.set(analysis.id, {
+        ...analysis, status: "cancelled", leaseOwner: undefined, leaseExpiresAt: undefined, updatedAt: now,
+      });
+      this.#analysisAvailableAt.delete(analysis.id);
+    }
+    this.#recordCommand(`cancel:${run.id}`, input.idempotencyKey, input.inputHash, cancelled);
+    return copy(this.#workflowRuns.get(run.id)!);
+  }
+
+  async reconcileWorkflows(workerId: string): Promise<number> {
+    assertWorkerId(workerId);
+    const now = this.clock();
+    let repaired = 0;
+    for (const task of [...this.#workflowTasks.values()]) {
+      if (task.phase === "analysis" || task.status !== "running" || !task.leaseExpiresAt
+        || new Date(task.leaseExpiresAt) > now) continue;
+      const run = this.#workflowRuns.get(task.workflowRunId);
+      if (!run || run.cancelRequestedAt || ["succeeded", "failed", "cancelled"].includes(run.status)) continue;
+      const terminal = task.attempts >= task.maxAttempts;
+      const updated: WorkflowTaskRecord = {
+        ...task,
+        status: terminal ? "failed" : "queued",
+        leaseOwner: undefined,
+        leaseExpiresAt: undefined,
+        availableAt: now.toISOString(),
+        reconciledAt: now.toISOString(),
+        errorCode: terminal ? "ATTEMPTS_EXHAUSTED" : task.errorCode,
+        updatedAt: now.toISOString(),
+      };
+      this.#workflowTasks.set(task.id, updated);
+      this.#workflowRuns.set(run.id, {
+        ...run,
+        status: terminal ? "failed" : "queued",
+        errorCode: terminal ? "ATTEMPTS_EXHAUSTED" : run.errorCode,
+        updatedAt: now.toISOString(),
+      });
+      this.#appendWorkflowEvent(run.id, "task.reconciled", task.id, terminal ? "ATTEMPTS_EXHAUSTED" : undefined);
+      this.#appendWorkflowEvent(run.id, "workflow.reconciled");
+      repaired += 1;
+    }
+    return repaired;
+  }
+
   async claimAnalysis(workerId: string, leaseMs: number): Promise<ClaimedAnalysisRunRecord | undefined> {
     const now = this.clock();
     const boundedLease = Math.max(1_000, Math.min(leaseMs, 300_000));
-    const candidates = [...this.#runs.values()].sort((left, right) => compareCodePoints(left.createdAt, right.createdAt));
+    const quota = Math.max(1, Math.min(this.workflowOptions.activeTaskQuota
+      ?? WORKFLOW_DEFAULT_ACTIVE_TASK_QUOTA, 100));
+    const activeByOrganization = new Map<string, number>();
+    for (const task of this.#workflowTasks.values()) {
+      if (task.status === "running" && task.leaseExpiresAt && new Date(task.leaseExpiresAt) > now) {
+        activeByOrganization.set(task.organizationId, (activeByOrganization.get(task.organizationId) ?? 0) + 1);
+      }
+    }
+    const candidates = [...this.#runs.values()].sort((left, right) =>
+      (this.#organizationClaimOrder.get(left.organizationId) ?? 0)
+        - (this.#organizationClaimOrder.get(right.organizationId) ?? 0)
+      || compareCodePoints(left.createdAt, right.createdAt)
+      || compareCodePoints(left.id, right.id));
     for (const run of candidates) {
+      if ((activeByOrganization.get(run.organizationId) ?? 0) >= quota) continue;
       const expired = run.status === "running" && run.leaseExpiresAt !== undefined && new Date(run.leaseExpiresAt) <= now;
       if (run.status !== "queued" && !expired) continue;
       if (run.status === "queued" && new Date(this.#analysisAvailableAt.get(run.id) ?? run.createdAt) > now) continue;
@@ -407,6 +999,17 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
         const project = this.#projects.get(run.projectId);
         if (project) this.#projects.set(project.id, { ...project, status: "failed" });
         this.#analysisAvailableAt.delete(run.id);
+        const workflow = this.#workflowRuns.get(run.id);
+        const task = [...this.#workflowTasks.values()].find((candidate) => candidate.workflowRunId === run.id && candidate.phase === "analysis");
+        if (workflow && task && workflow.status !== "failed") {
+          this.#workflowTasks.set(task.id, {
+            ...task, status: "failed", errorCode: undefined, leaseOwner: undefined, leaseExpiresAt: undefined,
+            updatedAt: now.toISOString(),
+          } as WorkflowTaskRecord);
+          this.#workflowRuns.set(workflow.id, { ...workflow, status: "failed", errorCode: "ATTEMPTS_EXHAUSTED", updatedAt: now.toISOString() });
+          this.#appendWorkflowEvent(workflow.id, "task.failed", task.id, "ATTEMPTS_EXHAUSTED");
+          this.#appendWorkflowEvent(workflow.id, "workflow.failed", undefined, "ATTEMPTS_EXHAUSTED");
+        }
         continue;
       }
       const claimed: AnalysisRunRecord = {
@@ -420,28 +1023,67 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
       this.#runs.set(run.id, claimed);
       const source = this.#analysisSources.get(run.id);
       if (!source) throw new RepositoryError("INVALID_STATE");
-      return copy({ ...claimed, ...source });
+      const workflow = this.#workflowRuns.get(run.id);
+      const task = [...this.#workflowTasks.values()].find((candidate) => candidate.workflowRunId === run.id && candidate.phase === "analysis");
+      if (!workflow || !task || !["queued", "running"].includes(task.status)) throw new RepositoryError("INVALID_STATE");
+      const workflowTask: WorkflowTaskRecord = {
+        ...task,
+        status: "running",
+        attempts: claimed.attempts,
+        leaseGeneration: task.leaseGeneration + 1,
+        leaseOwner: workerId,
+        leaseExpiresAt: claimed.leaseExpiresAt,
+        updatedAt: now.toISOString(),
+      };
+      this.#workflowTasks.set(task.id, workflowTask);
+      this.#organizationClaimOrder.set(run.organizationId, ++this.#claimSequence);
+      this.#workflowRuns.set(workflow.id, { ...workflow, status: "running", currentPhase: "analysis", updatedAt: now.toISOString() });
+      this.#appendWorkflowEvent(workflow.id, "task.claimed", task.id);
+      return copy({
+        ...claimed,
+        ...source,
+        workflowTaskId: workflowTask.id,
+        leaseGeneration: workflowTask.leaseGeneration,
+      });
     }
     return undefined;
   }
 
-  async heartbeatAnalysis(workerId: string, runId: string, leaseMs: number): Promise<void> {
+  async heartbeatAnalysis(workerId: string, runId: string, leaseMs: number, leaseGeneration?: number): Promise<void> {
+    const workflow = this.#workflowRuns.get(runId);
+    if (workflow?.cancelRequestedAt || workflow?.status === "cancelled") throw new RepositoryError("CANCELLED");
     const run = this.#runs.get(runId);
     const now = this.clock();
     if (!run || run.status !== "running" || run.leaseOwner !== workerId || !run.leaseExpiresAt
       || new Date(run.leaseExpiresAt) <= now) throw new RepositoryError("LEASE_LOST");
     const boundedLease = Math.max(1_000, Math.min(leaseMs, 300_000));
+    const task = [...this.#workflowTasks.values()].find((candidate) => candidate.workflowRunId === runId && candidate.phase === "analysis");
+    if (!task) throw new RepositoryError("INVALID_STATE");
+    this.#assertWorkflowLease(workerId, task, leaseGeneration ?? task.leaseGeneration);
+    const leaseExpiresAt = new Date(now.getTime() + boundedLease).toISOString();
     this.#runs.set(run.id, {
       ...run,
-      leaseExpiresAt: new Date(now.getTime() + boundedLease).toISOString(),
+      leaseExpiresAt,
       updatedAt: now.toISOString()
     });
+    this.#workflowTasks.set(task.id, { ...task, leaseExpiresAt, updatedAt: now.toISOString() });
+    this.#appendWorkflowEvent(task.workflowRunId, "task.heartbeat", task.id);
   }
 
-  async completeAnalysis(workerId: string, runId: string, result: AnalysisResult): Promise<AnalysisRunRecord> {
+  async completeAnalysis(
+    workerId: string,
+    runId: string,
+    result: AnalysisResult,
+    leaseGeneration?: number,
+  ): Promise<AnalysisRunRecord> {
+    const workflow = this.#workflowRuns.get(runId);
+    if (workflow?.cancelRequestedAt || workflow?.status === "cancelled") throw new RepositoryError("CANCELLED");
     const run = this.#runs.get(runId);
     if (!run || run.status !== "running" || run.leaseOwner !== workerId || !run.leaseExpiresAt
       || new Date(run.leaseExpiresAt) <= this.clock()) throw new RepositoryError("LEASE_LOST");
+    const workflowTask = [...this.#workflowTasks.values()].find((candidate) => candidate.workflowRunId === runId && candidate.phase === "analysis");
+    if (!workflowTask) throw new RepositoryError("INVALID_STATE");
+    this.#assertWorkflowLease(workerId, workflowTask, leaseGeneration ?? workflowTask.leaseGeneration);
     if (result.capabilities.length > MAX_CAPABILITIES || result.evidence.length > MAX_CAPABILITIES
       || result.release !== undefined && Buffer.byteLength(result.release.code) > MAX_RELEASE_BYTES) {
       throw new RepositoryError("INVALID_STATE");
@@ -492,6 +1134,7 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
       },
     };
     this.#results.set(run.id, normalizedResult);
+    const insertedCapabilities: CapabilityRecord[] = [];
     for (const plan of canonicalPlans) {
       const planDigest = capabilityPlanDigest(plan);
       const status = statuses.get(plan.tool.name) ?? "proposed";
@@ -509,6 +1152,7 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
         version: 1
       };
       this.#capabilities.set(capability.id, capability);
+      insertedCapabilities.push(capability);
     }
     const now = this.#now();
     const completed: AnalysisRunRecord = {
@@ -523,13 +1167,67 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
     this.#analysisAvailableAt.delete(run.id);
     const project = this.#projects.get(run.projectId);
     if (project) this.#projects.set(project.id, { ...project, status: "analyzed" });
+    const outputHash = stableHash(canonicalJson({
+      diagnostics: normalizedDiagnostics,
+      evidence: normalizedEvidence.map(({ reference }) => reference).sort(compareCodePoints),
+      plans: insertedCapabilities.map(({ planDigest }) => planDigest).sort(compareCodePoints),
+      release: normalizedResult.release?.contentHash,
+    }));
+    this.#workflowTasks.set(workflowTask.id, {
+      ...workflowTask,
+      status: "succeeded",
+      outputHash,
+      outputReference: normalizedResult.release
+        ? `urn:sha256:${normalizedResult.release.contentHash}`
+        : normalizedEvidence[0]?.reference,
+      leaseOwner: undefined,
+      leaseExpiresAt: undefined,
+      errorCode: undefined,
+      updatedAt: now,
+    });
+    const currentWorkflow = this.#workflowRuns.get(run.id);
+    if (!currentWorkflow) throw new RepositoryError("INVALID_STATE");
+    this.#workflowRuns.set(currentWorkflow.id, { ...currentWorkflow, status: "succeeded", errorCode: undefined, updatedAt: now });
+    this.#workflowEvidence.set(run.id, normalizedEvidence.map((evidence) => ({
+      id: randomUUID(),
+      organizationId: run.organizationId,
+      projectId: run.projectId,
+      workflowRunId: run.id,
+      taskId: workflowTask.id,
+      evidenceId: evidence.id!,
+      reference: evidence.reference,
+      createdAt: now,
+    })));
+    this.#workflowCapabilityPlans.set(run.id, insertedCapabilities.map((capability) => ({
+      id: randomUUID(),
+      organizationId: run.organizationId,
+      projectId: run.projectId,
+      workflowRunId: run.id,
+      taskId: workflowTask.id,
+      capabilityId: capability.id,
+      planDigest: capability.planDigest,
+      createdAt: now,
+    })));
+    this.#appendWorkflowEvent(currentWorkflow.id, "task.completed", workflowTask.id);
+    this.#appendWorkflowEvent(currentWorkflow.id, "workflow.completed");
     return copy(completed);
   }
 
-  async failAnalysis(workerId: string, runId: string, code: string, retryable: boolean): Promise<AnalysisRunRecord> {
+  async failAnalysis(
+    workerId: string,
+    runId: string,
+    code: string,
+    retryable: boolean,
+    leaseGeneration?: number,
+  ): Promise<AnalysisRunRecord> {
+    const workflow = this.#workflowRuns.get(runId);
+    if (workflow?.cancelRequestedAt || workflow?.status === "cancelled") throw new RepositoryError("CANCELLED");
     const run = this.#runs.get(runId);
     if (!run || run.status !== "running" || run.leaseOwner !== workerId || !run.leaseExpiresAt
       || new Date(run.leaseExpiresAt) <= this.clock()) throw new RepositoryError("LEASE_LOST");
+    const workflowTask = [...this.#workflowTasks.values()].find((candidate) => candidate.workflowRunId === runId && candidate.phase === "analysis");
+    if (!workflowTask) throw new RepositoryError("INVALID_STATE");
+    this.#assertWorkflowLease(workerId, workflowTask, leaseGeneration ?? workflowTask.leaseGeneration);
     const terminal = !retryable || run.attempts >= 3;
     const failed: AnalysisRunRecord = {
       ...run,
@@ -541,11 +1239,33 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
     };
     this.#runs.set(run.id, failed);
     if (terminal) this.#analysisAvailableAt.delete(run.id);
-    else this.#analysisAvailableAt.set(run.id, new Date(this.clock().getTime() + 1_000).toISOString());
+    else this.#analysisAvailableAt.set(run.id, new Date(this.clock().getTime()
+      + workflowRetryDelayMs(run.attempts, undefined, this.workflowOptions.random)).toISOString());
     if (terminal) {
       const project = this.#projects.get(run.projectId);
       if (project) this.#projects.set(project.id, { ...project, status: "failed" });
     }
+    const availableAt = this.#analysisAvailableAt.get(run.id) ?? this.#now();
+    this.#workflowTasks.set(workflowTask.id, {
+      ...workflowTask,
+      status: terminal ? "failed" : "queued",
+      leaseOwner: undefined,
+      leaseExpiresAt: undefined,
+      retryClassification: retryable ? "transient" : "permanent",
+      errorCode: code.slice(0, 64),
+      availableAt,
+      updatedAt: this.#now(),
+    });
+    const currentWorkflow = this.#workflowRuns.get(run.id);
+    if (!currentWorkflow) throw new RepositoryError("INVALID_STATE");
+    this.#workflowRuns.set(currentWorkflow.id, {
+      ...currentWorkflow,
+      status: terminal ? "failed" : "queued",
+      errorCode: code.slice(0, 64),
+      updatedAt: this.#now(),
+    });
+    this.#appendWorkflowEvent(currentWorkflow.id, terminal ? "task.failed" : "task.retry_scheduled", workflowTask.id, code.slice(0, 64));
+    if (terminal) this.#appendWorkflowEvent(currentWorkflow.id, "workflow.failed", undefined, code.slice(0, 64));
     return copy(failed);
   }
 
@@ -801,6 +1521,17 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
     this.#idempotency.clear();
     this.#analysisAvailableAt.clear();
     this.#analysisSources.clear();
+    this.#projectSources.clear();
+    this.#sourceSnapshots.clear();
+    this.#workflowRuns.clear();
+    this.#workflowTasks.clear();
+    this.#workflowEvents.clear();
+    this.#workflowEvidence.clear();
+    this.#workflowCapabilityPlans.clear();
+    this.#workflowCommands.clear();
+    this.#waitTokens.clear();
+    this.#organizationClaimOrder.clear();
+    this.#claimSequence = 0;
     this.#audit.splice(0);
   }
 }
@@ -911,6 +1642,40 @@ function canonicalJson(value: unknown): string {
 
 function compareCodePoints(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function stableHash(value: string): string {
+  if (typeof value !== "string" || value.length === 0 || Buffer.byteLength(value, "utf8") > 4_096) {
+    throw new RepositoryError("INVALID_STATE");
+  }
+  return /^[0-9a-f]{64}$/.test(value) ? value : createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+function workflowTaskIdempotencyKey(runId: string, phase: WorkflowTaskRecord["phase"], inputHash: string): string {
+  const normalizedHash = stableHash(inputHash);
+  return `wft_${stableHash(`${runId.length}:${runId}:${phase.length}:${phase}:${normalizedHash}`)}`;
+}
+
+function sourceIdentityMaterial(sourceType: string, sourceUrl: string): string {
+  return `${Buffer.byteLength(sourceType)}:${sourceType}:${Buffer.byteLength(sourceUrl)}:${sourceUrl}`;
+}
+
+function assertIdempotencyKey(value: string): void {
+  if (typeof value !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/.test(value)) {
+    throw new RepositoryError("INVALID_STATE");
+  }
+}
+
+function assertWorkerId(value: string): void {
+  if (typeof value !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value)) {
+    throw new RepositoryError("INVALID_STATE");
+  }
+}
+
+function validateWorkflowReference(value: string | undefined): void {
+  if (value !== undefined && !/^urn:sha256:[0-9a-f]{64}$/.test(value)) {
+    throw new RepositoryError("INVALID_STATE");
+  }
 }
 
 function copy<T>(value: T): T {
