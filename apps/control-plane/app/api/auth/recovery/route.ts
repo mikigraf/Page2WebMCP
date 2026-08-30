@@ -20,6 +20,6 @@ export async function POST(request: Request) {
         clearCsrfCookie(request)
       ]));
   } catch (error) {
-    return errorResponse(error, requestId);
+    return errorResponse(error, requestId, request);
   }
 }

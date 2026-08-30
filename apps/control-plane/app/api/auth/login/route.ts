@@ -29,6 +29,6 @@ export async function POST(request: Request) {
       headers
     );
   } catch (error) {
-    return errorResponse(error, requestId);
+    return errorResponse(error, requestId, request);
   }
 }

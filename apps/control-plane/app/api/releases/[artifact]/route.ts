@@ -38,6 +38,6 @@ export async function GET(
     if (request.headers.get("if-none-match") === etag) return new Response(null, { status: 304, headers });
     return new Response(release.code, { status: 200, headers });
   } catch (error) {
-    return errorResponse(error, requestId);
+    return errorResponse(error, requestId, request);
   }
 }

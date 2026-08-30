@@ -194,3 +194,132 @@ An additional Next production build was attempted with `/usr/local/bin/node ../.
 - Task 1's trusted installation-loader dependency remains: installation must verify exact artifact bytes and mandatory integrity metadata before JavaScript evaluation.
 
 Implementation and this report are committed together; the exact final HEAD is reported to the orchestrator after commit.
+
+## Fix round 1 (Task 6 independent review)
+
+### Findings resolved
+
+- Terminal Supabase sessions now converge to signed-out browser state regardless of which authoritative layer discovers the failure. `errorResponse` accepts request context, preserves the original `401 SESSION_REVOKED` / `SESSION_EXPIRED` response, and appends both observed Supabase session deletion cookies and the CSRF deletion cookie. Every control-plane route now supplies that request context, including repository-driven PostgreSQL revocation failures.
+- The SSR proxy still does not authorize or reject public navigation, but it now forwards the exact deletion cookies carried by a terminal `AuthError` instead of discarding them. Protected route handlers remain the fail-closed authorization boundary.
+- Fresh authentication and session-bound CSRF are now a distinct boundary from organization authorization. Logout, global revocation, and password rotation use `requireAuthenticatedMutation`; all project, analysis, capability, verification, and release mutations continue to use `requireMutationActor` and therefore require current membership.
+- The session endpoint still proves the exact database session and resolves membership. A valid but membership-orphaned account now receives an actor-free `{ membershipRequired: true }` session state plus a session-bound CSRF challenge, allowing the supported UI to log out, revoke sessions, or rotate a password without exposing organization data. Database `SESSION_REVOKED` continues to return 401 and clears cookies.
+
+Current official Supabase guidance was rechecked before the fix. It continues to recommend cookie-backed `@supabase/ssr`, `getClaims()` in the proxy, and fresh `getUser()` when current user records are required. No relevant August 2026 auth/SSR breaking change alters the pinned client contract used here.
+
+### Strict RED evidence
+
+The five review regressions were added first and executed against the reviewed implementation:
+
+```text
+/usr/local/bin/node /Users/miki/Cloudsail-Development/runmill/node_modules/tsx/dist/cli.mjs \
+  --test apps/control-plane/tests/auth-lifecycle-routes.test.ts
+tests 7; pass 2; fail 5; skipped 0; duration 646 ms
+```
+
+The failures matched the two reviewed root causes exactly:
+
+```text
+repository SESSION_REVOKED: expected sb-* Max-Age=0; actual Set-Cookie was empty
+proxy AuthError expiry: expected sb-* Max-Age=0; actual Set-Cookie was empty
+orphan logout: expected 200; actual 403
+orphan revoke: expected 200; actual 403
+orphan password rotation: expected 200; actual 403
+```
+
+An additional supported-flow regression was then written before changing the session endpoint. It proved that direct handler tests alone were insufficient because an orphaned browser could not obtain the required session-bound CSRF token:
+
+```text
+/usr/local/bin/node /Users/miki/Cloudsail-Development/runmill/node_modules/tsx/dist/cli.mjs \
+  --test --test-name-pattern='obtain session-bound CSRF' \
+  apps/control-plane/tests/auth-lifecycle-routes.test.ts
+tests 1; pass 0; fail 1
+expected session status 200; actual 403
+```
+
+### Focused and affected GREEN evidence
+
+Each finding was made green independently before the combined run:
+
+```text
+--test-name-pattern='repository session revocation|proxy forwards'
+tests 2; pass 2; fail 0
+
+--test-name-pattern='orphaned account'
+tests 3; pass 3; fail 0
+
+--test-name-pattern='obtain session-bound CSRF'
+tests 1; pass 1; fail 0
+```
+
+Final focused auth/API/authorization/CSRF run:
+
+```text
+/usr/local/bin/node /Users/miki/Cloudsail-Development/runmill/node_modules/tsx/dist/cli.mjs --test \
+  apps/control-plane/tests/auth-lifecycle-routes.test.ts \
+  apps/control-plane/tests/api-contract.test.ts \
+  apps/control-plane/tests/supabase-auth.test.ts \
+  apps/control-plane/tests/authorization.test.ts \
+  apps/control-plane/tests/csrf.test.ts
+tests 24; pass 24; fail 0; skipped 0; duration 1076 ms
+```
+
+Final affected control-plane/database run:
+
+```text
+/usr/local/bin/node /Users/miki/Cloudsail-Development/runmill/node_modules/tsx/dist/cli.mjs --test \
+  apps/control-plane/tests/*.test.ts \
+  packages/database/src/control-plane.test.ts \
+  packages/database/src/factory.test.ts \
+  packages/database/src/postgres.integration.test.ts \
+  packages/database/src/postgres.test.ts
+tests 99; pass 92; fail 0; skipped 7; duration 2563 ms
+```
+
+### PostgreSQL and full-suite evidence
+
+The fresh ephemeral PostgreSQL/RLS run remained green, including exact active-session enforcement, revocation, six repository integration tests, and the separate route/worker topology regression:
+
+```text
+PAGE2WEBMCP_NATIVE_TYPESCRIPT_TESTS=true PAGE2WEBMCP_NODE_BINARY=/usr/local/bin/node \
+  bash scripts/test-rls-local.sh
+PostgreSQL repository tests: 6 pass; 0 fail
+separate route/worker topology: 1 pass; 0 fail
+Standalone PostgreSQL RLS and production-topology integration tests passed.
+```
+
+Full trusted/native split on the final implementation tree:
+
+```text
+/usr/local/bin/node /Users/miki/Cloudsail-Development/runmill/node_modules/tsx/dist/cli.mjs --test \
+  $(rg --files -g '*.test.ts' -g '!node_modules' \
+    | rg -v '^packages/database/src/workflow\\.test\\.ts$' | LC_ALL=C sort)
+tests 298; pass 291; fail 0; skipped 7; duration 14888 ms
+
+/usr/local/bin/node --experimental-transform-types --test packages/database/src/workflow.test.ts
+tests 14; pass 14; fail 0; skipped 0; duration 1107 ms
+```
+
+Combined repository result: 312 tests, 305 pass, 7 explicit environment skips, 0 failures.
+
+Direct gates all exited zero:
+
+```text
+/usr/local/bin/node node_modules/typescript/bin/tsc --project tsconfig.base.json --noEmit
+/usr/local/bin/node node_modules/eslint/bin/eslint.js . --max-warnings=0
+/usr/local/bin/node scripts/lint-source.mjs
+/usr/local/bin/node scripts/check-source.mjs
+/usr/local/bin/node /opt/homebrew/Cellar/pnpm/10.14.0/bin/pnpm audit --prod --audit-level=high
+No known vulnerabilities found
+git diff --check
+```
+
+### Fix-round self-review and residuals
+
+- Confirmed all organization-scoped operations retain a fresh membership lookup; only account/session lifecycle operations use the new authentication-only mutation boundary.
+- Confirmed an orphan session response contains no role, organization, project, or repository data and still requires a currently valid Supabase identity plus exact database session.
+- Confirmed repository revocation and provider expiry preserve precise 401 diagnostics while clearing both authentication and CSRF state.
+- Confirmed the proxy forwards only provider-authored deletion cookies and does not become an authorization decision point.
+- No migration, RLS, workflow, canonical-plan, evidence, release, provider, or fixture-production contract was weakened.
+- Managed Supabase and browser deployment gates remain as documented above; this round adds hermetic real-handler/proxy and fresh PostgreSQL evidence only.
+
+The fix and this appended report are committed together; the exact fix commit is reported to the orchestrator after commit.

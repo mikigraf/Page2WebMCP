@@ -30,7 +30,7 @@ export async function GET(request: Request) {
     });
     return successResponse(page, requestId);
   } catch (error) {
-    return errorResponse(error, requestId);
+    return errorResponse(error, requestId, request);
   }
 }
 
@@ -59,7 +59,7 @@ export async function POST(request: Request) {
     });
     return successResponse(project, requestId, 201);
   } catch (error) {
-    const response = errorResponse(error, requestId);
+    const response = errorResponse(error, requestId, request);
     await recordLifecycleFailure({ event: "project_created", requestId, startedAt }, error, response.status);
     return response;
   }

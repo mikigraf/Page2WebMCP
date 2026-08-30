@@ -38,7 +38,7 @@ export async function POST(
     });
     return successResponse({ capability }, requestId);
   } catch (error) {
-    const response = errorResponse(error, requestId);
+    const response = errorResponse(error, requestId, request);
     await recordLifecycleFailure({ event: "capability_reviewed", requestId, startedAt }, error, response.status);
     return response;
   }

@@ -22,6 +22,6 @@ export async function GET(
       : [];
     return successResponse({ project, latestAnalysis, capabilities }, requestId);
   } catch (error) {
-    return errorResponse(error, requestId);
+    return errorResponse(error, requestId, request);
   }
 }

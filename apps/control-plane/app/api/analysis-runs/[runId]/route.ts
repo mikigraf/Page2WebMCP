@@ -30,6 +30,6 @@ export async function GET(
       : [];
     return successResponse({ run, projectId: run.projectId, result, capabilities }, requestId);
   } catch (error) {
-    return errorResponse(error, requestId);
+    return errorResponse(error, requestId, request);
   }
 }

@@ -44,6 +44,6 @@ export async function POST(request: Request) {
     const current = await repository.getAnalysis(actor, run.id);
     return successResponse({ runId: current.id, status: current.status }, requestId, 202);
   } catch (error) {
-    return errorResponse(error, requestId);
+    return errorResponse(error, requestId, request);
   }
 }

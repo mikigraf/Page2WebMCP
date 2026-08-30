@@ -90,9 +90,7 @@ export async function requireIdentityActor(
   request: Request,
   repository: ControlPlaneRepository = getControlPlaneRepository()
 ): Promise<{ actor: RepositoryActor; identity: AuthIdentity }> {
-  const authService = getAuthService();
-  const identity = await authService.identity(request);
-  if (!identity) throw new ApiError("AUTH_REQUIRED", 401);
+  const identity = await requireAuthenticatedIdentity(request);
   const requestedOrganization = request.headers.get("x-page2webmcp-organization-id") ?? undefined;
   if (requestedOrganization
     && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(requestedOrganization)) {
@@ -104,6 +102,18 @@ export async function requireIdentityActor(
     identity.sessionId
   );
   return { actor, identity };
+}
+
+export async function requireAuthenticatedIdentity(request: Request): Promise<AuthIdentity> {
+  const identity = await getAuthService().identity(request);
+  if (!identity) throw new ApiError("AUTH_REQUIRED", 401);
+  return identity;
+}
+
+export async function requireAuthenticatedMutation(request: Request): Promise<AuthIdentity> {
+  const identity = await requireAuthenticatedIdentity(request);
+  assertCsrf(request, { sessionId: identity.sessionId });
+  return identity;
 }
 
 export async function requireActor(
@@ -223,7 +233,7 @@ export function successResponse(data: unknown, requestId: string, status = 200, 
   return new Response(JSON.stringify(data), { status, headers: responseHeaders });
 }
 
-export function errorResponse(error: unknown, requestId: string): Response {
+export function errorResponse(error: unknown, requestId: string, request?: Request): Response {
   const mapped = mapError(error);
   const body: {
     code: string;
@@ -235,9 +245,16 @@ export function errorResponse(error: unknown, requestId: string): Response {
     requestId
   };
   if (mapped.details?.length) body.error.details = mapped.details;
-  const headers = error instanceof AuthError && error.cookies.length > 0
-    ? appendSetCookies(new Headers(), error.cookies)
-    : undefined;
+  const headers = new Headers();
+  if (error instanceof AuthError && error.cookies.length > 0) {
+    appendSetCookies(headers, error.cookies);
+  }
+  if (request && (mapped.code === "SESSION_REVOKED" || mapped.code === "SESSION_EXPIRED")) {
+    appendSetCookies(headers, [
+      ...getAuthService().clearSessionCookies(request),
+      clearCsrfCookie(request)
+    ]);
+  }
   return successResponse(body, requestId, mapped.status, headers);
 }
 

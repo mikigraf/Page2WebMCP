@@ -23,6 +23,6 @@ export async function GET(request: Request) {
     }), result.cookies);
     return new Response(null, { status: 303, headers });
   } catch (error) {
-    return errorResponse(error, requestId);
+    return errorResponse(error, requestId, request);
   }
 }

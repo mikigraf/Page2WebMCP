@@ -37,7 +37,7 @@ export async function POST(request: Request) {
     });
     return successResponse({ verification }, requestId);
   } catch (error) {
-    const response = errorResponse(error, requestId);
+    const response = errorResponse(error, requestId, request);
     await recordLifecycleFailure({ event: "release_verified", operation: "verify", requestId, startedAt }, error, response.status);
     return response;
   }

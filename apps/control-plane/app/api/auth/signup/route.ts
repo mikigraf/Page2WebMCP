@@ -26,6 +26,6 @@ export async function POST(request: Request) {
     }, requestId, 202,
       appendSetCookies(new Headers(), result.cookies));
   } catch (error) {
-    return errorResponse(error, requestId);
+    return errorResponse(error, requestId, request);
   }
 }

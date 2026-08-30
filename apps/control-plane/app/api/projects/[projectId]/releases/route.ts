@@ -46,7 +46,7 @@ export async function POST(
     });
     return successResponse({ release }, requestId, 201);
   } catch (error) {
-    const response = errorResponse(error, requestId);
+    const response = errorResponse(error, requestId, request);
     await recordLifecycleFailure({ event: "release_published", operation: "publish", requestId, startedAt }, error, response.status);
     return response;
   }

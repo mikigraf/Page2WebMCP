@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getAuthService } from "./src/auth.ts";
+import { AuthError, getAuthService } from "./src/auth.ts";
 
 /** Refresh only. Every protected route still performs fresh identity and DB authorization. */
 export async function proxy(request: Request) {
@@ -7,7 +7,10 @@ export async function proxy(request: Request) {
   try {
     const result = await getAuthService().refreshForProxy(request);
     for (const cookie of result.cookies) response.headers.append("set-cookie", cookie);
-  } catch {
+  } catch (error) {
+    if (error instanceof AuthError) {
+      for (const cookie of error.cookies) response.headers.append("set-cookie", cookie);
+    }
     // Routes return the precise expired/revoked diagnostic. Proxy is never an
     // authorization boundary and must not turn a public page into an auth error.
   }
