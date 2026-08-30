@@ -110,3 +110,56 @@ The trusted `tsx` CLI was used as directed. No provenance/quarantine metadata wa
 - These are hermetic browser-style doubles, not a claim of live browser/provider success. Live installation and provider validation remain later integration work.
 - Task 1's installation-layer integrity dependency is unchanged: the generated module supplies exact integrity/runtime identity metadata, but Task 8's trusted loader must verify bytes before evaluation. A JavaScript module cannot authenticate bytes that have already begun evaluating.
 - Semantic DOM mutation deliberately supports only reviewed non-navigating native clicks. Anchors and submit-like targets fail closed; broader navigation/submission behavior requires a separately reviewed future contract, not runtime inference.
+
+## Fix round 1 — semantic mutation target and drift review
+
+Implementation commit: `28e7ec06d16199b781ebea61ea1f23d7f0d6ec16` (`fix: constrain semantic DOM mutations`).
+
+The independent review's 1 Critical and 1 Important finding were reproduced and fixed without a contested skip.
+
+### C1 — generic scripted click targets
+
+- Added a distinct canonical `SemanticClickLocator` contract. Mutation click locators must now bind an exact `button` or `input`; role targets must be the exact `button` role, and named/reviewed stable-attribute targets cannot declare generic elements.
+- Runtime role resolution enforces the reviewed element tag. Immediately before dispatch, it re-resolves the exact target identity and mechanically requires an enabled native `button`/`input` with exact `type="button"`; submit defaults, other input types, `formaction`, and `formtarget` fail with `STALE_PAGE`.
+- Added a browser regression whose generic `div[role=button]` handler would update the success state. The bundle now rejects before native click dispatch, with zero click calls and zero handler side effects.
+- Added IR coverage that rejects a reviewed stable-attribute click target declared on a generic `div`. A cross-origin anchor likewise cannot satisfy the native-control locator and is classified as structural `STALE_PAGE` before click.
+
+### I1 — zero-match/drift during DOM success waits
+
+- The runtime captures the exact reviewed success node before confirmation/effect and revalidates both scope identity and success-node identity before click and on every wait iteration.
+- A stable target whose value has not reached the reviewed condition continues to wait; zero match, multiple match, node replacement/removal, scope replacement/removal, document replacement, or URL drift throws `STALE_PAGE` immediately.
+- Added a regression that removes the reviewed status node from the native button handler. It now rejects as `STALE_PAGE` rather than falling through to `DEADLINE_EXCEEDED`.
+
+### RED
+
+```text
+/usr/local/bin/node /Users/miki/Cloudsail-Development/runmill/node_modules/tsx/dist/cli.mjs --test --test-reporter=spec --test-name-pattern='generic scripted|disappearing reviewed' packages/compiler/src/compiler.adapters.test.ts
+tests 2; pass 0; fail 2
+both failures: AssertionError: Missing expected rejection
+```
+
+The generic role target executed its handler and returned success; the disappearing status target remained pending beyond the regression's bounded wait.
+
+### Focused GREEN
+
+```text
+/usr/local/bin/node /Users/miki/Cloudsail-Development/runmill/node_modules/tsx/dist/cli.mjs --test --test-reporter=spec --test-name-pattern='generic scripted|disappearing reviewed' packages/compiler/src/compiler.adapters.test.ts
+tests 2; pass 2; fail 0
+
+/usr/local/bin/node /Users/miki/Cloudsail-Development/runmill/node_modules/tsx/dist/cli.mjs --test --test-reporter=spec packages/capability-ir/src/plan.adapters.test.ts packages/capability-ir/src/plan.test.ts packages/compiler/src/compiler.adapters.test.ts packages/compiler/src/compiler.contract.test.ts packages/compiler/src/compiler.integrity.test.ts packages/compiler/src/compiler.test.ts
+tests 75; pass 75; fail 0; skipped 0
+```
+
+### Affected and full verification
+
+```text
+/usr/local/bin/node /Users/miki/Cloudsail-Development/runmill/node_modules/tsx/dist/cli.mjs --test --test-reporter=spec packages/capability-ir/src/*.test.ts packages/compiler/src/*.test.ts apps/acme-support/tests/*.test.ts apps/control-plane/tests/*.test.ts packages/database/src/*.test.ts
+tests 169; pass 164; fail 0; skipped 5
+
+/usr/local/bin/node /Users/miki/Cloudsail-Development/runmill/node_modules/tsx/dist/cli.mjs --test --test-reporter=spec test-support/**/*.test.ts apps/**/*.test.ts packages/**/*.test.ts
+tests 221; pass 216; fail 0; skipped 5; duration 3556 ms
+```
+
+The five skips remain the existing PostgreSQL/environment-gated tests. Direct typecheck, ESLint, source lint, security policy, and `git diff --check` all exited 0. The trusted runner was used and no provenance metadata was changed.
+
+The representative three-plan JSON artifact is now 51,024 bytes, leaving 14,512 bytes below the 64 KiB boundary. The pre-evaluation Task 8 trusted-loader dependency and hermetic-browser-test limitation remain unchanged.
