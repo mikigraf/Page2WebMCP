@@ -1,38 +1,89 @@
-import { AcmeSupport } from "../../acme-support/src/app";
-import { acmeCapabilityPlans } from "../../acme-support/src/capability-plans.ts";
-import { Capability, createCapability } from "../../../packages/capability-ir/src/status.ts";
-import { compileWebMcpRelease, CompiledRelease } from "../../../packages/compiler/src/compiler.ts";
-import { sanitizeEvidence } from "../../../packages/security/src/security.ts";
-import { compileOpenApi } from "../../../packages/openapi/src/compile.ts";
-import { analyzeSource, generateHardeningChange } from "../../../packages/source-analyzer/src/analyze.ts";
-import { LocalSourceControlProvider } from "../../../packages/providers/src/local.ts";
+import { createHash } from "node:crypto";
+import type { AnalysisResult, ClaimedAnalysisRunRecord } from "../../../packages/database/src/control-plane.ts";
+import { compileWebMcpRelease } from "../../../packages/compiler/src/compiler.ts";
+import {
+  compileOpenApiWithGrouping,
+  validateOpenApiSource,
+  type OpenApiGroupingPort,
+} from "../../../packages/openapi/src/compile.ts";
+import { fetchOpenApiSource, type OpenApiProviderControls } from "../../../packages/providers/src/openapi.ts";
 
-export type WorkflowResult = { capabilities: Capability[]; evidence: Array<Record<string, unknown>>; release: CompiledRelease };
+export type OpenApiAnalysisConfiguration = Readonly<{
+  targetOrigin: string;
+  testPageUrl: string;
+  environment: "test" | "staging" | "production";
+  provider: Omit<OpenApiProviderControls, "signal">;
+  groupingPort?: OpenApiGroupingPort;
+}>;
 
-export function runFixtureWorkflow(app: AcmeSupport, origin: string): WorkflowResult {
-  const document = app.openApiDocument();
-  const capabilitySpecs = [
-    ["find_order", "R0", true],
-    ["get_order_status", "R0", true],
-    ["create_support_ticket", "R1", false],
-    ["delete_account", "R3", false]
-  ] as const;
-  const openApi = compileOpenApi(document);
-  const capabilities = capabilitySpecs.map(([name, risk, readOnly]) => createCapability(name, risk, readOnly));
-  const evidence = Object.entries(document.paths).map(([path, operations]) => sanitizeEvidence({ source: "openapi", path, operations }));
-  const executableNames = new Set(capabilities
-    .filter((capability) => capability.status !== "blocked")
-    .map((capability) => capability.identity.name));
-  const release = compileWebMcpRelease(acmeCapabilityPlans(origin)
-    .filter((plan) => executableNames.has(plan.tool.name)));
-  return { capabilities, evidence: [...evidence, { source: "openapi", diagnostics: openApi.diagnostics }], release };
+type AnalysisSource = Pick<ClaimedAnalysisRunRecord, "sourceType" | "sourceUrl">;
+export type AnalysisAdapter = (source: AnalysisSource, signal: AbortSignal) => Promise<AnalysisResult>;
+
+function assertVerificationContext(configuration: OpenApiAnalysisConfiguration): void {
+  if (!configuration) throw new Error("OPENAPI_VERIFICATION_CONTEXT_REQUIRED");
+  let origin: URL;
+  let page: URL;
+  try {
+    origin = new URL(configuration.targetOrigin);
+    page = new URL(configuration.testPageUrl);
+  } catch {
+    throw new Error("OPENAPI_VERIFICATION_CONTEXT_REQUIRED");
+  }
+  if (origin.protocol !== "https:" || origin.origin !== configuration.targetOrigin || origin.username || origin.password
+    || page.protocol !== "https:" || page.origin !== origin.origin || page.username || page.password
+    || !["test", "staging", "production"].includes(configuration.environment)) {
+    throw new Error("OPENAPI_VERIFICATION_CONTEXT_REQUIRED");
+  }
 }
 
-export function runFixtureSourceHardening() {
-  const analysis = analyzeSource({
-    "app/api/tickets/route.ts": "export async function POST() { return acme.createTicket(session(request), await request.json()); }",
-    "app/api/_fixture.ts": "export function session(request) { return request.cookies.get('acme_session'); }"
+function evidenceContent(
+  sourceDigest: string,
+  openApiVersion: string,
+  configuration: Pick<OpenApiAnalysisConfiguration, "targetOrigin" | "testPageUrl" | "environment">,
+): string {
+  return JSON.stringify({
+    adapter: "bounded-openapi",
+    adapterVersion: 1,
+    environment: configuration.environment,
+    openApiVersion,
+    sourceDigest,
+    targetOrigin: configuration.targetOrigin,
+    testPageUrl: configuration.testPageUrl,
   });
-  const source = new LocalSourceControlProvider();
-  return source.openDraftPullRequest({ title: "feat: add Page2WebMCP tools", files: generateHardeningChange(analysis) });
+}
+
+/**
+ * Creates the production OpenAPI adapter only when every network and verification
+ * control is supplied explicitly. There is intentionally no implicit live fetcher.
+ */
+export function createOpenApiAnalysisAdapter(configuration: OpenApiAnalysisConfiguration): AnalysisAdapter {
+  assertVerificationContext(configuration);
+  if (!configuration?.provider?.resolver || !configuration.provider.transport) {
+    throw new Error("OPENAPI_PROVIDER_CONTROLS_REQUIRED");
+  }
+  return async (source, signal) => {
+    if (source.sourceType !== "openapi") throw new Error("SOURCE_TYPE_UNSUPPORTED");
+    const fetched = await fetchOpenApiSource(source.sourceUrl, { ...configuration.provider, signal });
+    const document = await validateOpenApiSource(fetched.source, fetched.format);
+    const content = evidenceContent(fetched.evidenceReference, document.openapi, configuration);
+    const reference = `urn:sha256:${createHash("sha256").update(content, "utf8").digest("hex")}`;
+    const compiled = await compileOpenApiWithGrouping(document, {
+      targetOrigin: configuration.targetOrigin,
+      testPageUrl: configuration.testPageUrl,
+      environment: configuration.environment,
+      evidenceReference: reference,
+    }, configuration.groupingPort);
+    if (compiled.plans.length === 0) throw new Error("NO_BROWSER_SAFE_CAPABILITIES");
+    const release = compileWebMcpRelease(compiled.plans);
+    return {
+      capabilities: release.manifest.plans.map((plan) => ({ plan, status: "proposed" as const })),
+      evidence: [{ source: "openapi", content, reference }],
+      release: {
+        code: release.code,
+        contentHash: release.contentHash,
+        allowedOrigin: release.allowedOrigin,
+        manifest: release.manifest,
+      },
+    };
+  };
 }

@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { acmeCapabilityPlans } from "../../../apps/acme-support/src/capability-plans.ts";
 import type { CapabilityPlan } from "../../capability-ir/src/plan.ts";
+import { compileOpenApi } from "../../openapi/src/compile.ts";
 import { compileWebMcpRelease } from "./compiler.ts";
 
 const REGISTRY = Symbol.for("page2webmcp.release.registry.v1");
@@ -106,6 +107,72 @@ test("compiler preserves the untrusted-content classification in its manifest an
   const { artifact, tools } = await loadArtifact("https://acme.example", classified);
   await registerWithFetch(artifact, async () => Response.json([]));
   assert.equal(tools[0]?.annotations?.untrustedContentHint, true);
+});
+
+test("generated JSON adapter serializes reviewed headers, optional query values, and form bodies exactly", async () => {
+  const evidenceReference = `urn:sha256:${"d".repeat(64)}`;
+  const compiled = compileOpenApi({ openapi: "3.1.0", paths: {
+    "/widgets/{id}": { get: {
+      parameters: [
+        { in: "path", name: "id", required: true, schema: { type: "string", maxLength: 20 } },
+        { in: "query", name: "locale", schema: { type: "string", maxLength: 5 } },
+        { in: "header", name: "X-Trace", required: true, schema: { type: "string", maxLength: 20 } },
+      ],
+      responses: { "200": { description: "ok", content: { "application/json": { schema: { type: "boolean" } } } } },
+    } },
+    "/widgets": { post: {
+      "x-page2webmcp": { reviewed: true, effect: "mutation", riskTier: "R1", reversible: true },
+      requestBody: { required: true, content: { "application/x-www-form-urlencoded": { schema: {
+        type: "object", required: ["name"], properties: { name: { type: "string", maxLength: 20 } },
+      } } } },
+      responses: { "201": { description: "ok", content: { "application/json": { schema: { type: "boolean" } } } } },
+    } },
+  } }, {
+    targetOrigin: "https://widgets.example",
+    testPageUrl: "https://widgets.example/review",
+    environment: "test",
+    evidenceReference,
+  });
+  const executablePlans = compiled.plans.map((plan) => plan.effects.kind === "mutation" ? {
+    ...plan,
+    effects: {
+      ...plan.effects,
+      sourceNativeConfirmation: {
+        reviewed: true as const,
+        globalName: "__page2webmcpConfirmSupportTicket",
+        evidenceReference,
+      },
+    },
+  } : plan);
+  const loaded = await loadArtifact("https://widgets.example", executablePlans);
+  const requests: Array<{ url: string; init?: RequestInit }> = [];
+  await registerWithFetch(loaded.artifact, async (input, init) => {
+    requests.push({ url: String(input), init });
+    return Response.json(true, { status: init?.method === "POST" ? 201 : 200 });
+  }, { confirm: () => true });
+  const platform = {
+    Headers: globalThis.Headers,
+    URL: globalThis.URL,
+    URLSearchParams: globalThis.URLSearchParams,
+    TextEncoder: globalThis.TextEncoder,
+    TextDecoder: globalThis.TextDecoder,
+  };
+  const replaced = class { constructor() { throw new Error("PAGE_REPLACEMENT_CALLED"); } };
+  try {
+    for (const name of Object.keys(platform)) Object.defineProperty(globalThis, name, { configurable: true, writable: true, value: replaced });
+    const read = loaded.tools.find(({ name }) => name.startsWith("get_operation_"))!;
+    await read.execute({ path_id: "a/b", header_x_trace: "trace-1" }, { signal: new AbortController().signal });
+    const mutation = loaded.tools.find(({ name }) => name.startsWith("post_operation_"))!;
+    await mutation.execute({ body_name: "blue widget" }, { signal: new AbortController().signal });
+  } finally {
+    for (const [name, constructor] of Object.entries(platform)) {
+      Object.defineProperty(globalThis, name, { configurable: true, writable: true, value: constructor });
+    }
+  }
+  assert.equal(requests[0]!.url, "https://widgets.example/widgets/a%2Fb");
+  assert.equal(new Headers(requests[0]!.init?.headers).get("x-trace"), "trace-1");
+  assert.equal(requests[1]!.init?.body, "name=blue+widget");
+  assert.match(new Headers(requests[1]!.init?.headers).get("content-type") ?? "", /^application\/x-www-form-urlencoded/);
 });
 
 test("compiler applies no fixture-name metadata fallback", () => {

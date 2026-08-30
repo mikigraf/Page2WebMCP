@@ -1,6 +1,4 @@
 import { randomUUID } from "node:crypto";
-import { AcmeSupport } from "../../acme-support/src/app.ts";
-import { compileWebMcpRelease } from "../../../packages/compiler/src/compiler.ts";
 import type {
   AnalysisResult,
   AnalysisRunRecord,
@@ -8,8 +6,6 @@ import type {
   ControlPlaneRepository,
 } from "../../../packages/database/src/control-plane.ts";
 import { getObservability } from "../../../packages/observability/src/server.ts";
-import { runFixtureSourceHardening, runFixtureWorkflow } from "./workflow.ts";
-import { acmeCapabilityEvidence, acmeCapabilityPlans } from "../../acme-support/src/capability-plans.ts";
 
 const LEASE_MS = 60_000;
 const HEARTBEAT_MS = 15_000;
@@ -22,6 +18,14 @@ export type ProcessAnalysisOptions = {
   heartbeatMs?: number;
   analyze?: (source: ClaimedAnalysisRunRecord, signal: AbortSignal) => Promise<AnalysisResult>;
 };
+
+type AnalysisAdapter = NonNullable<ProcessAnalysisOptions["analyze"]>;
+let testAnalysisAdapter: AnalysisAdapter | undefined;
+
+export function setAnalysisAdapterForTest(adapter: AnalysisAdapter | undefined): void {
+  if (process.env.NODE_ENV === "production") throw new Error("TEST_ADAPTER_FORBIDDEN");
+  testAnalysisAdapter = adapter;
+}
 
 /** Claims and processes at most one durable analysis job. */
 export async function processNextAnalysis(
@@ -48,8 +52,9 @@ export async function processNextAnalysis(
   });
 
   try {
+    const analyze = options.analyze ?? testAnalysisAdapter;
     const result = await withDeadline(
-      (signal) => options.analyze ? options.analyze(run, signal) : Promise.resolve(buildResult(run)),
+      (signal) => analyze ? analyze(run, signal) : Promise.reject(new Error("ANALYZER_NOT_CONFIGURED")),
       deadlineMs
     );
     heartbeatController.abort();
@@ -78,47 +83,6 @@ export async function processNextAnalysis(
 
 }
 
-function buildResult(source: ClaimedAnalysisRunRecord): AnalysisResult {
-  assertFixtureScope(source);
-
-  if (source.sourceType === "github") {
-    const draftPullRequest = runFixtureSourceHardening();
-    const origin = fixtureOrigin();
-    const release = compileWebMcpRelease(acmeCapabilityPlans(origin).slice(0, 1));
-    return {
-      capabilities: release.manifest.plans.map((plan) => ({ plan, status: "proposed" })),
-      evidence: acmeCapabilityEvidence()
-        .filter(({ reference }) => release.manifest.plans.some((plan) => plan.evidence.some((item) => item.reference === reference))),
-      release: {
-        code: release.code,
-        contentHash: release.contentHash,
-        allowedOrigin: release.allowedOrigin,
-        manifest: release.manifest
-      },
-      draftPullRequest
-    };
-  }
-
-  const origin = new URL(source.sourceUrl).origin;
-  const workflow = runFixtureWorkflow(new AcmeSupport(), origin);
-  const statusByName = new Map(workflow.capabilities.map((capability) => [capability.identity.name, capability.status]));
-  const capabilities = workflow.release.manifest.plans.map((plan) => ({
-    plan,
-    status: statusByName.get(plan.tool.name) === "blocked" ? "blocked" as const : "proposed" as const
-  }));
-  return {
-    capabilities,
-    evidence: acmeCapabilityEvidence()
-      .filter(({ reference }) => workflow.release.manifest.plans.some((plan) => plan.evidence.some((item) => item.reference === reference))),
-    release: {
-      code: workflow.release.code,
-      contentHash: workflow.release.contentHash,
-      allowedOrigin: workflow.release.allowedOrigin,
-      manifest: workflow.release.manifest
-    }
-  };
-}
-
 async function recordAnalysisOutcome(
   requestId: string,
   outcome: "success" | "failure",
@@ -144,20 +108,6 @@ async function recordAnalysisOutcome(
   } catch {
     // Observability is never allowed to influence durable worker state.
   }
-}
-
-function assertFixtureScope(source: ClaimedAnalysisRunRecord): void {
-  const expectedOrigin = fixtureOrigin();
-  if (source.sourceType === "website" && source.sourceUrl === `${expectedOrigin}/`) return;
-  if (source.sourceType === "openapi" && source.sourceUrl === `${expectedOrigin}/openapi.json`) return;
-  const expectedRepository = process.env.PAGE2WEBMCP_FIXTURE_GITHUB_URL ?? "https://github.com/acme/support";
-  if (source.sourceType === "github" && canonicalUrl(source.sourceUrl) === canonicalUrl(expectedRepository)) return;
-  throw new Error("SOURCE_SCOPE_MISMATCH");
-}
-
-function fixtureOrigin(): string {
-  const configured = process.env.PAGE2WEBMCP_FIXTURE_APP_URL ?? "https://acme.example";
-  return new URL(configured).origin;
 }
 
 function boundedDuration(value: number | undefined, fallback: number, minimum: number, maximum: number): number {
@@ -217,10 +167,6 @@ async function abortableDelay(milliseconds: number, signal: AbortSignal): Promis
       resolve();
     }
   });
-}
-
-function canonicalUrl(value: string): string {
-  return new URL(value).toString().replace(/\/$/, "");
 }
 
 function stableFailureCode(error: unknown): string {

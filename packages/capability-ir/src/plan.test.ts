@@ -386,6 +386,59 @@ test("CapabilityPlan canonicalizes safe header names and rejects reserved or col
     },
     idempotency: { strategy: "header", headerName: "x-operation-key", verified: true, retry: "safe_once" },
   })]), /collid|header/i);
+
+  assert.throws(() => canonicalizeCapabilityPlans([readPlan({
+    request: {
+      ...readPlan().request,
+      query: {},
+      headers: { "X-Forwarded-Host": "query" },
+    },
+  })]), /reserved|header/i);
+
+  assert.throws(() => canonicalizeCapabilityPlans([readPlan({
+    request: {
+      ...readPlan().request,
+      query: {},
+      headers: { "X-Client-Secret": "query" },
+    },
+  })]), /reserved|unsafe|header/i);
+});
+
+test("CapabilityPlan bounds form-encoded request bodies by their encoded wire size", () => {
+  assert.throws(() => canonicalizeCapabilityPlans([mutationPlan({
+    schemas: {
+      ...mutationPlan().schemas,
+      input: {
+        type: "object",
+        properties: { query: { type: "string", maxLength: 4096 } },
+        required: ["query"],
+        additionalProperties: false,
+      },
+    },
+    request: {
+      ...mutationPlan().request,
+      body: { query: "query" },
+      bodyEncoding: "form_urlencoded",
+    },
+  })]), /request body exceeds/i);
+
+  const encodedName = `a${"~".repeat(127)}`;
+  assert.throws(() => canonicalizeCapabilityPlans([mutationPlan({
+    schemas: {
+      ...mutationPlan().schemas,
+      input: {
+        type: "object",
+        properties: { query: { type: "string", maxLength: 2700 } },
+        required: ["query"],
+        additionalProperties: false,
+      },
+    },
+    request: {
+      ...mutationPlan().request,
+      body: { [encodedName]: "query" },
+      bodyEncoding: "form_urlencoded",
+    },
+  })]), /request body exceeds/i);
 });
 
 test("CapabilityPlan rejects poison JSON keys instead of changing reviewed semantics", () => {

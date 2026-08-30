@@ -36,6 +36,9 @@ function isBlockedIpv6(hostname: string): boolean {
   if (!parts) return false;
   if (parts.every((part) => part === 0) || parts.slice(0, 7).every((part) => part === 0) && parts[7] === 1) return true;
   if ((parts[0] & 0xfe00) === 0xfc00 || (parts[0] & 0xffc0) === 0xfe80 || (parts[0] & 0xff00) === 0xff00) return true;
+  // Permit only ordinary global-unicast space and exclude transition/documentation ranges.
+  if ((parts[0] & 0xe000) !== 0x2000 || parts[0] === 0x2002
+    || parts[0] === 0x2001 && (parts[1] === 0 || parts[1] === 0x10 || parts[1] === 0x0db8)) return true;
   if (parts.slice(0, 5).every((part) => part === 0) && parts[5] === 0xffff || parts.slice(0, 6).every((part) => part === 0)) {
     return isBlockedIpv4(`${parts[6] >>> 8}.${parts[6] & 0xff}.${parts[7] >>> 8}.${parts[7] & 0xff}`);
   }
@@ -45,6 +48,17 @@ function isBlockedIpv6(hostname: string): boolean {
 function isPrivateOrReservedHost(hostname: string): boolean {
   const host = hostname.toLowerCase().replace(/\.+$/, "");
   return host === "localhost" || host.endsWith(".localhost") || isBlockedIpv4(host) || isBlockedIpv6(host);
+}
+
+export function validateResolvedAddress(value: string): { ok: boolean; code?: string } {
+  const normalized = value.toLowerCase().replace(/^\[|\]$/g, "");
+  const ipv4 = normalized.split(".");
+  const validIpv4 = ipv4.length === 4
+    && ipv4.every((part) => /^(?:0|[1-9]\d{0,2})$/.test(part) && Number(part) <= 255);
+  const validIpv6 = normalized.includes(":") && parseIpv6(normalized) !== undefined;
+  if (!validIpv4 && !validIpv6) return { ok: false, code: "INVALID_RESOLVED_ADDRESS" };
+  if (isPrivateOrReservedHost(normalized)) return { ok: false, code: "PRIVATE_NETWORK_BLOCKED" };
+  return { ok: true };
 }
 
 export function validateTargetUrl(value: string): { ok: boolean; code?: string } {

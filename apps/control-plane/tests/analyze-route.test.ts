@@ -5,9 +5,25 @@ import { POST as analyze } from "../app/api/projects/analyze/route.ts";
 import { authenticate, issueSession } from "../src/auth.ts";
 import { InMemoryControlPlaneRepository } from "../../../packages/database/src/control-plane.ts";
 import { setControlPlaneRepositoryForTest } from "../../../packages/database/src/factory.ts";
+import { compileWebMcpRelease } from "../../../packages/compiler/src/compiler.ts";
+import { acmeCapabilityEvidence, acmeCapabilityPlans } from "../../acme-support/src/capability-plans.ts";
+import { setAnalysisAdapterForTest } from "../../worker/src/runner.ts";
 
 const actor = authenticate("owner@example.test", "fixture-password")!;
 const cookie = `page2webmcp_session=${issueSession(actor)}`;
+
+setAnalysisAdapterForTest(async (source) => {
+  const origin = source.sourceType === "github" ? "https://acme.example" : new URL(source.sourceUrl).origin;
+  const plans = acmeCapabilityPlans(origin).slice(0, source.sourceType === "github" ? 1 : 3);
+  const release = compileWebMcpRelease(plans);
+  return {
+    capabilities: plans.map((plan) => ({ plan, status: "proposed" as const })),
+    evidence: acmeCapabilityEvidence().filter(({ reference }) =>
+      plans.some((plan) => plan.evidence.some((item) => item.reference === reference))),
+    release,
+    ...(source.sourceType === "github" ? { draftPullRequest: { draft: true } } : {}),
+  };
+});
 
 async function createFixtureProject(repository: InMemoryControlPlaneRepository, sourceType: "website" | "openapi" | "github") {
   return repository.createProject(actor, {

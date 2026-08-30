@@ -53,7 +53,10 @@ export type JsonApiRequest = {
   pathTemplate: string;
   path: Record<string, string>;
   query: Record<string, string>;
+  headers?: Record<string, string>;
   body: Record<string, string>;
+  optional?: string[];
+  bodyEncoding?: "json" | "form_urlencoded";
 };
 
 export type HtmlFormRequest = {
@@ -350,7 +353,10 @@ const CapabilityPlanStructureSchema = z.object({
       pathTemplate: z.string().min(1).max(2048),
       path: FieldMapSchema,
       query: FieldMapSchema,
+      headers: FieldMapSchema.optional(),
       body: FieldMapSchema,
+      optional: z.array(z.string().regex(/^[A-Za-z][A-Za-z0-9_]{0,127}$/)).max(100).optional(),
+      bodyEncoding: z.enum(["json", "form_urlencoded"]).optional(),
     }).strict(),
     z.object({
       adapter: z.literal("html_form"),
@@ -623,6 +629,10 @@ function utf8Bytes(value: string): number {
   return new TextEncoder().encode(value).byteLength;
 }
 
+function urlEncodedNameBytes(value: string): number {
+  return utf8Bytes(new URLSearchParams([[value, ""]]).toString()) - 1;
+}
+
 function maximumScalarUrlBytes(schema: JsonSchema): number {
   if (schema.type === "string") {
     const maximumLength = schema.enum
@@ -745,9 +755,20 @@ function validateCapabilityPlan(plan: CapabilityPlan): void {
   const inputProperties = plan.schemas.input.properties;
   const inputMappings: Array<{ field: string; optional: boolean; target: string }> = [];
   if (plan.request.adapter === "json_api") {
-    for (const [target, field] of Object.entries(plan.request.path)) inputMappings.push({ target, field, optional: false });
-    for (const [target, field] of Object.entries(plan.request.query)) inputMappings.push({ target, field, optional: false });
-    for (const [target, field] of Object.entries(plan.request.body)) inputMappings.push({ target, field, optional: false });
+    const optional = new Set(plan.request.optional ?? []);
+    assertUnique(plan.request.optional ?? [], `${plan.tool.name}.request.optional`);
+    for (const [target, field] of Object.entries(plan.request.path)) inputMappings.push({ target, field, optional: optional.has(field) });
+    for (const [target, field] of Object.entries(plan.request.query)) inputMappings.push({ target, field, optional: optional.has(field) });
+    for (const [target, field] of Object.entries(plan.request.headers ?? {})) inputMappings.push({ target, field, optional: optional.has(field) });
+    for (const [target, field] of Object.entries(plan.request.body)) inputMappings.push({ target, field, optional: optional.has(field) });
+    for (const field of optional) {
+      if (!inputMappings.some((mapping) => mapping.field === field)) {
+        throw new Error(`request optional list references an unmapped input field for ${plan.tool.name}`);
+      }
+      if (Object.values(plan.request.path).includes(field)) {
+        throw new Error(`request path fields cannot be optional for ${plan.tool.name}`);
+      }
+    }
   } else if (plan.request.adapter === "html_form") {
     for (const [target, mapping] of Object.entries(plan.request.controls)) {
       inputMappings.push({ target, field: mapping.inputField, optional: mapping.optional });
@@ -764,7 +785,7 @@ function validateCapabilityPlan(plan: CapabilityPlan): void {
       throw new Error(`request plan references an unknown input field for ${plan.tool.name}`);
     }
     if (optional === requiredInputs.has(field)) {
-      if (plan.request.adapter === "json_api") {
+      if (plan.request.adapter === "json_api" && !optional) {
         throw new Error(`request plan references an optional input field for ${plan.tool.name}`);
       }
       throw new Error(`request mapping optionality does not match the input schema for ${plan.tool.name}`);
@@ -778,9 +799,12 @@ function validateCapabilityPlan(plan: CapabilityPlan): void {
     }
   }
   if (plan.request.adapter === "json_api") {
-    let maximumBodyBytes = 2;
+    const bodyEncoding = plan.request.bodyEncoding ?? "json";
+    let maximumBodyBytes = bodyEncoding === "json" ? 2 : 0;
     for (const [target, field] of Object.entries(plan.request.body)) {
-      maximumBodyBytes += utf8Bytes(JSON.stringify(target)) + 1 + maximumScalarJsonBytes(inputProperties[field]!) + 1;
+      maximumBodyBytes += bodyEncoding === "json"
+        ? utf8Bytes(JSON.stringify(target)) + 1 + maximumScalarJsonBytes(inputProperties[field]!) + 1
+        : urlEncodedNameBytes(target) + 2 + maximumScalarUrlBytes(inputProperties[field]!);
     }
     if (maximumBodyBytes > MAX_REQUEST_BODY_BYTES) {
       throw new Error(`request body exceeds the supported bound for ${plan.tool.name}`);
@@ -788,15 +812,25 @@ function validateCapabilityPlan(plan: CapabilityPlan): void {
     let maximumUrlBytes = utf8Bytes(plan.targetOrigin) + utf8Bytes(plan.request.pathTemplate);
     for (const field of Object.values(plan.request.path)) maximumUrlBytes += maximumScalarUrlBytes(inputProperties[field]!);
     for (const [target, field] of Object.entries(plan.request.query)) {
-      maximumUrlBytes += utf8Bytes(target) + 2 + maximumScalarUrlBytes(inputProperties[field]!);
+      maximumUrlBytes += urlEncodedNameBytes(target) + 2 + maximumScalarUrlBytes(inputProperties[field]!);
     }
     if (maximumUrlBytes > MAX_REQUEST_URL_BYTES) {
       throw new Error(`request URL exceeds the supported bound for ${plan.tool.name}`);
     }
+    let maximumHeaderBytes = 0;
+    for (const [target, field] of Object.entries(plan.request.headers ?? {})) {
+      maximumHeaderBytes += utf8Bytes(target) + 4 + maximumScalarUrlBytes(inputProperties[field]!);
+    }
+    if (maximumHeaderBytes > MAX_REQUEST_URL_BYTES) {
+      throw new Error(`request headers exceed the supported bound for ${plan.tool.name}`);
+    }
+    if (bodyEncoding === "form_urlencoded" && plan.request.method !== "POST") {
+      throw new Error(`form-encoded request bodies require POST for ${plan.tool.name}`);
+    }
   } else if (plan.request.adapter === "html_form") {
     let maximumEncodedBytes = utf8Bytes(plan.request.action);
     for (const { target, field } of inputMappings) {
-      maximumEncodedBytes += utf8Bytes(target) + 2 + maximumScalarUrlBytes(inputProperties[field]!);
+      maximumEncodedBytes += urlEncodedNameBytes(target) + 2 + maximumScalarUrlBytes(inputProperties[field]!);
     }
     if (maximumEncodedBytes > (plan.request.method === "GET" ? MAX_REQUEST_URL_BYTES : MAX_REQUEST_BODY_BYTES)) {
       throw new Error(`form request exceeds the supported bound for ${plan.tool.name}`);
@@ -810,6 +844,21 @@ function validateCapabilityPlan(plan: CapabilityPlan): void {
   const idempotencyHeader = plan.idempotency.headerName?.toLowerCase();
   const idempotencyField = plan.idempotency.fieldName;
   const csrfHeader = plan.authentication.csrf?.headerName.toLowerCase();
+  const mappedRequestHeaders = new Set<string>();
+  if (plan.request.adapter === "json_api") {
+    for (const header of Object.keys(plan.request.headers ?? {})) {
+      const normalized = header.toLowerCase();
+      if (reservedHeaders.has(normalized) || normalized.startsWith("sec-") || normalized.startsWith("proxy-")) {
+        throw new Error(`reserved request header for ${plan.tool.name}`);
+      }
+      if (mappedRequestHeaders.has(normalized)
+        || /^(?:forwarded|range|x-forwarded-.+|x-real-ip|x-http-method-override|x-method-override|x-original-url|x-rewrite-url)$/i.test(normalized)
+        || /(?:^|-)(?:api-key|authorization|bearer|cookie|credential|csrf|xsrf|idempotency|password|passwd|secret|session|token)(?:-|$)/i.test(normalized)) {
+        throw new Error(`reserved or unsafe request header for ${plan.tool.name}`);
+      }
+      mappedRequestHeaders.add(normalized);
+    }
+  }
   if (idempotencyHeader && (reservedHeaders.has(idempotencyHeader) || idempotencyHeader.startsWith("sec-")
     || idempotencyHeader.startsWith("proxy-") || !/^(?:x-)?idempotency(?:-key)?$/.test(idempotencyHeader))) {
     throw new Error(`reserved or unsupported idempotency header for ${plan.tool.name}`);
@@ -817,6 +866,9 @@ function validateCapabilityPlan(plan: CapabilityPlan): void {
   if (csrfHeader && reservedHeaders.has(csrfHeader)) throw new Error(`reserved CSRF header for ${plan.tool.name}`);
   if (csrfHeader && idempotencyHeader && csrfHeader === idempotencyHeader) {
     throw new Error(`CSRF and idempotency headers collide for ${plan.tool.name}`);
+  }
+  if ((csrfHeader && mappedRequestHeaders.has(csrfHeader)) || (idempotencyHeader && mappedRequestHeaders.has(idempotencyHeader))) {
+    throw new Error(`request headers collide with security headers for ${plan.tool.name}`);
   }
   if (idempotencyField && !/^(?:idempotency(?:[-_.]?key)?|request[-_.]?key)$/i.test(idempotencyField)) {
     throw new Error(`unsupported form idempotency field for ${plan.tool.name}`);
@@ -940,7 +992,11 @@ function canonicalRequest(request: CapabilityPlan["request"]): CapabilityPlan["r
       ...request,
       path: sortedRecord(request.path),
       query: sortedRecord(request.query),
+      ...(request.headers ? {
+        headers: sortedRecord(Object.fromEntries(Object.entries(request.headers).map(([header, field]) => [header.toLowerCase(), field]))),
+      } : {}),
       body: sortedRecord(request.body),
+      ...(request.optional ? { optional: [...request.optional].sort(compareStrings) } : {}),
     };
   }
   if (request.adapter === "html_form") return { ...request, controls: sortedRecord(request.controls) };

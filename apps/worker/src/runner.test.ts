@@ -31,25 +31,37 @@ async function enqueue(
   return { project, run };
 }
 
-test("worker canonicalizes the configured GitHub fixture URL before binding the job", async () => {
-  const previous = process.env.PAGE2WEBMCP_FIXTURE_GITHUB_URL;
-  process.env.PAGE2WEBMCP_FIXTURE_GITHUB_URL = "https://github.com/acme/support/";
+function fixtureAnalysisResult(): AnalysisResult {
+  const plans = acmeCapabilityPlans("https://acme.example").slice(0, 1);
+  const release = compileWebMcpRelease(plans);
+  return {
+    capabilities: plans.map((plan) => ({ plan, status: "proposed" })),
+    evidence: acmeCapabilityEvidence().filter(({ reference }) =>
+      plans.some((plan) => plan.evidence.some((item) => item.reference === reference))),
+    release
+  };
+}
+
+test("worker fails closed when no analysis adapter is configured", async () => {
   const repository = new InMemoryControlPlaneRepository();
-  try {
-    const { run } = await enqueue(repository, "github", "https://github.com/acme/support");
-    const completed = await processNextAnalysis(repository, { workerId: "github-worker" });
-    assert.equal(completed?.id, run.id);
-    assert.equal(completed?.status, "succeeded");
-  } finally {
-    if (previous === undefined) delete process.env.PAGE2WEBMCP_FIXTURE_GITHUB_URL;
-    else process.env.PAGE2WEBMCP_FIXTURE_GITHUB_URL = previous;
-  }
+  const { run } = await enqueue(repository, "github", "https://code.widgets.example/team/repository");
+  const completed = await processNextAnalysis(repository, { workerId: "unconfigured-worker" });
+  assert.equal(completed?.id, run.id);
+  assert.equal(completed?.status, "failed");
+  assert.equal(completed?.errorCode, "ANALYZER_NOT_CONFIGURED");
 });
 
-test("worker rejects a persisted source outside the fixed fixture without retrying", async () => {
+test("worker binds the persisted source to the explicit analysis adapter", async () => {
   const repository = new InMemoryControlPlaneRepository();
   const { run } = await enqueue(repository, "website", "https://unexpected.example/");
-  const completed = await processNextAnalysis(repository, { workerId: "scope-worker" });
+  const completed = await processNextAnalysis(repository, {
+    workerId: "scope-worker",
+    analyze: async (source) => {
+      assert.equal(source.sourceType, "website");
+      assert.equal(source.sourceUrl, "https://unexpected.example/");
+      throw new Error("SOURCE_SCOPE_MISMATCH");
+    },
+  });
   assert.equal(completed?.id, run.id);
   assert.equal(completed?.status, "failed");
   assert.equal(completed?.attempts, 1);
@@ -62,7 +74,8 @@ test("worker processing never needs member-scoped repository reads", async () =>
   repository.getProject = async () => { throw new Error("APP_CONTEXT_FORBIDDEN"); };
   repository.getAnalysis = async () => { throw new Error("APP_CONTEXT_FORBIDDEN"); };
 
-  const completed = await processNextAnalysis(repository, { workerId: "worker-only" });
+  const result = fixtureAnalysisResult();
+  const completed = await processNextAnalysis(repository, { workerId: "worker-only", analyze: async () => result });
 
   assert.equal(completed?.id, run.id);
   assert.equal(completed?.status, "succeeded");
@@ -111,14 +124,7 @@ test("heartbeats are serialized and stop before completion", async () => {
       active -= 1;
     }
   };
-  const plans = acmeCapabilityPlans("https://acme.example").slice(0, 1);
-  const release = compileWebMcpRelease(plans);
-  const result: AnalysisResult = {
-    capabilities: plans.map((plan) => ({ plan, status: "proposed" })),
-    evidence: acmeCapabilityEvidence().filter(({ reference }) =>
-      plans.some((plan) => plan.evidence.some((item) => item.reference === reference))),
-    release
-  };
+  const result = fixtureAnalysisResult();
   const completed = await processNextAnalysis(repository, {
     workerId: "heartbeat-worker",
     heartbeatMs: 10,

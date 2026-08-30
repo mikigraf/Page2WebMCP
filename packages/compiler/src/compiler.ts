@@ -68,6 +68,11 @@ const RELEASE_KEY = releaseManifest.releaseId;
 const platformFetch = typeof globalThis.fetch === "function" ? globalThis.fetch.bind(globalThis) : undefined;
 const PlatformEvent = globalThis.Event;
 const PlatformDOMParser = globalThis.DOMParser;
+const PlatformHeaders = globalThis.Headers;
+const PlatformURL = globalThis.URL;
+const PlatformURLSearchParams = globalThis.URLSearchParams;
+const PlatformTextEncoder = globalThis.TextEncoder;
+const PlatformTextDecoder = globalThis.TextDecoder;
 const platformSetTimeout = globalThis.setTimeout?.bind(globalThis);
 const nativeInputValueSetter = Object.getOwnPropertyDescriptor(globalThis.HTMLInputElement?.prototype || {}, "value")?.set;
 const nativeInputCheckedSetter = Object.getOwnPropertyDescriptor(globalThis.HTMLInputElement?.prototype || {}, "checked")?.set;
@@ -179,7 +184,7 @@ function sessionStorageOrUndefined() {
 async function mutationStorageKey(identity) {
   try {
     if (!globalThis.crypto?.subtle) return undefined;
-    const digest = await globalThis.crypto.subtle.digest("SHA-256", new TextEncoder().encode(identity));
+    const digest = await globalThis.crypto.subtle.digest("SHA-256", new PlatformTextEncoder().encode(identity));
     const hex = Array.from(new Uint8Array(digest), (value) => value.toString(16).padStart(2, "0")).join("");
     return "page2webmcp.mutation.v1." + hex;
   } catch {
@@ -216,10 +221,12 @@ function completePendingMutation(state, pending) {
 function requestUrl(request, input) {
   const path = request.pathTemplate.replace(/\{([A-Za-z][A-Za-z0-9_]*)\}/g, (_match, placeholder) =>
     encodeURIComponent(input[request.path[placeholder]]));
-  const url = new URL(path, releaseManifest.targetOrigin);
+  const url = new PlatformURL(path, releaseManifest.targetOrigin);
   if (url.origin !== releaseManifest.targetOrigin) throw new Page2WebMCPError("ORIGIN_MISMATCH");
-  for (const [parameter, field] of Object.entries(request.query)) url.searchParams.set(parameter, input[field]);
-  if (new TextEncoder().encode(url.href).byteLength > MAX_REQUEST_URL_BYTES) throw new Page2WebMCPError("INVALID_INPUT");
+  for (const [parameter, field] of Object.entries(request.query)) {
+    if (input[field] !== undefined) url.searchParams.set(parameter, input[field]);
+  }
+  if (new PlatformTextEncoder().encode(url.href).byteLength > MAX_REQUEST_URL_BYTES) throw new Page2WebMCPError("INVALID_INPUT");
   return url;
 }
 
@@ -329,7 +336,7 @@ async function requestJsonOnce(state, spec, url, init, signal) {
     const body = await readBoundedBody(response, signal);
     assertExecutionActive(signal);
     try {
-      return JSON.parse(new TextDecoder().decode(body));
+      return JSON.parse(new PlatformTextDecoder().decode(body));
     } catch {
       throw new DefinitiveRequestError("INVALID_OUTPUT");
     }
@@ -403,7 +410,7 @@ async function requestDocumentOnce(spec, url, init, signal, snapshot) {
           throw new DefinitiveRequestError(code);
         }
         if (response.url) {
-          const responseUrl = new URL(response.url);
+          const responseUrl = new PlatformURL(response.url);
           if (responseUrl.origin !== releaseManifest.targetOrigin) {
             void response.body?.cancel().catch(() => undefined);
             throw new DefinitiveRequestError("ORIGIN_MISMATCH");
@@ -417,7 +424,7 @@ async function requestDocumentOnce(spec, url, init, signal, snapshot) {
         const body = await readBoundedBody(response, guardedSignal);
         assertExecutionActive(guardedSignal);
         if (typeof PlatformDOMParser !== "function") throw new DefinitiveRequestError("INVALID_OUTPUT");
-        const parsed = new PlatformDOMParser().parseFromString(new TextDecoder().decode(body), "text/html");
+        const parsed = new PlatformDOMParser().parseFromString(new PlatformTextDecoder().decode(body), "text/html");
         if (!parsed) throw new DefinitiveRequestError("INVALID_OUTPUT");
         return parsed;
       } catch (error) {
@@ -658,7 +665,7 @@ function assertExactForm(state, spec, input) {
   const form = resolveSemantic(snapshot.document, spec.request.form);
   const actionAttribute = form.getAttribute?.("action") || snapshot.href;
   let actualAction;
-  try { actualAction = new URL(actionAttribute, snapshot.document?.baseURI || snapshot.href); } catch {
+  try { actualAction = new PlatformURL(actionAttribute, snapshot.document?.baseURI || snapshot.href); } catch {
     throw new Page2WebMCPError("STALE_PAGE");
   }
   if (actualAction.origin !== releaseManifest.targetOrigin) throw new Page2WebMCPError("ORIGIN_MISMATCH");
@@ -766,11 +773,19 @@ function ephemeralIdempotencyKey() {
 }
 
 async function executeJsonWithinDeadline(state, spec, input, signal) {
-  const headers = new Headers();
+  const headers = new PlatformHeaders();
   const bodyValue = Object.create(null);
-  for (const [targetField, inputField] of Object.entries(spec.request.body)) bodyValue[targetField] = input[inputField];
-  const hasBody = Object.keys(spec.request.body).length > 0;
-  if (hasBody) headers.set("content-type", "application/json");
+  for (const [targetField, inputField] of Object.entries(spec.request.body)) {
+    if (input[inputField] !== undefined) bodyValue[targetField] = input[inputField];
+  }
+  for (const [headerName, inputField] of Object.entries(spec.request.headers ?? {})) {
+    if (input[inputField] !== undefined) headers.set(headerName, String(input[inputField]));
+  }
+  const hasBody = Object.keys(bodyValue).length > 0;
+  const bodyEncoding = spec.request.bodyEncoding ?? "json";
+  if (hasBody) headers.set("content-type", bodyEncoding === "form_urlencoded"
+    ? "application/x-www-form-urlencoded;charset=UTF-8"
+    : "application/json");
   const csrf = resolveCsrf(spec);
   if (csrf) headers.set(csrf.name, csrf.value);
 
@@ -793,8 +808,12 @@ async function executeJsonWithinDeadline(state, spec, input, signal) {
     assertAllowedOrigin();
     assertExecutionActive(signal);
     finalRequestStarted = true;
-    const body = hasBody ? JSON.stringify(bodyValue) : undefined;
-    if (body !== undefined && new TextEncoder().encode(body).byteLength > MAX_REQUEST_BODY_BYTES) {
+    const body = hasBody
+      ? bodyEncoding === "form_urlencoded"
+        ? new PlatformURLSearchParams(Object.entries(bodyValue).map(([key, value]) => [key, String(value)])).toString()
+        : JSON.stringify(bodyValue)
+      : undefined;
+    if (body !== undefined && new PlatformTextEncoder().encode(body).byteLength > MAX_REQUEST_BODY_BYTES) {
       throw new Page2WebMCPError("INVALID_INPUT");
     }
     const raw = await requestJson(state, spec, requestUrl(spec.request, input), {
@@ -817,7 +836,7 @@ async function executeFormWithinDeadline(state, spec, input, signal) {
   const page = pageSnapshot();
   const formState = { page };
   const initial = assertExactForm(formState, spec, input);
-  const headers = new Headers();
+  const headers = new PlatformHeaders();
   const csrf = resolveCsrf(spec);
   if (csrf) headers.set(csrf.name, csrf.value);
   let pending;
@@ -839,7 +858,7 @@ async function executeFormWithinDeadline(state, spec, input, signal) {
     assertExecutionActive(signal);
     const current = assertExactForm(formState, spec, input);
     if (current.form !== initial.form) throw new Page2WebMCPError("STALE_PAGE");
-    const parameters = new URLSearchParams();
+    const parameters = new PlatformURLSearchParams();
     for (const [name, entry] of current.mapped) {
       if (!entry.inputPresent) continue;
       const value = input[entry.mapping.inputField];
@@ -864,14 +883,14 @@ async function executeFormWithinDeadline(state, spec, input, signal) {
     }
     assertSameSemantic(page.document, spec.request.form, current.form);
     assertPageStable(page);
-    const url = new URL(spec.request.action);
+    const url = new PlatformURL(spec.request.action);
     let body;
     if (spec.request.method === "GET") {
       for (const [name, value] of parameters) url.searchParams.set(name, value);
-      if (new TextEncoder().encode(url.href).byteLength > MAX_REQUEST_URL_BYTES) throw new Page2WebMCPError("INVALID_INPUT");
+      if (new PlatformTextEncoder().encode(url.href).byteLength > MAX_REQUEST_URL_BYTES) throw new Page2WebMCPError("INVALID_INPUT");
     } else {
       body = parameters.toString();
-      if (new TextEncoder().encode(body).byteLength > MAX_REQUEST_BODY_BYTES) throw new Page2WebMCPError("INVALID_INPUT");
+      if (new PlatformTextEncoder().encode(body).byteLength > MAX_REQUEST_BODY_BYTES) throw new Page2WebMCPError("INVALID_INPUT");
       headers.set("content-type", "application/x-www-form-urlencoded;charset=UTF-8");
     }
     assertAllowedOrigin();
