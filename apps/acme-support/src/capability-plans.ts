@@ -67,13 +67,14 @@ export function acmeCapabilityPlans(targetOrigin: string): CapabilityPlan[] {
         confirmation: "none",
       },
       idempotency: { strategy: "none", verified: false, retry: "safe_once" },
-      request: { method: "GET", pathTemplate: "/api/orders", path: {}, query: { q: "query" }, body: {} },
+      request: { adapter: "json_api", method: "GET", pathTemplate: "/api/orders", path: {}, query: { q: "query" }, body: {} },
       response: {
+        adapter: "json_api",
         contentTypes: ["application/json"],
         projection: { kind: "identity" },
         errorMappings: { ...commonErrors },
       },
-      success: { statusCodes: [200], requiredOutputFields: ["id", "email", "shipmentStatus"] },
+      success: { adapter: "json_api", statusCodes: [200], requiredOutputFields: ["id", "email", "shipmentStatus"] },
       evidence: [{ source: "openapi", reference: FIND_ORDER_EVIDENCE }],
     },
     {
@@ -114,6 +115,7 @@ export function acmeCapabilityPlans(targetOrigin: string): CapabilityPlan[] {
       },
       idempotency: { strategy: "none", verified: false, retry: "safe_once" },
       request: {
+        adapter: "json_api",
         method: "GET",
         pathTemplate: "/api/orders/{orderId}",
         path: { orderId: "query" },
@@ -121,11 +123,13 @@ export function acmeCapabilityPlans(targetOrigin: string): CapabilityPlan[] {
         body: {},
       },
       response: {
+        adapter: "json_api",
         contentTypes: ["application/json"],
         projection: { kind: "identity" },
         errorMappings: { ...commonErrors },
       },
       success: {
+        adapter: "json_api",
         statusCodes: [200],
         requiredOutputFields: ["orderId", "shipmentStatus", "customerNotes", "untrustedContent"],
       },
@@ -183,6 +187,7 @@ export function acmeCapabilityPlans(targetOrigin: string): CapabilityPlan[] {
         retry: "safe_once",
       },
       request: {
+        adapter: "json_api",
         method: "POST",
         pathTemplate: "/api/tickets",
         path: {},
@@ -190,11 +195,12 @@ export function acmeCapabilityPlans(targetOrigin: string): CapabilityPlan[] {
         body: { orderId: "orderId", priority: "priority", title: "title" },
       },
       response: {
+        adapter: "json_api",
         contentTypes: ["application/json"],
         projection: { kind: "identity" },
         errorMappings: { ...commonErrors },
       },
-      success: { statusCodes: [201], requiredOutputFields: ["ticketId", "status", "priority", "createdAt"] },
+      success: { adapter: "json_api", statusCodes: [201], requiredOutputFields: ["ticketId", "status", "priority", "createdAt"] },
       evidence: [
         { source: "openapi", reference: CREATE_TICKET_EVIDENCE },
         { source: "github", reference: CREATE_TICKET_SOURCE_EVIDENCE },

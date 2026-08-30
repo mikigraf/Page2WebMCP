@@ -43,6 +43,7 @@ function readPlan(overrides: Record<string, unknown> = {}): CapabilityPlan {
     },
     idempotency: { strategy: "none", verified: false, retry: "safe_once" },
     request: {
+      adapter: "json_api",
       method: "GET",
       pathTemplate: "/api/widgets",
       path: {},
@@ -50,6 +51,7 @@ function readPlan(overrides: Record<string, unknown> = {}): CapabilityPlan {
       body: {},
     },
     response: {
+      adapter: "json_api",
       contentTypes: ["application/json"],
       projection: { kind: "array", fields: { id: "id", label: "label" } },
       errorMappings: {
@@ -59,7 +61,7 @@ function readPlan(overrides: Record<string, unknown> = {}): CapabilityPlan {
         default: "TARGET_ERROR",
       },
     },
-    success: { statusCodes: [200], requiredOutputFields: ["id", "label"] },
+    success: { adapter: "json_api", statusCodes: [200], requiredOutputFields: ["id", "label"] },
     evidence: [{ source: "runtime", reference: `urn:sha256:${HASH_A}` }],
     ...overrides,
   } as CapabilityPlan;
@@ -79,7 +81,7 @@ function mutationPlan(overrides: Record<string, unknown> = {}): CapabilityPlan {
       confirmation: "always",
     },
     idempotency: { strategy: "header", headerName: "Idempotency-Key", verified: true, retry: "safe_once" },
-    request: { method: "POST", pathTemplate: "/api/widgets", path: {}, query: {}, body: { query: "query" } },
+    request: { adapter: "json_api", method: "POST", pathTemplate: "/api/widgets", path: {}, query: {}, body: { query: "query" } },
     success: { ...base.success, statusCodes: [201] },
     ...overrides,
   } as CapabilityPlan;
@@ -181,6 +183,7 @@ test("CapabilityPlan canonicalization rejects duplicates and sorts unordered dat
       },
     },
     request: {
+      adapter: "json_api",
       method: "GET",
       pathTemplate: "/api/widgets/{widgetId}",
       path: { widgetId: "id" },
@@ -188,11 +191,12 @@ test("CapabilityPlan canonicalization rejects duplicates and sorts unordered dat
       body: {},
     },
     response: {
+      adapter: "json_api",
       contentTypes: ["application/problem+json", "application/json"],
       projection: { kind: "object", fields: { label: "label", id: "id" } },
       errorMappings: { default: "TARGET_ERROR", "401": "AUTHENTICATION_REQUIRED" },
     },
-    success: { statusCodes: [206, 200], requiredOutputFields: ["label", "id"] },
+    success: { adapter: "json_api", statusCodes: [206, 200], requiredOutputFields: ["label", "id"] },
     evidence: [
       { source: "openapi", reference: `urn:sha256:${HASH_B}` },
       { source: "runtime", reference: `urn:sha256:${HASH_A}` },
@@ -201,6 +205,11 @@ test("CapabilityPlan canonicalization rejects duplicates and sorts unordered dat
   const canonical = canonicalizeCapabilityPlans([readPlan(), second]);
   assert.deepEqual(canonical.map((plan) => plan.tool.name), ["get_widget", "search_widgets"]);
   assert.deepEqual(canonical[0]!.schemas.input.required, ["id", "locale"]);
+  assert.equal(canonical[0]!.response.adapter, "json_api");
+  assert.equal(canonical[0]!.success.adapter, "json_api");
+  if (canonical[0]!.response.adapter !== "json_api" || canonical[0]!.success.adapter !== "json_api") {
+    throw new Error("expected JSON fixture adapter");
+  }
   assert.deepEqual(canonical[0]!.response.contentTypes, ["application/json", "application/problem+json"]);
   assert.deepEqual(canonical[0]!.success.statusCodes, [200, 206]);
   assert.ok(Object.isFrozen(canonical[0]!.evidence));

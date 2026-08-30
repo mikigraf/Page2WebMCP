@@ -525,13 +525,18 @@ test("all concurrent registration callers receive typed safe failures", async ()
 test("compiler rejects unsafe request plans", () => {
   const read = capabilities.find((plan) => plan.tool.name === "find_order")!;
   const mutation = capabilities.find((plan) => plan.tool.name === "create_support_ticket")!;
+  if (read.request.adapter !== "json_api" || mutation.request.adapter !== "json_api") {
+    throw new Error("expected JSON fixture adapters");
+  }
+  const readRequest = read.request;
+  const mutationRequest = mutation.request;
   assert.throws(() => compileWebMcpRelease([{
     ...read,
-    request: { ...read.request, pathTemplate: "https://evil.example/orders" },
+    request: { ...readRequest, pathTemplate: "https://evil.example/orders" },
   }]), /unsafe request path/i);
   assert.throws(() => compileWebMcpRelease([{
     ...read,
-    request: { ...read.request, method: "DELETE" },
+    request: { ...readRequest, method: "DELETE" },
   } as unknown as CapabilityPlan]), /invalid option|GET|POST/i);
   assert.throws(() => compileWebMcpRelease([{
     name: "lookup",
@@ -540,7 +545,7 @@ test("compiler rejects unsafe request plans", () => {
   } as unknown as CapabilityPlan]), /invalid input|expected/i);
   assert.throws(() => compileWebMcpRelease([{
     ...mutation,
-    request: { ...mutation.request, method: "GET" },
+    request: { ...mutationRequest, method: "GET" },
   }]), /mutation capability must use POST/i);
 
   const inheritedProperties = Object.create({ constructor: { type: "string" } }) as Record<string, { type: "string" }>;
@@ -550,6 +555,6 @@ test("compiler rejects unsafe request plans", () => {
       ...read.schemas,
       input: { type: "object", properties: inheritedProperties, required: ["constructor"], additionalProperties: false },
     },
-    request: { ...read.request, query: {} },
+    request: { ...readRequest, query: {} },
   }]), /unknown property/i);
 });

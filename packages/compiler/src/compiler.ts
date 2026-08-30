@@ -37,6 +37,7 @@ export class Page2WebMCPError extends Error {
       AUTHENTICATION_REQUIRED: "Sign in before using this tool.",
       FORBIDDEN: "The current account cannot perform this action.",
       STALE_TARGET: "The target changed before the action completed.",
+      STALE_PAGE: "The reviewed page structure changed before the action completed.",
       VALIDATION_FAILED: "The target rejected the request.",
       RATE_LIMITED: "The target temporarily rate-limited the request.",
       TARGET_ERROR: "The target request failed.",
@@ -65,6 +66,14 @@ const EXECUTION_DEADLINE_MS = 15000;
 const REGISTRY_SYMBOL = Symbol.for("page2webmcp.release.registry.v1");
 const RELEASE_KEY = releaseManifest.releaseId;
 const platformFetch = typeof globalThis.fetch === "function" ? globalThis.fetch.bind(globalThis) : undefined;
+const PlatformEvent = globalThis.Event;
+const PlatformDOMParser = globalThis.DOMParser;
+const platformSetTimeout = globalThis.setTimeout?.bind(globalThis);
+const nativeInputValueSetter = Object.getOwnPropertyDescriptor(globalThis.HTMLInputElement?.prototype || {}, "value")?.set;
+const nativeInputCheckedSetter = Object.getOwnPropertyDescriptor(globalThis.HTMLInputElement?.prototype || {}, "checked")?.set;
+const nativeTextAreaValueSetter = Object.getOwnPropertyDescriptor(globalThis.HTMLTextAreaElement?.prototype || {}, "value")?.set;
+const nativeSelectValueSetter = Object.getOwnPropertyDescriptor(globalThis.HTMLSelectElement?.prototype || {}, "value")?.set;
+const nativeClick = globalThis.HTMLElement?.prototype?.click;
 const sourceNativeConfirmations = new Map();
 for (const spec of releaseManifest.plans) {
   const integration = spec.effects.sourceNativeConfirmation;
@@ -345,6 +354,100 @@ async function requestJson(state, spec, url, init, signal) {
   throw new Page2WebMCPError("TARGET_ERROR");
 }
 
+async function runWithPageGuard(signal, snapshot, operation) {
+  if (typeof platformSetTimeout !== "function") throw new Page2WebMCPError("TARGET_ERROR");
+  const controller = new AbortController();
+  const onAbort = () => controller.abort(signalError(signal));
+  signal.addEventListener("abort", onAbort, { once: true });
+  let settled = false;
+  const monitor = (async () => {
+    while (!settled) {
+      await new Promise((resolve) => platformSetTimeout(resolve, 10));
+      if (settled) return undefined;
+      assertExecutionActive(signal);
+      try {
+        assertPageStable(snapshot);
+      } catch (error) {
+        controller.abort(error);
+        throw error;
+      }
+    }
+    return undefined;
+  })();
+  try {
+    return await Promise.race([operation(controller.signal), monitor]);
+  } finally {
+    settled = true;
+    signal.removeEventListener("abort", onAbort);
+  }
+}
+
+async function requestDocumentOnce(spec, url, init, signal, snapshot) {
+  assertAllowedOrigin();
+  assertExecutionActive(signal);
+  try {
+    return await runWithPageGuard(signal, snapshot, async (guardedSignal) => {
+      try {
+        if (!platformFetch) throw new Page2WebMCPError("TARGET_ERROR");
+        const response = await platformFetch(url, {
+          ...init,
+          credentials: "same-origin",
+          redirect: "error",
+          signal: guardedSignal,
+        });
+        assertExecutionActive(guardedSignal);
+        if (!spec.success.statusCodes.includes(response.status)) {
+          void response.body?.cancel().catch(() => undefined);
+          const code = mappedError(spec, response.status);
+          if (retryableStatus(response.status)) throw new RetryableRequestError(code);
+          throw new DefinitiveRequestError(code);
+        }
+        if (response.url) {
+          const responseUrl = new URL(response.url);
+          if (responseUrl.origin !== releaseManifest.targetOrigin) {
+            void response.body?.cancel().catch(() => undefined);
+            throw new DefinitiveRequestError("ORIGIN_MISMATCH");
+          }
+        }
+        const contentType = (response.headers.get("content-type") || "").split(";", 1)[0].trim().toLowerCase();
+        if (!spec.response.contentTypes.includes(contentType)) {
+          void response.body?.cancel().catch(() => undefined);
+          throw new DefinitiveRequestError("UNSUPPORTED_CONTENT_TYPE");
+        }
+        const body = await readBoundedBody(response, guardedSignal);
+        assertExecutionActive(guardedSignal);
+        if (typeof PlatformDOMParser !== "function") throw new DefinitiveRequestError("INVALID_OUTPUT");
+        const parsed = new PlatformDOMParser().parseFromString(new TextDecoder().decode(body), "text/html");
+        if (!parsed) throw new DefinitiveRequestError("INVALID_OUTPUT");
+        return parsed;
+      } catch (error) {
+        if (guardedSignal.aborted && guardedSignal.reason instanceof Page2WebMCPError) {
+          throw guardedSignal.reason;
+        }
+        throw error;
+      }
+    });
+  } catch (error) {
+    if (error instanceof Page2WebMCPError || error instanceof RetryableRequestError) throw error;
+    if (signal.aborted) throw signalError(signal);
+    throw new RetryableRequestError("TARGET_ERROR");
+  }
+}
+
+async function requestDocument(spec, url, init, signal, snapshot) {
+  const attempts = spec.idempotency.retry === "safe_once" ? 2 : 1;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      return await requestDocumentOnce(spec, url, init, signal, snapshot);
+    } catch (error) {
+      if (signal.aborted) throw signalError(signal);
+      if (!(error instanceof RetryableRequestError)) throw error;
+      if (attempt + 1 === attempts) throw new Page2WebMCPError(error.code);
+    }
+  }
+  throw new Page2WebMCPError("TARGET_ERROR");
+}
+
 function resolveCsrf(spec) {
   const csrf = spec.authentication.csrf;
   if (!csrf) return undefined;
@@ -365,6 +468,227 @@ function resolveCsrf(spec) {
     throw new Page2WebMCPError("CSRF_UNAVAILABLE");
   }
   return { name: csrf.headerName, value };
+}
+
+function normalizedText(value) {
+  return String(value ?? "").replace(/\s+/g, " ").trim();
+}
+
+function semanticElements(root) {
+  const descendants = Array.from(root?.getElementsByTagName?.("*") || []);
+  if (root?.tagName) descendants.unshift(root);
+  if (descendants.length > 2000) throw new Page2WebMCPError("STALE_PAGE");
+  return descendants;
+}
+
+function elementTag(element) {
+  return String(element?.tagName || "").toLowerCase();
+}
+
+function implicitRole(element) {
+  const tag = elementTag(element);
+  const type = String(element?.type || element?.getAttribute?.("type") || "").toLowerCase();
+  if (tag === "button") return "button";
+  if (tag === "form") return "form";
+  if (tag === "textarea") return "textbox";
+  if (tag === "select") return "combobox";
+  if (tag === "input" && ["checkbox", "radio"].includes(type)) return type === "checkbox" ? "checkbox" : undefined;
+  if (tag === "input" && !["button", "submit", "reset", "hidden", "file", "image"].includes(type)) return "textbox";
+  if (["h1", "h2", "h3"].includes(tag)) return "heading";
+  if (tag === "a" && element?.getAttribute?.("href")) return "link";
+  return undefined;
+}
+
+function labelsFor(root, element) {
+  const id = element?.getAttribute?.("id");
+  const labels = semanticElements(root).filter((candidate) => {
+    if (elementTag(candidate) !== "label") return false;
+    if (id && candidate.getAttribute?.("for") === id) return true;
+    return candidate.contains?.(element) === true;
+  });
+  return labels.map((label) => normalizedText(label.textContent)).filter(Boolean);
+}
+
+function accessibleName(root, element) {
+  const ariaLabel = element?.getAttribute?.("aria-label");
+  if (ariaLabel) return normalizedText(ariaLabel);
+  const labels = labelsFor(root, element);
+  if (labels.length === 1) return labels[0];
+  const tag = elementTag(element);
+  if (["button", "a", "h1", "h2", "h3", "output"].includes(tag)) return normalizedText(element.textContent);
+  return "";
+}
+
+function semanticMatches(root, locator) {
+  const matches = semanticElements(root).filter((element) => {
+    if (locator.kind === "role") {
+      const role = element.getAttribute?.("role") || implicitRole(element);
+      return role === locator.role && accessibleName(root, element) === locator.accessibleName;
+    }
+    if (elementTag(element) !== locator.element) return false;
+    if (locator.kind === "name") return element.getAttribute?.("name") === locator.name;
+    if (locator.kind === "stable_attribute") return element.getAttribute?.(locator.name) === locator.value;
+    const labels = labelsFor(root, element);
+    return labels.length === 1 && labels[0] === locator.label;
+  });
+  if (matches.length > 1) throw new Page2WebMCPError("STALE_PAGE");
+  return matches;
+}
+
+function resolveSemantic(root, locator) {
+  const matches = semanticMatches(root, locator);
+  if (matches.length !== 1) throw new Page2WebMCPError("STALE_PAGE");
+  return matches[0];
+}
+
+function pageSnapshot() {
+  return { document: globalThis.document, href: String(globalThis.window?.location?.href || "") };
+}
+
+function assertPageStable(snapshot) {
+  assertAllowedOrigin();
+  if (globalThis.document !== snapshot.document
+    || String(globalThis.window?.location?.href || "") !== snapshot.href) {
+    throw new Page2WebMCPError("STALE_PAGE");
+  }
+}
+
+function assertSameSemantic(root, locator, expected) {
+  const resolved = resolveSemantic(root, locator);
+  if (resolved !== expected || expected?.isConnected === false) throw new Page2WebMCPError("STALE_PAGE");
+}
+
+function sensitiveControl(element) {
+  const tag = elementTag(element);
+  const type = String(element?.type || element?.getAttribute?.("type") || "").toLowerCase();
+  const autocomplete = String(element?.getAttribute?.("autocomplete") || "").toLowerCase();
+  return tag === "input" && ["password", "file"].includes(type)
+    || /(?:current-password|new-password|one-time-code|cc-|webauthn)/.test(autocomplete);
+}
+
+function nativeSetControl(element, value) {
+  if (sensitiveControl(element) || element?.disabled === true) throw new Page2WebMCPError("STALE_PAGE");
+  const tag = elementTag(element);
+  const type = String(element?.type || element?.getAttribute?.("type") || "").toLowerCase();
+  let setter;
+  let nextValue = value;
+  if (tag === "input" && type === "checkbox") {
+    if (typeof value !== "boolean") throw new Page2WebMCPError("INVALID_INPUT");
+    setter = nativeInputCheckedSetter;
+  } else {
+    if (!["string", "number", "boolean"].includes(typeof value)) throw new Page2WebMCPError("INVALID_INPUT");
+    nextValue = String(value);
+    setter = tag === "input" ? nativeInputValueSetter
+      : tag === "textarea" ? nativeTextAreaValueSetter
+        : tag === "select" ? nativeSelectValueSetter : undefined;
+  }
+  if (typeof setter !== "function" || typeof PlatformEvent !== "function" || typeof element?.dispatchEvent !== "function") {
+    throw new Page2WebMCPError("STALE_PAGE");
+  }
+  setter.call(element, nextValue);
+  element.dispatchEvent(new PlatformEvent("input", { bubbles: true, composed: true }));
+  element.dispatchEvent(new PlatformEvent("change", { bubbles: true }));
+  if (tag === "input" && type === "checkbox") {
+    if (element.checked !== nextValue) throw new Page2WebMCPError("STALE_PAGE");
+  } else if (element.value !== nextValue) {
+    throw new Page2WebMCPError("STALE_PAGE");
+  }
+}
+
+function assertSafeClickTarget(element) {
+  const tag = elementTag(element);
+  if (tag === "a") {
+    const href = element.getAttribute?.("href");
+    let target;
+    try { target = new URL(href, globalThis.document?.baseURI || globalThis.window?.location?.href); } catch {
+      throw new Page2WebMCPError("STALE_PAGE");
+    }
+    if (target.origin !== releaseManifest.targetOrigin) throw new Page2WebMCPError("ORIGIN_MISMATCH");
+    throw new Page2WebMCPError("STALE_PAGE");
+  }
+  if (tag === "button" && String(element.getAttribute?.("type") || "submit").toLowerCase() !== "button") {
+    throw new Page2WebMCPError("STALE_PAGE");
+  }
+  if (tag === "input" && String(element.type || element.getAttribute?.("type") || "").toLowerCase() !== "button") {
+    throw new Page2WebMCPError("STALE_PAGE");
+  }
+  if (element.getAttribute?.("formaction") || element.getAttribute?.("formtarget")) {
+    throw new Page2WebMCPError("STALE_PAGE");
+  }
+}
+
+function readSemanticValue(root, projection) {
+  const element = resolveSemantic(root, projection.locator);
+  if (projection.read === "checked") {
+    if (elementTag(element) !== "input" || typeof element.checked !== "boolean") throw new Page2WebMCPError("STALE_PAGE");
+    return element.checked;
+  }
+  if (projection.read === "value") {
+    if (sensitiveControl(element) || typeof element.value !== "string") throw new Page2WebMCPError("STALE_PAGE");
+    return element.value;
+  }
+  return normalizedText(element.textContent);
+}
+
+function semanticConditionState(root, condition) {
+  const matches = semanticMatches(root, condition.locator);
+  if (matches.length === 0) return false;
+  return readSemanticValue(root, condition) === condition.equals;
+}
+
+function projectSemanticResponse(root, projection) {
+  const projected = Object.create(null);
+  for (const [field, source] of Object.entries(projection.fields)) projected[field] = readSemanticValue(root, source);
+  return projected;
+}
+
+async function waitForSemanticCondition(root, condition, snapshot, signal) {
+  while (true) {
+    assertExecutionActive(signal);
+    assertPageStable(snapshot);
+    if (semanticConditionState(root, condition)) return;
+    if (typeof platformSetTimeout !== "function") throw new Page2WebMCPError("STALE_PAGE");
+    await new Promise((resolve) => platformSetTimeout(resolve, 10));
+  }
+}
+
+function formControls(form) {
+  const controls = semanticElements(form).filter((element) => ["input", "textarea", "select"].includes(elementTag(element)));
+  if (controls.length > 200) throw new Page2WebMCPError("STALE_PAGE");
+  return controls;
+}
+
+function assertExactForm(state, spec, input) {
+  const snapshot = state.page;
+  assertPageStable(snapshot);
+  const form = resolveSemantic(snapshot.document, spec.request.form);
+  const actionAttribute = form.getAttribute?.("action") || snapshot.href;
+  let actualAction;
+  try { actualAction = new URL(actionAttribute, snapshot.document?.baseURI || snapshot.href); } catch {
+    throw new Page2WebMCPError("STALE_PAGE");
+  }
+  if (actualAction.origin !== releaseManifest.targetOrigin) throw new Page2WebMCPError("ORIGIN_MISMATCH");
+  if (actualAction.href !== spec.request.action) throw new Page2WebMCPError("STALE_PAGE");
+  const actualMethod = String(form.getAttribute?.("method") || "get").toUpperCase();
+  if (actualMethod !== spec.request.method) throw new Page2WebMCPError("STALE_PAGE");
+  const controls = formControls(form);
+  const allowedNames = new Set(Object.keys(spec.request.controls));
+  if (spec.idempotency.strategy === "form_field") allowedNames.add(spec.idempotency.fieldName);
+  if (spec.authentication.csrf?.resolution?.kind === "hidden_input") allowedNames.add(spec.authentication.csrf.resolution.name);
+  for (const control of controls) {
+    const name = control.getAttribute?.("name");
+    if (name && !allowedNames.has(name)) throw new Page2WebMCPError("STALE_PAGE");
+  }
+  const mapped = new Map();
+  for (const [name, mapping] of Object.entries(spec.request.controls)) {
+    const matches = controls.filter((control) => control.getAttribute?.("name") === name);
+    const inputPresent = Object.prototype.hasOwnProperty.call(input, mapping.inputField);
+    if (matches.length > 1 || (!mapping.optional && matches.length !== 1) || (inputPresent && matches.length !== 1)) {
+      throw new Page2WebMCPError("STALE_PAGE");
+    }
+    if (matches.length === 1) mapped.set(name, { control: matches[0], mapping, inputPresent });
+  }
+  return { form, controls, mapped, action: actualAction, snapshot };
 }
 
 function builtInConfirmation(spec, signal) {
@@ -441,9 +765,13 @@ async function confirmMutation(state, spec, input, idempotencyKey, signal) {
   if (approved !== true) throw new Page2WebMCPError("CONFIRMATION_DECLINED");
 }
 
-async function executeWithinDeadline(state, spec, rawInput, signal) {
-  assertAllowedOrigin();
-  const input = deepFreeze(validateAndProject(spec.schemas.input, rawInput, "INVALID_INPUT"));
+function ephemeralIdempotencyKey() {
+  const key = globalThis.crypto?.randomUUID?.();
+  if (!validIdempotencyKey(key)) throw new Page2WebMCPError("IDEMPOTENCY_UNAVAILABLE");
+  return key;
+}
+
+async function executeJsonWithinDeadline(state, spec, input, signal) {
   const headers = new Headers();
   const bodyValue = Object.create(null);
   for (const [targetField, inputField] of Object.entries(spec.request.body)) bodyValue[targetField] = input[inputField];
@@ -462,8 +790,7 @@ async function executeWithinDeadline(state, spec, rawInput, signal) {
           pending = await acquirePendingMutation(state, spec, input);
           idempotencyKey = pending.key;
         } else {
-          idempotencyKey = globalThis.crypto?.randomUUID?.();
-          if (!validIdempotencyKey(idempotencyKey)) throw new Page2WebMCPError("IDEMPOTENCY_UNAVAILABLE");
+          idempotencyKey = ephemeralIdempotencyKey();
         }
         headers.set(spec.idempotency.headerName, idempotencyKey);
       }
@@ -490,6 +817,135 @@ async function executeWithinDeadline(state, spec, rawInput, signal) {
     if (signal.aborted) throw signalError(signal);
     throw error;
   }
+}
+
+async function executeFormWithinDeadline(state, spec, input, signal) {
+  const page = pageSnapshot();
+  const formState = { page };
+  const initial = assertExactForm(formState, spec, input);
+  const headers = new Headers();
+  const csrf = resolveCsrf(spec);
+  if (csrf) headers.set(csrf.name, csrf.value);
+  let pending;
+  let idempotencyKey;
+  let finalRequestStarted = false;
+  try {
+    if (spec.effects.kind === "mutation") {
+      if (spec.idempotency.strategy !== "none") {
+        if (spec.idempotency.verified && spec.idempotency.retry === "safe_once") {
+          pending = await acquirePendingMutation(state, spec, input);
+          idempotencyKey = pending.key;
+        } else {
+          idempotencyKey = ephemeralIdempotencyKey();
+        }
+        if (spec.idempotency.strategy === "header") headers.set(spec.idempotency.headerName, idempotencyKey);
+      }
+      await confirmMutation(state, spec, input, idempotencyKey, signal);
+    }
+    assertExecutionActive(signal);
+    const current = assertExactForm(formState, spec, input);
+    if (current.form !== initial.form) throw new Page2WebMCPError("STALE_PAGE");
+    const parameters = new URLSearchParams();
+    for (const [name, entry] of current.mapped) {
+      if (!entry.inputPresent) continue;
+      const value = input[entry.mapping.inputField];
+      nativeSetControl(entry.control, value);
+      assertPageStable(page);
+      assertSameSemantic(current.form, entry.mapping.locator || {
+        kind: "name", element: elementTag(entry.control), name,
+      }, entry.control);
+      const type = String(entry.control.type || entry.control.getAttribute?.("type") || "").toLowerCase();
+      if (elementTag(entry.control) !== "input" || type !== "checkbox" || value === true) {
+        parameters.set(name, type === "checkbox" ? entry.control.getAttribute?.("value") || "on" : String(value));
+      }
+    }
+    if (spec.idempotency.strategy === "form_field") {
+      const matches = current.controls.filter((control) => control.getAttribute?.("name") === spec.idempotency.fieldName);
+      if (matches.length !== 1 || elementTag(matches[0]) !== "input"
+        || String(matches[0].type || matches[0].getAttribute?.("type") || "").toLowerCase() !== "hidden") {
+        throw new Page2WebMCPError("STALE_PAGE");
+      }
+      nativeSetControl(matches[0], idempotencyKey);
+      parameters.set(spec.idempotency.fieldName, idempotencyKey);
+    }
+    assertSameSemantic(page.document, spec.request.form, current.form);
+    assertPageStable(page);
+    const url = new URL(spec.request.action);
+    let body;
+    if (spec.request.method === "GET") {
+      for (const [name, value] of parameters) url.searchParams.set(name, value);
+      if (new TextEncoder().encode(url.href).byteLength > MAX_REQUEST_URL_BYTES) throw new Page2WebMCPError("INVALID_INPUT");
+    } else {
+      body = parameters.toString();
+      if (new TextEncoder().encode(body).byteLength > MAX_REQUEST_BODY_BYTES) throw new Page2WebMCPError("INVALID_INPUT");
+      headers.set("content-type", "application/x-www-form-urlencoded;charset=UTF-8");
+    }
+    assertAllowedOrigin();
+    finalRequestStarted = true;
+    const documentResult = await requestDocument(spec, url, {
+      method: spec.request.method,
+      headers,
+      body,
+    }, signal, page);
+    assertPageStable(page);
+    if (!semanticConditionState(documentResult, spec.success.condition)) throw new Page2WebMCPError("STALE_PAGE");
+    const projected = projectSemanticResponse(documentResult, spec.response.projection);
+    const output = validateAndProject(spec.schemas.output, projected, "INVALID_OUTPUT");
+    completePendingMutation(state, pending);
+    return output;
+  } catch (error) {
+    if (!finalRequestStarted || error instanceof DefinitiveRequestError) completePendingMutation(state, pending);
+    if (signal.aborted) throw signalError(signal);
+    throw error;
+  }
+}
+
+async function executeDomWithinDeadline(state, spec, input, signal) {
+  const snapshot = pageSnapshot();
+  assertPageStable(snapshot);
+  const scope = resolveSemantic(snapshot.document, spec.request.scope);
+  const inputs = new Map();
+  for (const [field, mapping] of Object.entries(spec.request.inputs)) {
+    const present = Object.prototype.hasOwnProperty.call(input, field);
+    const matches = semanticMatches(scope, mapping.locator);
+    if (matches.length !== 1 && (!mapping.optional || present)) throw new Page2WebMCPError("STALE_PAGE");
+    if (matches.length === 1) inputs.set(field, { element: matches[0], mapping, present });
+  }
+  const actionTarget = spec.request.action.kind === "click"
+    ? resolveSemantic(scope, spec.request.action.target) : undefined;
+  if (spec.effects.kind === "mutation") await confirmMutation(state, spec, input, undefined, signal);
+  assertPageStable(snapshot);
+  assertSameSemantic(snapshot.document, spec.request.scope, scope);
+  for (const [field, entry] of inputs) {
+    if (!entry.present) continue;
+    assertSameSemantic(scope, entry.mapping.locator, entry.element);
+    nativeSetControl(entry.element, input[field]);
+    assertPageStable(snapshot);
+    assertSameSemantic(snapshot.document, spec.request.scope, scope);
+    assertSameSemantic(scope, entry.mapping.locator, entry.element);
+  }
+  if (actionTarget) {
+    assertSameSemantic(scope, spec.request.action.target, actionTarget);
+    assertSafeClickTarget(actionTarget);
+    if (typeof nativeClick !== "function") throw new Page2WebMCPError("STALE_PAGE");
+    nativeClick.call(actionTarget);
+  }
+  if (spec.request.action.kind === "read") {
+    if (!semanticConditionState(scope, spec.success.condition)) throw new Page2WebMCPError("STALE_PAGE");
+  } else {
+    await waitForSemanticCondition(scope, spec.success.condition, snapshot, signal);
+  }
+  assertSameSemantic(snapshot.document, spec.request.scope, scope);
+  const projected = projectSemanticResponse(scope, spec.response.projection);
+  return validateAndProject(spec.schemas.output, projected, "INVALID_OUTPUT");
+}
+
+async function executeWithinDeadline(state, spec, rawInput, signal) {
+  assertAllowedOrigin();
+  const input = deepFreeze(validateAndProject(spec.schemas.input, rawInput, "INVALID_INPUT"));
+  if (spec.request.adapter === "json_api") return executeJsonWithinDeadline(state, spec, input, signal);
+  if (spec.request.adapter === "html_form") return executeFormWithinDeadline(state, spec, input, signal);
+  return executeDomWithinDeadline(state, spec, input, signal);
 }
 
 async function executePlan(state, spec, input, callerSignal) {

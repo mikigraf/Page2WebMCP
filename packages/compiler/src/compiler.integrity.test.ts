@@ -29,13 +29,14 @@ function plan(): CapabilityPlan {
     authentication: { mode: "same_origin_cookie", requiredScopes: [] },
     effects: { kind: "read", riskTier: "R0", reversible: true, summary: "Reads one probe.", confirmation: "none" },
     idempotency: { strategy: "none", verified: false, retry: "safe_once" },
-    request: { method: "GET", pathTemplate: "/probe", path: {}, query: { q: "query" }, body: {} },
+    request: { adapter: "json_api", method: "GET", pathTemplate: "/probe", path: {}, query: { q: "query" }, body: {} },
     response: {
+      adapter: "json_api",
       contentTypes: ["application/json"],
       projection: { kind: "identity" },
       errorMappings: { default: "TARGET_ERROR" },
     },
-    success: { statusCodes: [200], requiredOutputFields: ["value"] },
+    success: { adapter: "json_api", statusCodes: [200], requiredOutputFields: ["value"] },
     evidence: [{ source: "runtime", reference: `urn:sha256:${HASH}` }],
   };
 }

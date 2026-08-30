@@ -12,6 +12,101 @@ export type JsonSchema =
 
 export type ObjectJsonSchema = Extract<JsonSchema, { type: "object" }>;
 
+export type SemanticElement =
+  | "form"
+  | "input"
+  | "textarea"
+  | "select"
+  | "button"
+  | "output"
+  | "div"
+  | "span"
+  | "p"
+  | "section"
+  | "article"
+  | "h1"
+  | "h2"
+  | "h3"
+  | "a";
+
+export type SemanticLocator =
+  | { kind: "role"; role: "button" | "form" | "textbox" | "checkbox" | "combobox" | "status" | "alert" | "region" | "heading" | "link"; accessibleName: string }
+  | { kind: "label"; element: "input" | "textarea" | "select"; label: string }
+  | { kind: "name"; element: SemanticElement; name: string }
+  | { kind: "stable_attribute"; reviewed: true; element: SemanticElement; name: string; value: string };
+
+export type SemanticValue = {
+  locator: SemanticLocator;
+  read: "text" | "value" | "checked";
+};
+
+export type SemanticCondition = SemanticValue & { equals: string | boolean };
+
+export type JsonApiRequest = {
+  adapter: "json_api";
+  method: "GET" | "POST";
+  pathTemplate: string;
+  path: Record<string, string>;
+  query: Record<string, string>;
+  body: Record<string, string>;
+};
+
+export type HtmlFormRequest = {
+  adapter: "html_form";
+  form: SemanticLocator;
+  action: string;
+  method: "GET" | "POST";
+  controls: Record<string, { inputField: string; optional: boolean }>;
+};
+
+export type SemanticDomRequest = {
+  adapter: "semantic_dom";
+  scope: SemanticLocator;
+  inputs: Record<string, { locator: SemanticLocator; optional: boolean }>;
+  action: { kind: "read" } | { kind: "click"; target: SemanticLocator };
+};
+
+export type JsonApiResponse = {
+  adapter: "json_api";
+  contentTypes: string[];
+  projection:
+    | { kind: "identity" }
+    | { kind: "object"; fields: Record<string, string> }
+    | { kind: "array"; fields: Record<string, string> };
+  errorMappings: Record<string, CapabilityErrorCode>;
+};
+
+export type HtmlFormResponse = {
+  adapter: "html_form";
+  contentTypes: string[];
+  projection: { kind: "semantic_object"; fields: Record<string, SemanticValue> };
+  errorMappings: Record<string, CapabilityErrorCode>;
+};
+
+export type SemanticDomResponse = {
+  adapter: "semantic_dom";
+  projection: { kind: "semantic_object"; fields: Record<string, SemanticValue> };
+};
+
+export type JsonApiSuccess = {
+  adapter: "json_api";
+  statusCodes: number[];
+  requiredOutputFields: string[];
+};
+
+export type HtmlFormSuccess = {
+  adapter: "html_form";
+  statusCodes: number[];
+  condition: SemanticCondition;
+  requiredOutputFields: string[];
+};
+
+export type SemanticDomSuccess = {
+  adapter: "semantic_dom";
+  condition: SemanticCondition;
+  requiredOutputFields: string[];
+};
+
 export type CapabilityPlan = {
   version: typeof CAPABILITY_PLAN_VERSION;
   targetOrigin: string;
@@ -52,30 +147,15 @@ export type CapabilityPlan = {
     };
   };
   idempotency: {
-    strategy: "none" | "header";
+    strategy: "none" | "header" | "form_field";
     headerName?: string;
+    fieldName?: string;
     verified: boolean;
     retry: "none" | "safe_once";
   };
-  request: {
-    method: "GET" | "POST";
-    pathTemplate: string;
-    path: Record<string, string>;
-    query: Record<string, string>;
-    body: Record<string, string>;
-  };
-  response: {
-    contentTypes: string[];
-    projection:
-      | { kind: "identity" }
-      | { kind: "object"; fields: Record<string, string> }
-      | { kind: "array"; fields: Record<string, string> };
-    errorMappings: Record<string, CapabilityErrorCode>;
-  };
-  success: {
-    statusCodes: number[];
-    requiredOutputFields: string[];
-  };
+  request: JsonApiRequest | HtmlFormRequest | SemanticDomRequest;
+  response: JsonApiResponse | HtmlFormResponse | SemanticDomResponse;
+  success: JsonApiSuccess | HtmlFormSuccess | SemanticDomSuccess;
   evidence: Array<{
     source: "runtime" | "openapi" | "github" | "owner_review";
     reference: string;
@@ -134,6 +214,51 @@ const FieldMapSchema = z.record(
   z.string().regex(/^[A-Za-z][A-Za-z0-9_]{0,127}$/),
 );
 
+const SemanticElementSchema = z.enum([
+  "form", "input", "textarea", "select", "button", "output", "div", "span", "p", "section", "article", "h1", "h2", "h3", "a",
+]);
+
+const SemanticLocatorSchema: z.ZodType<SemanticLocator> = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("role"),
+    role: z.enum(["button", "form", "textbox", "checkbox", "combobox", "status", "alert", "region", "heading", "link"]),
+    accessibleName: z.string().trim().min(1).max(200),
+  }).strict(),
+  z.object({
+    kind: z.literal("label"),
+    element: z.enum(["input", "textarea", "select"]),
+    label: z.string().trim().min(1).max(200),
+  }).strict(),
+  z.object({
+    kind: z.literal("name"),
+    element: SemanticElementSchema,
+    name: z.string().regex(/^[A-Za-z_][A-Za-z0-9_.:-]{0,127}$/),
+  }).strict(),
+  z.object({
+    kind: z.literal("stable_attribute"),
+    reviewed: z.literal(true),
+    element: SemanticElementSchema,
+    name: z.string().regex(/^data-[a-z][a-z0-9-]{0,63}$/),
+    value: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/),
+  }).strict(),
+]);
+
+const SemanticValueSchema: z.ZodType<SemanticValue> = z.object({
+  locator: SemanticLocatorSchema,
+  read: z.enum(["text", "value", "checked"]),
+}).strict();
+
+const SemanticConditionSchema: z.ZodType<SemanticCondition> = z.object({
+  locator: SemanticLocatorSchema,
+  read: z.enum(["text", "value", "checked"]),
+  equals: z.union([z.string().max(4096), z.boolean()]),
+}).strict();
+
+const SemanticProjectionSchema = z.object({
+  kind: z.literal("semantic_object"),
+  fields: z.record(z.string().regex(/^[A-Za-z][A-Za-z0-9_]{0,127}$/), SemanticValueSchema),
+}).strict();
+
 const ErrorCodeSchema = z.enum([
   "AUTHENTICATION_REQUIRED",
   "FORBIDDEN",
@@ -186,31 +311,84 @@ const CapabilityPlanStructureSchema = z.object({
     }).strict().optional(),
   }).strict(),
   idempotency: z.object({
-    strategy: z.enum(["none", "header"]),
+    strategy: z.enum(["none", "header", "form_field"]),
     headerName: z.string().regex(/^[A-Za-z0-9!#$%&'*+.^_`|~-]{1,128}$/).optional(),
+    fieldName: z.string().regex(/^[A-Za-z_][A-Za-z0-9_.:-]{0,127}$/).optional(),
     verified: z.boolean(),
     retry: z.enum(["none", "safe_once"]),
   }).strict(),
-  request: z.object({
-    method: z.enum(["GET", "POST"]),
-    pathTemplate: z.string().min(1).max(2048),
-    path: FieldMapSchema,
-    query: FieldMapSchema,
-    body: FieldMapSchema,
-  }).strict(),
-  response: z.object({
-    contentTypes: z.array(z.string().min(1).max(128)).min(1).max(20),
-    projection: z.discriminatedUnion("kind", [
-      z.object({ kind: z.literal("identity") }).strict(),
-      z.object({ kind: z.literal("object"), fields: FieldMapSchema }).strict(),
-      z.object({ kind: z.literal("array"), fields: FieldMapSchema }).strict(),
-    ]),
-    errorMappings: z.record(z.string(), ErrorCodeSchema),
-  }).strict(),
-  success: z.object({
-    statusCodes: z.array(z.number().int().min(200).max(299)).min(1).max(100),
-    requiredOutputFields: z.array(z.string().regex(/^[A-Za-z][A-Za-z0-9_]{0,127}$/)).max(200),
-  }).strict(),
+  request: z.discriminatedUnion("adapter", [
+    z.object({
+      adapter: z.literal("json_api"),
+      method: z.enum(["GET", "POST"]),
+      pathTemplate: z.string().min(1).max(2048),
+      path: FieldMapSchema,
+      query: FieldMapSchema,
+      body: FieldMapSchema,
+    }).strict(),
+    z.object({
+      adapter: z.literal("html_form"),
+      form: SemanticLocatorSchema,
+      action: z.string().min(1).max(2048),
+      method: z.enum(["GET", "POST"]),
+      controls: z.record(z.string().regex(/^[A-Za-z_][A-Za-z0-9_.:-]{0,127}$/), z.object({
+        inputField: z.string().regex(/^[A-Za-z][A-Za-z0-9_]{0,127}$/),
+        optional: z.boolean(),
+      }).strict()),
+    }).strict(),
+    z.object({
+      adapter: z.literal("semantic_dom"),
+      scope: SemanticLocatorSchema,
+      inputs: z.record(z.string().regex(/^[A-Za-z][A-Za-z0-9_]{0,127}$/), z.object({
+        locator: SemanticLocatorSchema,
+        optional: z.boolean(),
+      }).strict()),
+      action: z.discriminatedUnion("kind", [
+        z.object({ kind: z.literal("read") }).strict(),
+        z.object({ kind: z.literal("click"), target: SemanticLocatorSchema }).strict(),
+      ]),
+    }).strict(),
+  ]),
+  response: z.discriminatedUnion("adapter", [
+    z.object({
+      adapter: z.literal("json_api"),
+      contentTypes: z.array(z.string().min(1).max(128)).min(1).max(20),
+      projection: z.discriminatedUnion("kind", [
+        z.object({ kind: z.literal("identity") }).strict(),
+        z.object({ kind: z.literal("object"), fields: FieldMapSchema }).strict(),
+        z.object({ kind: z.literal("array"), fields: FieldMapSchema }).strict(),
+      ]),
+      errorMappings: z.record(z.string(), ErrorCodeSchema),
+    }).strict(),
+    z.object({
+      adapter: z.literal("html_form"),
+      contentTypes: z.array(z.literal("text/html")).length(1),
+      projection: SemanticProjectionSchema,
+      errorMappings: z.record(z.string(), ErrorCodeSchema),
+    }).strict(),
+    z.object({
+      adapter: z.literal("semantic_dom"),
+      projection: SemanticProjectionSchema,
+    }).strict(),
+  ]),
+  success: z.discriminatedUnion("adapter", [
+    z.object({
+      adapter: z.literal("json_api"),
+      statusCodes: z.array(z.number().int().min(200).max(299)).min(1).max(100),
+      requiredOutputFields: z.array(z.string().regex(/^[A-Za-z][A-Za-z0-9_]{0,127}$/)).max(200),
+    }).strict(),
+    z.object({
+      adapter: z.literal("html_form"),
+      statusCodes: z.array(z.number().int().min(200).max(299)).min(1).max(100),
+      condition: SemanticConditionSchema,
+      requiredOutputFields: z.array(z.string().regex(/^[A-Za-z][A-Za-z0-9_]{0,127}$/)).max(200),
+    }).strict(),
+    z.object({
+      adapter: z.literal("semantic_dom"),
+      condition: SemanticConditionSchema,
+      requiredOutputFields: z.array(z.string().regex(/^[A-Za-z][A-Za-z0-9_]{0,127}$/)).max(200),
+    }).strict(),
+  ]),
   evidence: z.array(z.object({
     source: z.enum(["runtime", "openapi", "github", "owner_review"]),
     reference: z.string().regex(/^urn:sha256:[a-f0-9]{64}$/),
@@ -325,8 +503,8 @@ function validCsrfTokenName(name: string): boolean {
   return !credentialMarker.test(name) && /(?:^|[-_])(?:csrf|xsrf)(?:[-_]?token)?(?:$|[-_])/i.test(name);
 }
 
-function validateRequestPath(plan: CapabilityPlan): void {
-  const path = plan.request.pathTemplate;
+function validateRequestPath(plan: CapabilityPlan, request: JsonApiRequest): void {
+  const path = request.pathTemplate;
   let decoded: string;
   try {
     decoded = decodeURIComponent(path);
@@ -346,10 +524,56 @@ function validateRequestPath(plan: CapabilityPlan): void {
     throw new Error(`unsafe request path for ${plan.tool.name}`);
   }
   assertUnique(placeholders, `${plan.tool.name}.request.path placeholders`);
-  const mapped = Object.keys(plan.request.path);
+  const mapped = Object.keys(request.path);
   if (placeholders.length !== mapped.length || placeholders.some((placeholder) => !mapped.includes(placeholder))) {
     throw new Error(`request path mappings do not match the path template for ${plan.tool.name}`);
   }
+}
+
+function validateFormAction(plan: CapabilityPlan, request: HtmlFormRequest): void {
+  let url: URL;
+  try {
+    url = new URL(request.action);
+  } catch {
+    throw new Error(`form action must be an exact same-origin URL for ${plan.tool.name}`);
+  }
+  if (url.href !== request.action
+    || url.origin !== plan.targetOrigin
+    || url.username.length > 0
+    || url.password.length > 0
+    || url.hash.length > 0) {
+    throw new Error(`form action must be an exact same-origin URL for ${plan.tool.name}`);
+  }
+  const formLocator = request.form;
+  const locatesForm = formLocator.kind === "role"
+    ? formLocator.role === "form"
+    : formLocator.kind !== "label" && formLocator.element === "form";
+  if (!locatesForm) throw new Error(`form locator must identify a form for ${plan.tool.name}`);
+}
+
+function validateSemanticLocator(locator: SemanticLocator, label: string): void {
+  if (locator.kind !== "stable_attribute") return;
+  if (/(?:^|-)(?:testid|reactid|react|vue|angular|ember|session|temporary|transient|random|uuid)(?:-|$)/i.test(locator.name)) {
+    throw new Error(`${label} uses a transient or private framework attribute`);
+  }
+}
+
+function visitSemanticLocators(plan: CapabilityPlan, visit: (locator: SemanticLocator, label: string) => void): void {
+  const request = plan.request;
+  if (request.adapter === "html_form") visit(request.form, `${plan.tool.name}.request.form`);
+  if (request.adapter === "semantic_dom") {
+    visit(request.scope, `${plan.tool.name}.request.scope`);
+    for (const [field, mapping] of Object.entries(request.inputs)) {
+      visit(mapping.locator, `${plan.tool.name}.request.inputs.${field}`);
+    }
+    if (request.action.kind === "click") visit(request.action.target, `${plan.tool.name}.request.action.target`);
+  }
+  if (plan.response.adapter !== "json_api") {
+    for (const [field, projection] of Object.entries(plan.response.projection.fields)) {
+      visit(projection.locator, `${plan.tool.name}.response.projection.${field}`);
+    }
+  }
+  if (plan.success.adapter !== "json_api") visit(plan.success.condition.locator, `${plan.tool.name}.success.condition`);
 }
 
 function referencedOutputSchema(plan: CapabilityPlan): ObjectJsonSchema | undefined {
@@ -411,15 +635,27 @@ function validateCapabilityPlan(plan: CapabilityPlan): void {
   if (maximumValidationUnits(plan.schemas.input) > MAX_INPUT_VALIDATION_UNITS) {
     throw new Error(`input validation bound exceeds the supported limit for ${plan.tool.name}`);
   }
-  validateRequestPath(plan);
+  if (plan.request.adapter !== plan.response.adapter || plan.request.adapter !== plan.success.adapter) {
+    throw new Error(`request, response, and success adapters must match for ${plan.tool.name}`);
+  }
+  visitSemanticLocators(plan, validateSemanticLocator);
+  if (plan.request.adapter === "json_api") validateRequestPath(plan, plan.request);
+  if (plan.request.adapter === "html_form") validateFormAction(plan, plan.request);
 
   if (plan.effects.riskTier === "R3") throw new Error(`R3 capability ${plan.tool.name} cannot be compiled`);
   if (plan.effects.kind === "read") {
     if (!plan.annotations.readOnly || plan.effects.riskTier !== "R0" || plan.effects.confirmation !== "none") {
       throw new Error(`read effects require read-only R0 annotations for ${plan.tool.name}`);
     }
-    if (plan.request.method !== "GET" || Object.keys(plan.request.body).length > 0) {
+    if (plan.request.adapter === "json_api"
+      && (plan.request.method !== "GET" || Object.keys(plan.request.body).length > 0)) {
       throw new Error(`read capability must use GET without a body for ${plan.tool.name}`);
+    }
+    if (plan.request.adapter === "html_form" && plan.request.method !== "GET") {
+      throw new Error(`read form capability must use GET for ${plan.tool.name}`);
+    }
+    if (plan.request.adapter === "semantic_dom" && plan.request.action.kind !== "read") {
+      throw new Error(`read DOM capability must use a read action for ${plan.tool.name}`);
     }
     if (plan.effects.sourceNativeConfirmation) {
       throw new Error(`read capability cannot declare source-native confirmation for ${plan.tool.name}`);
@@ -431,19 +667,38 @@ function validateCapabilityPlan(plan: CapabilityPlan): void {
     if (plan.effects.riskTier === "R1" && !plan.effects.reversible) {
       throw new Error(`R1 mutation must be reversible for ${plan.tool.name}`);
     }
-    if (plan.request.method !== "POST") throw new Error(`mutation capability must use POST for ${plan.tool.name}`);
+    if (plan.request.adapter !== "semantic_dom" && plan.request.method !== "POST") {
+      throw new Error(`mutation capability must use POST for ${plan.tool.name}`);
+    }
+    if (plan.request.adapter === "semantic_dom" && plan.request.action.kind !== "click") {
+      throw new Error(`mutation DOM capability must use a click action for ${plan.tool.name}`);
+    }
   }
 
   if (plan.idempotency.strategy === "none") {
-    if (plan.idempotency.headerName !== undefined || plan.idempotency.verified) {
+    if (plan.idempotency.headerName !== undefined || plan.idempotency.fieldName !== undefined || plan.idempotency.verified) {
       throw new Error(`idempotency strategy none cannot declare verification for ${plan.tool.name}`);
     }
-  } else if (!plan.idempotency.headerName) {
-    throw new Error(`header idempotency requires a header name for ${plan.tool.name}`);
+  } else if (plan.idempotency.strategy === "header") {
+    if (!plan.idempotency.headerName || plan.idempotency.fieldName !== undefined) {
+      throw new Error(`header idempotency requires only a header name for ${plan.tool.name}`);
+    }
+  } else if (!plan.idempotency.fieldName || plan.idempotency.headerName !== undefined) {
+    throw new Error(`form-field idempotency requires only a field name for ${plan.tool.name}`);
   }
   if (plan.effects.kind === "mutation" && plan.idempotency.retry === "safe_once"
-    && (plan.idempotency.strategy !== "header" || !plan.idempotency.verified)) {
+    && (!plan.idempotency.verified
+      || (plan.request.adapter === "json_api" && plan.idempotency.strategy !== "header")
+      || (plan.request.adapter === "html_form" && !["header", "form_field"].includes(plan.idempotency.strategy))
+      || plan.request.adapter === "semantic_dom")) {
     throw new Error(`mutation retry requires verified idempotency for ${plan.tool.name}`);
+  }
+  if (plan.request.adapter === "semantic_dom"
+    && (plan.idempotency.strategy !== "none" || plan.idempotency.retry !== "none")) {
+    throw new Error(`DOM mutations cannot declare retry or idempotency for ${plan.tool.name}`);
+  }
+  if (plan.idempotency.strategy === "form_field" && plan.request.adapter !== "html_form") {
+    throw new Error(`form-field idempotency requires an HTML form adapter for ${plan.tool.name}`);
   }
 
   if (plan.authentication.mode === "public" && plan.authentication.requiredScopes.length > 0) {
@@ -462,41 +717,64 @@ function validateCapabilityPlan(plan: CapabilityPlan): void {
 
   const requiredInputs = new Set(plan.schemas.input.required);
   const inputProperties = plan.schemas.input.properties;
-  const referencedInputs = [
-    ...Object.values(plan.request.path),
-    ...Object.values(plan.request.query),
-    ...Object.values(plan.request.body),
-  ];
-  for (const field of referencedInputs) {
+  const inputMappings: Array<{ field: string; optional: boolean; target: string }> = [];
+  if (plan.request.adapter === "json_api") {
+    for (const [target, field] of Object.entries(plan.request.path)) inputMappings.push({ target, field, optional: false });
+    for (const [target, field] of Object.entries(plan.request.query)) inputMappings.push({ target, field, optional: false });
+    for (const [target, field] of Object.entries(plan.request.body)) inputMappings.push({ target, field, optional: false });
+  } else if (plan.request.adapter === "html_form") {
+    for (const [target, mapping] of Object.entries(plan.request.controls)) {
+      inputMappings.push({ target, field: mapping.inputField, optional: mapping.optional });
+    }
+  } else {
+    for (const [field, mapping] of Object.entries(plan.request.inputs)) {
+      inputMappings.push({ target: field, field, optional: mapping.optional });
+    }
+  }
+  if (inputMappings.length > 100) throw new Error(`input mapping count exceeds the supported bound for ${plan.tool.name}`);
+  assertUnique(inputMappings.map(({ field }) => field), `${plan.tool.name}.input mappings`);
+  for (const { field, optional } of inputMappings) {
     if (!Object.prototype.hasOwnProperty.call(inputProperties, field)) {
       throw new Error(`request plan references an unknown input field for ${plan.tool.name}`);
     }
-    if (!requiredInputs.has(field)) throw new Error(`request plan references an optional input field for ${plan.tool.name}`);
-  }
-  for (const field of [...Object.values(plan.request.path), ...Object.values(plan.request.query)]) {
+    if (optional === requiredInputs.has(field)) {
+      if (plan.request.adapter === "json_api") {
+        throw new Error(`request plan references an optional input field for ${plan.tool.name}`);
+      }
+      throw new Error(`request mapping optionality does not match the input schema for ${plan.tool.name}`);
+    }
     const schema = inputProperties[field]!;
     if (schema.type === "object" || schema.type === "array") {
-      throw new Error(`path and query mappings require scalar input fields for ${plan.tool.name}`);
+      if (plan.request.adapter === "json_api" && Object.values(plan.request.body).includes(field)) {
+        throw new Error(`request body mappings require scalar input fields for ${plan.tool.name}`);
+      }
+      throw new Error(`browser and request mappings require scalar input fields for ${plan.tool.name}`);
     }
   }
-  let maximumBodyBytes = 2;
-  for (const [target, field] of Object.entries(plan.request.body)) {
-    const schema = inputProperties[field]!;
-    if (schema.type === "object" || schema.type === "array") {
-      throw new Error(`request body mappings require scalar input fields for ${plan.tool.name}`);
+  if (plan.request.adapter === "json_api") {
+    let maximumBodyBytes = 2;
+    for (const [target, field] of Object.entries(plan.request.body)) {
+      maximumBodyBytes += utf8Bytes(JSON.stringify(target)) + 1 + maximumScalarJsonBytes(inputProperties[field]!) + 1;
     }
-    maximumBodyBytes += utf8Bytes(JSON.stringify(target)) + 1 + maximumScalarJsonBytes(schema) + 1;
-  }
-  if (maximumBodyBytes > MAX_REQUEST_BODY_BYTES) {
-    throw new Error(`request body exceeds the supported bound for ${plan.tool.name}`);
-  }
-  let maximumUrlBytes = utf8Bytes(plan.targetOrigin) + utf8Bytes(plan.request.pathTemplate);
-  for (const field of Object.values(plan.request.path)) maximumUrlBytes += maximumScalarUrlBytes(inputProperties[field]!);
-  for (const [target, field] of Object.entries(plan.request.query)) {
-    maximumUrlBytes += utf8Bytes(target) + 2 + maximumScalarUrlBytes(inputProperties[field]!);
-  }
-  if (maximumUrlBytes > MAX_REQUEST_URL_BYTES) {
-    throw new Error(`request URL exceeds the supported bound for ${plan.tool.name}`);
+    if (maximumBodyBytes > MAX_REQUEST_BODY_BYTES) {
+      throw new Error(`request body exceeds the supported bound for ${plan.tool.name}`);
+    }
+    let maximumUrlBytes = utf8Bytes(plan.targetOrigin) + utf8Bytes(plan.request.pathTemplate);
+    for (const field of Object.values(plan.request.path)) maximumUrlBytes += maximumScalarUrlBytes(inputProperties[field]!);
+    for (const [target, field] of Object.entries(plan.request.query)) {
+      maximumUrlBytes += utf8Bytes(target) + 2 + maximumScalarUrlBytes(inputProperties[field]!);
+    }
+    if (maximumUrlBytes > MAX_REQUEST_URL_BYTES) {
+      throw new Error(`request URL exceeds the supported bound for ${plan.tool.name}`);
+    }
+  } else if (plan.request.adapter === "html_form") {
+    let maximumEncodedBytes = utf8Bytes(plan.request.action);
+    for (const { target, field } of inputMappings) {
+      maximumEncodedBytes += utf8Bytes(target) + 2 + maximumScalarUrlBytes(inputProperties[field]!);
+    }
+    if (maximumEncodedBytes > (plan.request.method === "GET" ? MAX_REQUEST_URL_BYTES : MAX_REQUEST_BODY_BYTES)) {
+      throw new Error(`form request exceeds the supported bound for ${plan.tool.name}`);
+    }
   }
 
   const reservedHeaders = new Set([
@@ -504,6 +782,7 @@ function validateCapabilityPlan(plan: CapabilityPlan): void {
     "referer", "te", "trailer", "transfer-encoding", "upgrade",
   ]);
   const idempotencyHeader = plan.idempotency.headerName?.toLowerCase();
+  const idempotencyField = plan.idempotency.fieldName;
   const csrfHeader = plan.authentication.csrf?.headerName.toLowerCase();
   if (idempotencyHeader && (reservedHeaders.has(idempotencyHeader) || idempotencyHeader.startsWith("sec-")
     || idempotencyHeader.startsWith("proxy-") || !/^(?:x-)?idempotency(?:-key)?$/.test(idempotencyHeader))) {
@@ -513,24 +792,36 @@ function validateCapabilityPlan(plan: CapabilityPlan): void {
   if (csrfHeader && idempotencyHeader && csrfHeader === idempotencyHeader) {
     throw new Error(`CSRF and idempotency headers collide for ${plan.tool.name}`);
   }
+  if (idempotencyField && !/^(?:idempotency(?:[-_.]?key)?|request[-_.]?key)$/i.test(idempotencyField)) {
+    throw new Error(`unsupported form idempotency field for ${plan.tool.name}`);
+  }
+  if (idempotencyField && plan.request.adapter === "html_form"
+    && Object.prototype.hasOwnProperty.call(plan.request.controls, idempotencyField)) {
+    throw new Error(`idempotency field collides with a mapped form control for ${plan.tool.name}`);
+  }
 
-  assertUnique(plan.response.contentTypes, `${plan.tool.name}.response.contentTypes`);
-  for (const contentType of plan.response.contentTypes) {
-    if (contentType !== contentType.toLowerCase() || !/^application\/(?:[a-z0-9!#$&^_.+-]+\+)?json$/.test(contentType)) {
-      throw new Error(`unsupported response content type for ${plan.tool.name}`);
+  if (plan.response.adapter !== "semantic_dom") {
+    assertUnique(plan.response.contentTypes, `${plan.tool.name}.response.contentTypes`);
+    for (const contentType of plan.response.contentTypes) {
+      if (plan.response.adapter === "json_api"
+        && (contentType !== contentType.toLowerCase() || !/^application\/(?:[a-z0-9!#$&^_.+-]+\+)?json$/.test(contentType))) {
+        throw new Error(`unsupported response content type for ${plan.tool.name}`);
+      }
+    }
+    for (const status of Object.keys(plan.response.errorMappings)) {
+      if (status !== "default" && !/^[45][0-9]{2}$/.test(status)) throw new Error(`invalid error status mapping for ${plan.tool.name}`);
+    }
+    if (!Object.prototype.hasOwnProperty.call(plan.response.errorMappings, "default")) {
+      throw new Error(`default error mapping is required for ${plan.tool.name}`);
     }
   }
-  assertUnique(plan.success.statusCodes, `${plan.tool.name}.success.statusCodes`);
-  if (plan.success.statusCodes.some((status) => status === 204 || status === 205)) {
-    throw new Error(`204 and 205 are unsupported by the JSON response adapter for ${plan.tool.name}`);
+  if (plan.success.adapter !== "semantic_dom") {
+    assertUnique(plan.success.statusCodes, `${plan.tool.name}.success.statusCodes`);
+    if (plan.success.statusCodes.some((status) => status === 204 || status === 205)) {
+      throw new Error(`204 and 205 are unsupported by document response adapters for ${plan.tool.name}`);
+    }
   }
   assertUnique(plan.success.requiredOutputFields, `${plan.tool.name}.success.requiredOutputFields`);
-  for (const status of Object.keys(plan.response.errorMappings)) {
-    if (status !== "default" && !/^[45][0-9]{2}$/.test(status)) throw new Error(`invalid error status mapping for ${plan.tool.name}`);
-  }
-  if (!Object.prototype.hasOwnProperty.call(plan.response.errorMappings, "default")) {
-    throw new Error(`default error mapping is required for ${plan.tool.name}`);
-  }
 
   const outputSchema = referencedOutputSchema(plan);
   const referencedOutputs = [
@@ -548,7 +839,7 @@ function validateCapabilityPlan(plan: CapabilityPlan): void {
       }
       if (!requiredOutputs.has(field)) throw new Error(`response plan references an optional output field for ${plan.tool.name}`);
     }
-    if (plan.response.projection.kind !== "identity") {
+    if (plan.response.adapter === "json_api" && plan.response.projection.kind !== "identity") {
       const expectedKind = plan.schemas.output.type === "array" ? "array" : "object";
       if (plan.response.projection.kind !== expectedKind) throw new Error(`response projection kind does not match output schema for ${plan.tool.name}`);
       for (const field of requiredOutputs) {
@@ -556,6 +847,30 @@ function validateCapabilityPlan(plan: CapabilityPlan): void {
           throw new Error(`response projection omits required output field for ${plan.tool.name}`);
         }
       }
+    } else if (plan.response.adapter !== "json_api") {
+      if (plan.schemas.output.type !== "object") {
+        throw new Error(`semantic projection requires an object output schema for ${plan.tool.name}`);
+      }
+      for (const field of requiredOutputs) {
+        if (!Object.prototype.hasOwnProperty.call(plan.response.projection.fields, field)) {
+          throw new Error(`semantic response projection omits required output field for ${plan.tool.name}`);
+        }
+      }
+      for (const [field, projection] of Object.entries(plan.response.projection.fields)) {
+        const schema = outputSchema.properties[field]!;
+        if ((projection.read === "checked") !== (schema.type === "boolean")) {
+          throw new Error(`semantic projection source type does not match output field for ${plan.tool.name}`);
+        }
+        if (projection.read !== "checked" && schema.type !== "string") {
+          throw new Error(`semantic text/value projection requires a string output field for ${plan.tool.name}`);
+        }
+      }
+    }
+  }
+  if (plan.success.adapter !== "json_api") {
+    const condition = plan.success.condition;
+    if ((condition.read === "checked") !== (typeof condition.equals === "boolean")) {
+      throw new Error(`semantic success condition type does not match its source for ${plan.tool.name}`);
     }
   }
 
@@ -593,6 +908,49 @@ function canonicalSchema(schema: JsonSchema): JsonSchema {
   return { ...schema };
 }
 
+function canonicalRequest(request: CapabilityPlan["request"]): CapabilityPlan["request"] {
+  if (request.adapter === "json_api") {
+    return {
+      ...request,
+      path: sortedRecord(request.path),
+      query: sortedRecord(request.query),
+      body: sortedRecord(request.body),
+    };
+  }
+  if (request.adapter === "html_form") return { ...request, controls: sortedRecord(request.controls) };
+  return { ...request, inputs: sortedRecord(request.inputs) };
+}
+
+function canonicalResponse(response: CapabilityPlan["response"]): CapabilityPlan["response"] {
+  if (response.adapter === "semantic_dom") {
+    return { ...response, projection: { ...response.projection, fields: sortedRecord(response.projection.fields) } };
+  }
+  if (response.adapter === "html_form") {
+    return {
+      ...response,
+      contentTypes: [...response.contentTypes].sort(compareStrings),
+      projection: { ...response.projection, fields: sortedRecord(response.projection.fields) },
+      errorMappings: sortedRecord(response.errorMappings),
+    };
+  }
+  return {
+    ...response,
+    contentTypes: [...response.contentTypes].sort(compareStrings),
+    projection: response.projection.kind === "identity"
+      ? { kind: "identity" }
+      : { ...response.projection, fields: sortedRecord(response.projection.fields) },
+    errorMappings: sortedRecord(response.errorMappings),
+  };
+}
+
+function canonicalSuccess(success: CapabilityPlan["success"]): CapabilityPlan["success"] {
+  return {
+    ...success,
+    ...(success.adapter === "semantic_dom" ? {} : { statusCodes: [...success.statusCodes].sort((left, right) => left - right) }),
+    requiredOutputFields: [...success.requiredOutputFields].sort(compareStrings),
+  };
+}
+
 function canonicalPlan(plan: CapabilityPlan): CapabilityPlan {
   return {
     ...plan,
@@ -611,23 +969,9 @@ function canonicalPlan(plan: CapabilityPlan): CapabilityPlan {
       ...plan.idempotency,
       ...(plan.idempotency.headerName ? { headerName: plan.idempotency.headerName.toLowerCase() } : {}),
     },
-    request: {
-      ...plan.request,
-      path: sortedRecord(plan.request.path),
-      query: sortedRecord(plan.request.query),
-      body: sortedRecord(plan.request.body),
-    },
-    response: {
-      contentTypes: [...plan.response.contentTypes].sort(compareStrings),
-      projection: plan.response.projection.kind === "identity"
-        ? { kind: "identity" }
-        : { ...plan.response.projection, fields: sortedRecord(plan.response.projection.fields) },
-      errorMappings: sortedRecord(plan.response.errorMappings),
-    },
-    success: {
-      statusCodes: [...plan.success.statusCodes].sort((left, right) => left - right),
-      requiredOutputFields: [...plan.success.requiredOutputFields].sort(compareStrings),
-    },
+    request: canonicalRequest(plan.request),
+    response: canonicalResponse(plan.response),
+    success: canonicalSuccess(plan.success),
     evidence: [...plan.evidence].sort((left, right) =>
       compareStrings(left.reference, right.reference) || compareStrings(left.source, right.source)),
   };

@@ -101,8 +101,8 @@ test("verification binds the reviewed complete plan, not a same-name shallow cap
       planDigest,
       reviewedPlanDigest: planDigest,
     }]);
-    assert.equal(verification.schema, false, substitutedPlan.request.pathTemplate);
-    assert.equal(verification.selectionScore, 0, substitutedPlan.request.pathTemplate);
+    assert.equal(verification.schema, false, substitutedPlan.tool.name);
+    assert.equal(verification.selectionScore, 0, substitutedPlan.tool.name);
   }
 });
 

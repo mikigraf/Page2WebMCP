@@ -60,8 +60,9 @@ function plans(origin = "https://widgets.example"): CapabilityPlan[] {
         confirmation: "none",
       },
       idempotency: { strategy: "none", verified: false, retry: "safe_once" },
-      request: { method: "GET", pathTemplate: "/v7/widgets", path: {}, query: { q: "query" }, body: {} },
+      request: { adapter: "json_api", method: "GET", pathTemplate: "/v7/widgets", path: {}, query: { q: "query" }, body: {} },
       response: {
+        adapter: "json_api",
         contentTypes: ["application/json"],
         projection: { kind: "array", fields: { id: "widget_id", label: "display_name" } },
         errorMappings: {
@@ -71,7 +72,7 @@ function plans(origin = "https://widgets.example"): CapabilityPlan[] {
           default: "TARGET_ERROR",
         },
       },
-      success: { statusCodes: [200], requiredOutputFields: ["id", "label"] },
+      success: { adapter: "json_api", statusCodes: [200], requiredOutputFields: ["id", "label"] },
       evidence: [{ source: "openapi", reference: `urn:sha256:${HASH_A}` }],
     },
     {
@@ -115,8 +116,9 @@ function plans(origin = "https://widgets.example"): CapabilityPlan[] {
         },
       },
       idempotency: { strategy: "header", headerName: "idempotency-key", verified: true, retry: "safe_once" },
-      request: { method: "POST", pathTemplate: "/v7/widget-drafts", path: {}, query: {}, body: { label: "label" } },
+      request: { adapter: "json_api", method: "POST", pathTemplate: "/v7/widget-drafts", path: {}, query: {}, body: { label: "label" } },
       response: {
+        adapter: "json_api",
         contentTypes: ["application/json"],
         projection: { kind: "object", fields: { id: "widget_id", state: "state" } },
         errorMappings: {
@@ -127,7 +129,7 @@ function plans(origin = "https://widgets.example"): CapabilityPlan[] {
           default: "TARGET_ERROR",
         },
       },
-      success: { statusCodes: [201], requiredOutputFields: ["id", "state"] },
+      success: { adapter: "json_api", statusCodes: [201], requiredOutputFields: ["id", "state"] },
       evidence: [
         { source: "runtime", reference: `urn:sha256:${HASH_A}` },
         { source: "github", reference: `urn:sha256:${HASH_B}` },
@@ -190,7 +192,9 @@ test("compiler canonicalizes complete non-fixture plans and emits SHA-256/SHA-38
     ...plan,
     authentication: { ...plan.authentication, requiredScopes: [...plan.authentication.requiredScopes].reverse() },
     evidence: [...plan.evidence].reverse(),
-    success: { ...plan.success, statusCodes: [...plan.success.statusCodes].reverse(), requiredOutputFields: [...plan.success.requiredOutputFields].reverse() },
+    success: plan.success.adapter === "semantic_dom"
+      ? { ...plan.success, requiredOutputFields: [...plan.success.requiredOutputFields].reverse() }
+      : { ...plan.success, statusCodes: [...plan.success.statusCodes].reverse(), requiredOutputFields: [...plan.success.requiredOutputFields].reverse() },
   }));
   const reverse = compileWebMcpRelease(reordered);
 
