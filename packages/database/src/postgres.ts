@@ -9,6 +9,8 @@ import {
   capabilityStateDigest,
   normalizeAnalysisDiagnostics,
   normalizeAnalysisSourceTypes,
+  normalizeReleaseInstallation,
+  releaseFailures,
   RepositoryError,
   type AnalysisResult,
   type AnalysisEvidence,
@@ -26,6 +28,8 @@ import {
   type ProjectRecord,
   type PublishRequest,
   type ReleaseRecord,
+  type ReleaseInstallationRecord,
+  type ReleaseInstallationRequest,
   type RepositoryActor,
   type ReviewInput,
   type SourceType,
@@ -1643,7 +1647,8 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
         const verification = await client.query(
           "select id, project_id, analysis_run_id, capability_state_digest, candidate_content_hash, schema_valid, " +
           "candidate_code, candidate_allowed_origin, candidate_manifest, authenticated, replay_passes, " +
-          "no_secret_leakage, browser_execution, selection_score, eligible, failures, created_at " +
+          "no_secret_leakage, browser_execution, selection_score, checks, csp_result, verification_mode, " +
+          "eligible, failures, created_at " +
           "from public.verification_runs where project_id = $1 and organization_id = $2 and analysis_run_id = $3 " +
           "and capability_state_digest = $4 and candidate_content_hash = $5 order by revision desc limit 1",
           [projectId, actor.organizationId, run.id, input.capabilityStateDigest, candidateContentHash]
@@ -1659,19 +1664,21 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
         }
         throw new RepositoryError("RELEASE_GATE_FAILED", ["CANDIDATE_CHANGED"]);
       }
-      const failures = verificationFailures(input);
+      const failures = releaseFailures(input);
       const result = await client.query(
         "insert into public.verification_runs " +
         "(organization_id, project_id, analysis_run_id, capability_state_digest, candidate_content_hash, " +
         "candidate_code, candidate_allowed_origin, candidate_manifest, schema_valid, authenticated, replay_passes, " +
-        "no_secret_leakage, browser_execution, selection_score, eligible, failures) " +
-        "values ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10,$11,$12,$13,$14,$15,$16) " +
+        "no_secret_leakage, browser_execution, selection_score, checks, csp_result, verification_mode, eligible, failures) " +
+        "values ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10,$11,$12,$13,$14,$15::jsonb,$16::jsonb,$17,$18,$19) " +
         "returning id, project_id, analysis_run_id, capability_state_digest, candidate_content_hash, schema_valid, authenticated, " +
-        "replay_passes, no_secret_leakage, browser_execution, selection_score, eligible, failures, created_at",
+        "replay_passes, no_secret_leakage, browser_execution, selection_score, checks, csp_result, verification_mode, " +
+        "eligible, failures, created_at",
         [actor.organizationId, projectId, input.analysisRunId, input.capabilityStateDigest, candidateContentHash,
           input.candidate.code, input.candidate.allowedOrigin, JSON.stringify(input.candidate.manifest ?? {}),
           input.schema, input.authenticated, input.replayPasses, input.noSecretLeakage, input.browserExecution,
-          input.selectionScore, failures.length === 0, failures]
+          input.selectionScore, JSON.stringify(input.checks), JSON.stringify(input.csp), input.verificationMode,
+          failures.length === 0, failures]
       );
       return mapVerification(result.rows[0]);
     });
@@ -1799,6 +1806,105 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
     });
   }
 
+  async getRelease(actor: RepositoryActor, projectId: string, releaseId: string): Promise<ReleaseRecord> {
+    return this.#transaction({ kind: "app", actor }, async (client) => {
+      await this.#project(client, actor, projectId);
+      const result = await client.query(
+        "select id, organization_id, project_id, analysis_run_id, capability_state_digest, content_hash, sri, code, " +
+        "allowed_origin, manifest, status, created_at from public.releases " +
+        "where id = $1 and project_id = $2 and organization_id = $3 limit 1",
+        [releaseId, projectId, actor.organizationId]
+      );
+      if (!result.rows[0]) throw new RepositoryError("NOT_FOUND");
+      return mapRelease(result.rows[0]);
+    });
+  }
+
+  async getPreviousRelease(
+    actor: RepositoryActor,
+    projectId: string,
+    releaseId: string,
+  ): Promise<ReleaseRecord | undefined> {
+    return this.#transaction({ kind: "app", actor }, async (client) => {
+      await this.#project(client, actor, projectId);
+      const current = await client.query(
+        "select id, created_at from public.releases where id = $1 and project_id = $2 and organization_id = $3 limit 1",
+        [releaseId, projectId, actor.organizationId]
+      );
+      if (!current.rows[0]) throw new RepositoryError("NOT_FOUND");
+      const result = await client.query(
+        "select id, organization_id, project_id, analysis_run_id, capability_state_digest, content_hash, sri, code, " +
+        "allowed_origin, manifest, status, created_at from public.releases where project_id = $1 and organization_id = $2 " +
+        "and (created_at, id) < ($3::timestamptz, $4::uuid) order by created_at desc, id desc limit 1",
+        [projectId, actor.organizationId, current.rows[0].created_at, releaseId]
+      );
+      return result.rows[0] ? mapRelease(result.rows[0]) : undefined;
+    });
+  }
+
+  async saveReleaseInstallation(
+    actor: RepositoryActor,
+    projectId: string,
+    input: ReleaseInstallationRequest,
+  ): Promise<ReleaseInstallationRecord> {
+    if (actor.role !== "owner") throw new RepositoryError("FORBIDDEN");
+    return this.#transaction({ kind: "app", actor }, async (client) => {
+      await this.#project(client, actor, projectId);
+      const releaseResult = await client.query(
+        "select id, organization_id, project_id, analysis_run_id, capability_state_digest, content_hash, sri, code, " +
+        "allowed_origin, manifest, status, created_at from public.releases " +
+        "where id = $1 and project_id = $2 and organization_id = $3 limit 1 for share",
+        [input.releaseId, projectId, actor.organizationId]
+      );
+      if (!releaseResult.rows[0]) throw new RepositoryError("NOT_FOUND");
+      const normalized = normalizeReleaseInstallation(input, mapRelease(releaseResult.rows[0]));
+      const keyed = await client.query(
+        "select id, organization_id, project_id, release_id, actor_id, page_url, artifact_url, self_hosted_url, " +
+        "target_origin, artifact_content_hash, integrity, expected_tools, status, delivery, csp_status, csp_directive, " +
+        "webmcp_implementation, attestation, idempotency_key, input_hash, created_at, verified_at " +
+        "from public.release_installations where organization_id = $1 and actor_id = $2 and idempotency_key = $3 limit 1",
+        [actor.organizationId, actor.id, input.idempotencyKey]
+      );
+      if (keyed.rows[0]) {
+        const replay = mapReleaseInstallation(keyed.rows[0]);
+        if (replay.projectId !== projectId || replay.releaseId !== input.releaseId || replay.inputHash !== input.inputHash) {
+          throw new RepositoryError("IDEMPOTENCY_CONFLICT");
+        }
+        return replay;
+      }
+      const result = await client.query(
+        "insert into public.release_installations " +
+        "(organization_id, project_id, release_id, actor_id, page_url, artifact_url, self_hosted_url, target_origin, " +
+        "artifact_content_hash, integrity, expected_tools, status, delivery, csp_status, csp_directive, " +
+        "webmcp_implementation, attestation, idempotency_key, input_hash, verified_at) " +
+        "values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12,$13,$14,$15,$16,$17::jsonb,$18,$19," +
+        "case when $12 = 'verified' then now() else null end) " +
+        "on conflict (organization_id, project_id, release_id) do nothing " +
+        "returning id, organization_id, project_id, release_id, actor_id, page_url, artifact_url, self_hosted_url, " +
+        "target_origin, artifact_content_hash, integrity, expected_tools, status, delivery, csp_status, csp_directive, " +
+        "webmcp_implementation, attestation, idempotency_key, input_hash, created_at, verified_at",
+        [actor.organizationId, projectId, input.releaseId, actor.id, normalized.pageUrl, normalized.artifactUrl,
+          normalized.selfHostedUrl ?? null, normalized.targetOrigin, normalized.artifactContentHash, normalized.integrity,
+          JSON.stringify(normalized.expectedTools), normalized.status, normalized.delivery, normalized.csp.hosted,
+          normalized.csp.directive ?? null, normalized.webMcpImplementation, JSON.stringify(normalized.attestation),
+          normalized.idempotencyKey, normalized.inputHash]
+      );
+      if (result.rows[0]) return mapReleaseInstallation(result.rows[0]);
+      const existing = await client.query(
+        "select id, organization_id, project_id, release_id, actor_id, page_url, artifact_url, self_hosted_url, " +
+        "target_origin, artifact_content_hash, integrity, expected_tools, status, delivery, csp_status, csp_directive, " +
+        "webmcp_implementation, attestation, idempotency_key, input_hash, created_at, verified_at " +
+        "from public.release_installations where organization_id = $1 and project_id = $2 and release_id = $3 limit 1",
+        [actor.organizationId, projectId, input.releaseId]
+      );
+      const record = existing.rows[0] ? mapReleaseInstallation(existing.rows[0]) : undefined;
+      if (!record || record.inputHash !== input.inputHash || record.idempotencyKey !== input.idempotencyKey) {
+        throw new RepositoryError("IDEMPOTENCY_CONFLICT");
+      }
+      return record;
+    });
+  }
+
   async listAuditEvents(actor: RepositoryActor): Promise<AuditEventRecord[]> {
     if (actor.role !== "owner") throw new RepositoryError("FORBIDDEN");
     return this.#transaction({ kind: "app", actor }, async (client) => {
@@ -1815,7 +1921,7 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
   async reset(): Promise<void> {
     if (process.env.NODE_ENV !== "test") throw new RepositoryError("FORBIDDEN");
     await this.#pool.query(
-      "truncate public.installations, public.verification_checks, public.capability_plans, public.workflow_evidence, " +
+      "truncate public.release_installations, public.installations, public.verification_checks, public.capability_plans, public.workflow_evidence, " +
       "public.workflow_events, private.workflow_commands, private.workflow_tasks, public.workflow_runs, " +
       "public.source_snapshots, public.project_sources, public.audit_events, public.releases, " +
       "public.verification_runs, public.capability_reviews, " +
@@ -2006,8 +2112,26 @@ function mapVerification(row: QueryResultRow): VerificationRecord {
     candidateContentHash: String(row.candidate_content_hash),
     authenticated: Boolean(row.authenticated), replayPasses: Number(row.replay_passes),
     noSecretLeakage: Boolean(row.no_secret_leakage), browserExecution: Boolean(row.browser_execution),
-    selectionScore: Number(row.selection_score), eligible: Boolean(row.eligible), failures: row.failures as string[],
+    selectionScore: Number(row.selection_score), checks: row.checks as VerificationRecord["checks"],
+    csp: row.csp_result as VerificationRecord["csp"], verificationMode: row.verification_mode as VerificationRecord["verificationMode"],
+    eligible: Boolean(row.eligible), failures: row.failures as string[],
     createdAt: iso(row.created_at) };
+}
+
+function mapReleaseInstallation(row: QueryResultRow): ReleaseInstallationRecord {
+  return {
+    id: String(row.id), organizationId: String(row.organization_id), projectId: String(row.project_id),
+    releaseId: String(row.release_id), actorId: String(row.actor_id), pageUrl: String(row.page_url),
+    artifactUrl: String(row.artifact_url), ...(row.self_hosted_url ? { selfHostedUrl: String(row.self_hosted_url) } : {}),
+    targetOrigin: String(row.target_origin), artifactContentHash: String(row.artifact_content_hash),
+    integrity: String(row.integrity), expectedTools: row.expected_tools as string[],
+    status: row.status as ReleaseInstallationRecord["status"], delivery: row.delivery as ReleaseInstallationRecord["delivery"],
+    csp: { hosted: row.csp_status as "allowed" | "blocked",
+      ...(row.csp_directive ? { directive: String(row.csp_directive) } : {}) },
+    webMcpImplementation: row.webmcp_implementation as ReleaseInstallationRecord["webMcpImplementation"],
+    attestation: row.attestation, idempotencyKey: String(row.idempotency_key), inputHash: String(row.input_hash),
+    createdAt: iso(row.created_at), ...(row.verified_at ? { verifiedAt: iso(row.verified_at) } : {}),
+  };
 }
 
 function mapVerificationCandidate(row: QueryResultRow): CandidateRelease {
@@ -2025,14 +2149,6 @@ function mapRelease(row: QueryResultRow): ReleaseRecord {
     contentHash: String(row.content_hash), sri: String(row.sri),
     code: String(row.code), allowedOrigin: String(row.allowed_origin), manifest: row.manifest,
     status: "published", createdAt: iso(row.created_at) };
-}
-
-function verificationFailures(
-  input: VerificationRequest
-): string[] {
-  return [!input.schema && "SCHEMA", !input.authenticated && "AUTH", input.replayPasses < 3 && "REPLAY",
-    !input.noSecretLeakage && "SECRET_LEAKAGE", !input.browserExecution && "BROWSER",
-    input.selectionScore < 18 && "TOOL_SELECTION"].filter(Boolean) as string[];
 }
 
 function candidateMatches(candidate: CandidateRelease, stored: CandidateRelease): boolean {

@@ -10,11 +10,19 @@ import {
   type CapabilityRecord,
   type ControlPlaneRepository,
   type ReleaseRecord,
+  type ReleaseInstallationRecord,
   type RepositoryActor,
   type VerificationRecord,
   type VerificationRequest
 } from "../../../packages/database/src/control-plane.ts";
 import { ApiError } from "./api.ts";
+import {
+  attestReleaseCandidate,
+  attestReleaseInstallation,
+  releaseVerificationPort,
+  REQUIRED_CANDIDATE_CHECKS,
+  type CandidateAttestation,
+} from "./release-verification.ts";
 
 const ManifestSchema = z.object({
   version: z.literal(3),
@@ -33,8 +41,10 @@ export async function publishPersistedRelease(
   actor: RepositoryActor,
   projectId: string,
   analysisRunId: string,
-  idempotencyKey: string
-): Promise<ReleaseRecord & { url: string }> {
+  idempotencyKey: string,
+  signal: AbortSignal = new AbortController().signal,
+  publicOrigin = configuredPublicOrigin(),
+): Promise<ReleaseRecord & { url: string; installation: ReleaseInstallationGuide }> {
   if (actor.role !== "owner") throw new ApiError("FORBIDDEN", 403);
   const project = await repository.getProject(actor, projectId);
   const run = await repository.getAnalysis(actor, analysisRunId);
@@ -49,7 +59,9 @@ export async function publishPersistedRelease(
       && capability.status === "proposed"
   );
   if (pendingReview) throw new ApiError("REVIEW_REQUIRED", 409);
-  const verificationRequest = deriveVerification(analysisRunId, project.url, result, capabilities);
+  const verificationRequest = await deriveTrustedVerification(
+    analysisRunId, project.url, result, capabilities, signal
+  );
   const verification = await repository.saveVerification(actor, project.id, verificationRequest);
   const inputHash = createHash("sha256")
     .update(JSON.stringify({
@@ -67,14 +79,84 @@ export async function publishPersistedRelease(
     idempotencyKey,
     inputHash
   });
-  return { ...release, url: `/api/releases/${release.contentHash}.js` };
+  const previous = await repository.getPreviousRelease(actor, project.id, release.id);
+  const url = `/api/releases/${release.contentHash}.js`;
+  return {
+    ...release,
+    url,
+    installation: buildReleaseInstallationGuide(release, verification, previous, `${publicOrigin}${url}`),
+  };
+}
+
+export type ReleaseInstallationGuide = Readonly<{
+  artifactUrl: string;
+  downloadUrl: string;
+  moduleScriptTag: string;
+  manifest: unknown;
+  integrity: string;
+  contentHash: string;
+  targetOrigin: string;
+  compatibility: { moduleScripts: true; webMcp: "native-current-required" };
+  csp: VerificationRecord["csp"];
+  selfHost: { required: boolean; guidance: string };
+  previousRelease: null | { id: string; contentHash: string; integrity: string; artifactUrl: string };
+  installed: false;
+}>;
+
+export function buildReleaseInstallationGuide(
+  release: ReleaseRecord,
+  verification: VerificationRecord,
+  previous: ReleaseRecord | undefined,
+  artifactUrl: string,
+): ReleaseInstallationGuide {
+  const url = new URL(artifactUrl);
+  if (url.protocol !== "https:" || url.username || url.password || url.hash
+    || !url.pathname.endsWith(`/${release.contentHash}.js`)) throw new ApiError("INVALID_STATE", 409);
+  const previousArtifactUrl = previous
+    ? new URL(`/api/releases/${previous.contentHash}.js`, url.origin).toString()
+    : undefined;
+  return {
+    artifactUrl: url.toString(),
+    downloadUrl: `${url.toString()}?download=1`,
+    moduleScriptTag: `<script type="module" src="${url.toString()}" integrity="${release.sri}" crossorigin="anonymous"></script>`,
+    manifest: release.manifest,
+    integrity: release.sri,
+    contentHash: release.contentHash,
+    targetOrigin: release.allowedOrigin,
+    compatibility: { moduleScripts: true, webMcp: "native-current-required" },
+    csp: verification.csp,
+    selfHost: {
+      required: verification.csp.hosted === "blocked",
+      guidance: "Host the downloaded bytes unchanged on the target origin, then verify that exact SHA-256 before installation.",
+    },
+    previousRelease: previous && previousArtifactUrl ? {
+      id: previous.id,
+      contentHash: previous.contentHash,
+      integrity: previous.sri,
+      artifactUrl: previousArtifactUrl,
+    } : null,
+    installed: false,
+  };
+}
+
+export function configuredPublicOrigin(request?: Request): string {
+  const value = process.env.PAGE2WEBMCP_PUBLIC_ORIGIN ?? (process.env.NODE_ENV === "production" ? undefined : request?.url);
+  if (!value) throw new Error("PUBLIC_ORIGIN_CONFIGURATION_REQUIRED");
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "https:" || url.username || url.password) throw new Error("PUBLIC_ORIGIN_CONFIGURATION_REQUIRED");
+    return url.origin;
+  } catch {
+    throw new Error("PUBLIC_ORIGIN_CONFIGURATION_REQUIRED");
+  }
 }
 
 export async function verifyPersistedRelease(
   repository: ControlPlaneRepository,
   actor: RepositoryActor,
   projectId: string,
-  analysisRunId: string
+  analysisRunId: string,
+  signal: AbortSignal = new AbortController().signal,
 ): Promise<VerificationRecord> {
   if (actor.role !== "owner") throw new ApiError("FORBIDDEN", 403);
   const project = await repository.getProject(actor, projectId);
@@ -84,11 +166,113 @@ export async function verifyPersistedRelease(
   if (!result) throw new ApiError("INVALID_STATE", 409);
   assertCurrentEvidence(result, actor.organizationId, project.id, run.id);
   const capabilities = await repository.listAnalysisCapabilities(actor, run.id);
-  return repository.saveVerification(
-    actor,
-    project.id,
-    deriveVerification(run.id, project.url, result, capabilities)
-  );
+  return repository.saveVerification(actor, project.id,
+    await deriveTrustedVerification(run.id, project.url, result, capabilities, signal));
+}
+
+export async function verifyInstalledRelease(
+  repository: ControlPlaneRepository,
+  actor: RepositoryActor,
+  projectId: string,
+  releaseId: string,
+  pageUrl: string,
+  selfHostedUrl: string | undefined,
+  idempotencyKey: string,
+  publicOrigin: string,
+  signal: AbortSignal,
+): Promise<ReleaseInstallationRecord> {
+  if (actor.role !== "owner") throw new ApiError("FORBIDDEN", 403);
+  const release = await repository.getRelease(actor, projectId, releaseId);
+  const manifest = ManifestSchema.safeParse(release.manifest);
+  if (!manifest.success || manifest.data.targetOrigin !== release.allowedOrigin) {
+    throw new ApiError("INVALID_STATE", 409);
+  }
+  const expectedTools = manifest.data.plans.map(({ tool }) => tool.name).sort(compareStrings);
+  const artifactUrl = `${publicOrigin}/api/releases/${release.contentHash}.js`;
+  const attestation = await attestReleaseInstallation({
+    pageUrl,
+    artifactUrl,
+    contentHash: release.contentHash,
+    integrity: release.sri,
+    manifest: manifest.data,
+    targetOrigin: release.allowedOrigin,
+    expectedTools,
+    ...(selfHostedUrl ? { selfHostedUrl } : {}),
+  }, releaseVerificationPort(), signal);
+  const inputHash = createHash("sha256").update(JSON.stringify({
+    releaseId,
+    pageUrl,
+    selfHostedUrl: selfHostedUrl ?? null,
+    artifactUrl,
+    contentHash: release.contentHash,
+    integrity: release.sri,
+  })).digest("hex");
+  return repository.saveReleaseInstallation(actor, projectId, {
+    releaseId,
+    pageUrl,
+    artifactUrl,
+    ...(selfHostedUrl ? { selfHostedUrl } : {}),
+    targetOrigin: release.allowedOrigin,
+    artifactContentHash: release.contentHash,
+    integrity: release.sri,
+    expectedTools,
+    status: attestation.status,
+    delivery: attestation.delivery,
+    csp: attestation.csp,
+    webMcpImplementation: attestation.webMcpImplementation,
+    attestation: {
+      servedContentHash: release.contentHash,
+      executedContentHash: release.contentHash,
+      registeredTools: expectedTools,
+      normalPageLoad: true,
+      routeInterception: false,
+      injectedRegistration: false,
+      syntheticHarness: false,
+      duplicateLoadHarmless: true,
+    },
+    idempotencyKey,
+    inputHash,
+  });
+}
+
+async function deriveTrustedVerification(
+  analysisRunId: string,
+  projectUrl: string,
+  result: AnalysisResult,
+  capabilities: CapabilityRecord[],
+  signal: AbortSignal,
+): Promise<VerificationRequest> {
+  const prepared = deriveVerification(analysisRunId, projectUrl, result, capabilities);
+  const manifest = ManifestSchema.safeParse(prepared.candidate.manifest);
+  const targetOrigin = safeOrigin(projectUrl);
+  if (!manifest.success || !targetOrigin) return prepared;
+  const integrity = `sha384-${createHash("sha384").update(prepared.candidate.code).digest("base64")}`;
+  const expectedTools = capabilities.filter(({ status }) => status !== "blocked")
+    .map(({ stableName }) => stableName).sort(compareStrings);
+  const attestation = await attestReleaseCandidate({
+    code: prepared.candidate.code,
+    contentHash: prepared.candidate.contentHash,
+    integrity,
+    manifest: manifest.data,
+    targetOrigin,
+    expectedTools,
+  }, releaseVerificationPort(), signal);
+  return applyAttestation(prepared, attestation);
+}
+
+function applyAttestation(prepared: VerificationRequest, attestation: CandidateAttestation): VerificationRequest {
+  return {
+    ...prepared,
+    schema: prepared.schema && attestation.schema,
+    authenticated: prepared.authenticated && attestation.authenticated,
+    replayPasses: Math.min(prepared.replayPasses, attestation.replayPasses),
+    noSecretLeakage: prepared.noSecretLeakage && attestation.noSecretLeakage,
+    browserExecution: attestation.browserExecution,
+    selectionScore: Math.min(prepared.selectionScore, attestation.selectionScore),
+    checks: [...attestation.checks],
+    csp: attestation.csp,
+    verificationMode: attestation.verificationMode,
+  };
 }
 
 export function deriveVerification(
@@ -181,8 +365,15 @@ export function deriveVerification(
     authenticated,
     replayPasses,
     noSecretLeakage,
-    browserExecution,
-    selectionScore: exactSelection ? 20 : 0
+    browserExecution: false,
+    selectionScore: exactSelection ? 20 : 0,
+    checks: REQUIRED_CANDIDATE_CHECKS.map((name) => ({
+      name,
+      status: "failed" as const,
+      code: name === "trusted_loader" ? "TRUSTED_LOADER_REQUIRED" as const : "INVALID_OUTPUT" as const,
+    })),
+    csp: { hosted: "blocked", directive: "trusted verification required" },
+    verificationMode: "live",
   };
 }
 

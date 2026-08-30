@@ -1,100 +1,47 @@
-import test from "node:test";
 import assert from "node:assert/strict";
-import { loadWebMcpArtifact } from "../app/webmcp-registration.tsx";
+import { readFile } from "node:fs/promises";
+import test from "node:test";
+import { parseWebMcpReleaseScript } from "../app/webmcp-release-script.tsx";
 
-test("failed artifact loads clear the cache and emit only safe diagnostics", async () => {
-  const originalFetch = globalThis.fetch;
-  const originalWindow = globalThis.window;
-  const target = {} as Window;
-  Object.defineProperty(globalThis, "window", { configurable: true, value: target });
-  let calls = 0;
-  const diagnostics: Array<{ phase: string; code: string }> = [];
-  globalThis.fetch = async () => { calls += 1; return new Response("secret upstream detail", { status: 503 }); };
-  try {
-    await assert.rejects(loadWebMcpArtifact((event) => diagnostics.push(event)), /WEBMCP_RELEASE_UNAVAILABLE/);
-    await assert.rejects(loadWebMcpArtifact((event) => diagnostics.push(event)), /WEBMCP_RELEASE_UNAVAILABLE/);
-    assert.equal(calls, 2);
-    assert.deepEqual(diagnostics, [
-      { phase: "load", code: "RELEASE_UNAVAILABLE" },
-      { phase: "load", code: "RELEASE_UNAVAILABLE" },
-    ]);
-    assert.doesNotMatch(JSON.stringify(diagnostics), /secret/i);
-  } finally {
-    globalThis.fetch = originalFetch;
-    Object.defineProperty(globalThis, "window", { configurable: true, value: originalWindow });
-  }
+const hash = "a".repeat(64);
+const integrity = `sha384-${Buffer.alloc(48, 7).toString("base64")}`;
+
+test("Acme accepts only the common immutable release URL, exact SHA-256, SRI, and target origin", () => {
+  assert.deepEqual(parseWebMcpReleaseScript({
+    PAGE2WEBMCP_ACME_RELEASE_URL: `https://control.example/api/releases/${hash}.js`,
+    PAGE2WEBMCP_ACME_RELEASE_CONTENT_HASH: hash,
+    PAGE2WEBMCP_ACME_RELEASE_INTEGRITY: integrity,
+    PAGE2WEBMCP_ACME_PUBLIC_ORIGIN: "https://acme.example",
+  }), {
+    src: `https://control.example/api/releases/${hash}.js`,
+    integrity,
+    contentHash: hash,
+    targetOrigin: "https://acme.example",
+  });
 });
 
-test("stalled artifact fetches time out, abort, and can be retried", async () => {
-  const originalFetch = globalThis.fetch;
-  const originalWindow = globalThis.window;
-  const originalSetTimeout = globalThis.setTimeout;
-  const target = {} as Window;
-  Object.defineProperty(globalThis, "window", { configurable: true, value: target });
-  let calls = 0;
-  let aborted = false;
-  const diagnostics: Array<{ phase: string; code: string }> = [];
-  globalThis.setTimeout = ((callback: () => void) => originalSetTimeout(callback, 0)) as typeof setTimeout;
-  globalThis.fetch = async (_input, init) => {
-    calls += 1;
-    if (calls > 1) return new Response("retry failure", { status: 503 });
-    return new Promise<Response>((_resolve, reject) => {
-      init?.signal?.addEventListener("abort", () => {
-        aborted = true;
-        reject(init.signal!.reason);
-      }, { once: true });
-    });
+test("Acme release script fails closed for absent, mutable, corrupt, or cross-target metadata", () => {
+  const valid = {
+    PAGE2WEBMCP_ACME_RELEASE_URL: `https://control.example/api/releases/${hash}.js`,
+    PAGE2WEBMCP_ACME_RELEASE_CONTENT_HASH: hash,
+    PAGE2WEBMCP_ACME_RELEASE_INTEGRITY: integrity,
+    PAGE2WEBMCP_ACME_PUBLIC_ORIGIN: "https://acme.example",
   };
-  try {
-    await assert.rejects(
-      Promise.race([
-        loadWebMcpArtifact((event) => diagnostics.push(event)),
-        new Promise<never>((_resolve, reject) => originalSetTimeout(() => reject(new Error("TEST_STALLED")), 50)),
-      ]),
-      /WEBMCP_RELEASE_TIMEOUT/,
-    );
-    assert.equal(aborted, true);
-    await assert.rejects(loadWebMcpArtifact((event) => diagnostics.push(event)), /WEBMCP_RELEASE_UNAVAILABLE/);
-    assert.equal(calls, 2);
-    assert.deepEqual(diagnostics, [
-      { phase: "load", code: "LOAD_TIMEOUT" },
-      { phase: "load", code: "RELEASE_UNAVAILABLE" },
-    ]);
-  } finally {
-    globalThis.fetch = originalFetch;
-    globalThis.setTimeout = originalSetTimeout;
-    Object.defineProperty(globalThis, "window", { configurable: true, value: originalWindow });
-  }
+  const cases = [
+    {},
+    { ...valid, PAGE2WEBMCP_ACME_RELEASE_URL: "https://control.example/api/releases/latest.js" },
+    { ...valid, PAGE2WEBMCP_ACME_RELEASE_URL: `${valid.PAGE2WEBMCP_ACME_RELEASE_URL}?token=secret` },
+    { ...valid, PAGE2WEBMCP_ACME_RELEASE_CONTENT_HASH: "0".repeat(64) },
+    { ...valid, PAGE2WEBMCP_ACME_RELEASE_INTEGRITY: "sha384-corrupt*" },
+    { ...valid, PAGE2WEBMCP_ACME_PUBLIC_ORIGIN: "https://other.example/path" },
+  ];
+  for (const environment of cases) assert.throws(() => parseWebMcpReleaseScript(environment), /WEBMCP_RELEASE_CONFIG_INVALID/);
 });
 
-test("artifact downloads stream, cancel above the byte cap, and can be retried", async () => {
-  const originalFetch = globalThis.fetch;
-  const originalWindow = globalThis.window;
-  const target = {} as Window;
-  Object.defineProperty(globalThis, "window", { configurable: true, value: target });
-  let calls = 0;
-  let pulls = 0;
-  let cancelled = false;
-  globalThis.fetch = async () => {
-    calls += 1;
-    if (calls > 1) return new Response("retry failure", { status: 503 });
-    return new Response(new ReadableStream<Uint8Array>({
-      pull(controller) {
-        pulls += 1;
-        controller.enqueue(new Uint8Array(40_000));
-        if (pulls === 100) controller.close();
-      },
-      cancel() { cancelled = true; },
-    }));
-  };
-  try {
-    await assert.rejects(loadWebMcpArtifact(), /WEBMCP_RELEASE_TOO_LARGE/);
-    assert.equal(cancelled, true);
-    assert.ok(pulls < 100);
-    await assert.rejects(loadWebMcpArtifact(), /WEBMCP_RELEASE_UNAVAILABLE/);
-    assert.equal(calls, 2);
-  } finally {
-    globalThis.fetch = originalFetch;
-    Object.defineProperty(globalThis, "window", { configurable: true, value: originalWindow });
-  }
+test("Acme contains no blob loader, manual registration, or fixture compilation path", async () => {
+  const layout = await readFile(new URL("../app/layout.tsx", import.meta.url), "utf8");
+  const component = await readFile(new URL("../app/webmcp-release-script.tsx", import.meta.url), "utf8");
+  assert.doesNotMatch(`${layout}\n${component}`, /registerPage2WebMCPTools|unregisterPage2WebMCPTools|createObjectURL|Blob\(|webpackIgnore|compileWebMcpRelease/);
+  assert.match(component, /type="module"/);
+  assert.match(component, /crossOrigin="anonymous"/);
 });

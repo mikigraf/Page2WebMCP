@@ -7,9 +7,14 @@ import { compileWebMcpRelease } from "../../compiler/src/compiler.ts";
 import {
   capabilityStateDigest,
   InMemoryControlPlaneRepository,
+  RELEASE_VERIFICATION_CHECK_NAMES,
   RepositoryError,
   type RepositoryActor
 } from "./control-plane.ts";
+
+function passedVerificationChecks() {
+  return RELEASE_VERIFICATION_CHECK_NAMES.map((name) => ({ name, status: "passed" as const }));
+}
 
 const owner: RepositoryActor = {
   id: "11111111-1111-1111-1111-111111111111",
@@ -234,7 +239,10 @@ test("eligible publication is content addressed and idempotent", async () => {
     replayPasses: 3,
     noSecretLeakage: true,
     browserExecution: true,
-    selectionScore: 20
+    selectionScore: 20,
+    checks: passedVerificationChecks(),
+    csp: { hosted: "allowed" as const },
+    verificationMode: "hermetic" as const
   };
   const verification = await repository.saveVerification(owner, project.id, verificationInput);
 
@@ -255,6 +263,29 @@ test("eligible publication is content addressed and idempotent", async () => {
   assert.match(release.contentHash, /^[0-9a-f]{64}$/);
   assert.match(release.sri, /^sha384-/);
   assert.equal((await repository.getReleaseArtifact(release.contentHash)).code, "export const fixture = true;");
+  const installationInput = {
+    releaseId: release.id,
+    pageUrl: "https://acme.example/account",
+    artifactUrl: `https://control.example/api/releases/${release.contentHash}.js`,
+    targetOrigin: release.allowedOrigin,
+    artifactContentHash: release.contentHash,
+    integrity: release.sri,
+    expectedTools: ["find_order"],
+    status: "verified" as const,
+    delivery: "hosted" as const,
+    csp: { hosted: "allowed" as const },
+    webMcpImplementation: "native" as const,
+    attestation: { servedContentHash: release.contentHash, executedContentHash: release.contentHash },
+    idempotencyKey: "install-one",
+    inputHash: "a".repeat(64),
+  };
+  const installation = await repository.saveReleaseInstallation(owner, project.id, installationInput);
+  assert.equal(installation.status, "verified");
+  assert.equal((await repository.saveReleaseInstallation(owner, project.id, installationInput)).id, installation.id);
+  await assert.rejects(repository.saveReleaseInstallation(editor, project.id, {
+    ...installationInput,
+    idempotencyKey: "install-editor",
+  }), (error: unknown) => error instanceof RepositoryError && error.code === "FORBIDDEN");
   await assert.rejects(repository.saveVerification(owner, project.id, {
     ...verificationInput,
     candidate: releaseCandidate("export const changedAfterPublish = true;")
@@ -473,7 +504,10 @@ test("publication atomically rejects a stale capability-state verification", asy
     replayPasses: 3,
     noSecretLeakage: true,
     browserExecution: true,
-    selectionScore: 20
+    selectionScore: 20,
+    checks: passedVerificationChecks(),
+    csp: { hosted: "allowed" as const },
+    verificationMode: "hermetic" as const
   });
   await repository.reviewCapability(owner, capability.id, { action: "approve", expectedVersion: 1 });
 
@@ -533,7 +567,10 @@ test("a blocked capability publishes reviewed bytes without mutating the worker 
     replayPasses: 3,
     noSecretLeakage: true,
     browserExecution: true,
-    selectionScore: 20
+    selectionScore: 20,
+    checks: passedVerificationChecks(),
+    csp: { hosted: "allowed" as const },
+    verificationMode: "hermetic" as const
   });
   const release = await repository.publishRelease(owner, {
     projectId: project.id,
@@ -580,7 +617,10 @@ test("candidate hashes are validated and a later verification cannot be overwrit
     replayPasses: 3,
     noSecretLeakage: true,
     browserExecution: true,
-    selectionScore: 20
+    selectionScore: 20,
+    checks: passedVerificationChecks(),
+    csp: { hosted: "allowed" as const },
+    verificationMode: "hermetic" as const
   }), (error: unknown) => error instanceof RepositoryError
     && error.code === "RELEASE_GATE_FAILED"
     && error.details?.includes("CANDIDATE_HASH_MISMATCH"));
@@ -594,7 +634,10 @@ test("candidate hashes are validated and a later verification cannot be overwrit
     replayPasses: 3,
     noSecretLeakage: true,
     browserExecution: true,
-    selectionScore: 20
+    selectionScore: 20,
+    checks: passedVerificationChecks(),
+    csp: { hosted: "allowed" as const },
+    verificationMode: "hermetic" as const
   });
   const second = await repository.saveVerification(owner, project.id, {
     analysisRunId: run.id,
@@ -605,7 +648,10 @@ test("candidate hashes are validated and a later verification cannot be overwrit
     replayPasses: 3,
     noSecretLeakage: true,
     browserExecution: true,
-    selectionScore: 20
+    selectionScore: 20,
+    checks: passedVerificationChecks(),
+    csp: { hosted: "allowed" as const },
+    verificationMode: "hermetic" as const
   });
   await assert.rejects(repository.publishRelease(owner, {
     projectId: project.id,
@@ -662,7 +708,10 @@ test("identical code remains attributable to each exact analysis run", async () 
       replayPasses: 3,
       noSecretLeakage: true,
       browserExecution: true,
-      selectionScore: 20
+      selectionScore: 20,
+    checks: passedVerificationChecks(),
+    csp: { hosted: "allowed" as const },
+    verificationMode: "hermetic" as const
     });
     releases.push(await repository.publishRelease(owner, {
       projectId: project.id,

@@ -9,9 +9,14 @@ import type { CapabilityPlan } from "../../capability-ir/src/plan.ts";
 import { createPostgresRepository } from "./postgres.ts";
 import {
   capabilityStateDigest,
+  RELEASE_VERIFICATION_CHECK_NAMES,
   RepositoryError,
   type RepositoryActor
 } from "./control-plane.ts";
+
+function passedVerificationChecks() {
+  return RELEASE_VERIFICATION_CHECK_NAMES.map((name) => ({ name, status: "passed" as const }));
+}
 
 const connectionString = process.env.PAGE2WEBMCP_TEST_DATABASE_URL;
 const adminConnectionString = process.env.PAGE2WEBMCP_TEST_ADMIN_DATABASE_URL;
@@ -295,7 +300,10 @@ test("Postgres repository persists and recovers the fixture lifecycle", { skip: 
       replayPasses: 3,
       noSecretLeakage: true,
       browserExecution: true,
-      selectionScore: 20
+      selectionScore: 20,
+      checks: passedVerificationChecks(),
+      csp: { hosted: "allowed" as const },
+      verificationMode: "hermetic" as const
     };
     const verification = await repository.saveVerification(actor, project.id, verificationInput);
     const release = await repository.publishRelease(actor, {
@@ -339,7 +347,10 @@ test("Postgres repository persists and recovers the fixture lifecycle", { skip: 
       replayPasses: 3,
       noSecretLeakage: true,
       browserExecution: true,
-      selectionScore: 20
+      selectionScore: 20,
+      checks: passedVerificationChecks(),
+      csp: { hosted: "allowed" as const },
+      verificationMode: "hermetic" as const
     });
     const secondRelease = await repository.publishRelease(actor, {
       projectId: project.id,
@@ -809,7 +820,10 @@ test("Postgres queue exhaustion and stale release gates match the in-memory cont
       replayPasses: 3,
       noSecretLeakage: true,
       browserExecution: true,
-      selectionScore: 20
+      selectionScore: 20,
+      checks: passedVerificationChecks(),
+      csp: { hosted: "allowed" as const },
+      verificationMode: "hermetic" as const
     });
     await repository.reviewCapability(actor, capability.id, { action: "block", expectedVersion: 1 });
     await assert.rejects(repository.publishRelease(actor, {
@@ -833,7 +847,10 @@ test("Postgres queue exhaustion and stale release gates match the in-memory cont
       replayPasses: 3,
       noSecretLeakage: true,
       browserExecution: true,
-      selectionScore: 20
+      selectionScore: 20,
+      checks: passedVerificationChecks(),
+      csp: { hosted: "allowed" as const },
+      verificationMode: "hermetic" as const
     }), (error: unknown) => error instanceof RepositoryError
       && error.code === "RELEASE_GATE_FAILED"
       && error.details?.includes("CANDIDATE_HASH_MISMATCH"));
@@ -847,7 +864,10 @@ test("Postgres queue exhaustion and stale release gates match the in-memory cont
       replayPasses: 3,
       noSecretLeakage: true,
       browserExecution: true,
-      selectionScore: 20
+      selectionScore: 20,
+      checks: passedVerificationChecks(),
+      csp: { hosted: "allowed" as const },
+      verificationMode: "hermetic" as const
     });
     const latestCandidate = await repository.saveVerification(actor, publishProject.id, {
       analysisRunId: publishRun.id,
@@ -858,7 +878,10 @@ test("Postgres queue exhaustion and stale release gates match the in-memory cont
       replayPasses: 3,
       noSecretLeakage: true,
       browserExecution: true,
-      selectionScore: 20
+      selectionScore: 20,
+      checks: passedVerificationChecks(),
+      csp: { hosted: "allowed" as const },
+      verificationMode: "hermetic" as const
     });
     await admin.query(
       "update public.analysis_evidence set expires_at = now() - interval '1 second' " +
@@ -957,7 +980,10 @@ test("Postgres preserves the worker candidate across capability changes and publ
       replayPasses: 3,
       noSecretLeakage: true,
       browserExecution: true,
-      selectionScore: 20
+      selectionScore: 20,
+      checks: passedVerificationChecks(),
+      csp: { hosted: "allowed" as const },
+      verificationMode: "hermetic" as const
     });
 
     assert.equal((await repository.getAnalysisResult(actor, run.id))?.release?.code, source.code);
@@ -986,7 +1012,10 @@ test("Postgres preserves the worker candidate across capability changes and publ
       replayPasses: 3,
       noSecretLeakage: true,
       browserExecution: true,
-      selectionScore: 20
+      selectionScore: 20,
+      checks: passedVerificationChecks(),
+      csp: { hosted: "allowed" as const },
+      verificationMode: "hermetic" as const
     });
     const release = await repository.publishRelease(actor, {
       projectId: project.id,
@@ -1074,7 +1103,10 @@ test("publication evidence locking serializes with retention cleanup", {
       replayPasses: 3,
       noSecretLeakage: true,
       browserExecution: true,
-      selectionScore: 20
+      selectionScore: 20,
+      checks: passedVerificationChecks(),
+      csp: { hosted: "allowed" as const },
+      verificationMode: "hermetic" as const
     });
 
     await blocker.query("begin");

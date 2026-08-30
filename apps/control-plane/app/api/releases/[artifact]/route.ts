@@ -32,9 +32,13 @@ export async function GET(
       "cross-origin-resource-policy": "cross-origin",
       etag,
       "x-content-type-options": "nosniff",
+      "x-page2webmcp-content-hash": release.contentHash,
       "x-page2webmcp-integrity": release.sri,
       "x-request-id": requestId
     });
+    if (new URL(request.url).searchParams.get("download") === "1") {
+      headers.set("content-disposition", `attachment; filename="page2webmcp-${release.contentHash}.js"`);
+    }
     if (request.headers.get("if-none-match") === etag) return new Response(null, { status: 304, headers });
     return new Response(release.code, { status: 200, headers });
   } catch (error) {

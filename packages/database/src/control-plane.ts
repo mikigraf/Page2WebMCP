@@ -134,9 +134,51 @@ export type VerificationRecord = {
   noSecretLeakage: boolean;
   browserExecution: boolean;
   selectionScore: number;
+  checks: ReleaseVerificationCheckRecord[];
+  csp: { hosted: "allowed" | "blocked"; directive?: string };
+  verificationMode: "live" | "hermetic";
   eligible: boolean;
   failures: string[];
   createdAt: string;
+};
+
+export const RELEASE_VERIFICATION_CHECK_NAMES = [
+  "authentication",
+  "cancellation",
+  "confirmation",
+  "final_state",
+  "no_control_plane_or_model_calls",
+  "origin",
+  "read",
+  "replay_idempotency",
+  "reversible_mutation",
+  "schema",
+  "secret_leakage",
+  "tool_selection",
+  "trusted_loader",
+] as const;
+
+export type ReleaseVerificationCheckName = typeof RELEASE_VERIFICATION_CHECK_NAMES[number];
+export type ReleaseVerificationFailureCode =
+  | "LOGGED_OUT"
+  | "FORBIDDEN"
+  | "STALE_PAGE"
+  | "DEADLINE_EXCEEDED"
+  | "INVALID_OUTPUT"
+  | "WRONG_STATE"
+  | "DUPLICATE_REGISTRATION"
+  | "ORIGIN_MISMATCH"
+  | "WEBMCP_UNAVAILABLE"
+  | "TRUSTED_LOADER_REQUIRED"
+  | "SECRET_LEAKAGE"
+  | "CONTROL_PLANE_REQUEST"
+  | "MODEL_REQUEST"
+  | "CANCELLED";
+
+export type ReleaseVerificationCheckRecord = {
+  name: ReleaseVerificationCheckName;
+  status: "passed" | "failed";
+  code?: ReleaseVerificationFailureCode;
 };
 
 export type ReleaseRecord = {
@@ -153,6 +195,33 @@ export type ReleaseRecord = {
   status: "published";
   createdAt: string;
 };
+
+export type ReleaseInstallationRecord = {
+  id: string;
+  organizationId: string;
+  projectId: string;
+  releaseId: string;
+  actorId: string;
+  pageUrl: string;
+  artifactUrl: string;
+  selfHostedUrl?: string;
+  targetOrigin: string;
+  artifactContentHash: string;
+  integrity: string;
+  expectedTools: string[];
+  status: "pending_self_host" | "verified" | "failed";
+  delivery: "hosted" | "self_hosted";
+  csp: { hosted: "allowed" | "blocked"; directive?: string };
+  webMcpImplementation: "native" | "compatibility_shim";
+  attestation: unknown;
+  idempotencyKey: string;
+  inputHash: string;
+  createdAt: string;
+  verifiedAt?: string;
+};
+
+export type ReleaseInstallationRequest = Omit<ReleaseInstallationRecord,
+  "id" | "organizationId" | "projectId" | "actorId" | "createdAt" | "verifiedAt">;
 
 export type AuditEventRecord = {
   id: string;
@@ -235,6 +304,10 @@ export interface ControlPlaneRepository extends WorkflowRepository {
   reviewCapability(actor: RepositoryActor, capabilityId: string, input: ReviewInput): Promise<CapabilityRecord>;
   saveVerification(actor: RepositoryActor, projectId: string, input: VerificationRequest): Promise<VerificationRecord>;
   publishRelease(actor: RepositoryActor, input: PublishRequest): Promise<ReleaseRecord>;
+  getRelease(actor: RepositoryActor, projectId: string, releaseId: string): Promise<ReleaseRecord>;
+  getPreviousRelease(actor: RepositoryActor, projectId: string, releaseId: string): Promise<ReleaseRecord | undefined>;
+  saveReleaseInstallation(actor: RepositoryActor, projectId: string,
+    input: ReleaseInstallationRequest): Promise<ReleaseInstallationRecord>;
   getReleaseArtifact(contentHash: string): Promise<ReleaseRecord>;
   listAuditEvents(actor: RepositoryActor): Promise<AuditEventRecord[]>;
   reset(): Promise<void>;
@@ -330,15 +403,42 @@ export function capabilityPlanDigest(plan: CapabilityPlan): string {
   return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
 }
 
-function releaseFailures(input: VerificationRequest): string[] {
-  return [
-    !input.schema && "SCHEMA",
-    !input.authenticated && "AUTH",
-    input.replayPasses < 3 && "REPLAY",
-    !input.noSecretLeakage && "SECRET_LEAKAGE",
-    !input.browserExecution && "BROWSER",
-    input.selectionScore < 18 && "TOOL_SELECTION"
-  ].filter(Boolean) as string[];
+export function releaseFailures(input: VerificationRequest): string[] {
+  const typedFailures = verificationCheckFailures(input.checks);
+  if (typedFailures.includes("VERIFICATION_REPORT_INVALID") || !verificationSummaryMatches(input)) {
+    return ["VERIFICATION_REPORT_INVALID"];
+  }
+  return [...new Set(typedFailures)].sort(compareCodePoints);
+}
+
+function verificationSummaryMatches(input: VerificationRequest): boolean {
+  const passed = new Set(input.checks.filter(({ status }) => status === "passed").map(({ name }) => name));
+  return (input.verificationMode === "live" || input.verificationMode === "hermetic")
+    && (input.csp.hosted === "allowed" || input.csp.hosted === "blocked")
+    && (input.csp.directive === undefined || input.csp.directive.length <= 512 && !/[\r\n]/.test(input.csp.directive))
+    && input.schema === (passed.has("schema") && passed.has("trusted_loader"))
+    && input.authenticated === (passed.has("authentication") && passed.has("origin"))
+    && input.replayPasses === (passed.has("replay_idempotency") ? 3 : 0)
+    && input.noSecretLeakage === (passed.has("secret_leakage") && passed.has("no_control_plane_or_model_calls"))
+    && input.browserExecution === (passed.size === RELEASE_VERIFICATION_CHECK_NAMES.length)
+    && input.selectionScore === (passed.has("tool_selection") ? 20 : 0);
+}
+
+export function verificationCheckFailures(checks: readonly ReleaseVerificationCheckRecord[]): string[] {
+  if (!Array.isArray(checks) || checks.length !== RELEASE_VERIFICATION_CHECK_NAMES.length) {
+    return ["VERIFICATION_REPORT_INVALID"];
+  }
+  const expected = new Set<string>(RELEASE_VERIFICATION_CHECK_NAMES);
+  const seen = new Set<string>();
+  const failures: string[] = [];
+  for (const check of checks) {
+    if (!check || !expected.has(check.name) || seen.has(check.name)
+      || check.status === "passed" && check.code !== undefined
+      || check.status === "failed" && !check.code) return ["VERIFICATION_REPORT_INVALID"];
+    seen.add(check.name);
+    if (check.status === "failed") failures.push(check.code!);
+  }
+  return failures.sort(compareCodePoints);
 }
 
 export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
@@ -353,6 +453,8 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
   readonly #releases = new Map<string, ReleaseRecord>();
   readonly #releaseByHash = new Map<string, string[]>();
   readonly #releaseByRun = new Map<string, string>();
+  readonly #releaseInstallations = new Map<string, ReleaseInstallationRecord>();
+  readonly #releaseInstallationByRelease = new Map<string, string>();
   readonly #idempotency = new Map<string, IdempotencyRecord>();
   readonly #analysisAvailableAt = new Map<string, string>();
   readonly #analysisSources = new Map<string, Readonly<{ sourceType: SourceType; sourceUrl: string }>>();
@@ -434,7 +536,8 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
     });
   }
 
-  #idempotencyId(operation: "project" | "analysis" | "release" | "workflow", actor: RepositoryActor, key: string): string {
+  #idempotencyId(operation: "project" | "analysis" | "release" | "installation" | "workflow",
+    actor: RepositoryActor, key: string): string {
     return `${operation}:${actor.organizationId}:${actor.id}:${key}`;
   }
 
@@ -1680,6 +1783,69 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
     return copy(release);
   }
 
+  async getRelease(actor: RepositoryActor, projectId: string, releaseId: string): Promise<ReleaseRecord> {
+    this.#assertProject(actor, projectId);
+    const release = this.#releases.get(releaseId);
+    if (!release || release.organizationId !== actor.organizationId || release.projectId !== projectId) {
+      throw new RepositoryError("NOT_FOUND");
+    }
+    return copy(release);
+  }
+
+  async getPreviousRelease(
+    actor: RepositoryActor,
+    projectId: string,
+    releaseId: string,
+  ): Promise<ReleaseRecord | undefined> {
+    const current = await this.getRelease(actor, projectId, releaseId);
+    return [...this.#releases.values()]
+      .filter((release) => release.organizationId === actor.organizationId && release.projectId === projectId
+        && (release.createdAt < current.createdAt
+          || release.createdAt === current.createdAt && compareCodePoints(release.id, current.id) < 0))
+      .sort((left, right) => compareCodePoints(right.createdAt, left.createdAt) || compareCodePoints(right.id, left.id))[0];
+  }
+
+  async saveReleaseInstallation(
+    actor: RepositoryActor,
+    projectId: string,
+    input: ReleaseInstallationRequest,
+  ): Promise<ReleaseInstallationRecord> {
+    if (actor.role !== "owner") throw new RepositoryError("FORBIDDEN");
+    this.#assertProject(actor, projectId);
+    const release = await this.getRelease(actor, projectId, input.releaseId);
+    const normalized = normalizeReleaseInstallation(input, release);
+    const idempotencyId = this.#idempotencyId("installation", actor, input.idempotencyKey);
+    const replay = this.#idempotentReplay(idempotencyId, input.inputHash);
+    if (replay) {
+      const record = this.#releaseInstallations.get(replay.resultId);
+      if (!record || record.projectId !== projectId || record.releaseId !== input.releaseId) {
+        throw new RepositoryError("INVALID_STATE");
+      }
+      return copy(record);
+    }
+    const exactId = this.#releaseInstallationByRelease.get(input.releaseId);
+    if (exactId) {
+      const existing = this.#releaseInstallations.get(exactId);
+      if (!existing || existing.inputHash !== input.inputHash) throw new RepositoryError("IDEMPOTENCY_CONFLICT");
+      this.#reserveIdempotency(idempotencyId, input.inputHash, existing.id);
+      return copy(existing);
+    }
+    const record: ReleaseInstallationRecord = {
+      id: randomUUID(),
+      organizationId: actor.organizationId,
+      projectId,
+      actorId: actor.id,
+      ...normalized,
+      createdAt: this.#now(),
+      ...(normalized.status === "verified" ? { verifiedAt: this.#now() } : {}),
+    };
+    this.#releaseInstallations.set(record.id, record);
+    this.#releaseInstallationByRelease.set(record.releaseId, record.id);
+    this.#reserveIdempotency(idempotencyId, input.inputHash, record.id);
+    this.#auditEvent(actor, `release.installation.${record.status}`, record.id);
+    return copy(record);
+  }
+
   async listAuditEvents(actor: RepositoryActor): Promise<AuditEventRecord[]> {
     if (actor.role !== "owner") throw new RepositoryError("FORBIDDEN");
     return this.#audit.filter((event) => event.organizationId === actor.organizationId)
@@ -1699,6 +1865,8 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
     this.#releases.clear();
     this.#releaseByHash.clear();
     this.#releaseByRun.clear();
+    this.#releaseInstallations.clear();
+    this.#releaseInstallationByRelease.clear();
     this.#idempotency.clear();
     this.#analysisAvailableAt.clear();
     this.#analysisSources.clear();
@@ -1715,6 +1883,57 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
     this.#claimSequence = 0;
     this.#audit.splice(0);
   }
+}
+
+export function normalizeReleaseInstallation(
+  input: ReleaseInstallationRequest,
+  release: ReleaseRecord,
+): ReleaseInstallationRequest {
+  const expectedTools = plansFromManifest(release.manifest)?.map(({ tool }) => tool.name).sort(compareCodePoints);
+  let page: URL;
+  let artifact: URL;
+  try {
+    page = new URL(input.pageUrl);
+    artifact = new URL(input.artifactUrl);
+  } catch {
+    throw new RepositoryError("INVALID_STATE");
+  }
+  const selfHosted = input.selfHostedUrl ? safeUrl(input.selfHostedUrl) : undefined;
+  const canonicalAttestation = canonicalJson(input.attestation);
+  if (!expectedTools || expectedTools.length === 0
+    || page.origin !== release.allowedOrigin || page.protocol !== "https:" || page.username || page.password
+    || page.search || page.hash
+    || artifact.protocol !== "https:" || artifact.username || artifact.password || artifact.search || artifact.hash
+    || input.targetOrigin !== release.allowedOrigin || input.artifactContentHash !== release.contentHash
+    || input.integrity !== release.sri || !equalStringArrays(input.expectedTools, expectedTools)
+    || input.delivery === "self_hosted" && (!selfHosted || selfHosted.origin !== release.allowedOrigin)
+    || input.delivery === "hosted" && input.selfHostedUrl !== undefined
+    || input.status === "verified" && input.webMcpImplementation !== "native"
+    || input.status === "pending_self_host" && (input.delivery !== "hosted" || input.csp.hosted !== "blocked")
+    || input.csp.directive !== undefined && (input.csp.directive.length > 512 || /[\r\n]/.test(input.csp.directive))
+    || canonicalAttestation === "__INVALID_JSON__" || Buffer.byteLength(canonicalAttestation) > 16_384
+    || !/^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/.test(input.idempotencyKey)
+    || !/^[0-9a-f]{64}$/.test(input.inputHash)) throw new RepositoryError("INVALID_STATE");
+  return {
+    ...copy(input),
+    expectedTools,
+    attestation: JSON.parse(canonicalAttestation),
+  };
+}
+
+function safeUrl(value: string): URL | undefined {
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" && !url.username && !url.password && !url.search && !url.hash ? url : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function equalStringArrays(left: readonly string[], right: readonly string[]): boolean {
+  const a = [...left].sort(compareCodePoints);
+  const b = [...right].sort(compareCodePoints);
+  return a.length === b.length && new Set(a).size === a.length && a.every((value, index) => value === b[index]);
 }
 
 function candidateMatches(candidate: CandidateRelease, stored: CandidateRelease): boolean {

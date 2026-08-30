@@ -4,6 +4,11 @@ import { setControlPlaneRepositoryForTest } from "../../../packages/database/src
 import { issueCsrfChallenge } from "../src/api.ts";
 import { setAuthServiceForTest } from "../src/auth.ts";
 import {
+  REQUIRED_CANDIDATE_CHECKS,
+  setReleaseVerificationPortForTest,
+  type ReleaseVerificationPort,
+} from "../src/release-verification.ts";
+import {
   authenticate,
   createFixtureAuthService,
   fixtureSessionId,
@@ -17,6 +22,35 @@ export const owner = authenticate("owner@example.test", "fixture-password")!;
 export const editor = authenticate("editor@example.test", "fixture-password")!;
 export const viewer = authenticate("viewer@example.test", "fixture-password")!;
 
+export const hermeticReleaseVerificationPort: ReleaseVerificationPort = {
+  mode: "hermetic",
+  verifyCandidate: async (input) => ({
+    observedContentHash: input.contentHash,
+    observedIntegrity: input.integrity,
+    observedReleaseId: input.manifest.releaseId,
+    observedTargetOrigin: input.targetOrigin,
+    registeredTools: [...input.expectedTools],
+    trustedLoader: { enforcedBeforeEvaluation: true, evaluatedContentHash: input.contentHash },
+    controlPlaneRequestsDuringExecution: 0,
+    modelRequestsDuringExecution: 0,
+    checks: REQUIRED_CANDIDATE_CHECKS.map((name) => ({ name, status: "passed" as const })),
+    csp: { hosted: "allowed" as const },
+  }),
+  verifyInstalled: async (input) => ({
+    servedContentHash: input.contentHash,
+    executedContentHash: input.contentHash,
+    observedTargetOrigin: input.targetOrigin,
+    registeredTools: [...input.expectedTools],
+    webMcpImplementation: "native",
+    normalPageLoad: true,
+    routeInterception: false,
+    injectedRegistration: false,
+    syntheticHarness: false,
+    duplicateLoadHarmless: true,
+    csp: { hosted: "allowed" as const },
+  }),
+};
+
 setAuthServiceForTest(createFixtureAuthService());
 
 export function installTestRepository(repository = new InMemoryControlPlaneRepository()): InMemoryControlPlaneRepository {
@@ -25,6 +59,7 @@ export function installTestRepository(repository = new InMemoryControlPlaneRepos
   repository.seedMembershipForTest(viewer);
   setControlPlaneRepositoryForTest(repository);
   setAuthServiceForTest(createFixtureAuthService());
+  setReleaseVerificationPortForTest(hermeticReleaseVerificationPort);
   return repository;
 }
 

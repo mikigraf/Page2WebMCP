@@ -26,7 +26,8 @@ export async function POST(request: Request) {
       repository,
       actor,
       input.projectId,
-      input.analysisRunId
+      input.analysisRunId,
+      request.signal,
     );
     await recordLifecycle({
       event: "release_verified",
