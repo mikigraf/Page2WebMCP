@@ -216,7 +216,11 @@ export interface ControlPlaneRepository extends WorkflowRepository {
   getLatestAnalysis(actor: RepositoryActor, projectId: string): Promise<AnalysisRunRecord | undefined>;
   enqueueAnalysis(actor: RepositoryActor, input: IdempotentRequest): Promise<AnalysisRunRecord>;
   getAnalysis(actor: RepositoryActor, id: string): Promise<AnalysisRunRecord>;
-  claimAnalysis(workerId: string, leaseMs: number): Promise<ClaimedAnalysisRunRecord | undefined>;
+  claimAnalysis(
+    workerId: string,
+    leaseMs: number,
+    sourceTypes?: readonly SourceType[],
+  ): Promise<ClaimedAnalysisRunRecord | undefined>;
   heartbeatAnalysis(workerId: string, runId: string, leaseMs: number, leaseGeneration?: number): Promise<void>;
   completeAnalysis(workerId: string, runId: string, result: AnalysisResult, leaseGeneration?: number): Promise<AnalysisRunRecord>;
   failAnalysis(workerId: string, runId: string, code: string, retryable: boolean, leaseGeneration?: number): Promise<AnalysisRunRecord>;
@@ -259,6 +263,20 @@ const MAX_AUDIT_EVENTS = 1_000;
 const MAX_RELEASE_BYTES = 64 * 1_024;
 const MAX_ANALYSIS_DIAGNOSTICS = 1_000;
 const MAX_ANALYSIS_DIAGNOSTIC_BYTES = 64 * 1_024;
+const ANALYSIS_SOURCE_TYPES: readonly SourceType[] = ["github", "openapi", "website"];
+
+export function normalizeAnalysisSourceTypes(
+  sourceTypes: readonly SourceType[] | undefined,
+): ReadonlySet<SourceType> | undefined {
+  if (sourceTypes === undefined) return undefined;
+  const allowed = new Set(ANALYSIS_SOURCE_TYPES);
+  if (!Array.isArray(sourceTypes) || sourceTypes.length === 0 || sourceTypes.length > allowed.size
+    || sourceTypes.some((sourceType) => !allowed.has(sourceType))
+    || new Set(sourceTypes).size !== sourceTypes.length) {
+    throw new RepositoryError("INVALID_STATE");
+  }
+  return new Set(sourceTypes);
+}
 
 export function normalizeAnalysisDiagnostics(diagnostics: readonly AnalysisDiagnostic[]): AnalysisDiagnostic[] {
   if (!Array.isArray(diagnostics) || diagnostics.length > MAX_ANALYSIS_DIAGNOSTICS) {
@@ -1128,8 +1146,13 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
     return repaired;
   }
 
-  async claimAnalysis(workerId: string, leaseMs: number): Promise<ClaimedAnalysisRunRecord | undefined> {
+  async claimAnalysis(
+    workerId: string,
+    leaseMs: number,
+    sourceTypes?: readonly SourceType[],
+  ): Promise<ClaimedAnalysisRunRecord | undefined> {
     const now = this.clock();
+    const allowedSourceTypes = normalizeAnalysisSourceTypes(sourceTypes);
     const boundedLease = Math.max(1_000, Math.min(leaseMs, 300_000));
     const quota = Math.max(1, Math.min(this.workflowOptions.activeTaskQuota
       ?? WORKFLOW_DEFAULT_ACTIVE_TASK_QUOTA, 100));
@@ -1145,6 +1168,9 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
       || compareCodePoints(left.createdAt, right.createdAt)
       || compareCodePoints(left.id, right.id));
     for (const run of candidates) {
+      const source = this.#analysisSources.get(run.id);
+      if (!source) throw new RepositoryError("INVALID_STATE");
+      if (allowedSourceTypes && !allowedSourceTypes.has(source.sourceType)) continue;
       if ((activeByOrganization.get(run.organizationId) ?? 0) >= quota) continue;
       const expired = run.status === "running" && run.leaseExpiresAt !== undefined && new Date(run.leaseExpiresAt) <= now;
       if (run.status !== "queued" && !expired) continue;
@@ -1176,8 +1202,6 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
         updatedAt: now.toISOString()
       };
       this.#runs.set(run.id, claimed);
-      const source = this.#analysisSources.get(run.id);
-      if (!source) throw new RepositoryError("INVALID_STATE");
       const workflow = this.#workflowRuns.get(run.id);
       const task = [...this.#workflowTasks.values()].find((candidate) => candidate.workflowRunId === run.id && candidate.phase === "analysis");
       if (!workflow || !task || !["queued", "running"].includes(task.status)) throw new RepositoryError("INVALID_STATE");

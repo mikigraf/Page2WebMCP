@@ -4,6 +4,7 @@ import type {
   AnalysisRunRecord,
   ClaimedAnalysisRunRecord,
   ControlPlaneRepository,
+  SourceType,
 } from "../../../packages/database/src/control-plane.ts";
 import { getObservability } from "../../../packages/observability/src/server.ts";
 
@@ -16,6 +17,7 @@ export type ProcessAnalysisOptions = {
   leaseMs?: number;
   deadlineMs?: number;
   heartbeatMs?: number;
+  sourceTypes?: readonly SourceType[];
   analyze?: (source: ClaimedAnalysisRunRecord, signal: AbortSignal) => Promise<AnalysisResult>;
 };
 
@@ -41,7 +43,7 @@ export async function processNextAnalysis(
     10,
     Math.max(10, Math.floor(leaseMs / 2))
   );
-  const run = await repository.claimAnalysis(workerId, leaseMs);
+  const run = await repository.claimAnalysis(workerId, leaseMs, options.sourceTypes);
   if (!run) return undefined;
   const startedAt = Date.now();
 

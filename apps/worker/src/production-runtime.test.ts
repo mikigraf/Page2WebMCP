@@ -60,6 +60,7 @@ test("production iteration always passes its explicit configured adapter to the 
       reference: `urn:sha256:${createHash("sha256").update(evidenceContent).digest("hex")}` }],
   };
   const runtime: ProductionWorkerRuntime = {
+    analysisSourceTypes: ["github"],
     analyze: async (source) => {
       calls += 1;
       assert.equal(source.sourceType, "github");
@@ -87,6 +88,37 @@ test("production runtime requires the isolated sandbox before exposing workflow 
   assert.throws(() => createProductionWorkerRuntime(repository, missingSandbox, { fetch }), /GITHUB_SANDBOX_CONFIGURATION_REQUIRED/);
 });
 
+test("dedicated GitHub runtime never claims or fails website and OpenAPI analysis jobs", async () => {
+  const repository = new InMemoryControlPlaneRepository();
+  const runs = [];
+  for (const [sourceType, url] of [
+    ["website", "https://widgets.example/"],
+    ["openapi", "https://widgets.example/openapi.json"],
+  ] as const) {
+    const project = await repository.createProject(owner, {
+      name: `${sourceType} source stays on its worker`,
+      sourceType,
+      url,
+      idempotencyKey: `production-source-filter-project-${sourceType}`,
+      inputHash: `production-source-filter-project-${sourceType}`,
+    });
+    runs.push(await repository.enqueueAnalysis(owner, {
+      projectId: project.id,
+      idempotencyKey: `production-source-filter-analysis-${sourceType}`,
+      inputHash: `production-source-filter-analysis-${sourceType}`,
+    }));
+  }
+  let providerCalls = 0;
+  const runtime = createProductionWorkerRuntime(repository, configuredEnvironment(), {
+    fetch: async () => { providerCalls += 1; throw new Error("NON_GITHUB_PROVIDER_MUST_NOT_RUN"); },
+  });
+  assert.equal(await processProductionWorkerIteration(
+    repository, runtime, "dedicated-github-worker", new AbortController().signal,
+  ), false);
+  assert.equal(providerCalls, 0);
+  for (const run of runs) assert.equal((await repository.getAnalysis(owner, run.id)).status, "queued");
+});
+
 test("production iteration reaches the Task 5 controller when the analysis queue is empty", async () => {
   const repository = new InMemoryControlPlaneRepository();
   const project = await repository.createProject(owner, {
@@ -102,6 +134,7 @@ test("production iteration reaches the Task 5 controller when the analysis queue
     inputHash: "production-controller-workflow",
   });
   const runtime: ProductionWorkerRuntime = {
+    analysisSourceTypes: ["github"],
     analyze: async () => { throw new Error("analysis must stay empty"); },
     workflows: new WorkflowController(repository, {
       handlers: { preflight: async () => ({}) },

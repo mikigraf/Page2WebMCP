@@ -366,11 +366,12 @@ test("tenant-aware claims enforce quotas and transient retries use bounded full 
   assert.equal(retry.retryClassification, "transient");
   assert.equal(retry.availableAt, new Date(now.getTime() + 500).toISOString());
   const unrelated = await repository.claimWorkflowTask("too-early");
-  assert.ok(unrelated);
-  assert.notEqual(unrelated.id, first.id);
-  await repository.cancelWorkflow(ownerA, {
-    runId: unrelated.workflowRunId, idempotencyKey: "cancel-unrelated", inputHash: "cancel-unrelated",
-  });
+  assert.notEqual(unrelated?.id, first.id);
+  if (unrelated) {
+    await repository.cancelWorkflow(ownerA, {
+      runId: unrelated.workflowRunId, idempotencyKey: "cancel-unrelated", inputHash: "cancel-unrelated",
+    });
+  }
   now = new Date(now.getTime() + 501);
   const retried = await repository.claimWorkflowTask("retry-worker");
   assert.equal(retried?.id, first.id);

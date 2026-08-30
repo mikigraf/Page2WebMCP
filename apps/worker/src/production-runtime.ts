@@ -1,4 +1,4 @@
-import type { ControlPlaneRepository } from "../../../packages/database/src/control-plane.ts";
+import type { ControlPlaneRepository, SourceType } from "../../../packages/database/src/control-plane.ts";
 import { createHash } from "node:crypto";
 import { WorkflowController } from "../../../packages/database/src/workflow.ts";
 import { createConfiguredGitHubWorkflow } from "./github-live.ts";
@@ -14,6 +14,7 @@ type RuntimeEnvironment = Record<string, string | undefined>;
 
 export type ProductionWorkerRuntime = Readonly<{
   analyze: AnalysisAdapter;
+  analysisSourceTypes: readonly SourceType[];
   workflows: WorkflowController;
 }>;
 
@@ -36,6 +37,7 @@ export function createProductionWorkerRuntime(
   const sideEffects = Object.fromEntries(GITHUB_PRODUCTION_EFFECT_KINDS.map((kind) => [kind, sideEffect]));
   return {
     analyze: github.analyze,
+    analysisSourceTypes: ["github"],
     workflows: new WorkflowController(repository, {
       handlers: createGitHubWorkflowPhaseHandlers({
         inputHash: (phase, task) => createHash("sha256").update(`${task.inputHash}\0${phase}`, "utf8").digest("hex"),
@@ -51,7 +53,11 @@ export async function processProductionWorkerIteration(
   workerId: string,
   signal: AbortSignal,
 ): Promise<boolean> {
-  const analysis = await processNextAnalysis(repository, { workerId, analyze: runtime.analyze });
+  const analysis = await processNextAnalysis(repository, {
+    workerId,
+    analyze: runtime.analyze,
+    sourceTypes: runtime.analysisSourceTypes,
+  });
   if (analysis !== undefined) return true;
   await repository.reconcileWorkflows(`${workerId}-reconcile`);
   return await runtime.workflows.runNext(workerId, signal) !== undefined;

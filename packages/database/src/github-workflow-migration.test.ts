@@ -11,6 +11,13 @@ test("GitHub workflow migration binds exact reviewed analysis and grants only le
   assert.match(sql, /references public\.analysis_runs\(id, project_id, organization_id\)/);
   assert.match(sql, /worker reads reviewed workflow analysis evidence/);
   assert.match(sql, /worker reads reviewed workflow capabilities/);
+  assert.match(sql, /current_setting\('page2webmcp\.workflow_task_id', true\)/);
+  assert.match(sql, /current_setting\('page2webmcp\.worker_id', true\)/);
+  assert.match(sql, /current_setting\('page2webmcp\.lease_generation', true\)/);
+  assert.match(sql, /task\.status = 'running'/);
+  assert.match(sql, /task\.lease_expires_at > now\(\)/);
+  assert.match(sql, /task\.lease_owner = current_setting\('page2webmcp\.worker_id', true\)/);
+  assert.match(sql, /task\.lease_generation::text = current_setting\('page2webmcp\.lease_generation', true\)/);
   assert.match(sql, /grant select on public\.project_sources, public\.source_snapshots/);
   assert.doesNotMatch(sql, /grant (?:all|insert|update|delete).*project_sources/i);
   assert.doesNotMatch(sql, /\b(token|credential|private_key|secret_value)\b\s+(?:text|jsonb|bytea)/i);

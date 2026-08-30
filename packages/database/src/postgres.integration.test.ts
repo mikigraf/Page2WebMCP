@@ -80,6 +80,7 @@ test("Postgres GitHub workflow exposes exact reviewed material only under its li
   skip: !connectionString,
 }, async () => {
   const repository = createPostgresRepository({ connectionString: connectionString!, maxConnections: 3 });
+  const direct = new pg.Pool({ connectionString: connectionString!, max: 1 });
   const actor: RepositoryActor = {
     id: "11111111-1111-1111-1111-111111111111",
     organizationId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
@@ -118,6 +119,43 @@ test("Postgres GitHub workflow exposes exact reviewed material only under its li
     assert.equal(workflow.reviewedAnalysisRunId, analysis.id);
     const task = await repository.claimWorkflowTask("postgres-github-binding-worker");
     assert.ok(task);
+    const directMaterialCounts = async (workerId?: string, leaseGeneration?: number) => {
+      const client = await direct.connect();
+      try {
+        await client.query("begin");
+        await client.query("set local role page2webmcp_worker");
+        if (workerId !== undefined && leaseGeneration !== undefined) {
+          await client.query(
+            "select set_config('page2webmcp.workflow_task_id', $1, true), " +
+            "set_config('page2webmcp.worker_id', $2, true), " +
+            "set_config('page2webmcp.lease_generation', $3, true)",
+            [task.id, workerId, String(leaseGeneration)],
+          );
+        }
+        const counts = await client.query(
+          "select " +
+          "(select count(*)::integer from public.project_sources where project_id = $1) as sources, " +
+          "(select count(*)::integer from public.source_snapshots where project_id = $1) as snapshots, " +
+          "(select count(*)::integer from public.analysis_evidence where analysis_run_id = $2) as evidence, " +
+          "(select count(*)::integer from public.capabilities where analysis_run_id = $2) as capabilities",
+          [project.id, analysis.id],
+        );
+        return counts.rows[0] as { sources: number; snapshots: number; evidence: number; capabilities: number };
+      } finally {
+        await client.query("rollback").catch(() => undefined);
+        client.release();
+      }
+    };
+    assert.deepEqual(await directMaterialCounts(), { sources: 0, snapshots: 0, evidence: 0, capabilities: 0 });
+    assert.deepEqual(await directMaterialCounts("different-worker", task.leaseGeneration),
+      { sources: 0, snapshots: 0, evidence: 0, capabilities: 0 });
+    assert.deepEqual(await directMaterialCounts("postgres-github-binding-worker", task.leaseGeneration + 1),
+      { sources: 0, snapshots: 0, evidence: 0, capabilities: 0 });
+    const authorizedCounts = await directMaterialCounts("postgres-github-binding-worker", task.leaseGeneration);
+    assert.equal(authorizedCounts.sources, 1);
+    assert.equal(authorizedCounts.snapshots, 1);
+    assert.ok(authorizedCounts.evidence > 0);
+    assert.equal(authorizedCounts.capabilities, 1);
     const material = await repository.getWorkflowExecutionMaterial(
       "postgres-github-binding-worker", task.id, task.leaseGeneration,
     );
@@ -131,6 +169,51 @@ test("Postgres GitHub workflow exposes exact reviewed material only under its li
       idempotencyKey: "postgres-github-binding-cancel",
       inputHash: "postgres-github-binding-cancel",
     });
+    assert.deepEqual(await directMaterialCounts("postgres-github-binding-worker", task.leaseGeneration),
+      { sources: 0, snapshots: 0, evidence: 0, capabilities: 0 });
+  } finally {
+    await repository.close();
+    await direct.end();
+  }
+});
+
+test("Postgres dedicated analysis claims leave other source types queued", {
+  skip: !connectionString,
+}, async () => {
+  const repository = createPostgresRepository({ connectionString: connectionString!, maxConnections: 2 });
+  const actor: RepositoryActor = {
+    id: "11111111-1111-1111-1111-111111111111",
+    organizationId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+    role: "owner",
+  };
+  try {
+    const runs = new Map<string, string>();
+    for (const [sourceType, url] of [
+      ["website", "https://source-filter.widgets.example"],
+      ["github", "https://github.com/bright-tools/source-filter"],
+    ] as const) {
+      const project = await repository.createProject(actor, {
+        name: `Postgres ${sourceType} claim filter`, sourceType, url,
+        idempotencyKey: `postgres-source-filter-project-${sourceType}`,
+        inputHash: `postgres-source-filter-project-${sourceType}`,
+      });
+      const run = await repository.enqueueAnalysis(actor, {
+        projectId: project.id,
+        idempotencyKey: `postgres-source-filter-analysis-${sourceType}`,
+        inputHash: `postgres-source-filter-analysis-${sourceType}`,
+      });
+      runs.set(sourceType, run.id);
+    }
+    const github = await repository.claimAnalysis("postgres-github-only-worker", 60_000, ["github"]);
+    assert.equal(github?.id, runs.get("github"));
+    assert.equal(github?.sourceType, "github");
+    await repository.failAnalysis("postgres-github-only-worker", github!.id, "EXPECTED_TEST_CLEANUP", false,
+      github!.leaseGeneration);
+    const website = await repository.claimAnalysis("postgres-website-only-worker", 60_000, ["website"]);
+    assert.equal(website?.id, runs.get("website"));
+    assert.equal(website?.sourceType, "website");
+    await repository.failAnalysis("postgres-website-only-worker", website!.id, "EXPECTED_TEST_CLEANUP", false,
+      website!.leaseGeneration);
   } finally {
     await repository.close();
   }

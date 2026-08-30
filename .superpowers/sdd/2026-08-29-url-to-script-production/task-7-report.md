@@ -248,3 +248,98 @@ git diff --check
 - Installation tokens remain callback-scoped and are revoked after every session. The sandbox bearer is sent only to the configured exact sandbox origin and is never included in its JSON payload, logs, evidence, or workflow output.
 - No live GitHub App or sandbox credentials were available, so no live provider success is claimed. Hermetic fakes exercised the exact production factories and HTTP request/response contracts; missing live controls fail startup.
 - The external sandbox service and GitHub App installation remain deployment dependencies. The service must enforce the attested isolation limits, and the app must grant only checks/contents/pull-requests write plus deployments/metadata read for the configured repositories.
+
+## Fix round 2 — source-correct worker isolation and active-lease RLS
+
+Date: 2026-08-30
+
+### Result
+
+Resolved both Important findings in `task-7-rereview.md`.
+
+- Production GitHub mode is now explicitly a dedicated analysis worker. The runtime carries the bounded exact source-type set `['github']`, the durable runner passes that set into the repository claim, and both in-memory and PostgreSQL repositories skip other source types without changing their queued state. Existing unfiltered callers retain the generic website/OpenAPI/GitHub dispatch contract; the GitHub entrypoint can no longer claim a website/OpenAPI job and fail it through the GitHub adapter.
+- Filter validation rejects empty, duplicate, excessive, and unknown source-type lists. PostgreSQL applies the same filter to expired-attempt reconciliation as well as candidate selection, so a dedicated worker cannot terminally reconcile another source type.
+- Worker reads of source snapshots, project sources, reviewed evidence, and reviewed capabilities now require an exact transaction-local `workflow_task_id`/`worker_id`/`lease_generation` triple. The policy helper independently requires a running, unexpired task, matching lease owner/generation, the run's current phase, a running non-cancelled run, and the exact referenced workflow run.
+- `getWorkflowExecutionMaterial` sets the transaction-local lease context only after its existing repository lease proof succeeds. Missing context, wrong worker, wrong generation, expired/cancelled state, and unrelated workflow material fail closed through RLS.
+
+### Files
+
+- `apps/worker/src/production-runtime.ts`, `runner.ts`, and `production-runtime.test.ts` — explicit dedicated source-type contract and production regression.
+- `packages/database/src/control-plane.ts` and `postgres.ts` — bounded source-filtered claims in both repositories and transaction-local material-read lease context.
+- `packages/database/src/workflow.test.ts` — removed a pre-existing random-UUID ordering assumption exposed by repeated full-suite verification while preserving the retry/quota assertion.
+- `supabase/migrations/20260830180000_github_workflow_binding.sql` — active lease/run/context predicate for every GitHub workflow material policy.
+- `packages/database/src/github-workflow-migration.test.ts` and `postgres.integration.test.ts` — static policy contract, direct-role adversarial RLS coverage, and PostgreSQL claim-filter parity.
+- `docs/superpowers/plans/2026-08-30-task-7-rereview-fix.md` — executed fix plan.
+
+### Strict TDD evidence
+
+Production source isolation RED before implementation:
+
+```text
+/usr/local/bin/node /Users/miki/Cloudsail-Development/runmill/node_modules/tsx/dist/cli.mjs \
+  --test apps/worker/src/production-runtime.test.ts
+
+dedicated GitHub runtime never claims or fails website and OpenAPI analysis jobs
+not ok; Expected true !== false
+tests 6; pass 5; fail 1
+```
+
+Lease-scoped policy RED before implementation:
+
+```text
+/usr/local/bin/node /Users/miki/Cloudsail-Development/runmill/node_modules/tsx/dist/cli.mjs \
+  --test packages/database/src/github-workflow-migration.test.ts
+
+missing /current_setting('page2webmcp.workflow_task_id', true)/
+tests 1; pass 0; fail 1
+```
+
+Focused/affected GREEN on the final tree:
+
+```text
+/usr/local/bin/node .../tsx/dist/cli.mjs --test \
+  apps/worker/src/production-runtime.test.ts apps/worker/src/runner.test.ts \
+  apps/worker/src/github-live.test.ts apps/worker/src/github-workflow.test.ts \
+  packages/database/src/control-plane.test.ts packages/database/src/workflow.test.ts \
+  packages/database/src/github-workflow-migration.test.ts packages/database/src/postgres.integration.test.ts
+
+tests 64; pass 56; fail 0; skipped 8
+```
+
+Ephemeral PostgreSQL migrations, direct-role RLS, claim parity, repository integration, and production topology:
+
+```text
+PAGE2WEBMCP_NATIVE_TYPESCRIPT_TESTS=true PAGE2WEBMCP_NODE_BINARY=/usr/local/bin/node \
+  bash scripts/test-rls-local.sh
+
+Postgres repository: tests 8; pass 8; fail 0
+Production topology: tests 1; pass 1; fail 0
+Standalone PostgreSQL RLS and production-topology integration tests passed.
+```
+
+Final full trusted suite:
+
+```text
+/usr/local/bin/node /Users/miki/Cloudsail-Development/runmill/node_modules/tsx/dist/cli.mjs \
+  --test test-support/**/*.test.ts apps/**/*.test.ts packages/**/*.test.ts
+
+tests 350; pass 341; fail 0; skipped 9
+```
+
+Direct gates all exited zero:
+
+```text
+/usr/local/bin/node node_modules/typescript/bin/tsc --project tsconfig.base.json --noEmit --pretty false
+/usr/local/bin/node node_modules/eslint/bin/eslint.js . --max-warnings=0
+/usr/local/bin/node scripts/lint-source.mjs
+/usr/local/bin/node scripts/check-source.mjs
+git diff --check
+```
+
+### Self-review and residuals
+
+- Re-checked that GitHub production construction still fails before polling when live controls are absent, no fixture/test adapter is installed, and no merge/install surface was added.
+- Repeated concurrent full-suite verification exposed that the existing quota test assumed the first random UUID belonged to organization A; when B sorted first, all remaining A work was legitimately quota-bound. The test now permits no unrelated claim while still proving the delayed retry cannot be claimed early. No workflow product behavior changed for this test correction.
+- Website/OpenAPI jobs remain queued for their source-correct workers in dedicated GitHub mode; this fix does not invent or claim a live website/OpenAPI production adapter.
+- RLS grants remain read-only for material tables. The transaction context is local and automatically clears on commit/rollback; cancellation or lease expiry invalidates reads even if a stale context triple is reused.
+- No live GitHub App, sandbox, or website/OpenAPI provider success is claimed. External provider and trusted installation-layer dependencies from the original Task 7/Task 1 reports remain unchanged.

@@ -8,6 +8,7 @@ import {
   capabilityPlanDigest,
   capabilityStateDigest,
   normalizeAnalysisDiagnostics,
+  normalizeAnalysisSourceTypes,
   RepositoryError,
   type AnalysisResult,
   type AnalysisEvidence,
@@ -676,6 +677,12 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
   ): Promise<WorkflowExecutionMaterial> {
     return this.#transaction({ kind: "worker" }, async (client) => {
       await this.#assertWorkerWorkflowLease(client, workerId, taskId, leaseGeneration);
+      await client.query(
+        "select set_config('page2webmcp.workflow_task_id', $1, true), " +
+        "set_config('page2webmcp.worker_id', $2, true), " +
+        "set_config('page2webmcp.lease_generation', $3, true)",
+        [taskId, workerId, String(leaseGeneration)],
+      );
       const context = await client.query(
         "select run.id as workflow_run_id, run.project_id, run.source_snapshot_id, " +
         "run.reviewed_analysis_run_id, source.source_type, source.source_url " +
@@ -1108,12 +1115,20 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
     return mapAnalysis(result.rows[0]);
   }
 
-  async claimAnalysis(workerId: string, leaseMs: number): Promise<ClaimedAnalysisRunRecord | undefined> {
+  async claimAnalysis(
+    workerId: string,
+    leaseMs: number,
+    sourceTypes?: readonly SourceType[],
+  ): Promise<ClaimedAnalysisRunRecord | undefined> {
+    const allowedSourceTypes = normalizeAnalysisSourceTypes(sourceTypes);
+    const sourceTypeFilter = allowedSourceTypes ? [...allowedSourceTypes] : null;
     return this.#transaction({ kind: "worker" }, async (client) => {
       const exhausted = await client.query(
         "select analysis_run_id from private.analysis_jobs where status = 'running' " +
-        "and lease_expires_at <= now() and attempts >= 3 order by lease_expires_at, analysis_run_id " +
-        "limit 100"
+        "and lease_expires_at <= now() and attempts >= 3 " +
+        "and ($1::text[] is null or source_type = any($1::text[])) " +
+        "order by lease_expires_at, analysis_run_id limit 100",
+        [sourceTypeFilter]
       );
       for (const exhaustedJob of exhausted.rows) {
         const exhaustedRunId = String(exhaustedJob.analysis_run_id);
@@ -1163,12 +1178,13 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
         "select job.analysis_run_id, job.organization_id from private.analysis_jobs job " +
         "where ((job.status = 'queued' and job.available_at <= now()) or " +
         "(job.status = 'running' and job.lease_expires_at <= now())) and job.attempts < 3 " +
+        "and ($2::text[] is null or job.source_type = any($2::text[])) " +
         "and (select count(*) from private.workflow_tasks active where active.organization_id = job.organization_id " +
         "and active.status = 'running' and active.lease_expires_at > now()) < $1 " +
         "order by coalesce((select max(event.created_at) from public.workflow_events event " +
         "where event.organization_id = job.organization_id and event.event_type = 'task.claimed'), '-infinity'), " +
         "job.available_at, job.created_at, job.analysis_run_id limit 1",
-        [this.#activeTaskQuota]
+        [this.#activeTaskQuota, sourceTypeFilter]
       );
       const runId = candidate.rows[0]?.analysis_run_id;
       if (!runId) return undefined;
