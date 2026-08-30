@@ -5,6 +5,7 @@ export type PersistedWorkflow = {
   url: string;
   projectId?: string;
   analysisRunId?: string;
+  workflowRunId?: string;
   releaseUrl?: string;
 };
 
@@ -22,7 +23,7 @@ export function loadWorkflow(storage: Storage): PersistedWorkflow | undefined {
       try { storage.removeItem(WORKFLOW_KEY); } catch { /* Ignore unavailable browser storage. */ }
       return undefined;
     }
-    for (const optional of [value.projectId, value.analysisRunId, value.releaseUrl]) {
+    for (const optional of [value.projectId, value.analysisRunId, value.workflowRunId, value.releaseUrl]) {
       if (optional !== undefined && typeof optional !== "string") {
         try { storage.removeItem(WORKFLOW_KEY); } catch { /* Ignore unavailable browser storage. */ }
         return undefined;

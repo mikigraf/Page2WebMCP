@@ -111,6 +111,17 @@ export type AnalysisResult = {
   draftPullRequest?: { draft: boolean; url?: string; files?: string[] };
 };
 
+export type WorkflowExecutionMaterial = Readonly<{
+  workflowRunId: string;
+  projectId: string;
+  sourceSnapshotId: string;
+  sourceType: SourceType;
+  sourceUrl: string;
+  analysisRunId: string;
+  analysis: AnalysisResult;
+  capabilities: CapabilityRecord[];
+}>;
+
 export type VerificationRecord = {
   id: string;
   projectId: string;
@@ -210,6 +221,11 @@ export interface ControlPlaneRepository extends WorkflowRepository {
   completeAnalysis(workerId: string, runId: string, result: AnalysisResult, leaseGeneration?: number): Promise<AnalysisRunRecord>;
   failAnalysis(workerId: string, runId: string, code: string, retryable: boolean, leaseGeneration?: number): Promise<AnalysisRunRecord>;
   getAnalysisResult(actor: RepositoryActor, runId: string): Promise<AnalysisResult | undefined>;
+  getWorkflowExecutionMaterial(
+    workerId: string,
+    taskId: string,
+    leaseGeneration: number,
+  ): Promise<WorkflowExecutionMaterial>;
   listCapabilities(actor: RepositoryActor, projectId: string): Promise<CapabilityRecord[]>;
   listAnalysisCapabilities(actor: RepositoryActor, runId: string): Promise<CapabilityRecord[]>;
   reviewCapability(actor: RepositoryActor, capabilityId: string, input: ReviewInput): Promise<CapabilityRecord>;
@@ -496,6 +512,7 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
     inputHash: string;
     phase: WorkflowTaskRecord["phase"];
     analysisRunId?: string;
+    reviewedAnalysisRunId?: string;
   }>): WorkflowRunRecord {
     const now = this.#now();
     const run: WorkflowRunRecord = {
@@ -504,6 +521,7 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
       projectId: input.project.id,
       sourceSnapshotId: input.sourceSnapshotId,
       ...(input.analysisRunId ? { analysisRunId: input.analysisRunId } : {}),
+      ...(input.reviewedAnalysisRunId ? { reviewedAnalysisRunId: input.reviewedAnalysisRunId } : {}),
       status: "queued",
       currentPhase: input.phase,
       inputHash: stableHash(input.inputHash),
@@ -704,6 +722,22 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
     if (previous) return copy(this.#workflowRunForActor(actor, previous.resultId));
     if ([...this.#workflowRuns.values()].some((run) => run.projectId === project.id
       && ["queued", "running", "waiting"].includes(run.status))) throw new RepositoryError("INVALID_STATE");
+    let reviewedAnalysisRunId: string | undefined;
+    if (input.analysisRunId !== undefined) {
+      const analysis = this.#runs.get(input.analysisRunId);
+      const analysisWorkflow = this.#workflowRuns.get(input.analysisRunId);
+      const result = this.#results.get(input.analysisRunId);
+      const capabilities = this.#analysisCapabilities(input.analysisRunId);
+      if (project.sourceType !== "github" || !analysis || analysis.projectId !== project.id
+        || analysis.organizationId !== actor.organizationId || analysis.status !== "succeeded"
+        || !analysisWorkflow || analysisWorkflow.sourceSnapshotId !== this.#activeSourceSnapshot(project.id).id
+        || !result?.release || capabilities.length === 0
+        || capabilities.some((capability) => capability.status === "blocked"
+          || capability.reviewedPlanDigest !== capability.planDigest)) {
+        throw new RepositoryError("INVALID_STATE");
+      }
+      reviewedAnalysisRunId = analysis.id;
+    }
     const id = randomUUID();
     const run = this.#createWorkflowRun({
       id,
@@ -711,6 +745,7 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
       sourceSnapshotId: this.#activeSourceSnapshot(project.id).id,
       inputHash: input.inputHash,
       phase: "preflight",
+      ...(reviewedAnalysisRunId ? { reviewedAnalysisRunId } : {}),
     });
     this.#projects.set(project.id, { ...project, status: "analyzing" });
     this.#reserveIdempotency(idempotencyId, input.inputHash, id);
@@ -794,6 +829,37 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
 
   async assertWorkflowTaskLease(workerId: string, taskId: string, leaseGeneration: number): Promise<void> {
     this.#assertWorkflowLease(workerId, this.#workflowTask(taskId), leaseGeneration);
+  }
+
+  async getWorkflowExecutionMaterial(
+    workerId: string,
+    taskId: string,
+    leaseGeneration: number,
+  ): Promise<WorkflowExecutionMaterial> {
+    const task = this.#workflowTask(taskId);
+    this.#assertWorkflowLease(workerId, task, leaseGeneration);
+    const run = this.#workflowRuns.get(task.workflowRunId);
+    const sourceSnapshot = run ? this.#sourceSnapshots.get(run.sourceSnapshotId) : undefined;
+    const source = sourceSnapshot ? this.#projectSources.get(sourceSnapshot.projectSourceId) : undefined;
+    const analysisRunId = run?.reviewedAnalysisRunId;
+    const analysis = analysisRunId ? this.#results.get(analysisRunId) : undefined;
+    const capabilities = analysisRunId ? this.#analysisCapabilities(analysisRunId) : [];
+    if (!run || !sourceSnapshot || !source || !analysisRunId || !analysis?.release
+      || source.projectId !== run.projectId || source.sourceType !== "github"
+      || capabilities.length === 0 || capabilities.some((capability) => capability.status === "blocked"
+        || capability.reviewedPlanDigest !== capability.planDigest)) {
+      throw new RepositoryError("INVALID_STATE");
+    }
+    return copy({
+      workflowRunId: run.id,
+      projectId: run.projectId,
+      sourceSnapshotId: run.sourceSnapshotId,
+      sourceType: source.sourceType,
+      sourceUrl: source.sourceUrl,
+      analysisRunId,
+      analysis,
+      capabilities,
+    });
   }
 
   async heartbeatWorkflowTask(workerId: string, taskId: string, leaseGeneration: number): Promise<WorkflowTaskRecord> {

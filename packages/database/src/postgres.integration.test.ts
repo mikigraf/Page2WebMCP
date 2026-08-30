@@ -76,6 +76,66 @@ test("Postgres personal organization provisioning converges and revoked sessions
   }
 });
 
+test("Postgres GitHub workflow exposes exact reviewed material only under its live worker lease", {
+  skip: !connectionString,
+}, async () => {
+  const repository = createPostgresRepository({ connectionString: connectionString!, maxConnections: 3 });
+  const actor: RepositoryActor = {
+    id: "11111111-1111-1111-1111-111111111111",
+    organizationId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+    role: "owner",
+  };
+  try {
+    const project = await repository.createProject(actor, {
+      name: "Postgres reviewed GitHub binding",
+      sourceType: "github",
+      url: "https://github.com/bright-tools/postgres-widget",
+      idempotencyKey: "postgres-github-binding-project",
+      inputHash: "postgres-github-binding-project",
+    });
+    const analysis = await repository.enqueueAnalysis(actor, {
+      projectId: project.id,
+      idempotencyKey: "postgres-github-binding-analysis",
+      inputHash: "postgres-github-binding-analysis",
+    });
+    const analysisClaim = await repository.claimAnalysis("postgres-github-binding-analysis-worker", 60_000);
+    assert.equal(analysisClaim?.id, analysis.id);
+    await repository.completeAnalysis("postgres-github-binding-analysis-worker", analysis.id, {
+      capabilities: capabilities("create_support_ticket"),
+      diagnostics: [],
+      evidence: evidenceFor(plans("create_support_ticket")),
+      release: releaseCandidate("export const githubReviewed = true;", plans("create_support_ticket")),
+    }, analysisClaim!.leaseGeneration);
+    const [capability] = await repository.listAnalysisCapabilities(actor, analysis.id);
+    assert.ok(capability);
+    await repository.reviewCapability(actor, capability.id, { action: "approve", expectedVersion: capability.version });
+    const workflow = await repository.startWorkflow(actor, {
+      projectId: project.id,
+      analysisRunId: analysis.id,
+      idempotencyKey: "postgres-github-binding-workflow",
+      inputHash: "postgres-github-binding-workflow",
+    });
+    assert.equal(workflow.reviewedAnalysisRunId, analysis.id);
+    const task = await repository.claimWorkflowTask("postgres-github-binding-worker");
+    assert.ok(task);
+    const material = await repository.getWorkflowExecutionMaterial(
+      "postgres-github-binding-worker", task.id, task.leaseGeneration,
+    );
+    assert.equal(material.analysisRunId, analysis.id);
+    assert.equal(material.sourceUrl, project.url);
+    await assert.rejects(repository.getWorkflowExecutionMaterial(
+      "postgres-github-binding-worker", task.id, task.leaseGeneration + 1,
+    ), (error: unknown) => error instanceof RepositoryError && error.code === "LEASE_LOST");
+    await repository.cancelWorkflow(actor, {
+      runId: workflow.id,
+      idempotencyKey: "postgres-github-binding-cancel",
+      inputHash: "postgres-github-binding-cancel",
+    });
+  } finally {
+    await repository.close();
+  }
+});
+
 test("Postgres repository persists and recovers the fixture lifecycle", { skip: !connectionString }, async () => {
   const pool = new pg.Pool({ connectionString, max: 2 });
   const role = await pool.query(

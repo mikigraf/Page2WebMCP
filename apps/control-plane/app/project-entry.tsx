@@ -22,8 +22,11 @@ type Capability = {
 type ApiFailure = { code?: string };
 type AnalysisStatus = {
   run: { status: "queued" | "running" | "succeeded" | "failed" | "cancelled"; errorCode?: string };
-  result?: { draftPullRequest?: { draft: boolean } };
   capabilities: Capability[];
+};
+type GitHubWorkflowStatus = {
+  workflow: { status: "queued" | "running" | "waiting" | "succeeded" | "failed" | "cancelled"; errorCode?: string };
+  outcome: "tested_patch_draft_pull_request_pending" | "tested_patch_draft_pull_request_check_preview_reconciled" | "github_workflow_terminal_without_installation";
 };
 type ProjectSummary = {
   id: string;
@@ -55,7 +58,8 @@ export function ProjectEntry({ authState }: Readonly<{ authState?: "verified" | 
       ? "Email verified. Your personal organization is ready."
       : "");
   const [capabilities, setCapabilities] = useState<Capability[]>([]);
-  const [draftReady, setDraftReady] = useState(false);
+  const [workflowRunId, setWorkflowRunId] = useState<string>();
+  const [githubOutcome, setGitHubOutcome] = useState<GitHubWorkflowStatus["outcome"]>();
   const [projectId, setProjectId] = useState<string>();
   const [analysisRunId, setAnalysisRunId] = useState<string>();
   const [releaseUrl, setReleaseUrl] = useState<string>();
@@ -78,14 +82,20 @@ export function ProjectEntry({ authState }: Readonly<{ authState?: "verified" | 
       setUrl(restored.url);
       setProjectId(restored.projectId);
       setAnalysisRunId(restored.analysisRunId);
+      setWorkflowRunId(restored.workflowRunId);
       setReleaseUrl(restored.releaseUrl);
       if (!restored.analysisRunId) return;
       setBusy(true);
       void waitForAnalysis(restored.analysisRunId, controller.signal)
-        .then((completed) => {
+        .then(async (completed) => {
           setCapabilities(completed.capabilities);
-          setDraftReady(completed.result?.draftPullRequest?.draft === true);
-          setMessage(`Analysis complete for ${restored.sourceType}`);
+          if (restored.sourceType === "github" && restored.workflowRunId) {
+            const workflow = await waitForGitHubWorkflow(restored.workflowRunId, controller.signal);
+            setGitHubOutcome(workflow.outcome);
+            setMessage(workflow.outcome === "tested_patch_draft_pull_request_check_preview_reconciled"
+              ? "Tested patch and draft pull request reconciled"
+              : `GitHub workflow ${workflow.workflow.status}`);
+          } else setMessage(`Analysis complete for ${restored.sourceType}`);
         })
         .catch((error: unknown) => {
           if (controller.signal.aborted) return;
@@ -146,7 +156,6 @@ export function ProjectEntry({ authState }: Readonly<{ authState?: "verified" | 
         try {
           const completed = await waitForAnalysis(analysisRunId);
           setCapabilities(completed.capabilities);
-          setDraftReady(completed.result?.draftPullRequest?.draft === true);
           setMessage(`Analysis complete for ${sourceType}`);
         } catch (error) {
           if (error instanceof AnalysisRunError && error.terminal && projectId) {
@@ -343,7 +352,8 @@ export function ProjectEntry({ authState }: Readonly<{ authState?: "verified" | 
     setBusy(true);
     if (!analysisRunId) {
       setCapabilities([]);
-      setDraftReady(false);
+      setWorkflowRunId(undefined);
+      setGitHubOutcome(undefined);
       setReleaseUrl(undefined);
     }
     try {
@@ -363,7 +373,6 @@ export function ProjectEntry({ authState }: Readonly<{ authState?: "verified" | 
       }
       const completed = await waitForAnalysis(runId);
       setCapabilities(completed.capabilities);
-      setDraftReady(completed.result?.draftPullRequest?.draft === true);
       setMessage(`Analysis complete for ${sourceType}`);
     } catch (error) {
       if (error instanceof AnalysisRunError && error.terminal) {
@@ -421,6 +430,26 @@ export function ProjectEntry({ authState }: Readonly<{ authState?: "verified" | 
     }
     setBusy(true);
     try {
+      if (sourceType === "github") {
+        let runId = workflowRunId;
+        if (!runId) {
+          const started = await postIdempotent<{ workflow?: { id: string }; outcome?: GitHubWorkflowStatus["outcome"] } & ApiFailure>(
+            `/api/projects/${encodeURIComponent(projectId)}/workflows`,
+            { analysisRunId },
+            `github-workflow:${projectId}:${analysisRunId}`
+          );
+          if (!started.response.ok || !started.body.workflow?.id) throw new Error(started.body.code ?? "GITHUB_WORKFLOW_FAILED");
+          runId = started.body.workflow.id;
+          setWorkflowRunId(runId);
+          setGitHubOutcome(started.body.outcome);
+          persistWorkflow({ sourceType, url, projectId, analysisRunId, workflowRunId: runId });
+        }
+        const completed = await waitForGitHubWorkflow(runId);
+        setGitHubOutcome(completed.outcome);
+        persistWorkflow({ sourceType, url, projectId, analysisRunId, workflowRunId: runId });
+        setMessage("Tested patch and draft pull request/check/preview reconciled; no merge or installation was performed");
+        return;
+      }
       const published = await postIdempotent<{ release?: { url: string } } & ApiFailure>(
         `/api/projects/${encodeURIComponent(projectId)}/releases`,
         { analysisRunId },
@@ -433,7 +462,7 @@ export function ProjectEntry({ authState }: Readonly<{ authState?: "verified" | 
       persistWorkflow({ sourceType, url, projectId, analysisRunId, releaseUrl: published.body.release.url });
       setMessage("Immutable release published");
     } catch (error) {
-      setMessage(`Publication failed: ${errorCode(error)}`);
+      setMessage(`${sourceType === "github" ? "GitHub workflow" : "Publication"} failed: ${errorCode(error)}`);
     } finally {
       setBusy(false);
     }
@@ -458,7 +487,8 @@ export function ProjectEntry({ authState }: Readonly<{ authState?: "verified" | 
     setProjectId(undefined);
     setAnalysisRunId(undefined);
     setCapabilities([]);
-    setDraftReady(false);
+    setWorkflowRunId(undefined);
+    setGitHubOutcome(undefined);
     setReleaseUrl(undefined);
   }
 
@@ -500,9 +530,13 @@ export function ProjectEntry({ authState }: Readonly<{ authState?: "verified" | 
         <button type="button" disabled={busy} onClick={() => review(capability, "block")}>Block {capability.stableName}</button>
       </>}</li>
     )}</ul>}
-    <button type="button" onClick={publish} disabled={busy || !analysisRunId || sourceType === "github"}>Publish immutable release</button>
+    <button type="button" onClick={publish} disabled={busy || !analysisRunId}>
+      {sourceType === "github" ? (workflowRunId ? "Resume tested patch workflow" : "Create tested patch and draft PR") : "Publish immutable release"}
+    </button>
     {releaseUrl && <a href={releaseUrl}>Download immutable release</a>}
-    {draftReady && <p>Draft pull request prepared</p>}
+    {githubOutcome === "tested_patch_draft_pull_request_pending" && <p>GitHub workflow pending; no draft pull request is claimed yet</p>}
+    {githubOutcome === "tested_patch_draft_pull_request_check_preview_reconciled" &&
+      <p>Tested patch, draft pull request, check, and preview reconciled. Nothing was merged or installed.</p>}
   </section>;
 }
 
@@ -534,6 +568,25 @@ async function analysisStatus(runId: string, signal?: AbortSignal): Promise<Anal
   );
   if (!response.ok) throw new Error(body.code ?? "ANALYSIS_STATUS_FAILED");
   return body;
+}
+
+async function waitForGitHubWorkflow(runId: string, signal?: AbortSignal): Promise<GitHubWorkflowStatus> {
+  const deadline = Date.now() + ANALYSIS_POLL_DEADLINE_MS;
+  let delayMs = 250;
+  while (Date.now() < deadline) {
+    const { response, body } = await requestJson<GitHubWorkflowStatus & ApiFailure>(
+      `/api/workflow-runs/${encodeURIComponent(runId)}`,
+      { cache: "no-store", signal }
+    );
+    if (!response.ok) throw new Error(body.code ?? "GITHUB_WORKFLOW_STATUS_FAILED");
+    if (body.workflow.status === "succeeded") return body;
+    if (body.workflow.status === "failed" || body.workflow.status === "cancelled") {
+      throw new AnalysisRunError(body.workflow.errorCode ?? "GITHUB_WORKFLOW_FAILED", true);
+    }
+    await abortableDelay(delayMs, signal);
+    delayMs = Math.min(Math.round(delayMs * 1.5), 2_000);
+  }
+  throw new AnalysisRunError("GITHUB_WORKFLOW_DEADLINE_EXCEEDED", false);
 }
 
 async function postIdempotent<T extends ApiFailure>(url: string, body: unknown, operation: string) {

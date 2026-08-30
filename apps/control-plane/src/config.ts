@@ -21,7 +21,8 @@ export function validateWorkerRuntimeConfiguration(environment: RuntimeEnvironme
 }
 
 function validateSharedRuntimeConfiguration(environment: RuntimeEnvironment, allowTestMemory: boolean): void {
-  if (environment.PAGE2WEBMCP_PROVIDER_MODE && environment.PAGE2WEBMCP_PROVIDER_MODE !== "local") {
+  if (environment.PAGE2WEBMCP_PROVIDER_MODE
+    && !["local", "github"].includes(environment.PAGE2WEBMCP_PROVIDER_MODE)) {
     throw new Error("LIVE_PROVIDER_UNSUPPORTED");
   }
   const storageMode = environment.PAGE2WEBMCP_STORAGE_MODE ?? "postgres";

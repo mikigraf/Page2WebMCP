@@ -124,4 +124,9 @@ test("the standalone worker fails before polling without durable storage", () =>
     PAGE2WEBMCP_PROVIDER_MODE: "local",
     DATABASE_URL: "postgresql://database.example/page2webmcp"
   }));
+  assert.doesNotThrow(() => validateWorkerRuntimeConfiguration({
+    PAGE2WEBMCP_STORAGE_MODE: "postgres",
+    PAGE2WEBMCP_PROVIDER_MODE: "github",
+    DATABASE_URL: "postgresql://database.example/page2webmcp"
+  }));
 });

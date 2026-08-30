@@ -77,6 +77,7 @@ export type WorkflowRunRecord = Readonly<{
   projectId: string;
   sourceSnapshotId: string;
   analysisRunId?: string;
+  reviewedAnalysisRunId?: string;
   status: WorkflowRunStatus;
   currentPhase: WorkflowPhase;
   inputHash: string;
@@ -189,7 +190,10 @@ export type WorkflowIdempotentCommand = Readonly<{
   inputHash: string;
 }>;
 
-export type StartWorkflowInput = WorkflowIdempotentCommand & Readonly<{ projectId: string }>;
+export type StartWorkflowInput = WorkflowIdempotentCommand & Readonly<{
+  projectId: string;
+  analysisRunId?: string;
+}>;
 export type CompleteWorkflowTaskInput = WorkflowIdempotentCommand & Readonly<{
   checkpointReference?: string;
   outputReference?: string;
@@ -273,6 +277,11 @@ export type WorkflowSideEffectResult = Readonly<{
 }>;
 
 export type WorkflowSideEffectRequest = Readonly<{
+  workerId: string;
+  taskId: string;
+  workflowRunId: string;
+  phase: WorkflowPhase;
+  leaseGeneration: number;
   idempotencyKey: string;
   kind: string;
   inputHash: string;
@@ -392,7 +401,17 @@ export class WorkflowController {
       const idempotencyKey = `wfx_${digest}`;
       const cached = results.get(idempotencyKey);
       if (cached) return cached;
-      const request = { idempotencyKey, kind, inputHash, signal: lifecycle.signal };
+      const request: WorkflowSideEffectRequest = {
+        workerId,
+        taskId: task.id,
+        workflowRunId: task.workflowRunId,
+        phase: task.phase,
+        leaseGeneration: task.leaseGeneration,
+        idempotencyKey,
+        kind,
+        inputHash,
+        signal: lifecycle.signal,
+      };
       used.set(idempotencyKey, { port, request });
       let result = validateSideEffectResult(await port.lookup(request));
       if (!result) {

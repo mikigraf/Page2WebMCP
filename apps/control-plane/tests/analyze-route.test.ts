@@ -22,7 +22,6 @@ const fixtureAnalysisAdapter = async (source: Parameters<NonNullable<Parameters<
     evidence: acmeCapabilityEvidence().filter(({ reference }) =>
       plans.some((plan) => plan.evidence.some((item) => item.reference === reference))),
     release,
-    ...(source.sourceType === "github" ? { draftPullRequest: { draft: true } } : {}),
   };
 };
 
@@ -76,7 +75,9 @@ for (const sourceType of ["website", "openapi", "github"] as const) {
     assert.equal(body.run.status, "succeeded");
     assert.equal(body.projectId, project.id);
     if (sourceType === "github") {
-      assert.equal(body.result.draftPullRequest.draft, true);
+      assert.equal(body.result.draftPullRequest, undefined);
+      assert.equal(body.capabilities.length, 1);
+      assert.equal(body.capabilities[0].status, "proposed");
     } else {
       assert.deepEqual(body.capabilities.map((item: { stableName: string; status: string }) => [item.stableName, item.status]), [
         ["create_support_ticket", "proposed"],

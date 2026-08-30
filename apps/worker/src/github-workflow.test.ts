@@ -6,7 +6,9 @@ import { WorkflowController, type WorkflowPhase, type WorkflowSideEffectPort } f
 import { createGitHubAnalysisAdapter } from "./workflow.ts";
 import {
   createGitHubDraftPullRequestSideEffect,
+  createGitHubProductionWorkflowSideEffect,
   createGitHubWorkflowPhaseHandlers,
+  GITHUB_PRODUCTION_EFFECT_KINDS,
   gitHubDraftPullRequestEffectInputHash,
 } from "./github-workflow.ts";
 import { processNextAnalysis } from "./runner.ts";
@@ -147,7 +149,7 @@ test("GitHub Task 5 handlers expose only controller side effects with stable inp
   const handlers = createGitHubWorkflowPhaseHandlers({
     inputHash: (phase) => createHash("sha256").update(`github:${phase}`).digest("hex"),
   });
-  const workerPhases = ["preflight", "explore", "propose", "controlled_mutation_verification", "compile", "candidate_verify", "publish", "install_verify"] as const;
+  const workerPhases = ["preflight", "ownership", "browser_auth", "explore", "propose", "review_wait", "controlled_mutation_verification", "compile", "candidate_verify", "publish", "install_verify"] as const;
   for (const phase of workerPhases) {
     const handler = handlers[phase];
     assert.ok(handler, phase);
@@ -164,8 +166,11 @@ test("GitHub Task 5 handlers expose only controller side effects with stable inp
   }
   assert.deepEqual(calls.map(([phase, kind]) => `${phase}:${kind}`), [
     "preflight:github.installation.resolve",
+    "ownership:github.installation.verify",
+    "browser_auth:github.app_authorization.verify",
     "explore:github.snapshot.capture",
     "propose:github.source.analyze",
+    "review_wait:github.review.verify",
     "controlled_mutation_verification:github.patch.generate",
     "compile:github.release.compile",
     "candidate_verify:github.sandbox.verify",
@@ -314,6 +319,11 @@ test("draft PR provider composition is usable only as a stable controller side e
     },
   });
   const request = {
+    workerId: "github-draft-worker",
+    taskId: "task-draft",
+    workflowRunId: "run-draft",
+    phase: "publish" as const,
+    leaseGeneration: 1,
     idempotencyKey: `wfx_${"d".repeat(64)}`,
     kind: "github.draft_pull_request.reconcile",
     inputHash: gitHubDraftPullRequestEffectInputHash(input),
@@ -328,4 +338,107 @@ test("draft PR provider composition is usable only as a stable controller side e
   assert.match(persisted, /"installed":false/);
   assert.doesNotMatch(persisted, /ghs_worker_ephemeral|github\.com|api\.github/i);
   await assert.rejects(effect.execute({ ...request, kind: "github.unapproved" }), /GITHUB_WORKFLOW_EFFECT_REQUEST_INVALID/);
+});
+
+test("reviewed GitHub workflow reaches sandbox, draft PR, successful check, and preview without merge or install", async () => {
+  const repository = new InMemoryControlPlaneRepository();
+  const project = await repository.createProject(owner, {
+    name: "Reviewed widget workflow",
+    sourceType: "github",
+    url: "https://github.com/bright-tools/widget-console",
+    idempotencyKey: "project-reviewed-github-workflow",
+    inputHash: "project-reviewed-github-workflow",
+  });
+  const analysis = await repository.enqueueAnalysis(owner, {
+    projectId: project.id,
+    idempotencyKey: "analysis-reviewed-github-workflow",
+    inputHash: "analysis-reviewed-github-workflow",
+  });
+  await processNextAnalysis(repository, {
+    workerId: "reviewed-analysis-worker",
+    analyze: createGitHubAnalysisAdapter(configuration([])),
+  });
+  const [capability] = await repository.listAnalysisCapabilities(owner, analysis.id);
+  assert.ok(capability);
+  await repository.reviewCapability(owner, capability.id, { action: "approve", expectedVersion: capability.version });
+  const run = await repository.startWorkflow(owner, {
+    projectId: project.id,
+    analysisRunId: analysis.id,
+    idempotencyKey: "start-reviewed-github-workflow",
+    inputHash: "start-reviewed-github-workflow",
+  });
+  const providerState = new Map<string, unknown>();
+  let sandboxRuns = 0;
+  const provider = {
+    lookupBranch: async ({ idempotencyKey }: { idempotencyKey: string }) => providerState.get(`branch:${idempotencyKey}`),
+    createBranch: async (request: Record<string, unknown>) => {
+      const value = { ...selection, baseCommitSha: request.baseCommitSha, branch: request.branch, idempotencyKey: request.idempotencyKey };
+      providerState.set(`branch:${request.idempotencyKey}`, value);
+      return value;
+    },
+    lookupPatch: async ({ idempotencyKey }: { idempotencyKey: string }) => providerState.get(`patch:${idempotencyKey}`),
+    applyPatch: async (request: Record<string, unknown>) => {
+      const value = { ...selection, baseCommitSha: request.baseCommitSha, headCommitSha: "e".repeat(40), branch: request.branch,
+        patchDigest: request.patchDigest, idempotencyKey: request.idempotencyKey };
+      providerState.set(`patch:${request.idempotencyKey}`, value);
+      return value;
+    },
+    lookupDraftPullRequest: async ({ idempotencyKey }: { idempotencyKey: string }) => providerState.get(`pr:${idempotencyKey}`),
+    createDraftPullRequest: async (request: Record<string, unknown>) => {
+      const value = { ...selection, baseCommitSha: request.baseCommitSha, headCommitSha: request.headCommitSha, branch: request.branch,
+        number: 19, draft: true, idempotencyKey: request.idempotencyKey };
+      providerState.set(`pr:${request.idempotencyKey}`, value);
+      return value;
+    },
+    lookupCheck: async ({ idempotencyKey }: { idempotencyKey: string }) => providerState.get(`check:${idempotencyKey}`),
+    createCheck: async (request: Record<string, unknown>) => {
+      const value = { ...selection, baseCommitSha: request.baseCommitSha, headCommitSha: request.headCommitSha,
+        externalId: request.idempotencyKey, status: "completed", conclusion: "success" };
+      providerState.set(`check:${request.idempotencyKey}`, value);
+      return value;
+    },
+  };
+  const github = configuration([]);
+  const sideEffect = createGitHubProductionWorkflowSideEffect({
+    repository,
+    bindings: [{ ...selection, targetOrigin: "https://widgets.example" }],
+    clock: () => now,
+    tokens: github.tokens,
+    snapshot: github.snapshot,
+    sandbox: { run: async (input) => {
+      sandboxRuns += 1;
+      return {
+        snapshotReference: input.snapshotReference,
+        patchDigest: input.patchDigest,
+        baseCommitSha: input.baseCommitSha,
+        appliedLimits: input.limits,
+        environmentKeys: [],
+        networkAttempts: [],
+        steps: input.steps.map((step) => ({ step, exitCode: 0, log: `${step} passed` })),
+      };
+    } },
+    draftPullRequest: provider,
+    preview: { lookup: async ({ selection: actual, commitSha }) => ({
+      ...actual,
+      commitSha,
+      servedCommitSha: commitSha,
+      status: "ready",
+      url: "https://widgets.example/preview/reviewed",
+    }) },
+  });
+  const sideEffects = Object.fromEntries(GITHUB_PRODUCTION_EFFECT_KINDS.map((kind) => [kind, sideEffect]));
+  const controller = new WorkflowController(repository, {
+    handlers: createGitHubWorkflowPhaseHandlers({
+      inputHash: (phase, task) => createHash("sha256").update(`${task.inputHash}\0${phase}`).digest("hex"),
+    }),
+    sideEffects,
+  });
+  for (let index = 0; index < 11; index += 1) assert.ok(await controller.runNext(`github-production-${index}`));
+  const completed = await repository.getWorkflowRun(owner, run.id);
+  assert.equal(completed.status, "succeeded");
+  assert.equal(completed.currentPhase, "install_verify");
+  assert.equal(sandboxRuns, 3);
+  const published = (await repository.listWorkflowTasks(owner, run.id)).find(({ phase }) => phase === "publish");
+  assert.match(published?.outputReference ?? "", /^urn:sha256:/);
+  assert.doesNotMatch(JSON.stringify(await repository.listWorkflowTasks(owner, run.id)), /ghs_worker_ephemeral|merged":true|installed":true/);
 });

@@ -154,3 +154,97 @@ All exited 0; production scan returned no matches.
 - Live GitHub App, sandbox, webhook delivery, and preview credentials were unavailable. No live success is claimed. Only explicit hermetic fakes were exercised; production construction remains fail-closed without every control.
 - The sandbox implementation is an attested provider boundary, not an in-process shell executor. A real isolated runner must enforce the requested limits and return the exact attestation; weaker/no controls are rejected.
 - The installation/deployment layer must still perform Task 1's mandatory trusted pre-evaluation artifact integrity enforcement. This task generates and checks content-addressed source-native bytes but does not weaken or replace that dependency.
+
+## Fix round 1 — production wiring and truthful workflow reachability
+
+Date: 2026-08-30
+
+### Result
+
+Resolved every finding in `task-7-review.md`.
+
+- Production `main.ts` now constructs one explicit GitHub runtime before claiming work. Configuration requires a pinned GitHub App, exact repository/installation/ref/origin bindings, and a separate exact-origin isolated-sandbox service; absent controls fail startup before a queue claim. There is no test-adapter fallback.
+- The same production loop now drains compatibility analysis work and the Task 5 workflow controller. All eleven GitHub phases have explicit handlers, including deterministic installation/authorization/review verification phases.
+- Every controller side-effect request now carries worker, task, workflow, phase, and lease-generation identity. The provider reloads the exact reviewed analysis under that live lease, re-captures the configured ref, and requires exact commit/snapshot/evidence/plan/release/source-native bytes before sandbox or GitHub mutations.
+- Added the minimum richer persisted reference required for safe resume: `workflow_runs.reviewed_analysis_run_id`, constrained to the same project/organization analysis. This is an authorization reference to the existing canonical plans/evidence/release, not a second IR.
+- Added lease-scoped PostgreSQL RLS for the exact source snapshot, evidence, and reviewed capabilities. In-memory and PostgreSQL repositories enforce the same reviewed-run/project/source-snapshot/plan-digest contract.
+- Added bounded live GitHub REST adapters for repository-scoped tokens, immutable snapshots, branches, Git objects, draft PRs, completed-success checks backed by passed sandbox evidence, and deployment preview lookup. Requests pin GitHub API version `2026-03-10`, reject redirects/origin/content-type/size drift, and never expose merge/install operations.
+- Added a bounded exact-origin sandbox HTTP adapter. Its response remains subject to the existing deny-network, empty-environment, resource-limit, step, log, and identity attestation checks.
+- Added production workflow start/status routes. The UI persists and resumes the workflow ID, reports pending state without claiming a PR, and only reports tested patch/draft PR/check/preview reconciliation after the durable workflow succeeds. It explicitly says nothing was merged or installed.
+- Removed the analyze-route fixture's fabricated `draftPullRequest`. A generic real GitHub analysis + review + workflow-route integration now proves analysis alone returns no PR and workflow start binds the exact reviewed run.
+- Accepted signed GitHub check conclusion `stale`.
+
+### Files
+
+- `apps/worker/src/github-live.ts` and `.test.ts` — fail-closed production GitHub App/REST/sandbox/preview factories and hermetic integration coverage.
+- `apps/worker/src/production-runtime.ts` and `.test.ts`, `main.ts` — explicit analysis/controller production composition and loop reachability.
+- `apps/worker/src/github-workflow.ts` and `.test.ts` — all-phase mapping, exact reviewed-material derivation, sandbox/PR/check/preview side effect, cancellation and no-merge/install coverage.
+- `packages/database/src/workflow.ts`, `control-plane.ts`, `postgres.ts` and tests — lease identity, reviewed analysis reference, exact execution material, in-memory/PostgreSQL parity.
+- `supabase/migrations/20260830180000_github_workflow_binding.sql`, static migration test, PostgreSQL integration test, and RLS test update — additive reviewed binding and worker least-privilege reads.
+- `apps/control-plane/app/api/projects/[projectId]/workflows/route.ts`, `app/api/workflow-runs/[runId]/route.ts`, route test, `project-entry.tsx`, and client workflow state — truthful start/resume/status UI/API.
+- `apps/control-plane/tests/analyze-route.test.ts` — removed fabricated GitHub PR readiness.
+- `packages/providers/src/github.ts` and `.test.ts` — valid `stale` webhook conclusion.
+- `.env.example` — explicit production GitHub controls without committed secrets.
+
+### Strict TDD evidence
+
+Focused RED was captured before each behavior was implemented:
+
+```text
+signed stale conclusion: GITHUB_WEBHOOK_CHECK_STATUS_INVALID
+production composition: ERR_MODULE_NOT_FOUND production-runtime.ts; LIVE_PROVIDER_UNSUPPORTED
+exact reviewed binding: startWorkflow accepted unreviewed/cross-project state and no lease-scoped execution-material API existed
+all-phase mapping: ownership/browser_auth/review_wait handlers were undefined
+control-plane workflow route: ERR_MODULE_NOT_FOUND app/api/workflow-runs/[runId]/route.ts
+```
+
+Focused/affected GREEN on the final tree:
+
+```text
+/usr/local/bin/node .../tsx/dist/cli.mjs --test \
+  apps/worker/src/github-live.test.ts apps/worker/src/production-runtime.test.ts \
+  apps/worker/src/github-workflow.test.ts packages/providers/src/github.test.ts \
+  packages/database/src/workflow.test.ts packages/database/src/github-workflow-migration.test.ts \
+  apps/control-plane/tests/analyze-route.test.ts apps/control-plane/tests/github-workflow-route.test.ts \
+  apps/control-plane/tests/client-workflow.test.ts apps/control-plane/tests/next-structure.test.ts
+
+tests 55; pass 55; fail 0; skipped 0; duration 3413 ms
+```
+
+Full trusted suite:
+
+```text
+/usr/local/bin/node /Users/miki/Cloudsail-Development/runmill/node_modules/tsx/dist/cli.mjs \
+  --test test-support/**/*.test.ts apps/**/*.test.ts packages/**/*.test.ts
+
+tests 348; pass 340; fail 0; skipped 8; duration 8265 ms
+```
+
+Ephemeral PostgreSQL migrations, direct-role RLS, repository parity, reviewed-material lease regression, and production topology:
+
+```text
+PAGE2WEBMCP_NATIVE_TYPESCRIPT_TESTS=true PAGE2WEBMCP_NODE_BINARY=/usr/local/bin/node \
+  bash scripts/test-rls-local.sh
+
+Postgres repository: tests 7; pass 7; fail 0
+Production topology: tests 1; pass 1; fail 0
+Standalone PostgreSQL RLS and production-topology integration tests passed.
+```
+
+Direct gates all exited zero:
+
+```text
+/usr/local/bin/node node_modules/typescript/bin/tsc --project tsconfig.base.json --noEmit --pretty false
+/usr/local/bin/node node_modules/eslint/bin/eslint.js . --max-warnings=0
+/usr/local/bin/node scripts/lint-source.mjs
+/usr/local/bin/node scripts/check-source.mjs
+git diff --check
+```
+
+### Self-review and residuals
+
+- Re-checked that no production branch mentions Acme, fixtures, `LocalSourceControl`, or the test adapter, and that the production GitHub ports expose no merge or installation API.
+- A completed-success GitHub check is created only from the exact passed sandbox evidence reference; preview verification is then exact commit/origin bound. Provider output never transitions workflow state.
+- Installation tokens remain callback-scoped and are revoked after every session. The sandbox bearer is sent only to the configured exact sandbox origin and is never included in its JSON payload, logs, evidence, or workflow output.
+- No live GitHub App or sandbox credentials were available, so no live provider success is claimed. Hermetic fakes exercised the exact production factories and HTTP request/response contracts; missing live controls fail startup.
+- The external sandbox service and GitHub App installation remain deployment dependencies. The service must enforce the attested isolation limits, and the app must grant only checks/contents/pull-requests write plus deployments/metadata read for the configured repositories.

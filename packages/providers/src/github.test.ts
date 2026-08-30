@@ -249,6 +249,16 @@ test("official signed check webhook is fresh, delivery-deduplicated, and bound t
   const verified = await verifyGitHubCheckWebhook({ body, headers }, { secret, clock: () => now, replayStore, expected });
   assert.deepEqual(verified, { deliveryId: headers.deliveryId, status: "completed", conclusion: "success", commitSha: "a".repeat(40), externalId: expected.externalId });
   assert.equal(JSON.stringify(verified).includes(secret), false);
+  const staleConclusionBody = body.replace('"conclusion":"success"', '"conclusion":"stale"');
+  const staleConclusionHeaders = {
+    ...headers,
+    deliveryId: "55555555-5555-4555-8555-555555555555",
+    signature256: `sha256=${createHmac("sha256", secret).update(staleConclusionBody).digest("hex")}`,
+  };
+  assert.equal((await verifyGitHubCheckWebhook(
+    { body: staleConclusionBody, headers: staleConclusionHeaders },
+    { secret, clock: () => now, replayStore, expected },
+  )).conclusion, "stale");
   await assert.rejects(verifyGitHubCheckWebhook({ body, headers }, { secret, clock: () => now, replayStore, expected }), /GITHUB_WEBHOOK_REPLAYED/);
   await assert.rejects(verifyGitHubCheckWebhook({ body, headers: { ...headers, deliveryId: "22222222-2222-4222-8222-222222222222", signature256: "sha256=" + "0".repeat(64) } }, { secret, clock: () => now, replayStore, expected }), /GITHUB_WEBHOOK_SIGNATURE_INVALID/);
 

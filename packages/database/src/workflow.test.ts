@@ -16,6 +16,7 @@ import {
   WorkflowController,
   workflowRetryDelayMs,
   type WorkflowSideEffectPort,
+  type WorkflowSideEffectRequest,
 } from "./workflow.ts";
 
 const ownerA: RepositoryActor = {
@@ -88,6 +89,55 @@ function analysisResult(): AnalysisResult {
       manifest: release.manifest,
     },
   };
+}
+
+function mutationAnalysisResult(): AnalysisResult {
+  const content = JSON.stringify({ source: "generic-github", version: 1 });
+  const reference = `urn:sha256:${hash(content)}`;
+  const plan: CapabilityPlan = {
+    version: 1,
+    targetOrigin: "https://widgets.example",
+    tool: { name: "create_widget", title: "Create widget", description: "Creates one reviewed widget." },
+    schemas: {
+      input: { type: "object", properties: { title: { type: "string", maxLength: 120 } },
+        required: ["title"], additionalProperties: false },
+      output: { type: "object", properties: { id: { type: "string", maxLength: 64 } },
+        required: ["id"], additionalProperties: false },
+    },
+    annotations: { readOnly: false, untrusted: false },
+    authentication: { mode: "same_origin_cookie", requiredScopes: [] },
+    effects: { kind: "mutation", riskTier: "R2", reversible: false,
+      summary: "Creates one widget after explicit review.", confirmation: "always" },
+    idempotency: { strategy: "none", verified: false, retry: "none" },
+    request: { adapter: "json_api", method: "POST", pathTemplate: "/api/widgets", path: {}, query: {},
+      body: { title: "title" }, optional: [], bodyEncoding: "json" },
+    response: { adapter: "json_api", contentTypes: ["application/json"],
+      projection: { kind: "object", fields: { id: "id" } }, errorMappings: { default: "TARGET_ERROR" } },
+    success: { adapter: "json_api", statusCodes: [201], requiredOutputFields: ["id"] },
+    evidence: [{ source: "github", reference }],
+  };
+  const release = compileWebMcpRelease([plan]);
+  return {
+    capabilities: [{ plan, status: "proposed" }], diagnostics: [],
+    evidence: [{ source: "github", content, reference }],
+    release: { code: release.code, contentHash: release.contentHash,
+      allowedOrigin: release.allowedOrigin, manifest: release.manifest },
+  };
+}
+
+async function completeAnalysisForProject(
+  repository: InMemoryControlPlaneRepository,
+  projectId: string,
+  result: AnalysisResult,
+  suffix: string,
+) {
+  const analysis = await repository.enqueueAnalysis(ownerA, {
+    projectId, idempotencyKey: `analysis-${suffix}`, inputHash: `analysis-${suffix}`,
+  });
+  const claimed = await repository.claimAnalysis(`analysis-worker-${suffix}`, 60_000);
+  assert.ok(claimed);
+  await repository.completeAnalysis(`analysis-worker-${suffix}`, analysis.id, result, claimed.leaseGeneration);
+  return analysis;
 }
 
 async function createProject(
@@ -609,4 +659,104 @@ test("diagnostic-only analysis terminates without verification, publication, or 
   assert.deepEqual((await repository.listWorkflowTasks(ownerA, run.id)).map(({ phase }) => phase), ["analysis"]);
   assert.deepEqual(await repository.listWorkflowCapabilityPlans(ownerA, run.id), []);
   assert.equal((await repository.getWorkflowRun(ownerA, run.id)).status, "succeeded");
+});
+
+test("GitHub workflow binds the exact reviewed analysis and exposes lease-scoped execution material", async () => {
+  const repository = new InMemoryControlPlaneRepository();
+  const project = await repository.createProject(ownerA, {
+    name: "Bright tools widget console", sourceType: "github",
+    url: "https://github.com/bright-tools/widget-console",
+    idempotencyKey: "project-github-reviewed-binding", inputHash: "project-github-reviewed-binding",
+  });
+  const analysis = await completeAnalysisForProject(repository, project.id, mutationAnalysisResult(), "github-reviewed-binding");
+  await assert.rejects(repository.startWorkflow(ownerA, {
+    projectId: project.id, analysisRunId: analysis.id,
+    idempotencyKey: "workflow-before-review", inputHash: "workflow-before-review",
+  }), (error: unknown) => error instanceof RepositoryError && error.code === "INVALID_STATE");
+  const [capability] = await repository.listAnalysisCapabilities(ownerA, analysis.id);
+  assert.ok(capability);
+  await repository.reviewCapability(ownerA, capability.id, { action: "approve", expectedVersion: capability.version });
+  const run = await repository.startWorkflow(ownerA, {
+    projectId: project.id, analysisRunId: analysis.id,
+    idempotencyKey: "workflow-reviewed", inputHash: "workflow-reviewed",
+  });
+  assert.equal(run.reviewedAnalysisRunId, analysis.id);
+  const task = await repository.claimWorkflowTask("github-material-worker");
+  assert.ok(task);
+  const material = await repository.getWorkflowExecutionMaterial(
+    "github-material-worker", task.id, task.leaseGeneration,
+  );
+  assert.equal(material.workflowRunId, run.id);
+  assert.equal(material.analysisRunId, analysis.id);
+  assert.equal(material.sourceType, "github");
+  assert.equal(material.sourceUrl, project.url);
+  assert.deepEqual(material.capabilities.map(({ stableName, status }) => ({ stableName, status })), [
+    { stableName: "create_widget", status: "reviewed" },
+  ]);
+  await assert.rejects(repository.getWorkflowExecutionMaterial(
+    "github-material-worker", task.id, task.leaseGeneration + 1,
+  ), (error: unknown) => error instanceof RepositoryError && error.code === "LEASE_LOST");
+});
+
+test("reviewed analysis workflow binding rejects cross-project and blocked authorization", async () => {
+  const repository = new InMemoryControlPlaneRepository();
+  const first = await repository.createProject(ownerA, {
+    name: "First repository", sourceType: "github", url: "https://github.com/bright-tools/first",
+    idempotencyKey: "project-first-binding", inputHash: "project-first-binding",
+  });
+  const second = await repository.createProject(ownerA, {
+    name: "Second repository", sourceType: "github", url: "https://github.com/bright-tools/second",
+    idempotencyKey: "project-second-binding", inputHash: "project-second-binding",
+  });
+  const analysis = await completeAnalysisForProject(repository, first.id, mutationAnalysisResult(), "cross-project-binding");
+  const [capability] = await repository.listAnalysisCapabilities(ownerA, analysis.id);
+  assert.ok(capability);
+  await repository.reviewCapability(ownerA, capability.id, { action: "block", expectedVersion: capability.version });
+  await assert.rejects(repository.startWorkflow(ownerA, {
+    projectId: first.id, analysisRunId: analysis.id,
+    idempotencyKey: "workflow-blocked", inputHash: "workflow-blocked",
+  }), (error: unknown) => error instanceof RepositoryError && error.code === "INVALID_STATE");
+  await assert.rejects(repository.startWorkflow(ownerA, {
+    projectId: second.id, analysisRunId: analysis.id,
+    idempotencyKey: "workflow-cross-project", inputHash: "workflow-cross-project",
+  }), (error: unknown) => error instanceof RepositoryError && error.code === "INVALID_STATE");
+});
+
+test("controller binds every side effect to the exact worker lease and workflow task", async () => {
+  const repository = new InMemoryControlPlaneRepository();
+  const project = await createProject(repository, ownerA, "side-effect-lease-identity");
+  const run = await repository.startWorkflow(ownerA, {
+    projectId: project.id,
+    idempotencyKey: "workflow-side-effect-lease-identity",
+    inputHash: "workflow-side-effect-lease-identity",
+  });
+  const requests: WorkflowSideEffectRequest[] = [];
+  const outputHash = "e".repeat(64);
+  const controller = new WorkflowController(repository, {
+    handlers: { preflight: async ({ sideEffect }) => ({
+      outputReference: (await sideEffect("fixture.effect", "f".repeat(64))).outputReference,
+    }) },
+    sideEffects: { "fixture.effect": {
+      lookup: async (request) => { requests.push(request); return undefined; },
+      execute: async () => ({ outputReference: `urn:sha256:${outputHash}`, outputHash }),
+      reconcile: async () => undefined,
+      cleanup: async () => undefined,
+    } },
+  });
+  const task = await controller.runNext("worker-exact-lease");
+  assert.ok(task);
+  assert.equal(requests.length, 1);
+  assert.deepEqual({
+    workerId: requests[0]!.workerId,
+    taskId: requests[0]!.taskId,
+    workflowRunId: requests[0]!.workflowRunId,
+    phase: requests[0]!.phase,
+    leaseGeneration: requests[0]!.leaseGeneration,
+  }, {
+    workerId: "worker-exact-lease",
+    taskId: task.id,
+    workflowRunId: run.id,
+    phase: "preflight",
+    leaseGeneration: 1,
+  });
 });

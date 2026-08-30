@@ -23,6 +23,11 @@ test("auth/project UI exposes actionable SSR states without trusting browser rol
   assert.match(entry, /Sign out all devices/);
   assert.match(entry, /currentCsrfToken/);
   assert.match(entry, /anonymousCsrfRoutes/);
+  assert.match(entry, /Create tested patch and draft PR/);
+  assert.match(entry, /nothing was merged or installed/i);
+  assert.match(entry, /\/api\/workflow-runs\//);
+  assert.doesNotMatch(entry, /sourceType === "github"\}>Publish immutable release/);
+  assert.doesNotMatch(entry, /draftPullRequest\?\.draft/);
   assert.doesNotMatch(entry, /fixed Acme fixture|page2webmcp_role|localStorage/);
   assert.match(proxy, /Refresh only/);
   assert.match(proxy, /getAuthService\(\)\.refreshForProxy/);

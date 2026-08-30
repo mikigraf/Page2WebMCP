@@ -5,11 +5,14 @@ import {
   registerObservability,
   shutdownObservability
 } from "../../../packages/observability/src/server.ts";
-import { processNextAnalysis } from "./runner.ts";
+import { randomUUID } from "node:crypto";
+import { createProductionWorkerRuntime, processProductionWorkerIteration } from "./production-runtime.ts";
 
 validateWorkerRuntimeConfiguration();
 const repository = getControlPlaneRepository();
+const runtime = createProductionWorkerRuntime(repository);
 const shutdown = new AbortController();
+const workerId = `worker-${randomUUID()}`;
 const pollMs = boundedInteger(process.env.PAGE2WEBMCP_WORKER_POLL_MS, 1_000, 100, 30_000);
 let consecutiveFailures = 0;
 
@@ -21,7 +24,7 @@ await registerObservability();
 try {
   while (!shutdown.signal.aborted) {
     try {
-      const processed = await processNextAnalysis(repository);
+      const processed = await processProductionWorkerIteration(repository, runtime, workerId, shutdown.signal);
       consecutiveFailures = 0;
       if (!processed) await delay(pollMs, shutdown.signal);
     } catch (error) {

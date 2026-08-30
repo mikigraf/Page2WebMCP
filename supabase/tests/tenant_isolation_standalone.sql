@@ -68,10 +68,15 @@ begin
   end if;
 
   if has_table_privilege('page2webmcp_worker', 'public.projects', 'select')
-    or has_table_privilege('page2webmcp_worker', 'public.projects', 'update')
-    or has_table_privilege('page2webmcp_worker', 'public.analysis_evidence', 'select')
-    or has_table_privilege('page2webmcp_worker', 'public.capabilities', 'select') then
+    or has_table_privilege('page2webmcp_worker', 'public.projects', 'update') then
     raise exception 'worker role has unused public-table privileges';
+  end if;
+
+  if not has_table_privilege('page2webmcp_worker', 'public.project_sources', 'select')
+    or not has_table_privilege('page2webmcp_worker', 'public.source_snapshots', 'select')
+    or not has_table_privilege('page2webmcp_worker', 'public.analysis_evidence', 'select')
+    or not has_table_privilege('page2webmcp_worker', 'public.capabilities', 'select') then
+    raise exception 'worker cannot read exact reviewed workflow execution material';
   end if;
 
   if has_column_privilege('page2webmcp_worker', 'private.analysis_jobs', 'source_type', 'update')

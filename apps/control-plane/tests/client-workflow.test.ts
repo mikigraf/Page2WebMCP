@@ -32,7 +32,8 @@ test("workflow state round-trips across reload and invalid state fails closed", 
     sourceType: "website" as const,
     url: "https://acme.example",
     projectId: "project-1",
-    analysisRunId: "run-1"
+    analysisRunId: "run-1",
+    workflowRunId: "workflow-1"
   };
   saveWorkflow(storage, workflow);
   assert.deepEqual(loadWorkflow(storage), workflow);

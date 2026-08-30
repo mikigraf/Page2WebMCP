@@ -599,7 +599,7 @@ export async function verifyGitHubCheckWebhook(
   const status = String(check.status);
   if (!["queued", "in_progress", "completed"].includes(status)) throw new Error("GITHUB_WEBHOOK_CHECK_STATUS_INVALID");
   const conclusion = check.conclusion;
-  if (conclusion !== null && conclusion !== undefined && !["success", "failure", "neutral", "cancelled", "skipped", "timed_out", "action_required"].includes(String(conclusion))) {
+  if (conclusion !== null && conclusion !== undefined && !["success", "failure", "neutral", "cancelled", "skipped", "timed_out", "action_required", "stale"].includes(String(conclusion))) {
     throw new Error("GITHUB_WEBHOOK_CHECK_STATUS_INVALID");
   }
   const replayExpiresAt = new Date(now + 24 * 60 * 60 * 1_000).toISOString();

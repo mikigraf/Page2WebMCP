@@ -29,7 +29,8 @@ import {
   type ReviewInput,
   type SourceType,
   type VerificationRecord,
-  type VerificationRequest
+  type VerificationRequest,
+  type WorkflowExecutionMaterial,
 } from "./control-plane.ts";
 import {
   WORKFLOW_DEFAULT_ACTIVE_TASK_QUOTA,
@@ -382,7 +383,7 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
 
   async #workflowRun(db: Db, actor: RepositoryActor, runId: string): Promise<WorkflowRunRecord> {
     const result = await db.query(
-      "select id, organization_id, project_id, source_snapshot_id, analysis_run_id, status, current_phase, " +
+      "select id, organization_id, project_id, source_snapshot_id, analysis_run_id, reviewed_analysis_run_id, status, current_phase, " +
       "input_hash, version, cancel_requested_at, cancelled_at, error_code, created_at, updated_at " +
       "from public.workflow_runs where id = $1 and organization_id = $2 limit 1",
       [runId, actor.organizationId]
@@ -510,12 +511,34 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
         [project.id, actor.organizationId]
       );
       if (!snapshot.rows[0]) throw new RepositoryError("INVALID_STATE");
+      let reviewedAnalysisRunId: string | undefined;
+      if (input.analysisRunId !== undefined) {
+        if (project.sourceType !== "github") throw new RepositoryError("INVALID_STATE");
+        const reviewed = await client.query(
+          "select analysis.id from public.analysis_runs analysis " +
+          "join public.workflow_runs compatibility on compatibility.analysis_run_id = analysis.id " +
+          "where analysis.id = $1 and analysis.project_id = $2 and analysis.organization_id = $3 " +
+          "and analysis.status = 'succeeded' and compatibility.source_snapshot_id = $4 " +
+          "and analysis.release_code is not null and analysis.release_hash is not null " +
+          "and analysis.allowed_origin is not null and analysis.release_manifest is not null limit 1",
+          [input.analysisRunId, project.id, actor.organizationId, snapshot.rows[0].id]
+        );
+        const capabilities = await client.query(
+          "select count(*)::integer as total, count(*) filter (where status = 'blocked' " +
+          "or reviewed_plan_digest is distinct from plan_digest)::integer as invalid " +
+          "from public.capabilities where analysis_run_id = $1 and project_id = $2 and organization_id = $3",
+          [input.analysisRunId, project.id, actor.organizationId]
+        );
+        if (!reviewed.rows[0] || Number(capabilities.rows[0]?.total) <= 0
+          || Number(capabilities.rows[0]?.invalid) > 0) throw new RepositoryError("INVALID_STATE");
+        reviewedAnalysisRunId = String(reviewed.rows[0].id);
+      }
       const inputHash = stableHash(input.inputHash);
       const run = await client.query(
         "insert into public.workflow_runs " +
-        "(id, organization_id, project_id, source_snapshot_id, status, current_phase, input_hash) " +
-        "values ($1, $2, $3, $4, 'queued', 'preflight', $5) returning *",
-        [runId, actor.organizationId, project.id, snapshot.rows[0].id, inputHash]
+        "(id, organization_id, project_id, source_snapshot_id, reviewed_analysis_run_id, status, current_phase, input_hash) " +
+        "values ($1, $2, $3, $4, $5, 'queued', 'preflight', $6) returning *",
+        [runId, actor.organizationId, project.id, snapshot.rows[0].id, reviewedAnalysisRunId ?? null, inputHash]
       );
       const task = await client.query(
         "insert into private.workflow_tasks " +
@@ -643,6 +666,76 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
   async assertWorkflowTaskLease(workerId: string, taskId: string, leaseGeneration: number): Promise<void> {
     await this.#transaction({ kind: "worker" }, async (client) => {
       await this.#assertWorkerWorkflowLease(client, workerId, taskId, leaseGeneration);
+    });
+  }
+
+  async getWorkflowExecutionMaterial(
+    workerId: string,
+    taskId: string,
+    leaseGeneration: number,
+  ): Promise<WorkflowExecutionMaterial> {
+    return this.#transaction({ kind: "worker" }, async (client) => {
+      await this.#assertWorkerWorkflowLease(client, workerId, taskId, leaseGeneration);
+      const context = await client.query(
+        "select run.id as workflow_run_id, run.project_id, run.source_snapshot_id, " +
+        "run.reviewed_analysis_run_id, source.source_type, source.source_url " +
+        "from private.workflow_tasks task join public.workflow_runs run on run.id = task.workflow_run_id " +
+        "join public.source_snapshots snapshot on snapshot.id = run.source_snapshot_id " +
+        "join public.project_sources source on source.id = snapshot.project_source_id " +
+        "where task.id = $1 and source.project_id = run.project_id and source.organization_id = run.organization_id limit 1",
+        [taskId]
+      );
+      const row = context.rows[0];
+      if (!row || row.source_type !== "github" || !row.reviewed_analysis_run_id) {
+        throw new RepositoryError("INVALID_STATE");
+      }
+      const analysisRunId = String(row.reviewed_analysis_run_id);
+      const run = await client.query(
+        "select result, release_code, release_hash, allowed_origin, release_manifest " +
+        "from public.analysis_runs where id = $1 and project_id = $2 and status = 'succeeded' limit 1",
+        [analysisRunId, row.project_id]
+      );
+      const capabilities = await client.query(
+        "select id, organization_id, project_id, analysis_run_id, stable_name, risk_tier, status, plan, " +
+        "plan_digest, reviewed_plan_digest, version from public.capabilities " +
+        "where analysis_run_id = $1 and project_id = $2 order by stable_name, id limit $3",
+        [analysisRunId, row.project_id, MAX_CAPABILITIES]
+      );
+      const evidence = await client.query(
+        "select id, organization_id, project_id, analysis_run_id, source, content, reference, expires_at " +
+        "from public.analysis_evidence where analysis_run_id = $1 and project_id = $2 " +
+        "and expires_at > now() order by created_at, id limit $3",
+        [analysisRunId, row.project_id, MAX_EVIDENCE]
+      );
+      const storedCapabilities = capabilities.rows.map(mapCapability);
+      const analysisRow = run.rows[0];
+      if (!analysisRow || storedCapabilities.length === 0 || evidence.rows.length === 0
+        || storedCapabilities.some((capability) => capability.status === "blocked"
+          || capability.reviewedPlanDigest !== capability.planDigest)) {
+        throw new RepositoryError("INVALID_STATE");
+      }
+      const stored = analysisRow.result as { diagnostics?: AnalysisResult["diagnostics"] } | null;
+      const analysis: AnalysisResult = {
+        capabilities: storedCapabilities.map(({ plan, status }) => ({ plan, status })),
+        diagnostics: normalizeAnalysisDiagnostics(stored?.diagnostics ?? []),
+        evidence: evidence.rows.map(mapEvidence),
+        release: {
+          code: String(analysisRow.release_code),
+          contentHash: String(analysisRow.release_hash),
+          allowedOrigin: String(analysisRow.allowed_origin),
+          manifest: analysisRow.release_manifest,
+        },
+      };
+      return {
+        workflowRunId: String(row.workflow_run_id),
+        projectId: String(row.project_id),
+        sourceSnapshotId: String(row.source_snapshot_id),
+        sourceType: "github",
+        sourceUrl: String(row.source_url),
+        analysisRunId,
+        analysis,
+        capabilities: storedCapabilities,
+      };
     });
   }
 
@@ -1805,6 +1898,7 @@ function mapWorkflowRun(row: QueryResultRow): WorkflowRunRecord {
     id: String(row.id), organizationId: String(row.organization_id), projectId: String(row.project_id),
     sourceSnapshotId: String(row.source_snapshot_id),
     ...(row.analysis_run_id ? { analysisRunId: String(row.analysis_run_id) } : {}),
+    ...(row.reviewed_analysis_run_id ? { reviewedAnalysisRunId: String(row.reviewed_analysis_run_id) } : {}),
     status: row.status as WorkflowRunRecord["status"], currentPhase: row.current_phase as WorkflowRunRecord["currentPhase"],
     inputHash: String(row.input_hash), version: Number(row.version),
     ...(row.cancel_requested_at ? { cancelRequestedAt: iso(row.cancel_requested_at) } : {}),
