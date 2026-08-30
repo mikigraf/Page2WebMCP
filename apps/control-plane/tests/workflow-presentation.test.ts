@@ -161,3 +161,17 @@ test("verified releases expose truthful copy, download, self-host, and installed
   ]);
   assert.equal(presented.productionReady, false);
 });
+
+test("a succeeded analysis workflow is ready for verification, never implicitly published", () => {
+  const presented = workflowPresentation({
+    sourceType: "website",
+    run: { id: "workflow-7", status: "succeeded", currentPhase: "analysis", version: 5 },
+    tasks: [{ phase: "analysis", status: "succeeded" }],
+    diagnostics: [],
+  });
+  assert.equal(presented.state, "ready_for_verification");
+  assert.equal(presented.productionReady, false);
+  assert.deepEqual(presented.actions.map(({ id, enabled }) => [id, enabled]), [
+    ["verify", true], ["publish", false],
+  ]);
+});

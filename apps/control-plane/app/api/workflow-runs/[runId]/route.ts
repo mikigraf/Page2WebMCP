@@ -11,6 +11,7 @@ import {
   capabilityReviewPresentation,
   workflowPresentation,
 } from "../../../../src/workflow-presentation.ts";
+import { observeWorkflowStatus } from "../../../../../../packages/observability/src/workflow-runtime.ts";
 
 const RunIdSchema = z.string().uuid();
 
@@ -22,30 +23,46 @@ export async function GET(request: Request, context: { params: Promise<{ runId: 
     const parsedRunId = RunIdSchema.safeParse((await context.params).runId);
     if (!parsedRunId.success) throw new ApiError("NOT_FOUND", 404);
     const workflow = await repository.getWorkflowRun(actor, parsedRunId.data);
+    const project = await repository.getProject(actor, workflow.projectId);
     const [tasks, events, evidence, capabilityPlans] = await Promise.all([
       repository.listWorkflowTasks(actor, workflow.id),
       repository.listWorkflowEvents(actor, workflow.id),
       repository.listWorkflowEvidence(actor, workflow.id),
       repository.listWorkflowCapabilityPlans(actor, workflow.id),
     ]);
-    const analysis = workflow.reviewedAnalysisRunId
-      ? await repository.getAnalysisResult(actor, workflow.reviewedAnalysisRunId)
+    const analysisRunId = workflow.reviewedAnalysisRunId ?? workflow.analysisRunId;
+    const analysis = analysisRunId
+      ? await repository.getAnalysisResult(actor, analysisRunId)
       : undefined;
-    const capabilities = workflow.reviewedAnalysisRunId
-      ? await repository.listAnalysisCapabilities(actor, workflow.reviewedAnalysisRunId)
+    const capabilities = analysisRunId
+      ? await repository.listAnalysisCapabilities(actor, analysisRunId)
       : [];
     const presentation = workflowPresentation({
-      sourceType: "github",
+      sourceType: project.sourceType,
       run: workflow,
       tasks,
       diagnostics: analysis?.diagnostics ?? [],
     });
-    const outcome = workflow.status === "succeeded"
-      ? "tested_patch_draft_pull_request_check_preview_reconciled"
-      : workflow.status === "failed" || workflow.status === "cancelled"
-        ? "github_workflow_terminal_without_installation"
-        : "tested_patch_draft_pull_request_pending";
+    const operational = await observeWorkflowStatus({
+      run: workflow,
+      tasks,
+      events,
+      evidence,
+      capabilityPlans,
+    });
+    const outcome = project.sourceType === "github"
+      ? workflow.status === "succeeded"
+        ? "tested_patch_draft_pull_request_check_preview_reconciled"
+        : workflow.status === "failed" || workflow.status === "cancelled"
+          ? "github_workflow_terminal_without_installation"
+          : "tested_patch_draft_pull_request_pending"
+      : workflow.status === "succeeded"
+        ? "analysis_workflow_succeeded"
+        : workflow.status === "failed" || workflow.status === "cancelled"
+          ? "analysis_workflow_terminal"
+          : "analysis_workflow_pending";
     return successResponse({
+      sourceType: project.sourceType,
       workflow,
       tasks,
       events,
@@ -55,6 +72,7 @@ export async function GET(request: Request, context: { params: Promise<{ runId: 
       capabilityReviews: capabilities.map(capabilityReviewPresentation),
       diagnostics: analysis?.diagnostics ?? [],
       presentation,
+      operational,
       outcome,
     }, requestId);
   } catch (error) {

@@ -116,6 +116,7 @@ export type WorkflowPresentationState =
   | "failed"
   | "unsupported"
   | "verification_failed"
+  | "ready_for_verification"
   | "published"
   | "self_host_required"
   | "installed"
@@ -173,7 +174,10 @@ export function workflowPresentation(input: WorkflowPresentationInput): Workflow
         : "review_required";
     return presented(state, false, [action("resume", true), action("cancel", true), action("retry", false)], diagnostics);
   }
-  return presented("published", false, [action("verify", input.verification === undefined), action("publish", input.verification?.eligible === true)], diagnostics);
+  return presented("ready_for_verification", false, [
+    action("verify", input.verification === undefined),
+    action("publish", input.verification?.eligible === true),
+  ], diagnostics);
 }
 
 function requestMethod(request: CapabilityPlan["request"]): string {

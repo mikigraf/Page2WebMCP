@@ -3,7 +3,11 @@ import test from "node:test";
 import { LangfuseSpanProcessor } from "@langfuse/otel";
 import { propagateAttributes, startObservation } from "@langfuse/tracing";
 import { PostHog } from "posthog-node";
-import { flushPostHogEvent, shouldExportPage2WebMcpSpan } from "./server.ts";
+import {
+  createLangfuseWorkflowTelemetrySink,
+  flushPostHogEvent,
+  shouldExportPage2WebMcpSpan,
+} from "./server.ts";
 
 test("installed vendor SDKs expose the APIs used by the enabled server adapter", () => {
   assert.equal(typeof LangfuseSpanProcessor, "function");
@@ -53,6 +57,51 @@ test("PostHog lifecycle events use pseudonymous actor and organization grouping 
       $process_person_profile: false
     }
   }]);
+});
+
+test("production Langfuse workflow sink creates real workflow, task, and event nesting", async () => {
+  const calls: Array<{ parent: string; name: string; metadata: Record<string, string> }> = [];
+  type FakeObservation = {
+    startObservation(child: string, attributes?: { metadata?: Record<string, string> }): FakeObservation;
+    end(): void;
+  };
+  function observation(name: string): FakeObservation {
+    return {
+      startObservation: (child, attributes) => {
+        calls.push({ parent: name, name: child, metadata: attributes?.metadata ?? {} });
+        return observation(child);
+      },
+      end: () => undefined,
+    };
+  }
+  const sink = createLangfuseWorkflowTelemetrySink({
+    startObservation: (name, attributes) => {
+      calls.push({ parent: "root", name, metadata: attributes?.metadata ?? {} });
+      return observation(name);
+    },
+  });
+  await sink.exportBatch({
+    workflowId: "11111111-1111-4111-8111-111111111111",
+    batchIndex: 0,
+    observations: [{
+      observationId: "22222222-2222-4222-8222-222222222222",
+      parentObservationId: "33333333-3333-4333-8333-333333333333",
+      traceId: "11111111-1111-4111-8111-111111111111",
+      workflowId: "11111111-1111-4111-8111-111111111111",
+      taskId: "33333333-3333-4333-8333-333333333333",
+      sequence: 1,
+      version: 2,
+      name: "task.side_effect_completed",
+      startedAt: "2026-08-30T12:00:00.000Z",
+      attributes: { input_hash: "a".repeat(64), duration_ms: 12, outcome: "success" },
+    }],
+  });
+  assert.deepEqual(calls.map(({ parent, name }) => ({ parent, name })), [
+    { parent: "root", name: "page2webmcp.workflow" },
+    { parent: "page2webmcp.workflow", name: "page2webmcp.task" },
+    { parent: "page2webmcp.task", name: "page2webmcp.task.side_effect_completed" },
+  ]);
+  assert.equal(calls[2]?.metadata.input_hash, "a".repeat(64));
 });
 
 function span(name: string, scope: string) {

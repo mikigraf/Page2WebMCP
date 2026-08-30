@@ -1,4 +1,5 @@
 import { createObservability, type ObservabilityVendor, type VendorRecord } from "./index.ts";
+import type { WorkflowTelemetryBatch, WorkflowTelemetrySink } from "./workflow.ts";
 
 const LANGFUSE_FACADE_SCOPE = "langfuse-sdk";
 const LANGFUSE_FACADE_PREFIX = "page2webmcp.";
@@ -6,9 +7,23 @@ let observability = createObservability();
 let initialized = false;
 let langfuseSdk: { shutdown(): Promise<void> } | undefined;
 let posthogClient: PostHogClient | undefined;
+let workflowTelemetrySink: WorkflowTelemetrySink | undefined;
+let productionVendorLoad: Promise<ObservabilityVendor> | undefined;
 
 export function getObservability() {
   return observability;
+}
+
+export async function getWorkflowTelemetrySink(): Promise<WorkflowTelemetrySink | undefined> {
+  if (!workflowTelemetrySink && process.env.PAGE2WEBMCP_OBSERVABILITY_ENABLED === "true") {
+    await loadProductionVendorOnce();
+  }
+  return workflowTelemetrySink;
+}
+
+export function setWorkflowTelemetrySinkForTest(sink: WorkflowTelemetrySink | undefined): void {
+  if (process.env.NODE_ENV === "production") throw new Error("TEST_TELEMETRY_OVERRIDE_FORBIDDEN");
+  workflowTelemetrySink = sink;
 }
 
 export async function registerObservability(): Promise<void> {
@@ -16,9 +31,14 @@ export async function registerObservability(): Promise<void> {
   initialized = true;
   observability = createObservability({
     enabled: true,
-    loadVendor: loadProductionVendor,
+    loadVendor: loadProductionVendorOnce,
     onVendorError: () => writeOperatorDiagnostic("OBSERVABILITY_EXPORT_FAILED")
   });
+}
+
+function loadProductionVendorOnce(): Promise<ObservabilityVendor> {
+  productionVendorLoad ??= loadProductionVendor();
+  return productionVendorLoad;
 }
 
 export async function shutdownObservability(): Promise<void> {
@@ -26,6 +46,7 @@ export async function shutdownObservability(): Promise<void> {
   const posthog = posthogClient;
   langfuseSdk = undefined;
   posthogClient = undefined;
+  workflowTelemetrySink = undefined;
   await Promise.allSettled([sdk?.shutdown(), posthog?.shutdown?.()]);
 }
 
@@ -56,6 +77,7 @@ async function loadLangfuse(): Promise<Pick<ObservabilityVendor, "trace"> | unde
     });
     sdk.start();
     langfuseSdk = sdk;
+    workflowTelemetrySink = createLangfuseWorkflowTelemetrySink(tracing);
     return {
       trace: async (record) => tracing.propagateAttributes({
         traceName: `page2webmcp.${record.operation ?? record.event}`,
@@ -75,6 +97,64 @@ async function loadLangfuse(): Promise<Pick<ObservabilityVendor, "trace"> | unde
     writeOperatorDiagnostic("LANGFUSE_INITIALIZATION_FAILED");
     return undefined;
   }
+}
+
+export function createLangfuseWorkflowTelemetrySink(
+  tracing: Pick<LangfuseTracing, "startObservation">,
+): WorkflowTelemetrySink {
+  return {
+    exportBatch: async (batch) => exportLangfuseWorkflowBatch(tracing, batch),
+  };
+}
+
+async function exportLangfuseWorkflowBatch(
+  tracing: Pick<LangfuseTracing, "startObservation">,
+  batch: WorkflowTelemetryBatch,
+): Promise<void> {
+  const first = batch.observations[0];
+  const root = tracing.startObservation("page2webmcp.workflow", {
+    metadata: {
+      workflow_id: batch.workflowId,
+      batch_index: String(batch.batchIndex),
+      observations: String(batch.observations.length),
+    },
+  }, { asType: "span", startTime: safeObservationTime(first?.startedAt) });
+  const tasks = new Map<string, LangfuseObservation>();
+  try {
+    for (const item of batch.observations) {
+      let parent = root;
+      if (item.taskId) {
+        const existing = tasks.get(item.taskId);
+        if (existing) parent = existing;
+        else {
+          parent = root.startObservation("page2webmcp.task", {
+            metadata: { workflow_id: batch.workflowId, task_id: item.taskId },
+          }, { asType: "span", startTime: safeObservationTime(item.startedAt) });
+          tasks.set(item.taskId, parent);
+        }
+      }
+      const startedAt = safeObservationTime(item.startedAt);
+      const event = parent.startObservation(`page2webmcp.${item.name}`, {
+        metadata: {
+          workflow_id: batch.workflowId,
+          observation_id: item.observationId,
+          sequence: String(item.sequence),
+          version: String(item.version),
+          ...Object.fromEntries(Object.entries(item.attributes).map(([key, value]) => [key, String(value)])),
+        },
+      }, { asType: "span", startTime: startedAt });
+      const duration = typeof item.attributes.duration_ms === "number" ? item.attributes.duration_ms : 0;
+      event.end(new Date(startedAt.getTime() + duration));
+    }
+  } finally {
+    for (const task of tasks.values()) task.end();
+    root.end();
+  }
+}
+
+function safeObservationTime(value: string | undefined): Date {
+  const milliseconds = value === undefined ? Number.NaN : Date.parse(value);
+  return new Date(Number.isFinite(milliseconds) ? milliseconds : Date.now());
 }
 
 export function shouldExportPage2WebMcpSpan(input: { otelSpan: { name?: unknown; instrumentationScope?: { name?: unknown } } }): boolean {
@@ -142,7 +222,16 @@ type LangfuseTracing = {
     name: string,
     attributes: { metadata: Record<string, string> },
     options: { asType: "span"; startTime: Date }
-  ): { end(endTime?: Date): void };
+  ): LangfuseObservation;
+};
+
+type LangfuseObservation = {
+  startObservation(
+    name: string,
+    attributes?: { metadata?: Record<string, string> },
+    options?: { asType?: "span"; startTime?: Date },
+  ): LangfuseObservation;
+  end(endTime?: Date): void;
 };
 
 type PostHogClient = {
