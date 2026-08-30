@@ -11,6 +11,11 @@ export type WebsiteHttpResponse = Readonly<{
   status: number;
   url: string;
   connectedAddress: string;
+  tls: Readonly<{
+    authorized: true;
+    servername: string;
+    protocol: "TLSv1.2" | "TLSv1.3";
+  }>;
   headers: Readonly<Record<string, string>>;
   body: AsyncIterable<Uint8Array>;
 }>;
@@ -92,6 +97,14 @@ function header(headers: Readonly<Record<string, string>>, name: string): string
 
 function normalizedContentType(headers: Readonly<Record<string, string>>): string | undefined {
   return header(headers, "content-type")?.split(";", 1)[0]?.trim().toLowerCase();
+}
+
+async function assertVerifiedTls(response: WebsiteHttpResponse, hostname: string): Promise<void> {
+  if (!response.tls || response.tls.authorized !== true || response.tls.servername !== hostname
+    || !["TLSv1.2", "TLSv1.3"].includes(response.tls.protocol)) {
+    await discardBody(response.body);
+    throw new Error("WEBSITE_TLS_VERIFICATION_FAILED");
+  }
 }
 
 function validatedWebsiteUrl(value: string): URL {
@@ -191,7 +204,9 @@ async function preflightWithinPolicy(
       credentials: "omit",
       signal,
     });
-    if (!result || result.url !== current.href || !Number.isInteger(result.status)) {
+    if (!result) throw new Error("WEBSITE_TRANSPORT_POLICY_VIOLATION");
+    await assertVerifiedTls(result, current.hostname);
+    if (result.url !== current.href || !Number.isInteger(result.status)) {
       throw new Error("WEBSITE_TRANSPORT_POLICY_VIOLATION");
     }
     if (!validateResolvedAddress(result.connectedAddress).ok || !pins.includes(result.connectedAddress)) {
@@ -306,8 +321,10 @@ async function verifyWellKnown(
     credentials: "omit",
     signal,
   });
-  if (!result || result.url !== url) {
-    if (result?.body) await discardBody(result.body);
+  if (!result) throw new Error("OWNERSHIP_PROOF_MISSING");
+  await assertVerifiedTls(result, origin.hostname);
+  if (result.url !== url) {
+    await discardBody(result.body);
     throw new Error("OWNERSHIP_ORIGIN_MISMATCH");
   }
   if (!validateResolvedAddress(result.connectedAddress).ok || !pins.includes(result.connectedAddress)) {

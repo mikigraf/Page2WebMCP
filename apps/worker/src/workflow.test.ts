@@ -121,6 +121,7 @@ function websiteConfiguration(events: string[], observe: (phase: "public" | "aut
   const transport = {
     request: async ({ url }: { url: string }) => ({
       status: 200, url, connectedAddress: publicAddress,
+      tls: { authorized: true as const, servername: "widgets.example", protocol: "TLSv1.3" as const },
       headers: { "content-type": "text/html", "content-security-policy": "script-src https://scripts.page2webmcp.example" },
       body: bytes("<!doctype html><title>Widgets</title>"),
     }),

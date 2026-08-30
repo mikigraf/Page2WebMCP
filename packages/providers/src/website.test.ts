@@ -19,6 +19,7 @@ function response(input: Partial<WebsiteHttpResponse> = {}): WebsiteHttpResponse
     status: 200,
     url: `${targetOrigin}/`,
     connectedAddress: publicAddress,
+    tls: { authorized: true, servername: "widgets.example", protocol: "TLSv1.3" },
     headers: {
       "content-type": "text/html; charset=utf-8",
       "content-security-policy": "default-src 'self'; script-src 'self' https://scripts.page2webmcp.example",
@@ -107,6 +108,18 @@ test("website preflight rejects bad status/content type/size/time and reports re
     headers: { "content-type": "text/html", "content-security-policy": "default-src 'none'; script-src 'self'" },
   })));
   assert.equal(restrictive.csp.allowsHostedScript, false);
+});
+
+test("website preflight requires exact authorized modern-TLS transport attestation", async () => {
+  await assert.rejects(preflightWebsiteSource(`${targetOrigin}/`, controls(async () => response({
+    tls: { authorized: false, servername: "widgets.example", protocol: "TLSv1.3" } as unknown as WebsiteHttpResponse["tls"],
+  }))), /WEBSITE_TLS_VERIFICATION_FAILED/);
+  await assert.rejects(preflightWebsiteSource(`${targetOrigin}/`, controls(async () => response({
+    tls: { authorized: true, servername: "other.example", protocol: "TLSv1.3" },
+  }))), /WEBSITE_TLS_VERIFICATION_FAILED/);
+  await assert.rejects(preflightWebsiteSource(`${targetOrigin}/`, controls(async () => response({
+    tls: { authorized: true, servername: "widgets.example", protocol: "TLSv1" } as unknown as WebsiteHttpResponse["tls"],
+  }))), /WEBSITE_TLS_VERIFICATION_FAILED/);
 });
 
 test("ownership verification accepts exact DNS TXT proof once and stores only a token digest", async () => {
