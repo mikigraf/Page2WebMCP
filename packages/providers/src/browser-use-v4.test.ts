@@ -261,3 +261,36 @@ test("Browser Use provider startup receives cancellation and releases its durabl
   await assert.rejects(pending, /BROWSER_SESSION_ABORTED/);
   assert.deepEqual(events, ["release"]);
 });
+
+test("Browser Use session expiry aborts a stalled action and reconciles provider state", async () => {
+  const shortExpiry = "2026-08-30T12:00:00.040Z";
+  const events: string[] = [];
+  let actionCompleted = false;
+  await assert.rejects(withBrowserUseCloudV4Session({
+    organizationId: "org-1", projectId: "project-1", runId: "run-expiry", targetOrigin,
+    expiresAt: shortExpiry,
+    proxyPolicyReference: { reference: "secretref:proxy-policy", expiresAt },
+  }, controls({
+    leases: {
+      claim: async () => ({ leaseId: "lease-expiry" }),
+      release: async () => { events.push("release"); },
+    },
+    transport: {
+      start: async (request) => ({
+        providerSessionId: "provider-expiry",
+        liveUrl: "https://live.invalid/expiry",
+        cdpUrl: "wss://cdp.invalid/expiry",
+        appliedPolicyDigest: browserUseCloudV4PolicyDigest(request),
+      }),
+      stop: async (_id, reason) => { events.push(`stop:${reason}`); },
+      reconcile: async () => { events.push("reconcile"); },
+    },
+  }), async (_session, sessionSignal) => {
+    assert.equal(sessionSignal?.aborted ?? false, false);
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    actionCompleted = true;
+    return "must-not-complete";
+  }), /BROWSER_SESSION_EXPIRED/);
+  assert.equal(actionCompleted, false);
+  assert.deepEqual(events, ["stop:cancelled", "reconcile", "release"]);
+});

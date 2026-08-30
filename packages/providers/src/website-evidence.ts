@@ -52,6 +52,7 @@ export type WebsiteFormObservation = Readonly<{
   outputs: readonly (ObservedField & Readonly<{ value: SemanticValue }>)[];
   success: SemanticCondition;
   statusCodes: readonly number[];
+  redactedQueryParameters?: readonly string[];
 }>;
 
 export type WebsiteDomObservation = Readonly<{
@@ -103,8 +104,18 @@ type Snapshot = Readonly<{
   targetOrigin: string;
   provider: Readonly<{ apiVersion: "v4"; model: "browser-use-2.0"; policyDigest: string }>;
   observations: Readonly<{
-    navigations: readonly Readonly<{ sequence: number; url: string; origin: string }>[];
-    semanticTargets: readonly Readonly<{ url: string; locator: SemanticLocator; matches: number }>[];
+    navigations: readonly Readonly<{
+      sequence: number;
+      url: string;
+      origin: string;
+      redactedQueryParameters?: readonly string[];
+    }>[];
+    semanticTargets: readonly Readonly<{
+      url: string;
+      locator: SemanticLocator;
+      matches: number;
+      redactedQueryParameters?: readonly string[];
+    }>[];
     network: readonly WebsiteNetworkObservation[];
     forms: readonly WebsiteFormObservation[];
     dom: readonly WebsiteDomObservation[];
@@ -193,11 +204,39 @@ function normalizeCondition(condition: SemanticCondition): SemanticCondition {
   return { ...value, equals: condition.equals };
 }
 
-function exactSameOriginUrl(value: string, targetOrigin: string): string {
+const authSensitiveQueryParameters = new Set([
+  "accesstoken", "apikey", "assertion", "authorization", "clientsecret", "code", "credential", "csrf", "idtoken",
+  "next", "nonce", "oauthverifier", "otp", "passcode", "password", "redirect", "redirecturi", "refresh_token",
+  "refreshtoken", "returnto", "returnurl", "samlrequest", "samlresponse", "secret", "session", "sessionstate", "state",
+  "ticket", "token", "xsrf",
+]);
+
+function normalizedQueryName(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+function normalizedEvidenceUrl(
+  value: string,
+  targetOrigin: string,
+): Readonly<{ url: string; redactedQueryParameters: readonly string[] }> {
   let parsed: URL;
   try { parsed = new URL(value); } catch { throw new Error("WEBSITE_EVIDENCE_ORIGIN_MISMATCH"); }
   if (parsed.origin !== targetOrigin || parsed.username || parsed.password) throw new Error("WEBSITE_EVIDENCE_ORIGIN_MISMATCH");
-  return parsed.href;
+  if (parsed.hash) throw new Error("WEBSITE_EVIDENCE_URL_FRAGMENT_BLOCKED");
+  const retained: Array<readonly [string, string]> = [];
+  const redacted: string[] = [];
+  for (const [name, queryValue] of parsed.searchParams) {
+    if (authSensitiveQueryParameters.has(normalizedQueryName(name))) redacted.push(name);
+    else retained.push([name, queryValue]);
+  }
+  retained.sort(([leftName, leftValue], [rightName, rightValue]) => compareCodePoints(leftName, rightName)
+    || compareCodePoints(leftValue, rightValue));
+  parsed.search = "";
+  for (const [name, queryValue] of retained) parsed.searchParams.append(name, queryValue);
+  return {
+    url: parsed.href,
+    redactedQueryParameters: [...new Set(redacted)].sort(compareCodePoints),
+  };
 }
 
 function normalizedObservedField(field: ObservedField): ObservedField {
@@ -230,19 +269,32 @@ function normalizedCommon<T extends WebsiteNetworkObservation | WebsiteFormObser
 
 function normalizeObservations(input: WebsiteObservationInput, targetOrigin: string): Snapshot["observations"] {
   const navigations = boundedArray(input.navigations).map((item) => {
-    const url = exactSameOriginUrl(item.url, targetOrigin);
+    const normalized = normalizedEvidenceUrl(item.url, targetOrigin);
     if (item.origin !== targetOrigin || !Number.isInteger(item.sequence) || item.sequence < 0) {
       throw new Error("WEBSITE_EVIDENCE_ORIGIN_MISMATCH");
     }
-    return { sequence: item.sequence, url, origin: targetOrigin };
+    return {
+      sequence: item.sequence,
+      url: normalized.url,
+      origin: targetOrigin,
+      ...(normalized.redactedQueryParameters.length > 0
+        ? { redactedQueryParameters: normalized.redactedQueryParameters }
+        : {}),
+    };
   });
-  const semanticTargets = boundedArray(input.semanticTargets).map((item) => ({
-    url: exactSameOriginUrl(item.url, targetOrigin),
-    locator: normalizeLocator(item.locator),
-    matches: Number.isInteger(item.matches) && item.matches >= 0 && item.matches <= 100
-      ? item.matches
-      : (() => { throw new Error("WEBSITE_EVIDENCE_BOUNDS_EXCEEDED"); })(),
-  }));
+  const semanticTargets = boundedArray(input.semanticTargets).map((item) => {
+    const normalized = normalizedEvidenceUrl(item.url, targetOrigin);
+    return {
+      url: normalized.url,
+      locator: normalizeLocator(item.locator),
+      matches: Number.isInteger(item.matches) && item.matches >= 0 && item.matches <= 100
+        ? item.matches
+        : (() => { throw new Error("WEBSITE_EVIDENCE_BOUNDS_EXCEEDED"); })(),
+      ...(normalized.redactedQueryParameters.length > 0
+        ? { redactedQueryParameters: normalized.redactedQueryParameters }
+        : {}),
+    };
+  });
   const network = boundedArray(input.network).map((item): WebsiteNetworkObservation => ({
     ...normalizedCommon(item),
     method: item.method === "GET" || item.method === "POST" ? item.method : (() => { throw new Error("WEBSITE_EVIDENCE_BOUNDS_EXCEEDED"); })(),
@@ -263,21 +315,27 @@ function normalizeObservations(input: WebsiteObservationInput, targetOrigin: str
       path: boundedText(field.path, /^[A-Za-z][A-Za-z0-9_.~-]{0,127}$/, 128),
     })),
   }));
-  const forms = boundedArray(input.forms).map((item): WebsiteFormObservation => ({
-    ...normalizedCommon(item),
-    action: exactSameOriginUrl(item.action, targetOrigin),
-    method: item.method === "GET" || item.method === "POST" ? item.method : (() => { throw new Error("WEBSITE_EVIDENCE_BOUNDS_EXCEEDED"); })(),
-    form: normalizeLocator(item.form),
-    controls: boundedArray(item.controls, MAX_FIELDS).map((field) => ({
-      ...normalizedObservedField(field),
-      name: boundedText(field.name, /^[A-Za-z_][A-Za-z0-9_.:-]{0,127}$/, 128),
-    })),
-    outputs: boundedArray(item.outputs, MAX_FIELDS).map((field) => ({ ...normalizedObservedField(field), value: normalizeSemanticValue(field.value) })),
-    success: normalizeCondition(item.success),
-    statusCodes: boundedArray(item.statusCodes, 20).map((status) => Number.isInteger(status) && status >= 200 && status <= 299
-      ? status
-      : (() => { throw new Error("WEBSITE_EVIDENCE_BOUNDS_EXCEEDED"); })()),
-  }));
+  const forms = boundedArray(input.forms).map((item): WebsiteFormObservation => {
+    const normalized = normalizedEvidenceUrl(item.action, targetOrigin);
+    return {
+      ...normalizedCommon(item),
+      action: normalized.url,
+      method: item.method === "GET" || item.method === "POST" ? item.method : (() => { throw new Error("WEBSITE_EVIDENCE_BOUNDS_EXCEEDED"); })(),
+      form: normalizeLocator(item.form),
+      controls: boundedArray(item.controls, MAX_FIELDS).map((field) => ({
+        ...normalizedObservedField(field),
+        name: boundedText(field.name, /^[A-Za-z_][A-Za-z0-9_.:-]{0,127}$/, 128),
+      })),
+      outputs: boundedArray(item.outputs, MAX_FIELDS).map((field) => ({ ...normalizedObservedField(field), value: normalizeSemanticValue(field.value) })),
+      success: normalizeCondition(item.success),
+      statusCodes: boundedArray(item.statusCodes, 20).map((status) => Number.isInteger(status) && status >= 200 && status <= 299
+        ? status
+        : (() => { throw new Error("WEBSITE_EVIDENCE_BOUNDS_EXCEEDED"); })()),
+      ...(normalized.redactedQueryParameters.length > 0
+        ? { redactedQueryParameters: normalized.redactedQueryParameters }
+        : {}),
+    };
+  });
   const dom = boundedArray(input.dom).map((item): WebsiteDomObservation => ({
     ...normalizedCommon(item),
     scope: normalizeLocator(item.scope),
@@ -419,6 +477,7 @@ function apiPlan(candidate: WebsiteNetworkObservation, snapshot: Snapshot, refer
 }
 
 function formPlan(candidate: WebsiteFormObservation, snapshot: Snapshot, reference: string): CapabilityPlan {
+  if ((candidate.redactedQueryParameters?.length ?? 0) > 0) throw new Error("redacted_form_action");
   return CapabilityPlanSchema.parse({
     ...commonPlan(candidate, snapshot, reference),
     schemas: { input: schemaForFields(candidate.controls), output: outputSchema(candidate.outputs) },

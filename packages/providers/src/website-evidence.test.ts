@@ -192,3 +192,57 @@ test("proposal verification rejects corrupted or ownership-incomplete evidence",
   assert.throws(() => proposeWebsiteCapabilityPlans({ ...evidence, content: `${evidence.content} ` }), /WEBSITE_EVIDENCE_INTEGRITY_FAILED/);
   assert.throws(() => proposeWebsiteCapabilityPlans({ ...evidence, projectId: undefined } as unknown as typeof evidence), /WEBSITE_EVIDENCE_OWNERSHIP_INVALID/);
 });
+
+test("OAuth callback and login-return URLs redact sensitive query values deterministically", async () => {
+  const base = observations();
+  const callbackUrl = `${targetOrigin}/callback?state=csrf-ish&lang=en&code=secret-code`;
+  const loginUrl = `${targetOrigin}/login?theme=dark&returnTo=%2Fcallback%3Fcode%3Dnested-code`;
+  const evidence = await captureWebsiteEvidence({
+    ...ownership, targetOrigin,
+    provider: { apiVersion: "v4", model: "browser-use-2.0", policyDigest: "a".repeat(64) },
+    observations: {
+      ...base,
+      navigations: [{ sequence: 1, url: callbackUrl, origin: targetOrigin }],
+      semanticTargets: [{ ...base.semanticTargets[0]!, url: loginUrl }],
+      forms: [{
+        ...base.forms[0]!,
+        logicalAction: "login_return_form",
+        action: `${targetOrigin}/search?view=compact&state=form-secret-state`,
+      }],
+    },
+  }, { put: async ({ reference }) => ({ reference }) });
+
+  assert.doesNotMatch(evidence.content, /secret-code|csrf-ish|nested-code|form-secret-state/);
+  const snapshot = JSON.parse(evidence.content);
+  assert.equal(snapshot.targetOrigin, targetOrigin);
+  assert.equal(snapshot.observations.navigations[0].origin, targetOrigin);
+  assert.equal(snapshot.observations.navigations[0].url,
+    `${targetOrigin}/callback?lang=en`);
+  assert.deepEqual(snapshot.observations.navigations[0].redactedQueryParameters, ["code", "state"]);
+  assert.equal(snapshot.observations.semanticTargets[0].url,
+    `${targetOrigin}/login?theme=dark`);
+  assert.deepEqual(snapshot.observations.semanticTargets[0].redactedQueryParameters, ["returnTo"]);
+  assert.equal(snapshot.observations.forms[0].action,
+    `${targetOrigin}/search?view=compact`);
+  assert.deepEqual(snapshot.observations.forms[0].redactedQueryParameters, ["state"]);
+  const proposed = proposeWebsiteCapabilityPlans(evidence);
+  assert.equal(proposed.plans.some((plan) => plan.tool.name === "login_return_form"), false);
+  assert.ok(proposed.diagnostics.some((diagnostic) => diagnostic.operationKey === "login_return_form"
+    && diagnostic.code === "UNSUPPORTED_WEBSITE_CANDIDATE" && diagnostic.reason === "redacted_form_action"));
+});
+
+test("website evidence rejects URL fragments across navigation, semantic, and form facts", async () => {
+  const base = observations();
+  const cases: WebsiteObservationInput[] = [
+    { ...base, navigations: [{ sequence: 1, url: `${targetOrigin}/catalog#access_token=canary`, origin: targetOrigin }] },
+    { ...base, semanticTargets: [{ ...base.semanticTargets[0]!, url: `${targetOrigin}/catalog#state=canary` }] },
+    { ...base, forms: [{ ...base.forms[0]!, action: `${targetOrigin}/search#code=canary` }] },
+  ];
+  for (const observed of cases) {
+    await assert.rejects(captureWebsiteEvidence({
+      ...ownership, targetOrigin,
+      provider: { apiVersion: "v4", model: "browser-use-2.0", policyDigest: "a".repeat(64) },
+      observations: observed,
+    }, { put: async ({ reference }) => ({ reference }) }), /WEBSITE_EVIDENCE_URL_FRAGMENT_BLOCKED/);
+  }
+});

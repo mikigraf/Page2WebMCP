@@ -218,3 +218,22 @@ test("website worker construction and source ownership fail closed without every
   await assert.rejects(adapter({ sourceType: "openapi", sourceUrl: `${websiteOrigin}/` }, new AbortController().signal), /SOURCE_TYPE_UNSUPPORTED/);
   await assert.rejects(adapter({ sourceType: "website", sourceUrl: `${websiteOrigin}/` }, new AbortController().signal), /WEBSITE_SOURCE_OWNERSHIP_REQUIRED/);
 });
+
+test("website worker locally expires a stalled explorer and still reconciles the browser", async () => {
+  const events: string[] = [];
+  let observationCompleted = false;
+  const configuration = websiteConfiguration(events, async (_phase, signal) => {
+    assert.equal(signal.aborted, false);
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    observationCompleted = true;
+    return { observations: websiteObservations(), requiresAuthentication: false };
+  });
+  configuration.browser.expiresAt = "2026-08-30T12:00:00.040Z";
+  const adapter = createWebsiteAnalysisAdapter(configuration);
+  await assert.rejects(adapter({
+    sourceType: "website", sourceUrl: `${websiteOrigin}/`,
+    organizationId: "org-1", projectId: "project-1", id: "run-expired-explorer",
+  }, new AbortController().signal), /BROWSER_SESSION_EXPIRED/);
+  assert.equal(observationCompleted, false);
+  assert.deepEqual(events, ["stop:cancelled", "reconcile", "release"]);
+});

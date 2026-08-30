@@ -107,6 +107,47 @@ function validateIdentifier(value: string): boolean {
   return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value);
 }
 
+type BrowserSessionStopCode = "BROWSER_SESSION_ABORTED" | "BROWSER_SESSION_EXPIRED";
+
+function createBrowserSessionDeadline(
+  remainingMs: number,
+  callerSignal: AbortSignal | undefined,
+): Readonly<{
+  signal: AbortSignal;
+  stopped: Promise<never>;
+  code(): BrowserSessionStopCode | undefined;
+  dispose(): void;
+}> {
+  const controller = new AbortController();
+  let terminalCode: BrowserSessionStopCode | undefined;
+  let rejectStopped!: (error: Error) => void;
+  const stopped = new Promise<never>((_resolve, reject) => { rejectStopped = reject; });
+  // The promise can reject before action() is reached (for example while a
+  // lease claim finishes). Keep it observed until it is raced below.
+  void stopped.catch(() => undefined);
+  const stop = (code: BrowserSessionStopCode) => {
+    if (terminalCode) return;
+    terminalCode = code;
+    const error = new Error(code);
+    rejectStopped(error);
+    controller.abort(error);
+  };
+  const abort = () => stop("BROWSER_SESSION_ABORTED");
+  if (callerSignal?.aborted) abort();
+  else callerSignal?.addEventListener("abort", abort, { once: true });
+  const timeout = setTimeout(() => stop("BROWSER_SESSION_EXPIRED"), Math.max(0, remainingMs));
+  timeout.unref?.();
+  return {
+    signal: controller.signal,
+    stopped,
+    code: () => terminalCode,
+    dispose: () => {
+      clearTimeout(timeout);
+      callerSignal?.removeEventListener("abort", abort);
+    },
+  };
+}
+
 function validatedRequest(input: BrowserUseSessionInput, now: Date): BrowserUseCloudV4Request {
   if (![input.organizationId, input.projectId, input.runId].every(validateIdentifier)) {
     throw new Error("BROWSER_SESSION_INPUT_INVALID");
@@ -172,10 +213,13 @@ async function captureReference(
 export async function withBrowserUseCloudV4Session<T>(
   input: BrowserUseSessionInput,
   controls: BrowserUseCloudV4Controls,
-  action: (session: BrowserUseSession) => Promise<T>,
+  action: (session: BrowserUseSession, signal: AbortSignal) => Promise<T>,
 ): Promise<T> {
   assertControls(controls);
-  const request = validatedRequest(input, (controls.clock ?? (() => new Date()))());
+  const now = (controls.clock ?? (() => new Date()))();
+  const request = validatedRequest(input, now);
+  const initialRemainingMs = Date.parse(input.expiresAt) - now.getTime();
+  const monotonicStartedAt = Date.now();
   const policyDigest = browserUseCloudV4PolicyDigest(request);
   const lease = await controls.leases.claim({
     organizationId: input.organizationId,
@@ -186,14 +230,19 @@ export async function withBrowserUseCloudV4Session<T>(
     policyDigest,
   });
   if (!lease || !validateIdentifier(lease.leaseId)) throw new Error("BROWSER_SESSION_LEASE_INVALID");
+  const deadline = createBrowserSessionDeadline(
+    initialRemainingMs - (Date.now() - monotonicStartedAt),
+    controls.signal,
+  );
 
   let providerSessionId: string | undefined;
   const references: string[] = [];
   let primaryError: unknown;
   let outcome: "completed" | "failed" | "cancelled" = "failed";
   try {
-    if (controls.signal?.aborted) throw new Error("BROWSER_SESSION_ABORTED");
-    const started = await controls.transport.start(request, controls.signal ?? new AbortController().signal);
+    if (deadline.signal.aborted) throw deadline.signal.reason;
+    const started = await controls.transport.start(request, deadline.signal);
+    if (deadline.signal.aborted) throw deadline.signal.reason;
     assertRawSession(started);
     providerSessionId = started.providerSessionId;
     if (started.appliedPolicyDigest !== policyDigest) throw new Error("BROWSER_PROVIDER_CONTROL_ATTESTATION_FAILED");
@@ -211,27 +260,17 @@ export async function withBrowserUseCloudV4Session<T>(
       cdpReference,
       policyDigest,
     };
-    let removeAbort: () => void = () => undefined;
-    const aborted = new Promise<never>((_resolve, reject) => {
-      const listener = () => reject(new Error("BROWSER_SESSION_ABORTED"));
-      if (controls.signal?.aborted) listener();
-      else if (controls.signal) {
-        controls.signal.addEventListener("abort", listener, { once: true });
-        removeAbort = () => controls.signal?.removeEventListener("abort", listener);
-      }
-    });
-    try {
-      const value = await Promise.race([action(session), aborted]);
-      if (controls.signal?.aborted) throw new Error("BROWSER_SESSION_ABORTED");
-      outcome = "completed";
-      return value;
-    } finally {
-      removeAbort();
-    }
+    const value = await Promise.race([action(session, deadline.signal), deadline.stopped]);
+    if (deadline.signal.aborted) throw deadline.signal.reason;
+    outcome = "completed";
+    return value;
   } catch (error) {
-    const normalized = controls.signal?.aborted ? new Error("BROWSER_SESSION_ABORTED") : error;
+    const deadlineCode = deadline.code();
+    const normalized = deadlineCode ? new Error(deadlineCode) : error;
     primaryError = normalized;
-    if (normalized instanceof Error && normalized.message === "BROWSER_SESSION_ABORTED") outcome = "cancelled";
+    if (normalized instanceof Error && ["BROWSER_SESSION_ABORTED", "BROWSER_SESSION_EXPIRED"].includes(normalized.message)) {
+      outcome = "cancelled";
+    }
     throw normalized;
   } finally {
     const cleanupErrors: unknown[] = [];
@@ -243,6 +282,7 @@ export async function withBrowserUseCloudV4Session<T>(
       try { await controls.transport.reconcile(providerSessionId); } catch (error) { cleanupErrors.push(error); }
     }
     try { await controls.leases.release(lease.leaseId); } catch (error) { cleanupErrors.push(error); }
+    deadline.dispose();
     if (primaryError === undefined && cleanupErrors.length > 0) throw new Error("BROWSER_SESSION_CLEANUP_FAILED");
   }
 }

@@ -231,14 +231,14 @@ export function createWebsiteAnalysisAdapter(configuration: WebsiteAnalysisConfi
       targetOrigin: preflight.targetOrigin,
       expiresAt: configuration.browser.expiresAt,
       proxyPolicyReference: configuration.browser.proxyPolicyReference,
-    }, { ...configuration.browser.controls, signal }, async (session) => {
+    }, { ...configuration.browser.controls, signal }, async (session, sessionSignal) => {
       const first = await configuration.explorer.observe({
         phase: "public",
         targetOrigin: preflight.targetOrigin,
         sourceUrl: preflight.finalUrl,
         cdpReference: session.cdpReference,
         firewall,
-        signal,
+        signal: sessionSignal,
       });
       if (!first || !first.observations || typeof first.requiresAuthentication !== "boolean") {
         throw new Error("WEBSITE_EXPLORER_RESPONSE_INVALID");
@@ -254,14 +254,14 @@ export function createWebsiteAnalysisAdapter(configuration: WebsiteAnalysisConfi
           targetOrigin: preflight.targetOrigin,
           liveReference: session.liveReference,
           expiresAt: session.expiresAt,
-        }, { store: configuration.authentication.store, clock: configuration.clock, signal });
+        }, { store: configuration.authentication.store, clock: configuration.clock, signal: sessionSignal });
         second = await configuration.explorer.observe({
           phase: "authenticated",
           targetOrigin: preflight.targetOrigin,
           sourceUrl: preflight.finalUrl,
           cdpReference: session.cdpReference,
           firewall,
-          signal,
+          signal: sessionSignal,
         });
         if (!second || !second.observations || typeof second.requiresAuthentication !== "boolean") {
           throw new Error("WEBSITE_EXPLORER_RESPONSE_INVALID");
