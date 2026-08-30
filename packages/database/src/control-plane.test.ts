@@ -177,6 +177,7 @@ test("analysis completion persists capability ownership and optimistic reviews",
   await repository.claimAnalysis("worker-a", 60_000);
   const completed = await repository.completeAnalysis("worker-a", run.id, {
     capabilities: capabilities("find_order", "create_support_ticket"),
+    diagnostics: [],
     evidence: evidenceFor(plans("find_order", "create_support_ticket")),
     release: releaseCandidate("export const fixture = true;", plans("find_order", "create_support_ticket"))
   });
@@ -223,6 +224,7 @@ test("eligible publication is content addressed and idempotent", async () => {
   await repository.claimAnalysis("worker", 60_000);
   await repository.completeAnalysis("worker", run.id, {
     capabilities: capabilities("find_order"),
+    diagnostics: [],
     evidence: evidenceFor(plans("find_order")),
     release: releaseCandidate("export const fixture = true;")
   });
@@ -286,6 +288,7 @@ test("analysis ingestion rejects an exact plan without its immutable evidence", 
   await repository.claimAnalysis("evidence-worker", 60_000);
   await assert.rejects(repository.completeAnalysis("evidence-worker", run.id, {
     capabilities: capabilities("find_order"),
+    diagnostics: [],
     evidence: [],
     release: releaseCandidate("export const evidenceGate = true;")
   }), (error: unknown) => error instanceof RepositoryError && error.code === "INVALID_STATE");
@@ -309,6 +312,7 @@ test("capability approval rejects evidence that expired after analysis", async (
   await repository.claimAnalysis("review-evidence-worker", 60_000);
   await repository.completeAnalysis("review-evidence-worker", run.id, {
     capabilities: capabilities("create_support_ticket"),
+    diagnostics: [],
     evidence: evidenceFor(plans("create_support_ticket")).map((item) => ({
       ...item,
       expiresAt: new Date(now.getTime() + 1_000).toISOString(),
@@ -458,6 +462,7 @@ test("publication atomically rejects a stale capability-state verification", asy
   await repository.claimAnalysis("worker", 60_000);
   await repository.completeAnalysis("worker", run.id, {
     capabilities: capabilities("create_support_ticket"),
+    diagnostics: [],
     evidence: evidenceFor(plans("create_support_ticket")),
     release: releaseCandidate("export const state = true;", plans("create_support_ticket"))
   });
@@ -509,6 +514,7 @@ test("a blocked capability publishes reviewed bytes without mutating the worker 
   const sourceCandidate = releaseCandidate("export const includesAll = true;", plans("find_order", "create_support_ticket"));
   await repository.completeAnalysis("subset-worker", run.id, {
     capabilities: capabilities("find_order", "create_support_ticket"),
+    diagnostics: [],
     evidence: evidenceFor(plans("find_order", "create_support_ticket")),
     release: sourceCandidate
   });
@@ -564,6 +570,7 @@ test("candidate hashes are validated and a later verification cannot be overwrit
   await repository.claimAnalysis("candidate-worker", 60_000);
   await repository.completeAnalysis("candidate-worker", run.id, {
     capabilities: capabilities("find_order"),
+    diagnostics: [],
     evidence: evidenceFor(plans("find_order")),
     release: releaseCandidate("export const initial = true;")
   });
@@ -645,6 +652,7 @@ test("identical code remains attributable to each exact analysis run", async () 
     await repository.claimAnalysis(`worker-${index}`, 60_000);
     await repository.completeAnalysis(`worker-${index}`, run.id, {
       capabilities: capabilities("find_order"),
+      diagnostics: [],
       evidence: evidenceFor(plans("find_order")),
       release: releaseCandidate("export const same = true;")
     });

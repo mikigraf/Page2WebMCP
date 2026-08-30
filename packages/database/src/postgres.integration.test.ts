@@ -92,6 +92,7 @@ test("Postgres repository persists and recovers the fixture lifecycle", { skip: 
 
     const completed = await repository.completeAnalysis("postgres-worker", run.id, {
       capabilities: capabilities("find_order"),
+      diagnostics: [{ code: "SERVER_ADAPTER_REQUIRED", operationKey: "GET /private", reason: "api_key_header" }],
       evidence: evidenceFor(plans("find_order")),
       release: releaseCandidate("export const persisted = true;")
     });
@@ -100,6 +101,11 @@ test("Postgres repository persists and recovers the fixture lifecycle", { skip: 
     assert.equal(completed.leaseExpiresAt, undefined);
     assert.equal((await repository.getAnalysis(actor, run.id)).status, "succeeded");
     assert.equal((await repository.listCapabilities(actor, project.id)).length, 1);
+    assert.deepEqual((await repository.getAnalysisResult(actor, run.id))?.diagnostics, [{
+      code: "SERVER_ADAPTER_REQUIRED",
+      operationKey: "GET /private",
+      reason: "api_key_header"
+    }]);
 
     const capabilityDigest = capabilityStateDigest(await repository.listAnalysisCapabilities(actor, run.id));
     const verificationInput = {
@@ -141,6 +147,7 @@ test("Postgres repository persists and recovers the fixture lifecycle", { skip: 
     assert.equal((await repository.claimAnalysis("postgres-worker-two", 60_000))?.id, secondRun.id);
     await repository.completeAnalysis("postgres-worker-two", secondRun.id, {
       capabilities: capabilities("find_order"),
+      diagnostics: [],
       evidence: evidenceFor(plans("find_order")),
       release: releaseCandidate("export const persisted = true;")
     });
@@ -293,6 +300,7 @@ test("Postgres queue exhaustion and stale release gates match the in-memory cont
     assert.equal((await repository.claimAnalysis("stale-worker", 60_000))?.id, publishRun.id);
     await repository.completeAnalysis("stale-worker", publishRun.id, {
       capabilities: capabilities("create_support_ticket", "find_order"),
+      diagnostics: [],
       evidence: evidenceFor(plans("create_support_ticket", "find_order")),
       release: releaseCandidate("export const stale = true;", plans("create_support_ticket", "find_order"))
     });
@@ -438,6 +446,7 @@ test("Postgres preserves the worker candidate across capability changes and publ
     assert.equal((await repository.claimAnalysis("immutable-source-worker", 60_000))?.id, run.id);
     await repository.completeAnalysis("immutable-source-worker", run.id, {
       capabilities: fixturePlans.map((plan) => ({ plan, status: "proposed" as const })),
+      diagnostics: [],
       evidence: evidenceFor(fixturePlans),
       release: source
     });
@@ -561,6 +570,7 @@ test("publication evidence locking serializes with retention cleanup", {
     assert.equal((await repository.claimAnalysis("retention-race-worker", 60_000))?.id, run.id);
     await repository.completeAnalysis("retention-race-worker", run.id, {
       capabilities: capabilities("find_order"),
+      diagnostics: [],
       evidence: evidenceFor(plans("find_order")),
       release: releaseCandidate("export const retentionRace = true;")
     });

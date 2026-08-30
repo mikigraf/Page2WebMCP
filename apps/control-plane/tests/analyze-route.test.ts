@@ -8,22 +8,26 @@ import { setControlPlaneRepositoryForTest } from "../../../packages/database/src
 import { compileWebMcpRelease } from "../../../packages/compiler/src/compiler.ts";
 import { acmeCapabilityEvidence, acmeCapabilityPlans } from "../../acme-support/src/capability-plans.ts";
 import { setAnalysisAdapterForTest } from "../../worker/src/runner.ts";
+import { createOpenApiAnalysisAdapter } from "../../worker/src/workflow.ts";
 
 const actor = authenticate("owner@example.test", "fixture-password")!;
 const cookie = `page2webmcp_session=${issueSession(actor)}`;
 
-setAnalysisAdapterForTest(async (source) => {
+const fixtureAnalysisAdapter = async (source: Parameters<NonNullable<Parameters<typeof setAnalysisAdapterForTest>[0]>>[0]) => {
   const origin = source.sourceType === "github" ? "https://acme.example" : new URL(source.sourceUrl).origin;
   const plans = acmeCapabilityPlans(origin).slice(0, source.sourceType === "github" ? 1 : 3);
   const release = compileWebMcpRelease(plans);
   return {
     capabilities: plans.map((plan) => ({ plan, status: "proposed" as const })),
+    diagnostics: [],
     evidence: acmeCapabilityEvidence().filter(({ reference }) =>
       plans.some((plan) => plan.evidence.some((item) => item.reference === reference))),
     release,
     ...(source.sourceType === "github" ? { draftPullRequest: { draft: true } } : {}),
   };
-});
+};
+
+setAnalysisAdapterForTest(fixtureAnalysisAdapter);
 
 async function createFixtureProject(repository: InMemoryControlPlaneRepository, sourceType: "website" | "openapi" | "github") {
   return repository.createProject(actor, {
@@ -82,6 +86,66 @@ for (const sourceType of ["website", "openapi", "github"] as const) {
     }
   });
 }
+
+test("mixed OpenAPI analysis preserves unsupported-operation diagnostics through the run API", async () => {
+  const source = JSON.stringify({
+    openapi: "3.1.0",
+    info: { title: "Mixed Widgets", version: "1" },
+    components: { securitySchemes: { serviceKey: { type: "apiKey", in: "header", name: "X-Service-Key" } } },
+    paths: {
+      "/private": { get: {
+        security: [{ serviceKey: [] }],
+        responses: { "200": { description: "ok", content: { "application/json": { schema: { type: "boolean" } } } } },
+      } },
+      "/public": { get: {
+        security: [],
+        responses: { "200": { description: "ok", content: { "application/json": { schema: { type: "boolean" } } } } },
+      } },
+    },
+  });
+  const mixedAdapter = createOpenApiAnalysisAdapter({
+    targetOrigin: "https://widgets.example",
+    testPageUrl: "https://widgets.example/review/openapi",
+    environment: "test",
+    provider: {
+      resolver: { resolve: async () => ["93.184.216.34"] },
+      transport: { request: async ({ url }) => ({
+        status: 200,
+        url,
+        headers: { "content-type": "application/json" },
+        body: { async *[Symbol.asyncIterator]() { yield new TextEncoder().encode(source); } },
+      }) },
+    },
+  });
+  const repository = new InMemoryControlPlaneRepository();
+  setControlPlaneRepositoryForTest(repository);
+  setAnalysisAdapterForTest(mixedAdapter);
+  try {
+    const project = await repository.createProject(actor, {
+      name: "Mixed Widgets",
+      sourceType: "openapi",
+      url: "https://specs.widgets.example/openapi.json",
+      idempotencyKey: "project-mixed-openapi",
+      inputHash: "project-mixed-openapi",
+    });
+    const accepted = await (await analyze(analysisRequest(project.id, "analysis-mixed-openapi"))).json();
+    const response = await getRun(
+      new Request(`https://control.example/api/analysis-runs/${accepted.runId}`, { headers: { cookie } }),
+      { params: Promise.resolve({ runId: accepted.runId }) },
+    );
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.deepEqual(body.result.diagnostics, [{
+      code: "SERVER_ADAPTER_REQUIRED",
+      operationKey: "GET /private",
+      reason: "api_key_header",
+    }]);
+    assert.equal(body.capabilities.length, 1);
+    assert.match(body.capabilities[0].stableName, /^get_operation_/);
+  } finally {
+    setAnalysisAdapterForTest(fixtureAnalysisAdapter);
+  }
+});
 
 test("analysis requires authentication and an idempotency key", async () => {
   const repository = new InMemoryControlPlaneRepository();

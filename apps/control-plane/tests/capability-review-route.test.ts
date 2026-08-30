@@ -29,6 +29,7 @@ async function fixture(repository: InMemoryControlPlaneRepository) {
   const release = compileWebMcpRelease(plans);
   await repository.completeAnalysis("worker", run.id, {
     capabilities: plans.map((plan) => ({ plan, status: "proposed" })),
+    diagnostics: [],
     evidence: acmeCapabilityEvidence().filter(({ reference }) =>
       plans.some((plan) => plan.evidence.some((item) => item.reference === reference))),
     release

@@ -36,6 +36,7 @@ function fixtureAnalysisResult(): AnalysisResult {
   const release = compileWebMcpRelease(plans);
   return {
     capabilities: plans.map((plan) => ({ plan, status: "proposed" })),
+    diagnostics: [],
     evidence: acmeCapabilityEvidence().filter(({ reference }) =>
       plans.some((plan) => plan.evidence.some((item) => item.reference === reference))),
     release

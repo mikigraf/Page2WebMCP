@@ -77,6 +77,7 @@ export function createOpenApiAnalysisAdapter(configuration: OpenApiAnalysisConfi
     const release = compileWebMcpRelease(compiled.plans);
     return {
       capabilities: release.manifest.plans.map((plan) => ({ plan, status: "proposed" as const })),
+      diagnostics: compiled.diagnostics.map((diagnostic) => ({ ...diagnostic })),
       evidence: [{ source: "openapi", content, reference }],
       release: {
         code: release.code,

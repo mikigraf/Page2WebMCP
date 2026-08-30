@@ -741,6 +741,38 @@ function csrfFor(operation: Record<string, unknown>): CapabilityPlan["authentica
   throw new OperationDiagnostic("CSRF_REVIEW_REQUIRED");
 }
 
+function canonicalPlanDiagnostic(
+  issues: ReadonlyArray<Readonly<{ message: string; path: PropertyKey[] }>>,
+): OperationDiagnostic {
+  const detail = issues.map(({ message }) => message).join("\n");
+  const paths = issues.map(({ path }) => path.map(String).join("."));
+  if (/request body|form-encoded/i.test(detail)) return new OperationDiagnostic("UNSUPPORTED_REQUEST_BODY");
+  if (/request header|request URL|request path|request mapping|input field|optional input|scalar input/i.test(detail)) {
+    return new OperationDiagnostic("UNSUPPORTED_PARAMETER_SERIALIZATION");
+  }
+  if (/CSRF/i.test(detail)) return new OperationDiagnostic("CSRF_REVIEW_REQUIRED");
+  if (/idempotency|mutation effects|risk tier|\bR3\b/i.test(detail)) return new OperationDiagnostic("EFFECT_REVIEW_REQUIRED");
+  if (/response|success|output field|content type|204|205/i.test(detail)) return new OperationDiagnostic("UNSUPPORTED_RESPONSE");
+  if (/schema|validation bound|maxLength|maxItems|properties/i.test(detail)) return new OperationDiagnostic("UNSUPPORTED_SCHEMA");
+  if (paths.some((path) => path.startsWith("schemas."))) return new OperationDiagnostic("UNSUPPORTED_SCHEMA");
+  if (paths.some((path) => path.startsWith("request.body"))) return new OperationDiagnostic("UNSUPPORTED_REQUEST_BODY");
+  if (paths.some((path) => path.startsWith("request."))) return new OperationDiagnostic("UNSUPPORTED_PARAMETER_SERIALIZATION");
+  if (paths.some((path) => path.startsWith("response.") || path.startsWith("success."))) {
+    return new OperationDiagnostic("UNSUPPORTED_RESPONSE");
+  }
+  if (paths.some((path) => path.startsWith("effects.") || path.startsWith("idempotency.")
+    || path.startsWith("confirmation.") || path.startsWith("annotations."))) {
+    return new OperationDiagnostic("EFFECT_REVIEW_REQUIRED");
+  }
+  if (paths.some((path) => path.startsWith("authentication."))) {
+    return new OperationDiagnostic("AUTHENTICATION_AMBIGUOUS");
+  }
+  if (paths.some((path) => path === "targetOrigin" || path === "testPageUrl")) {
+    return new OperationDiagnostic("SERVER_ORIGIN_MISMATCH");
+  }
+  return new OperationDiagnostic("MALFORMED_OPERATION");
+}
+
 function compileOperation(root: Record<string, unknown>, extracted: ExtractedOperation, options: OpenApiCompileOptions): PlanOperation {
   const method = extracted.method.toUpperCase();
   if (method !== "GET" && method !== "POST") throw new OperationDiagnostic("UNSUPPORTED_HTTP_METHOD");
@@ -798,11 +830,9 @@ function compileOperation(root: Record<string, unknown>, extracted: ExtractedOpe
     success: { adapter: "json_api", statusCodes: response.statusCodes, requiredOutputFields: [] },
     evidence: [{ source: "openapi", reference: options.evidenceReference }],
   };
-  try {
-    return { key: extracted.key, method, path: runtimeExtracted.path, plan: CapabilityPlanSchema.parse(plan) };
-  } catch {
-    throw new OperationDiagnostic("MALFORMED_OPERATION");
-  }
+  const parsed = CapabilityPlanSchema.safeParse(plan);
+  if (!parsed.success) throw canonicalPlanDiagnostic(parsed.error.issues);
+  return { key: extracted.key, method, path: runtimeExtracted.path, plan: parsed.data };
 }
 
 function compileOperations(document: OpenApiDocument, options: OpenApiCompileOptions): {

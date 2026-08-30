@@ -44,6 +44,7 @@ async function fixture(
     .filter((plan) => plan.tool.name !== "get_order_status");
   await repository.completeAnalysis("worker", run.id, {
     capabilities: persistedPlans.map((plan) => ({ plan, status: "proposed" as const })),
+    diagnostics: [],
     evidence,
     release: {
       code: candidate.code,
@@ -81,6 +82,7 @@ test("verification binds the reviewed complete plan, not a same-name shallow cap
     const planDigest = createHash("sha256").update(JSON.stringify(reviewedPlan)).digest("hex");
     const verification = deriveVerification("run-reviewed", "https://acme.example", {
       capabilities: [],
+      diagnostics: [],
       evidence: acmeCapabilityEvidence(),
       release: {
         code: candidate.code,
@@ -286,6 +288,7 @@ test("analysis ingestion rejects a worker artifact that downgrades vetted untrus
     .find((plan) => plan.tool.name === "get_order_status")!;
   await assert.rejects(repository.completeAnalysis("worker", run.id, {
     capabilities: [{ plan: reviewedPlan, status: "proposed" }],
+    diagnostics: [],
     evidence: acmeCapabilityEvidence().filter(({ reference }) => reference === reviewedPlan.evidence[0]!.reference),
     release: {
       code,

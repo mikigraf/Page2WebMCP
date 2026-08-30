@@ -70,8 +70,15 @@ export type CandidateRelease = {
   manifest?: unknown;
 };
 
+export type AnalysisDiagnostic = Readonly<{
+  code: string;
+  operationKey: string;
+  reason?: string;
+}>;
+
 export type AnalysisResult = {
   capabilities: Array<{ plan: CapabilityPlan; status: Pick<CapabilityRecord, "status">["status"] }>;
+  diagnostics: AnalysisDiagnostic[];
   evidence: AnalysisEvidence[];
   release: CandidateRelease;
   draftPullRequest?: { draft: boolean; url?: string; files?: string[] };
@@ -182,6 +189,36 @@ const MAX_PROJECTS = 500;
 const MAX_CAPABILITIES = 1_000;
 const MAX_AUDIT_EVENTS = 1_000;
 const MAX_RELEASE_BYTES = 64 * 1_024;
+const MAX_ANALYSIS_DIAGNOSTICS = 1_000;
+const MAX_ANALYSIS_DIAGNOSTIC_BYTES = 64 * 1_024;
+
+export function normalizeAnalysisDiagnostics(diagnostics: readonly AnalysisDiagnostic[]): AnalysisDiagnostic[] {
+  if (!Array.isArray(diagnostics) || diagnostics.length > MAX_ANALYSIS_DIAGNOSTICS) {
+    throw new RepositoryError("INVALID_STATE");
+  }
+  const allowedKeys = new Set(["code", "operationKey", "reason"]);
+  const normalized = diagnostics.map((diagnostic) => {
+    if (!diagnostic || typeof diagnostic !== "object"
+      || Object.keys(diagnostic).some((key) => !allowedKeys.has(key))
+      || typeof diagnostic.code !== "string" || !/^[A-Z][A-Z0-9_]{0,63}$/.test(diagnostic.code)
+      || typeof diagnostic.operationKey !== "string" || diagnostic.operationKey.length === 0
+      || diagnostic.operationKey.length > 2_048 || /[\u0000-\u001f\u007f]/.test(diagnostic.operationKey)
+      || diagnostic.reason !== undefined && (typeof diagnostic.reason !== "string"
+        || !/^[a-z][a-z0-9_]{0,63}$/.test(diagnostic.reason))) {
+      throw new RepositoryError("INVALID_STATE");
+    }
+    return diagnostic.reason === undefined
+      ? { code: diagnostic.code, operationKey: diagnostic.operationKey }
+      : { code: diagnostic.code, operationKey: diagnostic.operationKey, reason: diagnostic.reason };
+  }).sort((left, right) => compareCodePoints(left.operationKey, right.operationKey)
+    || compareCodePoints(left.code, right.code)
+    || compareCodePoints(left.reason ?? "", right.reason ?? ""));
+  if (new Set(normalized.map((diagnostic) => JSON.stringify(diagnostic))).size !== normalized.length
+    || Buffer.byteLength(JSON.stringify(normalized), "utf8") > MAX_ANALYSIS_DIAGNOSTIC_BYTES) {
+    throw new RepositoryError("INVALID_STATE");
+  }
+  return normalized;
+}
 
 export function capabilityStateDigest(
   capabilities: ReadonlyArray<Pick<CapabilityRecord,
@@ -417,6 +454,7 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
     }
     const sourcePlans = plansFromManifest(result.release.manifest);
     if (!sourcePlans || !equalPlanSets(sourcePlans, canonicalPlans)) throw new RepositoryError("INVALID_STATE");
+    const normalizedDiagnostics = normalizeAnalysisDiagnostics(result.diagnostics);
     const statuses = new Map(result.capabilities.map(({ plan, status }) => [plan.tool.name, status]));
     const expiresAt = new Date(this.clock().getTime() + IDEMPOTENCY_TTL_MS).toISOString();
     const normalizedEvidence = result.evidence.map((item) => normalizeEvidence(
@@ -436,6 +474,7 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
     const normalizedResult: AnalysisResult = {
       ...structuredClone(result),
       capabilities: canonicalPlans.map((plan) => ({ plan, status: statuses.get(plan.tool.name) ?? "proposed" })),
+      diagnostics: normalizedDiagnostics,
       evidence: normalizedEvidence,
       release: {
         ...structuredClone(result.release),

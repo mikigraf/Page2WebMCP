@@ -7,6 +7,7 @@ import {
 import {
   capabilityPlanDigest,
   capabilityStateDigest,
+  normalizeAnalysisDiagnostics,
   RepositoryError,
   type AnalysisResult,
   type AnalysisEvidence,
@@ -331,6 +332,7 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
     }
     const sourcePlans = plansFromManifest(result.release.manifest);
     if (!sourcePlans || !equalPlanSets(sourcePlans, canonicalPlans)) throw new RepositoryError("INVALID_STATE");
+    const normalizedDiagnostics = normalizeAnalysisDiagnostics(result.diagnostics);
     const statuses = new Map(result.capabilities.map(({ plan, status }) => [plan.tool.name, status]));
     return this.#transaction({ kind: "worker" }, async (client) => {
       const job = await client.query(
@@ -381,7 +383,7 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
       await client.query(
         "update public.analysis_runs set result = $2::jsonb, release_code = $3, release_hash = $4, " +
         "allowed_origin = $5, release_manifest = $6::jsonb, error_code = null, updated_at = now() where id = $1",
-        [runId, JSON.stringify({ draftPullRequest: result.draftPullRequest }), result.release.code, releaseHash,
+        [runId, JSON.stringify({ diagnostics: normalizedDiagnostics, draftPullRequest: result.draftPullRequest }), result.release.code, releaseHash,
           result.release.allowedOrigin, JSON.stringify(result.release.manifest ?? {})]
       );
       const completed = await client.query(
@@ -437,10 +439,14 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
         "and expires_at > now() order by created_at, id limit $3",
         [runId, actor.organizationId, MAX_EVIDENCE]
       );
-      const stored = run.rows[0].result as { draftPullRequest?: AnalysisResult["draftPullRequest"] } | null;
+      const stored = run.rows[0].result as {
+        diagnostics?: AnalysisResult["diagnostics"];
+        draftPullRequest?: AnalysisResult["draftPullRequest"];
+      } | null;
       return {
         capabilities: capabilities.rows.map((row) => ({ plan: row.plan as CapabilityPlan,
           status: row.status as CapabilityRecord["status"] })),
+        diagnostics: normalizeAnalysisDiagnostics(stored?.diagnostics ?? []),
         evidence: evidence.rows.map(mapEvidence),
         release: { code: String(run.rows[0].release_code), contentHash: String(run.rows[0].release_hash),
           allowedOrigin: String(run.rows[0].allowed_origin), manifest: run.rows[0].release_manifest },

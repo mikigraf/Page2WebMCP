@@ -184,6 +184,21 @@ test("diagnoses cookie parameters, unsupported schema constraints, and recursive
   assert.deepEqual(result.plans, []);
 });
 
+test("preserves a precise diagnostic when canonical plan validation rejects case-colliding headers", () => {
+  const result = compileOpenApi({ openapi: "3.1.0", paths: { "/widgets": { get: {
+    parameters: [
+      { in: "header", name: "X-Trace", required: true, schema: { type: "string", maxLength: 20 } },
+      { in: "header", name: "x-trace", required: true, schema: { type: "string", maxLength: 20 } },
+    ],
+    responses: { "200": { description: "ok", content: { "application/json": { schema: { type: "boolean" } } } } },
+  } } } }, compileOptions);
+  assert.deepEqual(result.plans, []);
+  assert.deepEqual(result.diagnostics, [{
+    code: "UNSUPPORTED_PARAMETER_SERIALIZATION",
+    operationKey: "GET /widgets",
+  }]);
+});
+
 test("rejects Reference Objects with behavior-changing siblings", () => {
   const document = {
     openapi: "3.1.0",
