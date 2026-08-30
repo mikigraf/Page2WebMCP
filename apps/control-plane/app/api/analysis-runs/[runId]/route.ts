@@ -16,11 +16,11 @@ export async function GET(
 ) {
   const requestId = createRequestId();
   try {
-    const actor = requireActor(request);
+    const repository = getControlPlaneRepository();
+    const actor = await requireActor(request, repository);
     const { runId: rawRunId } = await context.params;
     const parsed = RunIdSchema.safeParse(rawRunId);
     if (!parsed.success) throw new ApiError("NOT_FOUND", 404);
-    const repository = getControlPlaneRepository();
     const run = await repository.getAnalysis(actor, parsed.data);
     const result = run.status === "succeeded"
       ? await repository.getAnalysisResult(actor, run.id)

@@ -2,16 +2,15 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { GET as getRun } from "../app/api/analysis-runs/[runId]/route.ts";
 import { POST as analyze } from "../app/api/projects/analyze/route.ts";
-import { authenticate, issueSession } from "../src/auth.ts";
 import { InMemoryControlPlaneRepository } from "../../../packages/database/src/control-plane.ts";
-import { setControlPlaneRepositoryForTest } from "../../../packages/database/src/factory.ts";
 import { compileWebMcpRelease } from "../../../packages/compiler/src/compiler.ts";
 import { acmeCapabilityEvidence, acmeCapabilityPlans } from "../../acme-support/src/capability-plans.ts";
 import { setAnalysisAdapterForTest } from "../../worker/src/runner.ts";
 import { createOpenApiAnalysisAdapter } from "../../worker/src/workflow.ts";
+import { authenticatedHeaders, installTestRepository, owner as actor } from "./auth-test-helpers.ts";
 
-const actor = authenticate("owner@example.test", "fixture-password")!;
-const cookie = `page2webmcp_session=${issueSession(actor)}`;
+const authHeaders = authenticatedHeaders(actor);
+const cookie = authHeaders.cookie;
 
 const fixtureAnalysisAdapter = async (source: Parameters<NonNullable<Parameters<typeof setAnalysisAdapterForTest>[0]>>[0]) => {
   const origin = source.sourceType === "github" ? "https://acme.example" : new URL(source.sourceUrl).origin;
@@ -48,7 +47,8 @@ function analysisRequest(projectId: string, key: string, sessionCookie = cookie)
     method: "POST",
     headers: {
       cookie: sessionCookie,
-      origin: "https://control.example",
+      ...authHeaders,
+      ...(sessionCookie === cookie ? {} : { cookie: sessionCookie }),
       "content-type": "application/json",
       "idempotency-key": key
     },
@@ -59,7 +59,7 @@ function analysisRequest(projectId: string, key: string, sessionCookie = cookie)
 for (const sourceType of ["website", "openapi", "github"] as const) {
   test(`analysis is bound to the persisted ${sourceType} project and exposes durable run state`, async () => {
     const repository = new InMemoryControlPlaneRepository();
-    setControlPlaneRepositoryForTest(repository);
+    installTestRepository(repository);
     const project = await createFixtureProject(repository, sourceType);
 
     const response = await analyze(analysisRequest(project.id, `analysis-${sourceType}`));
@@ -118,7 +118,7 @@ test("mixed OpenAPI analysis preserves unsupported-operation diagnostics through
     },
   });
   const repository = new InMemoryControlPlaneRepository();
-  setControlPlaneRepositoryForTest(repository);
+  installTestRepository(repository);
   setAnalysisAdapterForTest(mixedAdapter);
   try {
     const project = await repository.createProject(actor, {
@@ -172,7 +172,7 @@ test("all-unsupported OpenAPI analysis exposes exact diagnostics without an inve
     },
   });
   const repository = new InMemoryControlPlaneRepository();
-  setControlPlaneRepositoryForTest(repository);
+  installTestRepository(repository);
   setAnalysisAdapterForTest(unsupportedAdapter);
   try {
     const project = await repository.createProject(actor, {
@@ -206,13 +206,13 @@ test("all-unsupported OpenAPI analysis exposes exact diagnostics without an inve
 
 test("analysis requires authentication and an idempotency key", async () => {
   const repository = new InMemoryControlPlaneRepository();
-  setControlPlaneRepositoryForTest(repository);
+  installTestRepository(repository);
   const project = await createFixtureProject(repository, "website");
   assert.equal((await analyze(analysisRequest(project.id, "anonymous", ""))).status, 401);
 
   const missingKey = new Request("https://control.example/api/projects/analyze", {
     method: "POST",
-    headers: { cookie, origin: "https://control.example", "content-type": "application/json" },
+    headers: { ...authHeaders, "content-type": "application/json" },
     body: JSON.stringify({ projectId: project.id })
   });
   const response = await analyze(missingKey);
@@ -222,7 +222,7 @@ test("analysis requires authentication and an idempotency key", async () => {
 
 test("duplicate analysis requests return the original run", async () => {
   const repository = new InMemoryControlPlaneRepository();
-  setControlPlaneRepositoryForTest(repository);
+  installTestRepository(repository);
   const project = await createFixtureProject(repository, "openapi");
   const first = await analyze(analysisRequest(project.id, "same-analysis"));
   const second = await analyze(analysisRequest(project.id, "same-analysis"));
@@ -231,7 +231,7 @@ test("duplicate analysis requests return the original run", async () => {
 
 test("fixture execution drains earlier queued work until the requested run completes", async () => {
   const repository = new InMemoryControlPlaneRepository();
-  setControlPlaneRepositoryForTest(repository);
+  installTestRepository(repository);
   const earlier = await createFixtureProject(repository, "website");
   await repository.enqueueAnalysis(actor, {
     projectId: earlier.id,

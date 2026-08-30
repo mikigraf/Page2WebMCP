@@ -2,11 +2,10 @@ import { z } from "zod";
 import { getControlPlaneRepository } from "../../../../../../../packages/database/src/factory.ts";
 import {
   ApiError,
-  assertSameOrigin,
   createRequestId,
   errorResponse,
   parseJsonBody,
-  requireActor,
+  requireMutationActor,
   successResponse
 } from "../../../../../src/api.ts";
 import { publishPersistedRelease } from "../../../../../src/releases.ts";
@@ -23,8 +22,8 @@ export async function POST(
   const requestId = createRequestId();
   const startedAt = Date.now();
   try {
-    assertSameOrigin(request);
-    const actor = requireActor(request);
+    const repository = getControlPlaneRepository();
+    const actor = await requireMutationActor(request, repository);
     const input = await parseJsonBody(request, PublishInputSchema);
     const { projectId: rawProjectId } = await context.params;
     const projectId = ProjectIdSchema.safeParse(rawProjectId);
@@ -32,7 +31,7 @@ export async function POST(
     const idempotencyKey = request.headers.get("idempotency-key") ?? "";
     if (!IDEMPOTENCY_KEY.test(idempotencyKey)) throw new ApiError("IDEMPOTENCY_KEY_REQUIRED", 400);
     const release = await publishPersistedRelease(
-      getControlPlaneRepository(),
+      repository,
       actor,
       projectId.data,
       input.analysisRunId,

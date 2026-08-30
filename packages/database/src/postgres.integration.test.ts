@@ -41,6 +41,41 @@ function releaseCandidate(code: string, selectedPlans = plans("find_order"), all
   };
 }
 
+test("Postgres personal organization provisioning converges and revoked sessions fail closed", {
+  skip: !connectionString || !adminConnectionString
+}, async () => {
+  const userId = "66666666-6666-4666-8666-666666666666";
+  const sessionId = "66666666-aaaa-4aaa-8aaa-666666666666";
+  const admin = new pg.Pool({ connectionString: adminConnectionString!, max: 1 });
+  const repository = createPostgresRepository({ connectionString: connectionString!, maxConnections: 5 });
+  try {
+    await admin.query(
+      "insert into auth.users (id, email, email_confirmed_at) values ($1, $2, now()) on conflict (id) do update set email_confirmed_at = now()",
+      [userId, "concurrent@example.test"]
+    );
+    await admin.query(
+      "insert into auth.sessions (id, user_id, not_after) values ($1, $2, now() + interval '1 hour') on conflict (id) do update set not_after = excluded.not_after",
+      [sessionId, userId]
+    );
+    const actors = await Promise.all(Array.from({ length: 12 }, () =>
+      repository.provisionPersonalOrganization({ id: userId, email: "concurrent@example.test" })));
+    assert.equal(new Set(actors.map(({ organizationId }) => organizationId)).size, 1);
+    assert.equal(actors.every(({ role }) => role === "owner"), true);
+    assert.deepEqual(await repository.resolveActor(userId, undefined, sessionId), actors[0]);
+
+    await admin.query("delete from auth.sessions where id = $1", [sessionId]);
+    await assert.rejects(repository.resolveActor(userId, undefined, sessionId), (error: unknown) =>
+      error instanceof RepositoryError && error.code === "SESSION_REVOKED");
+  } finally {
+    await admin.query("delete from public.memberships where user_id = $1", [userId]);
+    await admin.query("delete from public.organizations where personal_owner_user_id = $1", [userId]);
+    await admin.query("delete from auth.sessions where user_id = $1", [userId]);
+    await admin.query("delete from auth.users where id = $1", [userId]);
+    await repository.close();
+    await admin.end();
+  }
+});
+
 test("Postgres repository persists and recovers the fixture lifecycle", { skip: !connectionString }, async () => {
   const pool = new pg.Pool({ connectionString, max: 2 });
   const role = await pool.query(

@@ -5,13 +5,11 @@ import { validateRuntimeConfiguration, validateWorkerRuntimeConfiguration } from
 const production = {
   NODE_ENV: "production",
   PAGE2WEBMCP_SESSION_SECRET: "a-production-session-secret-with-32-bytes",
-  PAGE2WEBMCP_OWNER_PASSWORD: "a-production-owner-password-with-32-bytes",
-  PAGE2WEBMCP_EDITOR_PASSWORD: "a-production-editor-password-with-32-bytes",
+  NEXT_PUBLIC_SUPABASE_URL: "https://auth.example",
+  NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: "sb_publishable_safe-public-key-value",
   PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN: "https://control.example",
   PAGE2WEBMCP_STORAGE_MODE: "postgres",
-  DATABASE_URL: "postgresql://database.example/page2webmcp",
-  PAGE2WEBMCP_FIXTURE_APP_URL: "https://acme.example",
-  PAGE2WEBMCP_FIXTURE_GITHUB_URL: "https://github.com/acme/support"
+  DATABASE_URL: "postgresql://database.example/page2webmcp"
 };
 
 test("production configuration requires a strong session secret and durable database", () => {
@@ -46,17 +44,29 @@ test("production memory storage is restricted to an explicit ephemeral-test over
   }), /EPHEMERAL_STORAGE_FORBIDDEN/);
 });
 
-test("production never accepts the committed fixture passwords or one shared credential", () => {
+test("production requires public Supabase configuration and rejects browser-exposed secret keys", () => {
+  const serviceRoleJwt = [
+    Buffer.from(JSON.stringify({ alg: "HS256", typ: "JWT" })).toString("base64url"),
+    Buffer.from(JSON.stringify({ role: "service_role", ref: "project" })).toString("base64url"),
+    "unsafe-signature-value"
+  ].join(".");
   assert.throws(
-    () => validateRuntimeConfiguration({ ...production, PAGE2WEBMCP_OWNER_PASSWORD: "" }),
-    /AUTH_CREDENTIALS_REQUIRED/
+    () => validateRuntimeConfiguration({ ...production, NEXT_PUBLIC_SUPABASE_URL: "" }),
+    /SUPABASE_CONFIGURATION_REQUIRED/
   );
   assert.throws(
     () => validateRuntimeConfiguration({
       ...production,
-      PAGE2WEBMCP_EDITOR_PASSWORD: production.PAGE2WEBMCP_OWNER_PASSWORD
+      NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: "sb_secret_this-must-never-enter-browser-code"
     }),
-    /AUTH_CREDENTIALS_MUST_DIFFER/
+    /SUPABASE_CONFIGURATION_REQUIRED/
+  );
+  assert.throws(
+    () => validateRuntimeConfiguration({
+      ...production,
+      NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: serviceRoleJwt
+    }),
+    /SUPABASE_CONFIGURATION_REQUIRED/
   );
 });
 
@@ -86,18 +96,10 @@ test("production requires an exact HTTPS public origin for CSRF validation", () 
   }));
 });
 
-test("fixture source configuration remains exact and HTTPS", () => {
+test("live provider mode remains fail closed until explicit controls are configured", () => {
   assert.throws(
     () => validateRuntimeConfiguration({ ...production, PAGE2WEBMCP_PROVIDER_MODE: "live" }),
     /LIVE_PROVIDER_UNSUPPORTED/
-  );
-  assert.throws(
-    () => validateRuntimeConfiguration({ ...production, PAGE2WEBMCP_FIXTURE_APP_URL: "http://localhost:3200" }),
-    /INVALID_FIXTURE_APP_URL/
-  );
-  assert.throws(
-    () => validateRuntimeConfiguration({ ...production, PAGE2WEBMCP_FIXTURE_GITHUB_URL: "https://gitlab.example/acme/support" }),
-    /INVALID_FIXTURE_GITHUB_URL/
   );
 });
 
@@ -120,8 +122,6 @@ test("the standalone worker fails before polling without durable storage", () =>
   assert.doesNotThrow(() => validateWorkerRuntimeConfiguration({
     PAGE2WEBMCP_STORAGE_MODE: "postgres",
     PAGE2WEBMCP_PROVIDER_MODE: "local",
-    DATABASE_URL: "postgresql://database.example/page2webmcp",
-    PAGE2WEBMCP_FIXTURE_APP_URL: "https://acme.example",
-    PAGE2WEBMCP_FIXTURE_GITHUB_URL: "https://github.com/acme/support"
+    DATABASE_URL: "postgresql://database.example/page2webmcp"
   }));
 });

@@ -5,11 +5,10 @@ import { getControlPlaneRepository } from "../../../../../../packages/database/s
 import { processNextAnalysis } from "../../../../../worker/src/runner.ts";
 import {
   ApiError,
-  assertSameOrigin,
   createRequestId,
   errorResponse,
   parseJsonBody,
-  requireActor,
+  requireMutationActor,
   successResponse
 } from "../../../../src/api.ts";
 
@@ -19,13 +18,12 @@ const IDEMPOTENCY_KEY = /^[a-zA-Z0-9._:-]{8,128}$/;
 export async function POST(request: Request) {
   const requestId = createRequestId();
   try {
-    assertSameOrigin(request);
-    const actor = requireActor(request);
+    const repository = getControlPlaneRepository();
+    const actor = await requireMutationActor(request, repository);
     const input = await parseJsonBody(request, AnalyzeInputSchema);
     const idempotencyKey = request.headers.get("idempotency-key") ?? "";
     if (!IDEMPOTENCY_KEY.test(idempotencyKey)) throw new ApiError("IDEMPOTENCY_KEY_REQUIRED", 400);
 
-    const repository = getControlPlaneRepository();
     await repository.getProject(actor, input.projectId);
     const inputHash = createHash("sha256").update(JSON.stringify(input)).digest("hex");
     const run = await repository.enqueueAnalysis(actor, {

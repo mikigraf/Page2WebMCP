@@ -9,6 +9,14 @@ task_initdb="$task_pg_bindir/initdb"
 task_pg_ctl="$task_pg_bindir/pg_ctl"
 task_psql="$task_pg_bindir/psql"
 
+run_typescript_test() {
+  if [[ "${PAGE2WEBMCP_NATIVE_TYPESCRIPT_TESTS:-false}" == "true" ]]; then
+    "${PAGE2WEBMCP_NODE_BINARY:-node}" --experimental-transform-types --test "$@"
+  else
+    pnpm exec tsx --test "$@"
+  fi
+}
+
 cleanup() {
   "$task_pg_ctl" -D "$task_data_dir" -m immediate stop >/dev/null 2>&1 || true
   rm -rf "$task_tmp_dir"
@@ -18,7 +26,7 @@ trap cleanup EXIT
 "$task_initdb" -D "$task_data_dir" --auth=trust --no-locale >/dev/null
 "$task_pg_ctl" -D "$task_data_dir" -o "-k $task_tmp_dir -p $task_port" -w start >/dev/null
 
-"$task_psql" -h "$task_tmp_dir" -p "$task_port" -d postgres -v ON_ERROR_STOP=1 -c "create schema auth; create table auth.users (id uuid primary key, email text not null); create function auth.uid() returns uuid language sql stable as 'select nullif(current_setting(''request.jwt.claim.sub'', true), '''')::uuid'; create role anon nologin; create role authenticated nologin;"
+"$task_psql" -h "$task_tmp_dir" -p "$task_port" -d postgres -v ON_ERROR_STOP=1 -c "create extension if not exists pgcrypto; create schema auth; create table auth.users (id uuid primary key, email text not null, email_confirmed_at timestamptz); create table auth.sessions (id uuid primary key, user_id uuid not null references auth.users(id), not_after timestamptz); create function auth.uid() returns uuid language sql stable as 'select nullif(current_setting(''request.jwt.claim.sub'', true), '''')::uuid'; create role anon nologin; create role authenticated nologin;"
 for migration in supabase/migrations/*.sql; do
   "$task_psql" -h "$task_tmp_dir" -p "$task_port" -d postgres -v ON_ERROR_STOP=1 -f "$migration"
   if [[ "$(basename "$migration")" == "20260826000000_page2webmcp.sql" ]]; then
@@ -158,16 +166,18 @@ done
    grant page2webmcp_app, page2webmcp_worker to page2webmcp_test_runtime;
    grant page2webmcp_app to page2webmcp_test_app;
    grant page2webmcp_worker to page2webmcp_test_worker;"
+"$task_psql" -h "$task_tmp_dir" -p "$task_port" -d postgres -v ON_ERROR_STOP=1 -f supabase/tests/auth_identity_standalone.sql
 "$task_psql" -h "$task_tmp_dir" -p "$task_port" -d postgres -v ON_ERROR_STOP=1 -f supabase/tests/tenant_isolation_standalone.sql
 "$task_psql" -h "$task_tmp_dir" -p "$task_port" -d postgres -v ON_ERROR_STOP=1 -f supabase/tests/retention_standalone.sql
 
 PAGE2WEBMCP_TEST_DATABASE_URL="postgresql://page2webmcp_test_runtime@127.0.0.1:$task_port/postgres?host=$task_tmp_dir" \
 PAGE2WEBMCP_TEST_ADMIN_DATABASE_URL="postgresql://127.0.0.1:$task_port/postgres?host=$task_tmp_dir" \
-  pnpm exec tsx --test packages/database/src/postgres.integration.test.ts
+  run_typescript_test packages/database/src/postgres.integration.test.ts
 
 NODE_ENV=test \
 PAGE2WEBMCP_TEST_APP_DATABASE_URL="postgresql://page2webmcp_test_app@127.0.0.1:$task_port/postgres?host=$task_tmp_dir" \
 PAGE2WEBMCP_TEST_WORKER_DATABASE_URL="postgresql://page2webmcp_test_worker@127.0.0.1:$task_port/postgres?host=$task_tmp_dir" \
-  pnpm exec tsx --test apps/control-plane/tests/postgres-topology.integration.test.ts
+PAGE2WEBMCP_TEST_ADMIN_DATABASE_URL="postgresql://127.0.0.1:$task_port/postgres?host=$task_tmp_dir" \
+  run_typescript_test apps/control-plane/tests/postgres-topology.integration.test.ts
 
 echo "Standalone PostgreSQL RLS and production-topology integration tests passed."

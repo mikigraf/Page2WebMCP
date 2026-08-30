@@ -30,6 +30,7 @@ import {
 
 export type RepositoryRole = "owner" | "editor" | "viewer";
 export type RepositoryActor = { id: string; organizationId: string; role: RepositoryRole };
+export type AuthenticatedIdentity = { id: string; email?: string };
 export type SourceType = "website" | "openapi" | "github";
 
 export type ProjectRecord = {
@@ -158,6 +159,8 @@ export type CreateProjectRequest = {
   sourceType: SourceType;
   url: string;
 } & IdempotencyInput;
+export type ProjectPageRequest = Readonly<{ limit?: number; cursor?: string }>;
+export type ProjectPage = Readonly<{ projects: ProjectRecord[]; nextCursor?: string }>;
 export type IdempotentRequest = { projectId: string } & IdempotencyInput;
 export type VerificationRequest = Omit<
   VerificationRecord,
@@ -180,7 +183,10 @@ export type RepositoryErrorCode =
   | "INVALID_STATE"
   | "LEASE_LOST"
   | "CANCELLED"
-  | "WAIT_EXPIRED";
+  | "WAIT_EXPIRED"
+  | "MEMBERSHIP_REQUIRED"
+  | "INVALID_CURSOR"
+  | "SESSION_REVOKED";
 
 export class RepositoryError extends Error {
   constructor(readonly code: RepositoryErrorCode, readonly details?: string[]) {
@@ -190,9 +196,13 @@ export class RepositoryError extends Error {
 }
 
 export interface ControlPlaneRepository extends WorkflowRepository {
+  provisionPersonalOrganization(identity: AuthenticatedIdentity): Promise<RepositoryActor>;
+  resolveActor(identityId: string, organizationId?: string, sessionId?: string): Promise<RepositoryActor>;
   createProject(actor: RepositoryActor, input: CreateProjectRequest): Promise<ProjectRecord>;
   listProjects(actor: RepositoryActor): Promise<ProjectRecord[]>;
+  listProjectsPage(actor: RepositoryActor, input?: ProjectPageRequest): Promise<ProjectPage>;
   getProject(actor: RepositoryActor, id: string): Promise<ProjectRecord>;
+  getLatestAnalysis(actor: RepositoryActor, projectId: string): Promise<AnalysisRunRecord | undefined>;
   enqueueAnalysis(actor: RepositoryActor, input: IdempotentRequest): Promise<AnalysisRunRecord>;
   getAnalysis(actor: RepositoryActor, id: string): Promise<AnalysisRunRecord>;
   claimAnalysis(workerId: string, leaseMs: number): Promise<ClaimedAnalysisRunRecord | undefined>;
@@ -227,7 +237,7 @@ type InMemoryRepositoryOptions = Readonly<{
 }>;
 
 const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1_000;
-const MAX_PROJECTS = 500;
+const MAX_PROJECT_PAGE_SIZE = 100;
 const MAX_CAPABILITIES = 1_000;
 const MAX_AUDIT_EVENTS = 1_000;
 const MAX_RELEASE_BYTES = 64 * 1_024;
@@ -298,6 +308,8 @@ function releaseFailures(input: VerificationRequest): string[] {
 }
 
 export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
+  readonly #personalOrganizations = new Map<string, { id: string; name: string }>();
+  readonly #memberships = new Map<string, RepositoryActor>();
   readonly #projects = new Map<string, ProjectRecord>();
   readonly #runs = new Map<string, AnalysisRunRecord>();
   readonly #results = new Map<string, AnalysisResult>();
@@ -330,6 +342,45 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
 
   #now(): string {
     return this.clock().toISOString();
+  }
+
+  async provisionPersonalOrganization(identity: AuthenticatedIdentity): Promise<RepositoryActor> {
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(identity.id)) {
+      throw new RepositoryError("MEMBERSHIP_REQUIRED");
+    }
+    let organization = this.#personalOrganizations.get(identity.id);
+    if (!organization) {
+      const localPart = identity.email?.split("@", 1)[0]?.trim().slice(0, 80);
+      organization = { id: randomUUID(), name: localPart ? `${localPart}'s workspace` : "Personal workspace" };
+      this.#personalOrganizations.set(identity.id, organization);
+    }
+    const key = `${organization.id}:${identity.id}`;
+    const actor = this.#memberships.get(key) ?? {
+      id: identity.id,
+      organizationId: organization.id,
+      role: "owner" as const
+    };
+    this.#memberships.set(key, actor);
+    return copy(actor);
+  }
+
+  async resolveActor(identityId: string, organizationId?: string, sessionId?: string): Promise<RepositoryActor> {
+    void sessionId; // The in-memory repository has no Supabase session table; production Postgres validates it.
+    const personal = this.#personalOrganizations.get(identityId);
+    const selectedOrganization = organizationId ?? personal?.id;
+    const matches = [...this.#memberships.values()]
+      .filter((membership) => membership.id === identityId
+        && (!selectedOrganization || membership.organizationId === selectedOrganization))
+      .sort((left, right) => compareCodePoints(left.organizationId, right.organizationId));
+    if (matches.length === 0) throw new RepositoryError("MEMBERSHIP_REQUIRED");
+    return copy(matches[0]!);
+  }
+
+  /** Explicit hermetic-test setup hook; production identity still uses resolveActor. */
+  seedMembershipForTest(actor: RepositoryActor): void {
+    if (process.env.NODE_ENV === "production") throw new Error("TEST_MEMBERSHIP_OVERRIDE_FORBIDDEN");
+    this.#personalOrganizations.set(actor.id, { id: actor.organizationId, name: "Hermetic test workspace" });
+    this.#memberships.set(`${actor.organizationId}:${actor.id}`, copy(actor));
   }
 
   #assertProject(actor: RepositoryActor, id: string): ProjectRecord {
@@ -547,12 +598,37 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
     return [...this.#projects.values()]
       .filter((project) => project.organizationId === actor.organizationId)
       .sort((left, right) => compareCodePoints(left.createdAt, right.createdAt) || compareCodePoints(left.id, right.id))
-      .slice(0, MAX_PROJECTS)
       .map(copy);
+  }
+
+  async listProjectsPage(actor: RepositoryActor, input: ProjectPageRequest = {}): Promise<ProjectPage> {
+    const limit = input.limit ?? 50;
+    if (!Number.isInteger(limit) || limit < 1 || limit > MAX_PROJECT_PAGE_SIZE) {
+      throw new RepositoryError("INVALID_CURSOR");
+    }
+    const cursor = input.cursor ? decodeProjectCursor(input.cursor) : undefined;
+    const candidates = [...this.#projects.values()]
+      .filter((project) => project.organizationId === actor.organizationId)
+      .sort((left, right) => compareCodePoints(left.createdAt, right.createdAt) || compareCodePoints(left.id, right.id))
+      .filter((project) => !cursor || compareProjectPosition(project, cursor) > 0);
+    const page = candidates.slice(0, limit);
+    const hasMore = candidates.length > limit;
+    return {
+      projects: page.map(copy),
+      ...(hasMore && page.length > 0 ? { nextCursor: encodeProjectCursor(page[page.length - 1]!) } : {})
+    };
   }
 
   async getProject(actor: RepositoryActor, id: string): Promise<ProjectRecord> {
     return copy(this.#assertProject(actor, id));
+  }
+
+  async getLatestAnalysis(actor: RepositoryActor, projectId: string): Promise<AnalysisRunRecord | undefined> {
+    this.#assertProject(actor, projectId);
+    const run = [...this.#runs.values()]
+      .filter((candidate) => candidate.projectId === projectId && candidate.organizationId === actor.organizationId)
+      .sort((left, right) => compareCodePoints(right.createdAt, left.createdAt) || compareCodePoints(right.id, left.id))[0];
+    return run ? copy(run) : undefined;
   }
 
   async enqueueAnalysis(actor: RepositoryActor, input: IdempotentRequest): Promise<AnalysisRunRecord> {
@@ -1320,7 +1396,7 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
     const capability = this.#capabilities.get(capabilityId);
     if (!capability || capability.organizationId !== actor.organizationId) throw new RepositoryError("NOT_FOUND");
     if (capability.version !== input.expectedVersion) throw new RepositoryError("VERSION_CONFLICT");
-    if (input.action === "approve" && capability.riskTier !== "R0" && actor.role !== "owner") {
+    if (input.action === "approve" && capability.riskTier === "R2" && actor.role !== "owner") {
       throw new RepositoryError("OWNER_APPROVAL_REQUIRED");
     }
     if (input.action === "approve") {
@@ -1522,6 +1598,8 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
   }
 
   async reset(): Promise<void> {
+    this.#personalOrganizations.clear();
+    this.#memberships.clear();
     this.#projects.clear();
     this.#runs.clear();
     this.#results.clear();
@@ -1655,6 +1733,37 @@ function canonicalJson(value: unknown): string {
 
 function compareCodePoints(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
+}
+
+type ProjectCursor = Readonly<{ createdAt: string; id: string }>;
+
+function compareProjectPosition(project: ProjectRecord, cursor: ProjectCursor): number {
+  return compareCodePoints(project.createdAt, cursor.createdAt) || compareCodePoints(project.id, cursor.id);
+}
+
+function encodeProjectCursor(project: ProjectRecord): string {
+  return Buffer.from(JSON.stringify({ createdAt: project.createdAt, id: project.id })).toString("base64url");
+}
+
+function decodeProjectCursor(value: string): ProjectCursor {
+  if (!/^[A-Za-z0-9_-]{8,512}$/.test(value)) throw new RepositoryError("INVALID_CURSOR");
+  try {
+    const parsed = JSON.parse(Buffer.from(value, "base64url").toString("utf8")) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)
+      || Object.keys(parsed).sort(compareCodePoints).join(",") !== "createdAt,id") {
+      throw new RepositoryError("INVALID_CURSOR");
+    }
+    const cursor = parsed as { createdAt?: unknown; id?: unknown };
+    if (typeof cursor.createdAt !== "string" || !Number.isFinite(Date.parse(cursor.createdAt))
+      || typeof cursor.id !== "string"
+      || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(cursor.id)) {
+      throw new RepositoryError("INVALID_CURSOR");
+    }
+    return { createdAt: new Date(cursor.createdAt).toISOString(), id: cursor.id };
+  } catch (error) {
+    if (error instanceof RepositoryError) throw error;
+    throw new RepositoryError("INVALID_CURSOR");
+  }
 }
 
 function stableHash(value: string): string {

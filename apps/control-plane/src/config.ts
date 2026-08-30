@@ -1,12 +1,11 @@
+import { unsafeSupabaseBrowserKey } from "./supabase-config.ts";
+
 type RuntimeEnvironment = Record<string, string | undefined>;
 
 export function validateRuntimeConfiguration(environment: RuntimeEnvironment = process.env): void {
   if (environment.NODE_ENV !== "production") return;
   if ((environment.PAGE2WEBMCP_SESSION_SECRET?.length ?? 0) < 32) throw new Error("SESSION_SECRET_REQUIRED");
-  const ownerPassword = environment.PAGE2WEBMCP_OWNER_PASSWORD ?? "";
-  const editorPassword = environment.PAGE2WEBMCP_EDITOR_PASSWORD ?? "";
-  if (ownerPassword.length < 32 || editorPassword.length < 32) throw new Error("AUTH_CREDENTIALS_REQUIRED");
-  if (ownerPassword === editorPassword) throw new Error("AUTH_CREDENTIALS_MUST_DIFFER");
+  validateSupabaseConfiguration(environment);
   const publicOrigin = exactUrl(environment.PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN ?? "");
   const permitsHttp = environment.PAGE2WEBMCP_TEST_MODE === "true";
   if (!publicOrigin
@@ -38,13 +37,25 @@ function validateSharedRuntimeConfiguration(environment: RuntimeEnvironment, all
     throw new Error("INVALID_STORAGE_MODE");
   }
 
-  const fixtureApp = exactUrl(environment.PAGE2WEBMCP_FIXTURE_APP_URL ?? "https://acme.example");
-  if (!fixtureApp || fixtureApp.protocol !== "https:" || fixtureApp.origin !== fixtureApp.toString().replace(/\/$/, "")) {
-    throw new Error("INVALID_FIXTURE_APP_URL");
+}
+
+function validateSupabaseConfiguration(environment: RuntimeEnvironment): void {
+  const url = exactUrl(environment.NEXT_PUBLIC_SUPABASE_URL ?? "");
+  const key = environment.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY
+    ?? environment.NEXT_PUBLIC_SUPABASE_ANON_KEY
+    ?? "";
+  const permitsHttp = environment.PAGE2WEBMCP_TEST_MODE === "true";
+  if (!url || url.origin !== url.toString().replace(/\/$/, "")
+    || (url.protocol !== "https:" && !(permitsHttp && url.protocol === "http:"))
+    || key.length < 20 || unsafeSupabaseBrowserKey(key)) {
+    throw new Error("SUPABASE_CONFIGURATION_REQUIRED");
   }
-  const fixtureGithub = exactUrl(environment.PAGE2WEBMCP_FIXTURE_GITHUB_URL ?? "https://github.com/acme/support");
-  if (!fixtureGithub || fixtureGithub.protocol !== "https:" || fixtureGithub.hostname !== "github.com") {
-    throw new Error("INVALID_FIXTURE_GITHUB_URL");
+  for (const [name, value] of Object.entries(environment)) {
+    if (name.startsWith("NEXT_PUBLIC_") && name.includes("SUPABASE")
+      && /(?:KEY|TOKEN|SECRET)$/.test(name) && value
+      && unsafeSupabaseBrowserKey(value)) {
+      throw new Error("SUPABASE_SECRET_EXPOSURE_BLOCKED");
+    }
   }
 }
 

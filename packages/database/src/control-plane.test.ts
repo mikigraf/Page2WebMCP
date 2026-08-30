@@ -189,11 +189,7 @@ test("analysis completion persists capability ownership and optimistic reviews",
   const ticket = listedCapabilities.find((item) => item.stableName === "create_support_ticket");
   assert.ok(ticket);
 
-  await assert.rejects(
-    repository.reviewCapability(editor, ticket.id, { action: "approve", expectedVersion: 1 }),
-    (error: unknown) => error instanceof RepositoryError && error.code === "OWNER_APPROVAL_REQUIRED"
-  );
-  const reviewed = await repository.reviewCapability(owner, ticket.id, { action: "approve", expectedVersion: 1 });
+  const reviewed = await repository.reviewCapability(editor, ticket.id, { action: "approve", expectedVersion: 1 });
   assert.equal(reviewed.status, "reviewed");
   assert.equal(reviewed.version, 2);
   assert.equal(

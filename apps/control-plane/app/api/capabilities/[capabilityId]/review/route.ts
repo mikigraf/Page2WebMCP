@@ -2,11 +2,10 @@ import { z } from "zod";
 import { getControlPlaneRepository } from "../../../../../../../packages/database/src/factory.ts";
 import {
   ApiError,
-  assertSameOrigin,
   createRequestId,
   errorResponse,
   parseJsonBody,
-  requireActor,
+  requireMutationActor,
   successResponse
 } from "../../../../../src/api.ts";
 import { recordLifecycle, recordLifecycleFailure } from "../../../../../src/telemetry.ts";
@@ -24,13 +23,13 @@ export async function POST(
   const requestId = createRequestId();
   const startedAt = Date.now();
   try {
-    assertSameOrigin(request);
-    const actor = requireActor(request);
+    const repository = getControlPlaneRepository();
+    const actor = await requireMutationActor(request, repository);
     const input = await parseJsonBody(request, ReviewInputSchema);
     const { capabilityId: rawCapabilityId } = await context.params;
     const capabilityId = CapabilityIdSchema.safeParse(rawCapabilityId);
     if (!capabilityId.success) throw new ApiError("NOT_FOUND", 404);
-    const capability = await getControlPlaneRepository().reviewCapability(actor, capabilityId.data, input);
+    const capability = await repository.reviewCapability(actor, capabilityId.data, input);
     await recordLifecycle({
       event: "capability_reviewed",
       outcome: "success",

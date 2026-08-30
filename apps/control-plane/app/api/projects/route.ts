@@ -2,11 +2,11 @@ import { createHash } from "node:crypto";
 import { getControlPlaneRepository } from "../../../../../packages/database/src/factory.ts";
 import {
   ApiError,
-  assertSameOrigin,
   createRequestId,
   errorResponse,
   parseJsonBody,
   requireActor,
+  requireMutationActor,
   successResponse
 } from "../../../src/api.ts";
 import { normalizeProjectInput, ProjectInputSchema } from "../../../src/projects.ts";
@@ -17,9 +17,18 @@ const IDEMPOTENCY_KEY = /^[a-zA-Z0-9._:-]{8,128}$/;
 export async function GET(request: Request) {
   const requestId = createRequestId();
   try {
-    const actor = requireActor(request);
-    const projects = await getControlPlaneRepository().listProjects(actor);
-    return successResponse({ projects }, requestId);
+    const repository = getControlPlaneRepository();
+    const actor = await requireActor(request, repository);
+    const url = new URL(request.url);
+    const unknownParameters = [...url.searchParams.keys()].filter((key) => key !== "cursor" && key !== "limit");
+    if (unknownParameters.length > 0) throw new ApiError("INVALID_CURSOR", 400);
+    const rawLimit = url.searchParams.get("limit");
+    const limit = rawLimit === null ? undefined : Number(rawLimit);
+    const page = await repository.listProjectsPage(actor, {
+      ...(limit === undefined ? {} : { limit }),
+      ...(url.searchParams.get("cursor") ? { cursor: url.searchParams.get("cursor")! } : {})
+    });
+    return successResponse(page, requestId);
   } catch (error) {
     return errorResponse(error, requestId);
   }
@@ -29,15 +38,15 @@ export async function POST(request: Request) {
   const requestId = createRequestId();
   const startedAt = Date.now();
   try {
-    assertSameOrigin(request);
-    const actor = requireActor(request);
+    const repository = getControlPlaneRepository();
+    const actor = await requireMutationActor(request, repository);
     const input = await parseJsonBody(request, ProjectInputSchema);
     const normalized = normalizeProjectInput(input);
     if (!normalized.ok) throw new ApiError(normalized.code, 400);
     const idempotencyKey = request.headers.get("idempotency-key") ?? "";
     if (!IDEMPOTENCY_KEY.test(idempotencyKey)) throw new ApiError("IDEMPOTENCY_KEY_REQUIRED", 400);
     const inputHash = createHash("sha256").update(JSON.stringify(normalized.value)).digest("hex");
-    const project = await getControlPlaneRepository().createProject(actor, {
+    const project = await repository.createProject(actor, {
       ...normalized.value,
       idempotencyKey,
       inputHash

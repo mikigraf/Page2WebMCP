@@ -4,7 +4,6 @@ import test from "node:test";
 import { POST as verify } from "../app/api/capabilities/verify/route.ts";
 import { GET as getArtifact } from "../app/api/releases/[artifact]/route.ts";
 import { POST as publish } from "../app/api/projects/[projectId]/releases/route.ts";
-import { authenticate, issueSession } from "../src/auth.ts";
 import { compileWebMcpRelease } from "../../../packages/compiler/src/compiler.ts";
 import { acmeCapabilityEvidence, acmeCapabilityPlans } from "../../acme-support/src/capability-plans.ts";
 import {
@@ -14,11 +13,8 @@ import {
   type VerificationRecord,
   type VerificationRequest
 } from "../../../packages/database/src/control-plane.ts";
-import { setControlPlaneRepositoryForTest } from "../../../packages/database/src/factory.ts";
 import { deriveVerification } from "../src/releases.ts";
-
-const owner = authenticate("owner@example.test", "fixture-password")!;
-const editor = authenticate("editor@example.test", "fixture-password")!;
+import { authenticatedHeaders, editor, installTestRepository, owner } from "./auth-test-helpers.ts";
 
 async function fixture(
   repository: InMemoryControlPlaneRepository,
@@ -130,7 +126,7 @@ test("verification rejects missing, changed, cross-run, and expired evidence ref
   for (const [name, tamper] of cases) {
     await context.test(name, async () => {
       const repository = new TamperedEvidenceRepository(tamper);
-      setControlPlaneRepositoryForTest(repository);
+      installTestRepository(repository);
       const { project, run } = await fixture(repository);
       await approveTicket(repository, project.id);
       const response = await verify(verificationRequest(project.id, run.id));
@@ -186,8 +182,7 @@ function request(projectId: string, runId: string, key: string, actor = owner, e
   return new Request(`https://control.example/api/projects/${projectId}/releases`, {
     method: "POST",
     headers: {
-      cookie: `page2webmcp_session=${issueSession(actor)}`,
-      origin: "https://control.example",
+      ...authenticatedHeaders(actor),
       "content-type": "application/json",
       "idempotency-key": key
     },
@@ -199,8 +194,7 @@ function verificationRequest(projectId: string, runId: string): Request {
   return new Request("https://control.example/api/capabilities/verify", {
     method: "POST",
     headers: {
-      cookie: `page2webmcp_session=${issueSession(owner)}`,
-      origin: "https://control.example",
+      ...authenticatedHeaders(owner),
       "content-type": "application/json"
     },
     body: JSON.stringify({ projectId, analysisRunId: runId })
@@ -216,7 +210,7 @@ async function approveTicket(repository: InMemoryControlPlaneRepository, project
 
 test("verification and publication fail closed when exact-run evidence is absent", async () => {
   const repository = new TamperedEvidenceRepository(() => []);
-  setControlPlaneRepositoryForTest(repository);
+  installTestRepository(repository);
   const { project, run } = await fixture(repository);
   await approveTicket(repository, project.id);
 
@@ -242,7 +236,7 @@ test("verification and publication fail closed when exact-run evidence is absent
 
 test("publication cannot reuse verification after its exact-run evidence expires", async () => {
   const repository = new ExpiringEvidenceRepository();
-  setControlPlaneRepositoryForTest(repository);
+  installTestRepository(repository);
   const { project, run } = await fixture(repository);
   await approveTicket(repository, project.id);
 
@@ -265,7 +259,7 @@ test("publication cannot reuse verification after its exact-run evidence expires
 
 test("analysis ingestion rejects a worker artifact that downgrades vetted untrusted content", async () => {
   const repository = new InMemoryControlPlaneRepository();
-  setControlPlaneRepositoryForTest(repository);
+  installTestRepository(repository);
   const canonical = compileWebMcpRelease(acmeCapabilityPlans("https://acme.example")
     .filter((plan) => plan.tool.name === "get_order_status"));
   const code = canonical.code.replaceAll('"untrusted":true', '"untrusted":false');
@@ -301,7 +295,7 @@ test("analysis ingestion rejects a worker artifact that downgrades vetted untrus
 
 test("publication derives verification from persisted state and requires R1 review", async () => {
   const repository = new InMemoryControlPlaneRepository();
-  setControlPlaneRepositoryForTest(repository);
+  installTestRepository(repository);
   const { project, run } = await fixture(repository);
 
   const denied = await publish(
@@ -334,7 +328,7 @@ test("publication derives verification from persisted state and requires R1 revi
 
 test("publication rejects caller reports, non-owners, and serves immutable exact bytes", async () => {
   const repository = new InMemoryControlPlaneRepository();
-  setControlPlaneRepositoryForTest(repository);
+  installTestRepository(repository);
   const { project, run, candidate } = await fixture(repository);
   const ticket = (await repository.listCapabilities(owner, project.id))
     .find((item) => item.stableName === "create_support_ticket")!;
@@ -387,7 +381,7 @@ test("publication rejects caller reports, non-owners, and serves immutable exact
 
 test("blocking a proposed capability publishes the deterministic reviewed subset", async () => {
   const repository = new InMemoryControlPlaneRepository();
-  setControlPlaneRepositoryForTest(repository);
+  installTestRepository(repository);
   const { project, run } = await fixture(repository);
   const ticket = (await repository.listAnalysisCapabilities(owner, run.id))
     .find((item) => item.stableName === "create_support_ticket")!;
@@ -415,7 +409,7 @@ test("blocking a proposed capability publishes the deterministic reviewed subset
 
 test("a capability change after subset verification rejects stale publication and a retry restores the tool", async () => {
   const repository = new CapabilityChangeAfterVerificationRepository();
-  setControlPlaneRepositoryForTest(repository);
+  installTestRepository(repository);
   const { project, run, candidate } = await fixture(repository);
   const ticket = (await repository.listAnalysisCapabilities(owner, run.id))
     .find((item) => item.stableName === "create_support_ticket");

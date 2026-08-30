@@ -18,7 +18,10 @@ import {
   type ClaimedAnalysisRunRecord,
   type ControlPlaneRepository,
   type CreateProjectRequest,
+  type AuthenticatedIdentity,
   type IdempotentRequest,
+  type ProjectPage,
+  type ProjectPageRequest,
   type ProjectRecord,
   type PublishRequest,
   type ReleaseRecord,
@@ -62,10 +65,11 @@ type PostgresOptions = {
 type Db = Pick<PoolClient, "query">;
 type ExecutionContext =
   | { kind: "app"; actor: RepositoryActor }
+  | { kind: "identity"; identityId: string }
   | { kind: "artifact" }
   | { kind: "worker" };
 
-const MAX_PROJECTS = 500;
+const MAX_PROJECT_PAGE_SIZE = 100;
 const MAX_CAPABILITIES = 1_000;
 const MAX_EVIDENCE = 1_000;
 const MAX_AUDIT_EVENTS = 1_000;
@@ -117,6 +121,11 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
           "set_config('page2webmcp.actor_id', $2, true), set_config('page2webmcp.access', 'member', true)",
           [context.actor.organizationId, context.actor.id]
         );
+      } else if (context.kind === "identity") {
+        await client.query(
+          "select set_config('page2webmcp.actor_id', $1, true), set_config('page2webmcp.access', 'identity', true)",
+          [context.identityId]
+        );
       } else if (context.kind === "artifact") {
         await client.query("select set_config('page2webmcp.access', 'artifact', true)");
       }
@@ -133,6 +142,29 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
     } finally {
       client.release();
     }
+  }
+
+  async provisionPersonalOrganization(identity: AuthenticatedIdentity): Promise<RepositoryActor> {
+    return this.#transaction({ kind: "identity", identityId: identity.id }, async (client) => {
+      const result = await client.query(
+        "select organization_id, user_id, role from private.provision_personal_organization($1, $2)",
+        [identity.id, identity.email ?? null]
+      );
+      if (!result.rows[0]) throw new RepositoryError("MEMBERSHIP_REQUIRED");
+      return mapActor(result.rows[0]);
+    });
+  }
+
+  async resolveActor(identityId: string, organizationId?: string, sessionId?: string): Promise<RepositoryActor> {
+    if (!sessionId) throw new RepositoryError("SESSION_REVOKED");
+    return this.#transaction({ kind: "identity", identityId }, async (client) => {
+      const result = await client.query(
+        "select organization_id, user_id, role from private.resolve_identity_membership($1, $2, $3)",
+        [identityId, organizationId ?? null, sessionId]
+      );
+      if (!result.rows[0]) throw new RepositoryError("MEMBERSHIP_REQUIRED");
+      return mapActor(result.rows[0]);
+    });
   }
 
   async #project(db: Db, actor: RepositoryActor, id: string): Promise<ProjectRecord> {
@@ -218,15 +250,52 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
     return this.#transaction({ kind: "app", actor }, async (client) => {
       const result = await client.query(
         "select id, organization_id, created_by, name, source_type, source_url, status, created_at " +
-        "from public.projects where organization_id = $1 order by created_at, id limit $2",
-        [actor.organizationId, MAX_PROJECTS]
+        "from public.projects where organization_id = $1 order by created_at, id",
+        [actor.organizationId]
       );
       return result.rows.map(mapProject);
     });
   }
 
+  async listProjectsPage(actor: RepositoryActor, input: ProjectPageRequest = {}): Promise<ProjectPage> {
+    const limit = input.limit ?? 50;
+    if (!Number.isInteger(limit) || limit < 1 || limit > MAX_PROJECT_PAGE_SIZE) {
+      throw new RepositoryError("INVALID_CURSOR");
+    }
+    const cursor = input.cursor ? decodeProjectCursor(input.cursor) : undefined;
+    return this.#transaction({ kind: "app", actor }, async (client) => {
+      const result = await client.query(
+        "select id, organization_id, created_by, name, source_type, source_url, status, created_at " +
+        "from public.projects where organization_id = $1 " +
+        "and ($2::timestamptz is null or (created_at, id) > ($2::timestamptz, $3::uuid)) " +
+        "order by created_at, id limit $4",
+        [actor.organizationId, cursor?.createdAt ?? null, cursor?.id ?? null, limit + 1]
+      );
+      const projects = result.rows.slice(0, limit).map(mapProject);
+      return {
+        projects,
+        ...(result.rows.length > limit && projects.length > 0
+          ? { nextCursor: encodeProjectCursor(projects[projects.length - 1]!) }
+          : {})
+      };
+    });
+  }
+
   async getProject(actor: RepositoryActor, id: string): Promise<ProjectRecord> {
     return this.#transaction({ kind: "app", actor }, (client) => this.#project(client, actor, id));
+  }
+
+  async getLatestAnalysis(actor: RepositoryActor, projectId: string): Promise<AnalysisRunRecord | undefined> {
+    return this.#transaction({ kind: "app", actor }, async (client) => {
+      await this.#project(client, actor, projectId);
+      const result = await client.query(
+        "select id, organization_id, project_id, requested_by, status, attempts, error_code, created_at, updated_at " +
+        "from public.analysis_runs where organization_id = $1 and project_id = $2 " +
+        "order by created_at desc, id desc limit 1",
+        [actor.organizationId, projectId]
+      );
+      return result.rows[0] ? mapAnalysis(result.rows[0]) : undefined;
+    });
   }
 
   async enqueueAnalysis(actor: RepositoryActor, input: IdempotentRequest): Promise<AnalysisRunRecord> {
@@ -1376,7 +1445,7 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
       if (!result.rows[0]) throw new RepositoryError("NOT_FOUND");
       const capability = mapCapability(result.rows[0]);
       if (capability.version !== input.expectedVersion) throw new RepositoryError("VERSION_CONFLICT");
-      if (input.action === "approve" && capability.riskTier !== "R0" && actor.role !== "owner") {
+      if (input.action === "approve" && capability.riskTier === "R2" && actor.role !== "owner") {
         throw new RepositoryError("OWNER_APPROVAL_REQUIRED");
       }
       if (input.action === "approve") {
@@ -1658,6 +1727,41 @@ function mapProject(row: QueryResultRow): ProjectRecord {
   return { id: String(row.id), organizationId: String(row.organization_id), createdBy: String(row.created_by),
     name: String(row.name), sourceType: row.source_type as SourceType, url: String(row.source_url),
     status: row.status as ProjectRecord["status"], createdAt: iso(row.created_at) };
+}
+
+function mapActor(row: QueryResultRow): RepositoryActor {
+  const role = String(row.role);
+  if (role !== "owner" && role !== "editor" && role !== "viewer") {
+    throw new RepositoryError("MEMBERSHIP_REQUIRED");
+  }
+  return { id: String(row.user_id), organizationId: String(row.organization_id), role };
+}
+
+type ProjectCursor = Readonly<{ createdAt: string; id: string }>;
+
+function encodeProjectCursor(project: ProjectRecord): string {
+  return Buffer.from(JSON.stringify({ createdAt: project.createdAt, id: project.id })).toString("base64url");
+}
+
+function decodeProjectCursor(value: string): ProjectCursor {
+  if (!/^[A-Za-z0-9_-]{8,512}$/.test(value)) throw new RepositoryError("INVALID_CURSOR");
+  try {
+    const parsed = JSON.parse(Buffer.from(value, "base64url").toString("utf8")) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)
+      || Object.keys(parsed).sort(compareStrings).join(",") !== "createdAt,id") {
+      throw new RepositoryError("INVALID_CURSOR");
+    }
+    const cursor = parsed as { createdAt?: unknown; id?: unknown };
+    if (typeof cursor.createdAt !== "string" || !Number.isFinite(Date.parse(cursor.createdAt))
+      || typeof cursor.id !== "string"
+      || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(cursor.id)) {
+      throw new RepositoryError("INVALID_CURSOR");
+    }
+    return { createdAt: new Date(cursor.createdAt).toISOString(), id: cursor.id };
+  } catch (error) {
+    if (error instanceof RepositoryError) throw error;
+    throw new RepositoryError("INVALID_CURSOR");
+  }
 }
 
 function mapAnalysis(row: QueryResultRow): AnalysisRunRecord {
@@ -1978,6 +2082,9 @@ function compareStrings(left: string, right: string): number {
 function mapPostgresError(error: unknown): unknown {
   if (error instanceof RepositoryError) return error;
   if (!(error instanceof pg.DatabaseError)) return error;
+  if (error.code === "42501" && /active auth session required/i.test(error.message)) {
+    return new RepositoryError("SESSION_REVOKED");
+  }
   if (error.code === "42501") return new RepositoryError("FORBIDDEN");
   if (error.code === "23505") {
     if (error.constraint === "analysis_runs_one_active_per_project_idx") return new RepositoryError("INVALID_STATE");

@@ -1,11 +1,10 @@
 import { z } from "zod";
 import { getControlPlaneRepository } from "../../../../../../packages/database/src/factory.ts";
 import {
-  assertSameOrigin,
   createRequestId,
   errorResponse,
   parseJsonBody,
-  requireActor,
+  requireMutationActor,
   successResponse
 } from "../../../../src/api.ts";
 import { verifyPersistedRelease } from "../../../../src/releases.ts";
@@ -20,11 +19,11 @@ export async function POST(request: Request) {
   const requestId = createRequestId();
   const startedAt = Date.now();
   try {
-    assertSameOrigin(request);
-    const actor = requireActor(request);
+    const repository = getControlPlaneRepository();
+    const actor = await requireMutationActor(request, repository);
     const input = await parseJsonBody(request, VerifyInputSchema);
     const verification = await verifyPersistedRelease(
-      getControlPlaneRepository(),
+      repository,
       actor,
       input.projectId,
       input.analysisRunId

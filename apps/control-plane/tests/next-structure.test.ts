@@ -10,3 +10,21 @@ test("control plane is a TypeScript Next App Router application with a durable a
   assert.match(route, /processNextAnalysis/);
   assert.doesNotMatch(route, /runFixtureWorkflow/);
 });
+
+test("auth/project UI exposes actionable SSR states without trusting browser role storage", async () => {
+  const entry = await readFile(new URL("../app/project-entry.tsx", import.meta.url), "utf8");
+  const proxy = await readFile(new URL("../proxy.ts", import.meta.url), "utf8");
+  assert.match(entry, /Create account/);
+  assert.match(entry, /Recover password/);
+  assert.match(entry, /Your projects/);
+  assert.match(entry, /Open and resume/);
+  assert.match(entry, /Load more projects/);
+  assert.match(entry, /Set new password/);
+  assert.match(entry, /Sign out all devices/);
+  assert.match(entry, /currentCsrfToken/);
+  assert.match(entry, /anonymousCsrfRoutes/);
+  assert.doesNotMatch(entry, /fixed Acme fixture|page2webmcp_role|localStorage/);
+  assert.match(proxy, /Refresh only/);
+  assert.match(proxy, /getAuthService\(\)\.refreshForProxy/);
+  assert.doesNotMatch(proxy, /role|organizationId/);
+});

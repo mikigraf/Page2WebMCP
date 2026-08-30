@@ -1,30 +1,32 @@
 import { z } from "zod";
+import { getControlPlaneRepository } from "../../../../../../packages/database/src/factory.ts";
 import {
   ApiError,
-  assertSameOrigin,
+  appendSetCookies,
+  assertCsrf,
   createRequestId,
   errorResponse,
   parseJsonBody,
   successResponse
 } from "../../../../src/api.ts";
-import { authenticate, issueSession, sessionCookie } from "../../../../src/auth.ts";
+import { getAuthService } from "../../../../src/auth.ts";
 
-const InputSchema = z.object({ email: z.string().email(), password: z.string().min(1) }).strict();
+const InputSchema = z.object({ email: z.string().email().max(320), password: z.string().min(1).max(1_024) }).strict();
 
 export async function POST(request: Request) {
   const requestId = createRequestId();
   try {
-    assertSameOrigin(request);
+    assertCsrf(request);
     const input = await parseJsonBody(request, InputSchema);
-    const actor = authenticate(input.email, input.password);
-    if (!actor) throw new ApiError("AUTH_REQUIRED", 401);
-    const token = issueSession(actor);
-    const secure = new URL(request.url).protocol === "https:" || process.env.NODE_ENV === "production";
+    const result = await getAuthService().signIn(request, input.email, input.password);
+    if (!result.user) throw new ApiError("AUTH_REQUIRED", 401);
+    const actor = await getControlPlaneRepository().provisionPersonalOrganization(result.user);
+    const headers = appendSetCookies(new Headers(), result.cookies);
     return successResponse(
-      { actorId: actor.id, role: actor.role },
+      { actorId: actor.id, role: actor.role, organizationId: actor.organizationId },
       requestId,
       200,
-      { "set-cookie": sessionCookie(token, secure) }
+      headers
     );
   } catch (error) {
     return errorResponse(error, requestId);

@@ -25,18 +25,35 @@ type AnalysisStatus = {
   result?: { draftPullRequest?: { draft: boolean } };
   capabilities: Capability[];
 };
+type ProjectSummary = {
+  id: string;
+  name: string;
+  sourceType: SourceType;
+  url: string;
+  status: string;
+};
 
 const DEFAULT_URLS: Record<SourceType, string> = {
-  website: "https://acme.example",
-  openapi: "https://acme.example/openapi.json",
-  github: "https://github.com/acme/support"
+  website: "https://docs.example/",
+  openapi: "https://api.example/openapi.json",
+  github: "https://github.com/example/project"
 };
 const ANALYSIS_POLL_DEADLINE_MS = 10 * 60_000;
+const anonymousCsrfRoutes = new Set([
+  "/api/auth/login",
+  "/api/auth/recovery",
+  "/api/auth/refresh",
+  "/api/auth/signup"
+]);
 
-export function ProjectEntry() {
+export function ProjectEntry({ authState }: Readonly<{ authState?: "verified" | "recovery" }> = {}) {
   const [sourceType, setSourceType] = useState<SourceType>("website");
   const [url, setUrl] = useState(DEFAULT_URLS.website);
-  const [message, setMessage] = useState("");
+  const [message, setMessage] = useState(authState === "recovery"
+    ? "Choose a new password to finish recovery."
+    : authState === "verified"
+      ? "Email verified. Your personal organization is ready."
+      : "");
   const [capabilities, setCapabilities] = useState<Capability[]>([]);
   const [draftReady, setDraftReady] = useState(false);
   const [projectId, setProjectId] = useState<string>();
@@ -45,6 +62,9 @@ export function ProjectEntry() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [signedInRole, setSignedInRole] = useState("");
+  const [projects, setProjects] = useState<ProjectSummary[]>([]);
+  const [nextProjectsCursor, setNextProjectsCursor] = useState<string>();
+  const [recoveryMode, setRecoveryMode] = useState(authState === "recovery");
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
@@ -82,6 +102,25 @@ export function ProjectEntry() {
     return () => controller.abort();
   }, []);
 
+  useEffect(() => {
+    const controller = new AbortController();
+    void loadServerSession(controller.signal).then(async (session) => {
+      if (!session || controller.signal.aborted) return;
+      setSignedInRole(session.role);
+      const listed = await requestJson<{ projects: ProjectSummary[]; nextCursor?: string } & ApiFailure>("/api/projects?limit=50", {
+        cache: "no-store",
+        signal: controller.signal
+      });
+      if (listed.response.ok && !controller.signal.aborted) {
+        setProjects(listed.body.projects);
+        setNextProjectsCursor(listed.body.nextCursor);
+      }
+    }).catch(() => {
+      if (!controller.signal.aborted) setSignedInRole("");
+    });
+    return () => controller.abort();
+  }, []);
+
   async function signIn(event: FormEvent) {
     event.preventDefault();
     setBusy(true);
@@ -95,6 +134,14 @@ export function ProjectEntry() {
       setSignedInRole(body.role ?? "");
       setPassword("");
       setMessage("");
+      const listed = await requestJson<{ projects: ProjectSummary[]; nextCursor?: string } & ApiFailure>(
+        "/api/projects?limit=50",
+        { cache: "no-store" }
+      );
+      if (listed.response.ok) {
+        setProjects(listed.body.projects);
+        setNextProjectsCursor(listed.body.nextCursor);
+      }
       if (analysisRunId) {
         try {
           const completed = await waitForAnalysis(analysisRunId);
@@ -116,6 +163,121 @@ export function ProjectEntry() {
     }
   }
 
+  async function signUp() {
+    setBusy(true);
+    try {
+      const { response, body } = await requestJson<{
+        emailVerificationRequired?: boolean;
+        role?: string;
+      } & ApiFailure>("/api/auth/signup", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ email, password })
+      });
+      if (!response.ok) throw new Error(body.code ?? "SIGNUP_FAILED");
+      if (body.role) setSignedInRole(body.role);
+      setPassword("");
+      setMessage(body.emailVerificationRequired
+        ? "Check your email to verify this account before signing in."
+        : "Account created.");
+    } catch (error) {
+      setMessage(`Sign up failed: ${errorCode(error)}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function recoverPassword() {
+    setBusy(true);
+    try {
+      const { response, body } = await requestJson<ApiFailure>("/api/auth/recovery", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ email })
+      });
+      if (!response.ok) throw new Error(body.code ?? "PASSWORD_RECOVERY_FAILED");
+      setMessage("If the account exists, a password recovery email has been sent.");
+    } catch (error) {
+      setMessage(`Password recovery failed: ${errorCode(error)}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function signOut() {
+    setBusy(true);
+    try {
+      const { response, body } = await requestJson<ApiFailure>("/api/auth/logout", { method: "POST" });
+      if (!response.ok) throw new Error(body.code ?? "SIGNOUT_FAILED");
+      setSignedInRole("");
+      setProjects([]);
+      setNextProjectsCursor(undefined);
+      resetWorkflow();
+      setMessage("Signed out.");
+    } catch (error) {
+      setMessage(`Sign out failed: ${errorCode(error)}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function revokeAllSessions() {
+    setBusy(true);
+    try {
+      const { response, body } = await requestJson<ApiFailure>("/api/auth/revoke", { method: "POST" });
+      if (!response.ok) throw new Error(body.code ?? "SESSION_REVOCATION_FAILED");
+      setSignedInRole("");
+      setProjects([]);
+      setNextProjectsCursor(undefined);
+      resetWorkflow();
+      setMessage("All sessions revoked. Sign in again to continue.");
+    } catch (error) {
+      setMessage(`Session revocation failed: ${errorCode(error)}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function setNewPassword() {
+    setBusy(true);
+    try {
+      const { response, body } = await requestJson<ApiFailure>("/api/auth/password", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ password })
+      });
+      if (!response.ok) throw new Error(body.code ?? "PASSWORD_UPDATE_FAILED");
+      setPassword("");
+      setRecoveryMode(false);
+      setMessage("Password updated. Other sessions were revoked.");
+    } catch (error) {
+      setMessage(`Password update failed: ${errorCode(error)}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function loadMoreProjects() {
+    if (!nextProjectsCursor) return;
+    setBusy(true);
+    try {
+      const query = new URLSearchParams({ limit: "50", cursor: nextProjectsCursor });
+      const { response, body } = await requestJson<{
+        projects?: ProjectSummary[];
+        nextCursor?: string;
+      } & ApiFailure>(`/api/projects?${query}`, { cache: "no-store" });
+      if (!response.ok || !body.projects) throw new Error(body.code ?? "PROJECT_LIST_FAILED");
+      setProjects((current) => [...current, ...body.projects!.filter((candidate) =>
+        !current.some((project) => project.id === candidate.id)
+      )]);
+      setNextProjectsCursor(body.nextCursor);
+    } catch (error) {
+      setMessage(`Project list failed: ${errorCode(error)}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function createProject(event: FormEvent) {
     event.preventDefault();
     setBusy(true);
@@ -129,10 +291,45 @@ export function ProjectEntry() {
       );
       if (!response.ok || !body.id) throw new Error(body.code ?? "PROJECT_CREATE_FAILED");
       setProjectId(body.id);
+      setProjects((current) => [{
+        id: body.id!,
+        name: new URL(url).hostname,
+        sourceType,
+        url,
+        status: "created"
+      }, ...current.filter((project) => project.id !== body.id)]);
       persistWorkflow({ sourceType, url, projectId: body.id });
       setMessage(`Project ${body.id} created`);
     } catch (error) {
       setMessage(`Project creation failed: ${errorCode(error)}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function resumeProject(id: string) {
+    setBusy(true);
+    try {
+      const { response, body } = await requestJson<{
+        project?: ProjectSummary;
+        latestAnalysis?: { id: string; status: AnalysisStatus["run"]["status"] };
+        capabilities?: Capability[];
+      } & ApiFailure>(`/api/projects/${encodeURIComponent(id)}`, { cache: "no-store" });
+      if (!response.ok || !body.project) throw new Error(body.code ?? "PROJECT_LOAD_FAILED");
+      setSourceType(body.project.sourceType);
+      setUrl(body.project.url);
+      setProjectId(body.project.id);
+      setAnalysisRunId(body.latestAnalysis?.id);
+      setCapabilities(body.capabilities ?? []);
+      persistWorkflow({
+        sourceType: body.project.sourceType,
+        url: body.project.url,
+        projectId: body.project.id,
+        analysisRunId: body.latestAnalysis?.id
+      });
+      setMessage(body.latestAnalysis ? `Resumed ${body.project.name}` : `Loaded ${body.project.name}`);
+    } catch (error) {
+      setMessage(`Project load failed: ${errorCode(error)}`);
     } finally {
       setBusy(false);
     }
@@ -271,15 +468,28 @@ export function ProjectEntry() {
       <label>Email <input type="email" value={email} onChange={(event) => setEmail(event.target.value)} required /></label>
       <label>Password <input type="password" value={password} onChange={(event) => setPassword(event.target.value)} required /></label>
       <button type="submit" disabled={busy}>Sign in</button>
+      <button type="button" disabled={busy || password.length < 12} onClick={signUp}>Create account</button>
+      <button type="button" disabled={busy || !email} onClick={recoverPassword}>Recover password</button>
     </form>
-    {signedInRole && <p>Signed in as {signedInRole}</p>}
+    {recoveryMode && <p><button type="button" disabled={busy || password.length < 12}
+      onClick={setNewPassword}>Set new password</button></p>}
+    {signedInRole && <p>Signed in with current {signedInRole} membership. <button type="button" disabled={busy} onClick={signOut}>Sign out</button>{" "}
+      <button type="button" disabled={busy} onClick={revokeAllSessions}>Sign out all devices</button></p>}
+    {projects.length > 0 && <section aria-labelledby="existing-projects-heading">
+      <h3 id="existing-projects-heading">Your projects</h3>
+      <ul>{projects.map((project) => <li key={project.id}>
+        {project.name} ({project.sourceType}, {project.status}) <button type="button" disabled={busy}
+          onClick={() => resumeProject(project.id)}>Open and resume</button>
+      </li>)}</ul>
+      {nextProjectsCursor && <button type="button" disabled={busy} onClick={loadMoreProjects}>Load more projects</button>}
+    </section>}
     <form onSubmit={createProject}>
       <label>Source type <select value={sourceType} onChange={(event) => selectSource(event.target.value as SourceType)}>
         <option value="website">Website URL</option>
         <option value="openapi">OpenAPI URL</option>
         <option value="github">GitHub repository</option>
       </select></label>
-      <label>Source URL (fixed Acme fixture) <input type="url" value={url} onChange={(event) => { setUrl(event.target.value); resetWorkflow(); }} required /></label>
+      <label>Public source URL <input type="url" value={url} onChange={(event) => { setUrl(event.target.value); resetWorkflow(); }} required /></label>
       <button type="submit" disabled={busy || !signedInRole}>Create project</button>
     </form>
     <button type="button" onClick={analyze} disabled={busy || !projectId}>{analysisRunId ? "Resume analysis" : `Analyze ${sourceType}`}</button>
@@ -291,7 +501,7 @@ export function ProjectEntry() {
       </>}</li>
     )}</ul>}
     <button type="button" onClick={publish} disabled={busy || !analysisRunId || sourceType === "github"}>Publish immutable release</button>
-    {releaseUrl && <a href={releaseUrl}>Download Acme release</a>}
+    {releaseUrl && <a href={releaseUrl}>Download immutable release</a>}
     {draftReady && <p>Draft pull request prepared</p>}
   </section>;
 }
@@ -359,12 +569,37 @@ async function requestJson<T>(url: string, init: RequestInit): Promise<{ respons
   const timeout = setTimeout(() => controller.abort(), 15_000);
   try {
     const signal = init.signal ? AbortSignal.any([init.signal, controller.signal]) : controller.signal;
-    const response = await fetch(url, { ...init, signal });
+    const headers = new Headers(init.headers);
+    if (init.method && !["GET", "HEAD"].includes(init.method.toUpperCase())) {
+      headers.set("x-csrf-token", await currentCsrfToken(signal, anonymousCsrfRoutes.has(url)));
+    }
+    const response = await fetch(url, { ...init, headers, signal });
     const body = await response.json() as T;
     return { response, body };
   } finally {
     clearTimeout(timeout);
   }
+}
+
+async function currentCsrfToken(signal: AbortSignal, anonymousOnly = false): Promise<string> {
+  if (!anonymousOnly) {
+    const session = await fetch("/api/auth/session", { cache: "no-store", signal });
+    if (session.ok) {
+      const body = await session.json() as { csrfToken?: string };
+      if (body.csrfToken) return body.csrfToken;
+    }
+  }
+  const anonymous = await fetch("/api/auth/csrf", { cache: "no-store", signal });
+  const body = await anonymous.json() as { csrfToken?: string; code?: string };
+  if (!anonymous.ok || !body.csrfToken) throw new Error(body.code ?? "CSRF_TOKEN_REQUIRED");
+  return body.csrfToken;
+}
+
+async function loadServerSession(signal: AbortSignal): Promise<{ role: string } | undefined> {
+  const response = await fetch("/api/auth/session", { cache: "no-store", signal });
+  if (!response.ok) return undefined;
+  const body = await response.json() as { actor?: { role?: string } };
+  return body.actor?.role ? { role: body.actor.role } : undefined;
 }
 
 function abortableDelay(delayMs: number, signal?: AbortSignal): Promise<void> {
