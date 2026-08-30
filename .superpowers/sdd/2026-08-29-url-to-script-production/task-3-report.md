@@ -233,3 +233,78 @@ The production fixture-name scan returned no matches. No provenance/quarantine m
 
 - The four Postgres repository tests and one Postgres route/worker test remain environment-gated in this workspace. The Postgres implementation is typechecked and its integration fixture now asserts the new JSONB round-trip, but this run did not have a live database with which to execute it.
 - Diagnostic categories intentionally remain stable, non-sensitive codes plus bounded operation keys/reasons; raw Zod messages are used only inside the mapper and are never returned or persisted.
+
+## Fix round 2: all-unsupported documents retain diagnostics
+
+### Result and commit
+
+Implemented the remaining Important rereview finding in `1541c7f` (`fix: persist all-unsupported OpenAPI diagnostics`).
+
+- The OpenAPI adapter now returns a succeeded diagnostic-only `AnalysisResult` when compilation emits zero browser-safe plans and at least one precise diagnostic. It carries the exact immutable source evidence but deliberately has no `release` candidate.
+- Zero-plan/zero-diagnostic documents retain the existing `NO_BROWSER_SAFE_CAPABILITIES` failure. Invalid source bytes, wrong source types, missing provider controls, and unconfigured worker adapters retain their existing fail-closed paths.
+- `AnalysisResult.release` is optional only to represent the diagnostic-only state. Both repositories enforce the cross-field invariant mechanically: zero plans require nonempty bounded diagnostics, immutable evidence, and no release; one or more plans require an exact compiler release whose manifest replays the same canonical plans.
+- Postgres persists diagnostic-only results in the existing JSONB result and leaves the already-nullable release columns null. Rehydration rejects partial release state, release-bearing zero-capability rows, and release-less capability rows.
+- Verification and publication reject a diagnostic-only result with `INVALID_STATE`; no empty, unsigned, sentinel, or otherwise invented artifact is produced. This preserves the Task 1 compiler and trusted-loader integrity contract.
+- The run GET API returns the succeeded result with `capabilities: []`, exact per-operation diagnostics, immutable evidence, and no release. The environment-gated Postgres lifecycle now asserts the same round-trip.
+
+### Files
+
+- `apps/worker/src/workflow.ts`
+- `apps/worker/src/workflow.test.ts`
+- `apps/control-plane/tests/analyze-route.test.ts`
+- `apps/control-plane/src/releases.ts`
+- `packages/database/src/control-plane.ts`
+- `packages/database/src/control-plane.test.ts`
+- `packages/database/src/postgres.ts`
+- `packages/database/src/postgres.integration.test.ts`
+
+### Strict TDD evidence
+
+The worker and end-to-end run API regressions were written before production changes. Focused RED:
+
+```text
+/usr/local/bin/node /Users/miki/Cloudsail-Development/runmill/node_modules/tsx/dist/cli.mjs --test --test-name-pattern='returns exact diagnostics without an invented release|all-unsupported OpenAPI analysis exposes' apps/worker/src/workflow.test.ts apps/control-plane/tests/analyze-route.test.ts
+tests 2; pass 0; fail 2
+worker error: NO_BROWSER_SAFE_CAPABILITIES
+API actual status: failed; expected: succeeded
+```
+
+Focused GREEN after the minimal adapter/result/repository changes:
+
+```text
+/usr/local/bin/node /Users/miki/Cloudsail-Development/runmill/node_modules/tsx/dist/cli.mjs --test --test-name-pattern='returns exact diagnostics without an invented release|all-unsupported OpenAPI analysis exposes' apps/worker/src/workflow.test.ts apps/control-plane/tests/analyze-route.test.ts
+tests 2; pass 2; fail 0; skipped 0; duration 745 ms
+```
+
+Affected GREEN:
+
+```text
+/usr/local/bin/node /Users/miki/Cloudsail-Development/runmill/node_modules/tsx/dist/cli.mjs --test apps/worker/src/workflow.test.ts apps/worker/src/runner.test.ts apps/control-plane/tests/analyze-route.test.ts apps/control-plane/tests/release-route.test.ts packages/database/src/control-plane.test.ts packages/database/src/postgres.integration.test.ts
+tests 48; pass 44; fail 0; skipped 4; duration 1008 ms
+```
+
+Final full trusted suite:
+
+```text
+/usr/local/bin/node /Users/miki/Cloudsail-Development/runmill/node_modules/tsx/dist/cli.mjs --test test-support/**/*.test.ts apps/**/*.test.ts packages/**/*.test.ts
+tests 240; pass 235; fail 0; skipped 5; duration 3154 ms
+```
+
+The five skips remain the existing environment-gated PostgreSQL/control-plane integration tests.
+
+Direct gates all exited 0:
+
+```text
+/usr/local/bin/node node_modules/typescript/bin/tsc --project tsconfig.base.json --noEmit --pretty false
+/usr/local/bin/node node_modules/eslint/bin/eslint.js . --max-warnings=0
+/usr/local/bin/node scripts/lint-source.mjs
+/usr/local/bin/node scripts/check-source.mjs
+git diff --check
+```
+
+The production Acme/operation-name scan returned no matches. The only `fixture` token in the touched production set is the pre-existing `fixture-password` secret-denylist in release verification, not a source-specific execution branch. No provenance/quarantine metadata changed.
+
+### Fix-round concerns
+
+- The diagnostic-only Postgres path is implemented and covered in the existing lifecycle integration, but that test remained environment-gated because this workspace did not provide a live test database.
+- A diagnostic-only analysis is intentionally terminal-success for discovery, not release-ready. Callers must inspect its diagnostics; verification/publication correctly return `INVALID_STATE` because there is no reviewed compiler artifact to install.
