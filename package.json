@@ -37,8 +37,7 @@
     "@types/react-dom": "^19.2.5",
     "eslint": "9.39.5",
     "eslint-config-next": "16.3.3",
-    "tsx": "4.23.12",
-    "typescript": "5.9.2"
+    "tsx": "4.23.12"
   },
   "dependencies": {
     "@langfuse/otel": "5.11.0",
@@ -53,6 +52,7 @@
     "posthog-node": "5.51.4",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
+    "typescript": "5.9.2",
     "yaml": "2.9.0",
     "zod": "^4.5.2"
   }

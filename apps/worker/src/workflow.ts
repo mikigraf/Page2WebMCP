@@ -27,6 +27,17 @@ import {
   type WebsiteObservationInput,
 } from "../../../packages/providers/src/website-evidence.ts";
 import { createDiscoveryFirewall } from "../../../packages/security/src/security.ts";
+import {
+  captureGitHubSourceSnapshot,
+  withGitHubAppSession,
+  type GitHubRepositorySelection,
+  type GitHubSnapshotPort,
+  type GitHubTokenPort,
+} from "../../../packages/providers/src/github.ts";
+import {
+  analyzeGitHubSourceSnapshot,
+  generateSourceNativeChange,
+} from "../../../packages/source-analyzer/src/analyze.ts";
 
 export type OpenApiAnalysisConfiguration = Readonly<{
   targetOrigin: string;
@@ -39,6 +50,22 @@ export type OpenApiAnalysisConfiguration = Readonly<{
 type AnalysisSource = Pick<ClaimedAnalysisRunRecord, "sourceType" | "sourceUrl">
   & Partial<Pick<ClaimedAnalysisRunRecord, "id" | "organizationId" | "projectId">>;
 export type AnalysisAdapter = (source: AnalysisSource, signal: AbortSignal) => Promise<AnalysisResult>;
+
+export type GitHubAnalysisConfiguration = Readonly<{
+  targetOrigin: string;
+  clock: () => Date;
+  installation: Readonly<{
+    resolve(input: Readonly<{
+      sourceUrl: string;
+      organizationId: string;
+      projectId: string;
+      runId: string;
+      signal: AbortSignal;
+    }>): Promise<GitHubRepositorySelection>;
+  }>;
+  tokens: GitHubTokenPort;
+  snapshot: GitHubSnapshotPort;
+}>;
 
 export type WebsiteAnalysisConfiguration = Readonly<{
   clock?: () => Date;
@@ -147,6 +174,91 @@ export function createOpenApiAnalysisAdapter(configuration: OpenApiAnalysisConfi
         manifest: release.manifest,
       },
     };
+  };
+}
+
+function githubSourceIdentity(sourceUrl: string): Readonly<{ owner: string; repository: string }> {
+  let url: URL;
+  try { url = new URL(sourceUrl); } catch { throw new Error("GITHUB_SOURCE_URL_INVALID"); }
+  const parts = url.pathname.split("/").filter(Boolean);
+  if (url.protocol !== "https:" || url.hostname !== "github.com" || url.username || url.password
+    || url.search || url.hash || parts.length !== 2
+    || !/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/.test(parts[0]!)
+    || !/^[A-Za-z0-9._-]{1,100}$/.test(parts[1]!)) throw new Error("GITHUB_SOURCE_URL_INVALID");
+  return { owner: parts[0]!, repository: parts[1]! };
+}
+
+function sourceNativeEvidenceContent(
+  snapshot: Awaited<ReturnType<typeof captureGitHubSourceSnapshot>>,
+  change: ReturnType<typeof generateSourceNativeChange>,
+): string {
+  return JSON.stringify({
+    adapter: "github-source-native-change",
+    adapterVersion: 1,
+    baseCommitSha: change.baseCommitSha,
+    files: change.files.map(({ path, contentHash }) => ({ path, contentHash })),
+    patchDigest: change.patchDigest,
+    releaseContentHash: change.release.contentHash,
+    snapshotReference: snapshot.reference,
+  });
+}
+
+/**
+ * Creates the read-only GitHub analysis adapter from explicit GitHub App
+ * installation, ephemeral-token, and immutable-snapshot ports. Draft PR,
+ * checks, sandbox, webhook, and preview operations are Task 5 side effects and
+ * are deliberately absent from this compatibility analysis adapter.
+ */
+export function createGitHubAnalysisAdapter(configuration: GitHubAnalysisConfiguration): AnalysisAdapter {
+  if (!configuration?.installation || typeof configuration.installation.resolve !== "function"
+    || !configuration.tokens || typeof configuration.tokens.issue !== "function" || typeof configuration.tokens.revoke !== "function"
+    || !configuration.snapshot || typeof configuration.snapshot.resolveRef !== "function" || typeof configuration.snapshot.readTree !== "function"
+    || typeof configuration.clock !== "function" || typeof configuration.targetOrigin !== "string") {
+    throw new Error("GITHUB_ANALYSIS_CONTROLS_REQUIRED");
+  }
+  return async (source, signal) => {
+    if (source.sourceType !== "github") throw new Error("SOURCE_TYPE_UNSUPPORTED");
+    if (!source.id || !source.organizationId || !source.projectId) throw new Error("GITHUB_SOURCE_OWNERSHIP_REQUIRED");
+    const requested = githubSourceIdentity(source.sourceUrl);
+    const selection = await configuration.installation.resolve({
+      sourceUrl: source.sourceUrl,
+      organizationId: source.organizationId,
+      projectId: source.projectId,
+      runId: source.id,
+      signal,
+    });
+    if (selection.owner !== requested.owner || selection.repository !== requested.repository) {
+      throw new Error("GITHUB_SOURCE_SELECTION_MISMATCH");
+    }
+    return withGitHubAppSession(selection, {
+      clock: configuration.clock,
+      tokens: configuration.tokens,
+      signal,
+    }, async (session) => {
+      const snapshot = await captureGitHubSourceSnapshot(session, configuration.snapshot);
+      const analysis = analyzeGitHubSourceSnapshot(snapshot, { targetOrigin: configuration.targetOrigin });
+      if (analysis.plans.length === 0) {
+        return {
+          capabilities: [],
+          diagnostics: analysis.diagnostics.map((diagnostic) => ({ ...diagnostic })),
+          evidence: [analysis.evidence],
+        };
+      }
+      const change = generateSourceNativeChange(snapshot, analysis);
+      const changeContent = sourceNativeEvidenceContent(snapshot, change);
+      const changeReference = `urn:sha256:${createHash("sha256").update(changeContent, "utf8").digest("hex")}`;
+      return {
+        capabilities: change.release.manifest.plans.map((plan) => ({ plan, status: "proposed" as const })),
+        diagnostics: analysis.diagnostics.map((diagnostic) => ({ ...diagnostic })),
+        evidence: [analysis.evidence, { source: "source" as const, content: changeContent, reference: changeReference }],
+        release: {
+          code: change.release.code,
+          contentHash: change.release.contentHash,
+          allowedOrigin: change.release.allowedOrigin,
+          manifest: change.release.manifest,
+        },
+      };
+    });
   };
 }
 
