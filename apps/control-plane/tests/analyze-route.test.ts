@@ -147,6 +147,63 @@ test("mixed OpenAPI analysis preserves unsupported-operation diagnostics through
   }
 });
 
+test("all-unsupported OpenAPI analysis exposes exact diagnostics without an invented release", async () => {
+  const source = JSON.stringify({
+    openapi: "3.1.0",
+    info: { title: "Private Widgets", version: "1" },
+    components: { securitySchemes: { serviceKey: { type: "apiKey", in: "header", name: "X-Service-Key" } } },
+    paths: { "/private": { get: {
+      security: [{ serviceKey: [] }],
+      responses: { "200": { description: "ok", content: { "application/json": { schema: { type: "boolean" } } } } },
+    } } },
+  });
+  const unsupportedAdapter = createOpenApiAnalysisAdapter({
+    targetOrigin: "https://widgets.example",
+    testPageUrl: "https://widgets.example/review/openapi",
+    environment: "test",
+    provider: {
+      resolver: { resolve: async () => ["93.184.216.34"] },
+      transport: { request: async ({ url }) => ({
+        status: 200,
+        url,
+        headers: { "content-type": "application/json" },
+        body: { async *[Symbol.asyncIterator]() { yield new TextEncoder().encode(source); } },
+      }) },
+    },
+  });
+  const repository = new InMemoryControlPlaneRepository();
+  setControlPlaneRepositoryForTest(repository);
+  setAnalysisAdapterForTest(unsupportedAdapter);
+  try {
+    const project = await repository.createProject(actor, {
+      name: "Private Widgets",
+      sourceType: "openapi",
+      url: "https://specs.widgets.example/openapi.json",
+      idempotencyKey: "project-private-openapi",
+      inputHash: "project-private-openapi",
+    });
+    const accepted = await (await analyze(analysisRequest(project.id, "analysis-private-openapi"))).json();
+    assert.equal(accepted.status, "succeeded");
+    const response = await getRun(
+      new Request(`https://control.example/api/analysis-runs/${accepted.runId}`, { headers: { cookie } }),
+      { params: Promise.resolve({ runId: accepted.runId }) },
+    );
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(body.run.status, "succeeded");
+    assert.deepEqual(body.result.capabilities, []);
+    assert.deepEqual(body.capabilities, []);
+    assert.deepEqual(body.result.diagnostics, [{
+      code: "SERVER_ADAPTER_REQUIRED",
+      operationKey: "GET /private",
+      reason: "api_key_header",
+    }]);
+    assert.equal(body.result.release, undefined);
+  } finally {
+    setAnalysisAdapterForTest(fixtureAnalysisAdapter);
+  }
+});
+
 test("analysis requires authentication and an idempotency key", async () => {
   const repository = new InMemoryControlPlaneRepository();
   setControlPlaneRepositoryForTest(repository);

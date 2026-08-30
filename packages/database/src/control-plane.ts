@@ -80,7 +80,7 @@ export type AnalysisResult = {
   capabilities: Array<{ plan: CapabilityPlan; status: Pick<CapabilityRecord, "status">["status"] }>;
   diagnostics: AnalysisDiagnostic[];
   evidence: AnalysisEvidence[];
-  release: CandidateRelease;
+  release?: CandidateRelease;
   draftPullRequest?: { draft: boolean; url?: string; files?: string[] };
 };
 
@@ -443,18 +443,27 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
     if (!run || run.status !== "running" || run.leaseOwner !== workerId || !run.leaseExpiresAt
       || new Date(run.leaseExpiresAt) <= this.clock()) throw new RepositoryError("LEASE_LOST");
     if (result.capabilities.length > MAX_CAPABILITIES || result.evidence.length > MAX_CAPABILITIES
-      || Buffer.byteLength(result.release.code) > MAX_RELEASE_BYTES) {
+      || result.release !== undefined && Buffer.byteLength(result.release.code) > MAX_RELEASE_BYTES) {
       throw new RepositoryError("INVALID_STATE");
     }
     let canonicalPlans: readonly CapabilityPlan[];
     try {
-      canonicalPlans = canonicalizeCapabilityPlans(result.capabilities.map(({ plan }) => plan));
+      canonicalPlans = result.capabilities.length === 0
+        ? []
+        : canonicalizeCapabilityPlans(result.capabilities.map(({ plan }) => plan));
     } catch {
       throw new RepositoryError("INVALID_STATE");
     }
-    const sourcePlans = plansFromManifest(result.release.manifest);
-    if (!sourcePlans || !equalPlanSets(sourcePlans, canonicalPlans)) throw new RepositoryError("INVALID_STATE");
     const normalizedDiagnostics = normalizeAnalysisDiagnostics(result.diagnostics);
+    if (canonicalPlans.length === 0) {
+      if (normalizedDiagnostics.length === 0 || result.evidence.length === 0 || result.release !== undefined) {
+        throw new RepositoryError("INVALID_STATE");
+      }
+    } else {
+      if (result.release === undefined) throw new RepositoryError("INVALID_STATE");
+      const sourcePlans = plansFromManifest(result.release.manifest);
+      if (!sourcePlans || !equalPlanSets(sourcePlans, canonicalPlans)) throw new RepositoryError("INVALID_STATE");
+    }
     const statuses = new Map(result.capabilities.map(({ plan, status }) => [plan.tool.name, status]));
     const expiresAt = new Date(this.clock().getTime() + IDEMPOTENCY_TTL_MS).toISOString();
     const normalizedEvidence = result.evidence.map((item) => normalizeEvidence(
@@ -470,17 +479,17 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
     if (!evidenceResolves(normalizedEvidence, canonicalPlans, run, this.clock())) {
       throw new RepositoryError("INVALID_STATE");
     }
-    const releaseCode = Buffer.from(result.release.code);
+    const releaseCode = result.release === undefined ? undefined : Buffer.from(result.release.code);
     const normalizedResult: AnalysisResult = {
       ...structuredClone(result),
       capabilities: canonicalPlans.map((plan) => ({ plan, status: statuses.get(plan.tool.name) ?? "proposed" })),
       diagnostics: normalizedDiagnostics,
       evidence: normalizedEvidence,
-      release: {
+      release: result.release === undefined || releaseCode === undefined ? undefined : {
         ...structuredClone(result.release),
         contentHash: createHash("sha256").update(releaseCode).digest("hex"),
         manifest: structuredClone(result.release.manifest ?? {})
-      }
+      },
     };
     this.#results.set(run.id, normalizedResult);
     for (const plan of canonicalPlans) {

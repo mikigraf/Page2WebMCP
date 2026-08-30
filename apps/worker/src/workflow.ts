@@ -73,7 +73,14 @@ export function createOpenApiAnalysisAdapter(configuration: OpenApiAnalysisConfi
       environment: configuration.environment,
       evidenceReference: reference,
     }, configuration.groupingPort);
-    if (compiled.plans.length === 0) throw new Error("NO_BROWSER_SAFE_CAPABILITIES");
+    if (compiled.plans.length === 0) {
+      if (compiled.diagnostics.length === 0) throw new Error("NO_BROWSER_SAFE_CAPABILITIES");
+      return {
+        capabilities: [],
+        diagnostics: compiled.diagnostics.map((diagnostic) => ({ ...diagnostic })),
+        evidence: [{ source: "openapi", content, reference }],
+      };
+    }
     const release = compileWebMcpRelease(compiled.plans);
     return {
       capabilities: release.manifest.plans.map((plan) => ({ plan, status: "proposed" as const })),

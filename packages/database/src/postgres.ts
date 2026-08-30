@@ -323,16 +323,27 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
 
   async completeAnalysis(workerId: string, runId: string, result: AnalysisResult): Promise<AnalysisRunRecord> {
     if (result.capabilities.length > MAX_CAPABILITIES || result.evidence.length > MAX_EVIDENCE
-      || Buffer.byteLength(result.release.code) > MAX_RELEASE_BYTES) throw new RepositoryError("INVALID_STATE");
+      || result.release !== undefined && Buffer.byteLength(result.release.code) > MAX_RELEASE_BYTES) {
+      throw new RepositoryError("INVALID_STATE");
+    }
     let canonicalPlans: readonly CapabilityPlan[];
     try {
-      canonicalPlans = canonicalizeCapabilityPlans(result.capabilities.map(({ plan }) => plan));
+      canonicalPlans = result.capabilities.length === 0
+        ? []
+        : canonicalizeCapabilityPlans(result.capabilities.map(({ plan }) => plan));
     } catch {
       throw new RepositoryError("INVALID_STATE");
     }
-    const sourcePlans = plansFromManifest(result.release.manifest);
-    if (!sourcePlans || !equalPlanSets(sourcePlans, canonicalPlans)) throw new RepositoryError("INVALID_STATE");
     const normalizedDiagnostics = normalizeAnalysisDiagnostics(result.diagnostics);
+    if (canonicalPlans.length === 0) {
+      if (normalizedDiagnostics.length === 0 || result.evidence.length === 0 || result.release !== undefined) {
+        throw new RepositoryError("INVALID_STATE");
+      }
+    } else {
+      if (result.release === undefined) throw new RepositoryError("INVALID_STATE");
+      const sourcePlans = plansFromManifest(result.release.manifest);
+      if (!sourcePlans || !equalPlanSets(sourcePlans, canonicalPlans)) throw new RepositoryError("INVALID_STATE");
+    }
     const statuses = new Map(result.capabilities.map(({ plan, status }) => [plan.tool.name, status]));
     return this.#transaction({ kind: "worker" }, async (client) => {
       const job = await client.query(
@@ -379,12 +390,15 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
             JSON.stringify(plan), planDigest, plan.effects.riskTier === "R0" || status === "blocked" ? planDigest : null]
         );
       }
-      const releaseHash = createHash("sha256").update(Buffer.from(result.release.code)).digest("hex");
+      const releaseHash = result.release === undefined
+        ? null
+        : createHash("sha256").update(Buffer.from(result.release.code)).digest("hex");
       await client.query(
         "update public.analysis_runs set result = $2::jsonb, release_code = $3, release_hash = $4, " +
         "allowed_origin = $5, release_manifest = $6::jsonb, error_code = null, updated_at = now() where id = $1",
-        [runId, JSON.stringify({ diagnostics: normalizedDiagnostics, draftPullRequest: result.draftPullRequest }), result.release.code, releaseHash,
-          result.release.allowedOrigin, JSON.stringify(result.release.manifest ?? {})]
+        [runId, JSON.stringify({ diagnostics: normalizedDiagnostics, draftPullRequest: result.draftPullRequest }),
+          result.release?.code ?? null, releaseHash, result.release?.allowedOrigin ?? null,
+          result.release === undefined ? null : JSON.stringify(result.release.manifest ?? {})]
       );
       const completed = await client.query(
         "update private.analysis_jobs set status = 'succeeded', lease_owner = null, lease_expires_at = null, " +
@@ -443,13 +457,22 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
         diagnostics?: AnalysisResult["diagnostics"];
         draftPullRequest?: AnalysisResult["draftPullRequest"];
       } | null;
+      const diagnostics = normalizeAnalysisDiagnostics(stored?.diagnostics ?? []);
+      const releaseValues = [run.rows[0].release_code, run.rows[0].release_hash,
+        run.rows[0].allowed_origin, run.rows[0].release_manifest];
+      const hasRelease = releaseValues.every((value) => value !== null && value !== undefined);
+      if (releaseValues.some((value) => value !== null && value !== undefined) !== hasRelease
+        || capabilities.rows.length === 0 && (diagnostics.length === 0 || hasRelease)
+        || capabilities.rows.length > 0 && !hasRelease) {
+        throw new RepositoryError("INVALID_STATE");
+      }
       return {
         capabilities: capabilities.rows.map((row) => ({ plan: row.plan as CapabilityPlan,
           status: row.status as CapabilityRecord["status"] })),
-        diagnostics: normalizeAnalysisDiagnostics(stored?.diagnostics ?? []),
+        diagnostics,
         evidence: evidence.rows.map(mapEvidence),
-        release: { code: String(run.rows[0].release_code), contentHash: String(run.rows[0].release_hash),
-          allowedOrigin: String(run.rows[0].allowed_origin), manifest: run.rows[0].release_manifest },
+        release: hasRelease ? { code: String(run.rows[0].release_code), contentHash: String(run.rows[0].release_hash),
+          allowedOrigin: String(run.rows[0].allowed_origin), manifest: run.rows[0].release_manifest } : undefined,
         draftPullRequest: stored?.draftPullRequest
       };
     });

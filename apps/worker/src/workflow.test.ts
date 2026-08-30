@@ -30,6 +30,7 @@ test("OpenAPI worker adapter binds exact source bytes to generic canonical plans
   const result = await adapter({ sourceType: "openapi", sourceUrl: "https://specs.widgets.example/openapi.json" }, new AbortController().signal);
   assert.equal(result.capabilities.length, 1);
   assert.equal(result.capabilities[0]!.plan.targetOrigin, "https://widgets.example");
+  assert.ok(result.release);
   assert.equal(result.release.manifest && typeof result.release.manifest === "object", true);
   assert.equal(result.evidence.length, 1);
   assert.equal(result.capabilities[0]!.plan.evidence[0]!.reference, result.evidence[0]!.reference);
@@ -45,7 +46,7 @@ test("OpenAPI worker adapter binds exact source bytes to generic canonical plans
   assert.doesNotMatch(JSON.stringify(result), /sk-live|never-persist/i);
 });
 
-test("OpenAPI worker adapter fails closed for other source types or when no browser-safe plan exists", async () => {
+test("OpenAPI worker adapter fails closed for other source types and returns exact diagnostics without an invented release", async () => {
   const source = JSON.stringify({ openapi: "3.1.0", info: { title: "Widgets", version: "1" }, paths: { "/admin": { delete: {
     responses: { "200": { description: "ok", content: { "application/json": { schema: { type: "boolean" } } } } },
   } } } });
@@ -64,7 +65,14 @@ test("OpenAPI worker adapter fails closed for other source types or when no brow
     },
   });
   await assert.rejects(() => adapter({ sourceType: "website", sourceUrl: "https://widgets.example" }, new AbortController().signal), /SOURCE_TYPE_UNSUPPORTED/);
-  await assert.rejects(() => adapter({ sourceType: "openapi", sourceUrl: "https://specs.widgets.example/openapi.json" }, new AbortController().signal), /NO_BROWSER_SAFE_CAPABILITIES/);
+  const result = await adapter(
+    { sourceType: "openapi", sourceUrl: "https://specs.widgets.example/openapi.json" },
+    new AbortController().signal,
+  );
+  assert.deepEqual(result.capabilities, []);
+  assert.deepEqual(result.diagnostics, [{ code: "UNSUPPORTED_HTTP_METHOD", operationKey: "DELETE /admin" }]);
+  assert.equal(result.release, undefined);
+  assert.equal(result.evidence.length, 1);
 
   assert.throws(() => createOpenApiAnalysisAdapter({
     targetOrigin: "http://widgets.example",

@@ -97,6 +97,7 @@ export function deriveVerification(
   result: AnalysisResult,
   capabilities: CapabilityRecord[]
 ): VerificationRequest {
+  if (result.release === undefined) throw new ApiError("INVALID_STATE", 409);
   const parsedSourceManifest = ManifestSchema.safeParse(result.release.manifest);
   const targetOrigin = safeOrigin(projectUrl);
   const selectedCapabilities = capabilities.filter((capability) => capability.status !== "blocked");
@@ -221,6 +222,7 @@ function assertCurrentEvidence(
   projectId: string,
   analysisRunId: string,
 ): void {
+  if (result.release === undefined) throw new ApiError("INVALID_STATE", 409);
   const manifest = ManifestSchema.safeParse(result.release.manifest);
   const referenced = manifest.success
     ? manifest.data.plans.flatMap((plan) => plan.evidence.map(({ source, reference }) => ({ source, reference })))

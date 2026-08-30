@@ -550,7 +550,7 @@ test("a blocked capability publishes reviewed bytes without mutating the worker 
 
   assert.equal(release.code, candidate.code);
   assert.equal(release.contentHash, candidate.contentHash);
-  assert.equal((await repository.getAnalysisResult(owner, run.id))?.release.code, sourceCandidate.code);
+  assert.equal((await repository.getAnalysisResult(owner, run.id))?.release?.code, sourceCandidate.code);
 });
 
 test("candidate hashes are validated and a later verification cannot be overwritten by an older publish", async () => {

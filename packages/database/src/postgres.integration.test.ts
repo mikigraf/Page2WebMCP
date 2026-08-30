@@ -176,6 +176,28 @@ test("Postgres repository persists and recovers the fixture lifecycle", { skip: 
     assert.equal(secondRelease.contentHash, release.contentHash);
     assert.notEqual(secondRelease.analysisRunId, release.analysisRunId);
 
+    const diagnosticRun = await repository.enqueueAnalysis(actor, {
+      projectId: project.id,
+      idempotencyKey: "postgres-analysis-diagnostic-only",
+      inputHash: "analysis-input-diagnostic-only"
+    });
+    assert.equal((await repository.claimAnalysis("postgres-worker-diagnostic-only", 60_000))?.id, diagnosticRun.id);
+    const diagnosticContent = JSON.stringify({ adapter: "bounded-openapi", sourceDigest: "urn:sha256:source" });
+    const diagnosticReference = `urn:sha256:${createHash("sha256").update(diagnosticContent).digest("hex")}`;
+    await repository.completeAnalysis("postgres-worker-diagnostic-only", diagnosticRun.id, {
+      capabilities: [],
+      diagnostics: [{ code: "SERVER_ADAPTER_REQUIRED", operationKey: "GET /private", reason: "api_key_header" }],
+      evidence: [{ source: "openapi", content: diagnosticContent, reference: diagnosticReference }]
+    });
+    const diagnosticResult = await repository.getAnalysisResult(actor, diagnosticRun.id);
+    assert.deepEqual(diagnosticResult?.capabilities, []);
+    assert.deepEqual(diagnosticResult?.diagnostics, [{
+      code: "SERVER_ADAPTER_REQUIRED",
+      operationKey: "GET /private",
+      reason: "api_key_header"
+    }]);
+    assert.equal(diagnosticResult?.release, undefined);
+
     const failedRun = await repository.enqueueAnalysis(actor, {
       projectId: project.id,
       idempotencyKey: "postgres-analysis-failed",
@@ -470,7 +492,7 @@ test("Postgres preserves the worker candidate across capability changes and publ
       selectionScore: 20
     });
 
-    assert.equal((await repository.getAnalysisResult(actor, run.id))?.release.code, source.code);
+    assert.equal((await repository.getAnalysisResult(actor, run.id))?.release?.code, source.code);
     await repository.reviewCapability(actor, blocked.id, {
       action: "approve",
       expectedVersion: blocked.version
