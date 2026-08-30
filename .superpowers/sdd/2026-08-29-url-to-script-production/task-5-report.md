@@ -220,3 +220,83 @@ The production source audit again found no locale-sensitive sort and no Acme/fix
 - The PostgreSQL checks are from a fresh local hermetic cluster, not a managed deployment. Staging must still rehearse the migration/backfill and grants with production-shaped data.
 - Phase handlers now have the complete classified-failure contract, but live provider adapters remain later work and must deliberately classify only proven retryable failures as transient.
 - Existing one-time wait-token and trusted-loader installation constraints remain unchanged from the original Task 5 report.
+
+## Fix round 2 (Task 5 rereview)
+
+Implementation commit: `d8bd3a5 fix: reject illegal initial workflow state`
+
+### Finding resolved
+
+- `private.enforce_workflow_run_phase` now rejects every runtime insert that does not begin queued with version `0`, next event sequence `1`, and empty cancellation/error state. This applies equally to direct `page2webmcp_app` and `page2webmcp_worker` grants.
+- `private.enforce_workflow_task_phase` now validates the complete initial execution state before its legacy-analysis branch: queued status, zero attempts/lease generation, no lease, outputs, checkpoint, wait, resume, cancellation, retry, error, or reconciliation metadata. The legacy branch can no longer return early around these checks.
+- The INSERT/phase triggers are installed after the one-time compatibility backfill. Historical analysis rows may therefore be mirrored in their real terminal, leased, cancelled, or retried states, while every repository-created row after migration is subject to the stricter runtime contract.
+- PostgreSQL missing-next reconciliation now inserts a pristine queued task through the guard and marks it reconciled in a subsequent update in the same transaction. This preserves the existing exact predecessor/output-hash and idempotency behavior.
+
+### Strict RED evidence
+
+The focused static contract was added first and failed before implementation:
+
+```text
+/usr/local/bin/node /Users/miki/Cloudsail-Development/runmill/node_modules/tsx/dist/cli.mjs --test packages/database/src/workflow-migration.test.ts
+tests 1; pass 0; fail 1
+missing /illegal initial workflow run state/
+```
+
+The direct-role behavioral regression was then run against a fresh PostgreSQL cluster. Before the guards, an illegal initial run insert fulfilled instead of failing:
+
+```text
+/usr/local/bin/node /Users/miki/Cloudsail-Development/runmill/node_modules/tsx/dist/cli.mjs --test --test-name-pattern "Postgres phased workflow" packages/database/src/postgres.integration.test.ts
+tests 1; pass 0; fail 1
+expected rejected; actual fulfilled
+```
+
+The regression attempts status-, version-, event-sequence-, and cancellation-seeded workflow run inserts under both direct roles. It also deletes a compatibility task as the migration owner and proves that both direct roles cannot reinsert an `analysis` task with terminal status and populated counters; every attempt must fail with SQLSTATE `23514`.
+
+### GREEN and migration evidence
+
+Focused contract/controller run:
+
+```text
+/usr/local/bin/node /Users/miki/Cloudsail-Development/runmill/node_modules/tsx/dist/cli.mjs --test packages/database/src/workflow-migration.test.ts packages/database/src/workflow.test.ts
+tests 15; pass 15; fail 0; skipped 0; duration 333 ms
+```
+
+A fresh hermetic PostgreSQL cluster applied every migration and the compatibility backfill before running the direct-role suite:
+
+```text
+/usr/local/bin/node /Users/miki/Cloudsail-Development/runmill/node_modules/tsx/dist/cli.mjs --test packages/database/src/postgres.integration.test.ts
+tests 5; pass 5; fail 0; skipped 0; duration 870 ms
+```
+
+The local bootstrap explicitly created `pgcrypto`, which the managed Supabase environment provides, before applying repository migrations. An additional production-topology launch was attempted after the completed database suite but hit the already documented local untrusted-`tsx` worker startup timeout; it is separately environment-gated in the trusted full suite and does not affect the five completed PostgreSQL tests.
+
+Affected repository/worker run:
+
+```text
+/usr/local/bin/node /Users/miki/Cloudsail-Development/runmill/node_modules/tsx/dist/cli.mjs --test packages/database/src/workflow.test.ts packages/database/src/workflow-migration.test.ts packages/database/src/control-plane.test.ts packages/database/src/postgres.integration.test.ts apps/worker/src/runner.test.ts
+tests 41; pass 36; fail 0; skipped 5; duration 454 ms
+```
+
+Full trusted suite:
+
+```text
+/usr/local/bin/node /Users/miki/Cloudsail-Development/runmill/node_modules/tsx/dist/cli.mjs --test test-support/**/*.test.ts apps/**/*.test.ts packages/**/*.test.ts
+tests 284; pass 278; fail 0; skipped 6; duration 4064 ms
+```
+
+Direct gates all exited `0`:
+
+```text
+/usr/local/bin/node node_modules/typescript/bin/tsc --project tsconfig.base.json --noEmit --pretty false
+/usr/local/bin/node node_modules/eslint/bin/eslint.js . --max-warnings=0
+/usr/local/bin/node scripts/lint-source.mjs
+/usr/local/bin/node scripts/check-source.mjs
+git diff --check
+```
+
+### Fix-round self-review and residuals
+
+- Confirmed the raw app/worker grants remain usable for every legal repository insert and that RLS, transition triggers, immutable task identity, predecessor adjacency, one-active-run uniqueness, and legacy job synchronization are unchanged.
+- Confirmed compatibility rows are the only inserts allowed to bypass runtime initial-state guards, and only while the migration is applying before the triggers are created.
+- Confirmed reconciler task creation and its `reconciled_at` update remain in one transaction and retain run-before-task lock order.
+- No managed deployment was changed. Staging still needs a production-shaped migration/backfill rehearsal; all pre-existing provider, wait-token, and trusted-loader deployment limits remain unchanged.
