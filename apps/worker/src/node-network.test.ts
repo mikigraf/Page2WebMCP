@@ -7,6 +7,7 @@ import type { RequestOptions } from "node:https";
 import {
   createNodeOpenApiResolver,
   createNodeOpenApiTransport,
+  createNodePinnedJsonTransport,
   type NodeHttpsRequest,
 } from "./node-network.ts";
 
@@ -318,4 +319,117 @@ test("Node HTTPS closes the construction abort-listener race before sending the 
   await assert.rejects(pending, /^Error: OPENAPI_FETCH_ABORTED$/);
   assert.equal(destroyed, true);
   assert.equal(ended, false);
+});
+
+test("pinned JSON transport rejects private DNS before credential-bearing HTTPS construction", async () => {
+  let requestCalls = 0;
+  const transport = createNodePinnedJsonTransport({
+    resolver: {
+      resolve: async (hostname: string) => {
+        assert.equal(hostname, "127.0.0.1.nip.io");
+        return ["127.0.0.1", "::1"];
+      },
+    },
+    request: () => {
+      requestCalls += 1;
+      throw new Error("CREDENTIAL_TRANSPORT_MUST_NOT_START");
+    },
+  });
+  await assert.rejects(transport.request({
+    url: "https://127.0.0.1.nip.io/v1/control",
+    method: "POST",
+    headers: { authorization: "Bearer secret-control-token", "content-type": "application/json" },
+    body: "{}",
+    signal: new AbortController().signal,
+  }), /^Error: WEBSITE_CONTROL_HOST_BLOCKED$/);
+  assert.equal(requestCalls, 0);
+});
+
+test("pinned JSON transport writes credentials only after pinned TLS peer verification", async () => {
+  let sentBody: string | undefined;
+  let capturedOptions: RequestOptions | undefined;
+  const request: NodeHttpsRequest = (_url, options, onResponse) => {
+    capturedOptions = options;
+    const client = new EventEmitter() as EventEmitter & { end(body?: string): void; destroy(error?: Error): void };
+    const socket = new EventEmitter() as EventEmitter & {
+      remoteAddress: string; authorized: boolean; servername: string;
+      getProtocol(): string; destroy(error?: Error): void;
+    };
+    Object.assign(socket, {
+      remoteAddress: "93.184.216.34",
+      authorized: true,
+      servername: "control.widgets.example",
+      getProtocol: () => "TLSv1.3",
+      destroy: () => undefined,
+    });
+    client.end = (body?: string) => {
+      sentBody = body;
+      const response = Readable.from([Buffer.from('{"ok":true}')]) as Readable & {
+        statusCode?: number; headers: Record<string, string>; socket: unknown;
+      };
+      response.statusCode = 200;
+      response.headers = { "content-type": "application/json" };
+      response.socket = socket;
+      onResponse(response as never);
+    };
+    client.destroy = (error?: Error) => { if (error) client.emit("error", error); };
+    queueMicrotask(() => {
+      client.emit("socket", socket);
+      assert.equal(sentBody, undefined);
+      socket.emit("secureConnect");
+    });
+    return client as never;
+  };
+  const response = await createNodePinnedJsonTransport({
+    resolver: { resolve: async () => ["93.184.216.34"] },
+    request,
+  }).request({
+    url: "https://control.widgets.example/v1/control",
+    method: "POST",
+    headers: { authorization: "Bearer secret-control-token", "content-type": "application/json" },
+    body: '{"operation":"test"}',
+    signal: new AbortController().signal,
+  });
+  assert.equal(sentBody, '{"operation":"test"}');
+  assert.equal(capturedOptions?.servername, "control.widgets.example");
+  assert.equal(capturedOptions?.rejectUnauthorized, true);
+  assert.equal(capturedOptions?.minVersion, "TLSv1.2");
+  assert.equal(capturedOptions?.agent, false);
+  assert.equal(response.status, 200);
+  assert.deepEqual(JSON.parse(new TextDecoder().decode(response.body)), { ok: true });
+});
+
+test("pinned JSON transport does not write credentials to an unpinned actual peer", async () => {
+  let endCalls = 0;
+  const request: NodeHttpsRequest = () => {
+    const client = new EventEmitter() as EventEmitter & { end(body?: string): void; destroy(error?: Error): void };
+    const socket = new EventEmitter() as EventEmitter & {
+      remoteAddress: string; authorized: boolean; servername: string;
+      getProtocol(): string; destroy(error?: Error): void;
+    };
+    Object.assign(socket, {
+      remoteAddress: "8.8.8.8",
+      authorized: true,
+      servername: "control.widgets.example",
+      getProtocol: () => "TLSv1.3",
+      destroy: () => undefined,
+    });
+    client.end = () => { endCalls += 1; };
+    client.destroy = (error?: Error) => { if (error) queueMicrotask(() => client.emit("error", error)); };
+    queueMicrotask(() => {
+      client.emit("socket", socket);
+      socket.emit("secureConnect");
+    });
+    return client as never;
+  };
+  await assert.rejects(createNodePinnedJsonTransport({
+    resolver: { resolve: async () => ["93.184.216.34"] }, request,
+  }).request({
+    url: "https://control.widgets.example/v1/control",
+    method: "POST",
+    headers: { authorization: "Bearer secret-control-token", "content-type": "application/json" },
+    body: "{}",
+    signal: new AbortController().signal,
+  }), /^Error: WEBSITE_CONTROL_HOST_BLOCKED$/);
+  assert.equal(endCalls, 0);
 });

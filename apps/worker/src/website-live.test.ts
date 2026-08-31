@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
 import { browserUseCloudV4PolicyDigest, type BrowserUseCloudV4Request } from "../../../packages/providers/src/browser-use-v4.ts";
 import type { WebsiteProviderControls } from "../../../packages/providers/src/website.ts";
+import type { NodePinnedJsonTransport } from "./node-network.ts";
 import {
   createConfiguredWebsiteAnalysisAdapter,
   WEBSITE_LIVE_CONTROL_PATHS,
@@ -84,9 +86,15 @@ function controlHarness(input: Readonly<{
   badRoutePolicyDigest?: boolean;
   badIssueAttestation?: boolean;
   failApply?: boolean;
+  requiresAuthentication?: boolean;
+  badAuthAttestation?: boolean;
+  badSecretDigest?: boolean;
+  issueStatus?: number;
 }> = {}) {
   const calls: ControlCall[] = [];
   let currentExpiry = new Date(now.getTime() + 9 * 60_000).toISOString();
+  const issuedPolicies = new Map<string, Readonly<{ expiresAt: string; reference: string }>>();
+  let observationCount = 0;
   const fetcher: typeof fetch = async (rawUrl, init) => {
     const url = String(rawUrl);
     const method = init?.method ?? "GET";
@@ -97,11 +105,19 @@ function controlHarness(input: Readonly<{
     assert.ok(init?.signal instanceof AbortSignal);
     assert.equal(method, "POST");
     if (url.endsWith("/v1/website-egress-policies/issue")) {
-      currentExpiry = String(body.expiresAt);
+      if (input.issueStatus !== undefined) return jsonResponse(url, { rejected: true }, input.issueStatus);
+      const idempotencyKey = String(body.idempotencyKey);
+      const issued = issuedPolicies.get(idempotencyKey) ?? {
+        expiresAt: new Date(now.getTime() + 9 * 60_000 + issuedPolicies.size * 60_000).toISOString(),
+        reference: `secretref:policy-${String((body.ownership as Record<string, unknown>).runId)}`,
+      };
+      issuedPolicies.set(idempotencyKey, issued);
+      currentExpiry = issued.expiresAt;
       return jsonResponse(url, {
         ...body,
         targetOrigin: input.badIssueAttestation ? "https://other.example" : body.targetOrigin,
-        reference: `secretref:policy-${String((body.ownership as Record<string, unknown>).runId)}`,
+        expiresAt: issued.expiresAt,
+        reference: issued.reference,
       });
     }
     if (url.endsWith("/v1/website-egress-policies/apply")) {
@@ -150,21 +166,24 @@ function controlHarness(input: Readonly<{
       return jsonResponse(url, { ...body, stopped: true });
     }
     if (url.endsWith("/v1/browser-use-v4/sessions/reconcile")) {
-      return jsonResponse(url, { ...body, reconciled: true });
+      return jsonResponse(url, { ...body, reconciled: true, terminated: true });
     }
     if (url.endsWith("/v1/ttl-secrets/put")) {
+      const valueDigest = createHash("sha256").update(String(body.value), "utf8").digest("hex");
       return jsonResponse(url, {
         gatewayProtocolVersion: body.gatewayProtocolVersion,
         idempotencyKey: body.idempotencyKey,
         ownership: body.ownership,
         purpose: body.purpose, expiresAt: body.expiresAt,
-        kmsKeyId: body.kmsKeyId, reference: `secretref:${String(body.purpose)}-1`,
+        kmsKeyId: body.kmsKeyId, valueDigest: input.badSecretDigest ? "0".repeat(64) : valueDigest,
+        reference: `secretref:${String(body.purpose)}-1`,
       });
     }
     if (url.endsWith("/v1/ttl-secrets/revoke")) {
       return jsonResponse(url, { ...body, revoked: true });
     }
     if (url.endsWith("/v1/website-observations/observe")) {
+      observationCount += 1;
       return jsonResponse(url, {
         gatewayProtocolVersion: body.gatewayProtocolVersion,
         idempotencyKey: body.idempotencyKey,
@@ -172,12 +191,39 @@ function controlHarness(input: Readonly<{
         phase: body.phase, targetOrigin: body.targetOrigin, cdpReference: body.cdpReference,
         routePolicyDigest: input.badRoutePolicyDigest ? "0".repeat(64) : body.routePolicyDigest,
         enforced: true,
-        requiresAuthentication: false,
+        requiresAuthentication: input.requiresAuthentication === true && observationCount === 1,
         observations: {
           navigations: [], semanticTargets: [], network: [], forms: [], dom: [],
           authSignals: [], blockedMutations: [], stateTransitions: [],
         },
       });
+    }
+    if (url.endsWith("/v1/auth-handoffs/open")) {
+      return jsonResponse(url, {
+        gatewayProtocolVersion: body.gatewayProtocolVersion,
+        idempotencyKey: body.idempotencyKey,
+        ownership: body.ownership,
+        handoffId: "handoff-1",
+        targetOrigin: input.badAuthAttestation ? "https://other.example" : body.targetOrigin,
+        liveReference: body.liveReference,
+        expiresAt: body.expiresAt,
+      });
+    }
+    if (url.endsWith("/v1/auth-handoffs/wait")) {
+      return jsonResponse(url, {
+        gatewayProtocolVersion: body.gatewayProtocolVersion,
+        idempotencyKey: body.idempotencyKey,
+        ownership: body.ownership,
+        handoffId: body.handoffId,
+        completion: {
+          authenticatedOrigin: "https://widgets.example",
+          observedAt: "2026-08-31T12:01:00.000Z",
+          signals: ["account_control"],
+        },
+      });
+    }
+    if (url.endsWith("/v1/auth-handoffs/close")) {
+      return jsonResponse(url, { ...body, closed: true });
     }
     if (url.endsWith("/v1/website-evidence/put")) {
       const record = body.record as Record<string, unknown>;
@@ -193,7 +239,18 @@ function controlHarness(input: Readonly<{
     }
     throw new Error(`UNEXPECTED_CONTROL_REQUEST:${url}`);
   };
-  return { calls, fetch: fetcher, expiresAt: () => currentExpiry };
+  const transport: NodePinnedJsonTransport = {
+    request: async ({ url, method, headers, body, signal }) => {
+      const response = await fetcher(url, { method, headers, body, signal, redirect: "error" });
+      return {
+        status: response.status,
+        url: response.url,
+        headers: Object.fromEntries(response.headers.entries()),
+        body: new Uint8Array(await response.arrayBuffer()),
+      };
+    },
+  };
+  return { calls, fetch: fetcher, transport, expiresAt: () => currentExpiry };
 }
 
 test("website control inventory is exact, sorted, validates values, and never returns secrets", () => {
@@ -225,7 +282,7 @@ test("website control inventory is exact, sorted, validates values, and never re
 test("website adapter rejects noncanonical source configuration before issuing a policy", async () => {
   const harness = controlHarness();
   const adapter = createConfiguredWebsiteAnalysisAdapter(environment(), {
-    fetch: harness.fetch, clock: () => now, ...networkControls(harness.expiresAt),
+    controlTransport: harness.transport, clock: () => now, ...networkControls(harness.expiresAt),
   });
   await assert.rejects(adapter({
     id: "analysis-run-wrong-config", organizationId: "organization-1", projectId: "project-1",
@@ -239,7 +296,7 @@ test("configured website adapter issues fresh target-bound policies and sends th
   const harness = controlHarness();
   let clock = new Date(now);
   const adapter = createConfiguredWebsiteAnalysisAdapter(environment(), {
-    fetch: harness.fetch,
+    controlTransport: harness.transport,
     clock: () => clock,
     ...networkControls(harness.expiresAt),
   });
@@ -256,29 +313,30 @@ test("configured website adapter issues fresh target-bound policies and sends th
   }
   const issueCalls = harness.calls.filter(({ url }) => url.endsWith("/v1/website-egress-policies/issue"));
   assert.equal(issueCalls.length, 2);
-  assert.notEqual(issueCalls[0]!.body.expiresAt, issueCalls[1]!.body.expiresAt);
   for (const [index, call] of issueCalls.entries()) {
     assert.deepEqual(call.body, {
       gatewayProtocolVersion: 1,
-      idempotencyKey: `website:analysis-run-${index + 1}:policy-issue`,
+      idempotencyKey: call.body.idempotencyKey,
       ownership: {
         organizationId: "organization-1",
         projectId: "project-1",
         runId: `analysis-run-${index + 1}`,
       },
       denyByDefault: true,
-      expiresAt: new Date(now.getTime() + (index + 9) * 60_000).toISOString(),
+      ttlSeconds: 540,
       routes: [{ methods: ["GET", "HEAD"], origin: "https://widgets.example", pathPrefix: "/" }],
       targetOrigin: "https://widgets.example",
     });
+    assert.match(String(call.body.idempotencyKey), new RegExp(`^website:analysis-run-${index + 1}:policy-issue:[a-f0-9]{64}$`));
   }
   const starts = harness.calls.filter(({ url }) => url.endsWith("/v1/browser-use-v4/sessions/start"));
   assert.equal(starts.length, 2);
   for (const start of starts) {
-    const ownership = { organizationId: "organization-1", projectId: "project-1", runId: start.body.idempotencyKey === "website:analysis-run-1:browser-start" ? "analysis-run-1" : "analysis-run-2" };
+    const runId = String(start.body.idempotencyKey).startsWith("website:analysis-run-1:") ? "analysis-run-1" : "analysis-run-2";
+    const ownership = { organizationId: "organization-1", projectId: "project-1", runId };
     assert.deepEqual(start.body, {
       gatewayProtocolVersion: 1,
-      idempotencyKey: `website:${ownership.runId}:browser-start`,
+      idempotencyKey: start.body.idempotencyKey,
       ownership,
       request: {
       apiVersion: "v4",
@@ -298,6 +356,7 @@ test("configured website adapter issues fresh target-bound policies and sends th
       expiresAt: (start.body.request as Record<string, unknown>).expiresAt,
       },
     });
+    assert.match(String(start.body.idempotencyKey), new RegExp(`^website:${ownership.runId}:browser-start:[a-f0-9]{64}$`));
   }
   const cdpCalls = harness.calls.filter(({ url }) => url.endsWith("/v1/website-observations/observe"));
   assert.equal(cdpCalls.length, 2);
@@ -317,10 +376,121 @@ test("configured website adapter issues fresh target-bound policies and sends th
   assert.equal(harness.calls.filter(({ url }) => url.endsWith("/v1/website-egress-policies/revoke")).length, 4);
 });
 
+test("same website run never changes the payload behind a reused idempotency key", async () => {
+  const harness = controlHarness();
+  let clock = new Date(now);
+  const adapter = createConfiguredWebsiteAnalysisAdapter(environment(), {
+    controlTransport: harness.transport, clock: () => clock, ...networkControls(harness.expiresAt),
+  });
+  const source = {
+    id: "analysis-run-retry", organizationId: "organization-1", projectId: "project-1",
+    sourceType: "website" as const, sourceUrl: "https://widgets.example/app",
+    sourceConfiguration: { kind: "website" as const },
+  };
+  await adapter(source, new AbortController().signal);
+  clock = new Date(clock.getTime() + 30_000);
+  await adapter(source, new AbortController().signal);
+  const byKey = new Map<string, string>();
+  for (const { body } of harness.calls) {
+    const key = String(body.idempotencyKey);
+    const serialized = JSON.stringify(body);
+    if (byKey.has(key)) assert.equal(serialized, byKey.get(key));
+    else byKey.set(key, serialized);
+  }
+  const issues = harness.calls.filter(({ url }) => url.endsWith(WEBSITE_LIVE_CONTROL_PATHS.policyIssue));
+  assert.equal(issues.length, 2);
+  assert.deepEqual(issues[0]!.body, issues[1]!.body);
+  assert.equal(issues[0]!.body.ttlSeconds, 540);
+  assert.equal("expiresAt" in issues[0]!.body, false);
+});
+
+test("website control aborts redact arbitrary caller reasons", async () => {
+  const secret = "Bearer should-never-escape";
+  const controller = new AbortController();
+  controller.abort(new Error(secret));
+  const adapter = createConfiguredWebsiteAnalysisAdapter(environment(), {
+    controlTransport: { request: async ({ signal }) => { throw signal.reason; } },
+    clock: () => now,
+    ...networkControls(() => new Date(now.getTime() + 9 * 60_000).toISOString()),
+  });
+  const error = await adapter({
+    id: "analysis-run-abort", organizationId: "organization-1", projectId: "project-1",
+    sourceType: "website", sourceUrl: "https://widgets.example/app", sourceConfiguration: { kind: "website" },
+  }, controller.signal).catch((reason: unknown) => reason);
+  assert.equal(error instanceof Error && error.message, "WEBSITE_CONTROL_ABORTED");
+  assert.doesNotMatch(String(error), /should-never-escape/);
+});
+
+test("website default controls never fall back to the injected loose fetch function", async () => {
+  let looseFetchCalls = 0;
+  const controller = new AbortController();
+  controller.abort(new Error("Bearer loose-fetch-secret"));
+  const adapter = createConfiguredWebsiteAnalysisAdapter(environment(), {
+    fetch: async () => { looseFetchCalls += 1; throw new Error("LOOSE_FETCH_USED"); },
+    clock: () => now,
+    ...networkControls(() => new Date(now.getTime() + 9 * 60_000).toISOString()),
+  });
+  await assert.rejects(adapter({
+    id: "analysis-run-default-transport", organizationId: "organization-1", projectId: "project-1",
+    sourceType: "website", sourceUrl: "https://widgets.example/app", sourceConfiguration: { kind: "website" },
+  }, controller.signal), /^Error: WEBSITE_CONTROL_ABORTED$/);
+  assert.equal(looseFetchCalls, 0);
+});
+
+test("website TTL secrets and auth-open require exact non-secret attestations", async () => {
+  const harness = controlHarness({ requiresAuthentication: true });
+  const adapter = createConfiguredWebsiteAnalysisAdapter(environment(), {
+    controlTransport: harness.transport, clock: () => now, ...networkControls(harness.expiresAt),
+  });
+  await adapter({
+    id: "analysis-run-auth", organizationId: "organization-1", projectId: "project-1",
+    sourceType: "website", sourceUrl: "https://widgets.example/app", sourceConfiguration: { kind: "website" },
+  }, new AbortController().signal);
+  for (const call of harness.calls.filter(({ url }) => url.endsWith(WEBSITE_LIVE_CONTROL_PATHS.secretPut))) {
+    assert.equal(call.body.valueDigest, createHash("sha256").update(String(call.body.value), "utf8").digest("hex"));
+  }
+  const open = harness.calls.find(({ url }) => url.endsWith(WEBSITE_LIVE_CONTROL_PATHS.authOpen));
+  assert.ok(open);
+  assert.equal(open.body.targetOrigin, "https://widgets.example");
+  assert.match(String(open.body.liveReference), /^secretref:/);
+  assert.equal(open.body.expiresAt, harness.expiresAt());
+
+  const malformed = controlHarness({ requiresAuthentication: true, badAuthAttestation: true });
+  const malformedAdapter = createConfiguredWebsiteAnalysisAdapter(environment(), {
+    controlTransport: malformed.transport, clock: () => now, ...networkControls(malformed.expiresAt),
+  });
+  await assert.rejects(malformedAdapter({
+    id: "analysis-run-auth-drift", organizationId: "organization-1", projectId: "project-1",
+    sourceType: "website", sourceUrl: "https://widgets.example/app", sourceConfiguration: { kind: "website" },
+  }, new AbortController().signal), /^Error: WEBSITE_CONTROL_RESPONSE_INVALID$/);
+
+  const malformedSecret = controlHarness({ badSecretDigest: true });
+  const malformedSecretAdapter = createConfiguredWebsiteAnalysisAdapter(environment(), {
+    controlTransport: malformedSecret.transport, clock: () => now, ...networkControls(malformedSecret.expiresAt),
+  });
+  await assert.rejects(malformedSecretAdapter({
+    id: "analysis-run-secret-drift", organizationId: "organization-1", projectId: "project-1",
+    sourceType: "website", sourceUrl: "https://widgets.example/app", sourceConfiguration: { kind: "website" },
+  }, new AbortController().signal), /^Error: WEBSITE_CONTROL_RESPONSE_INVALID$/);
+});
+
+test("website control status classification retries only 429 and 5xx", async () => {
+  for (const [status, code] of [[429, "WEBSITE_CONTROL_RETRYABLE"], [503, "WEBSITE_CONTROL_RETRYABLE"], [401, "WEBSITE_CONTROL_REJECTED"], [422, "WEBSITE_CONTROL_REJECTED"]] as const) {
+    const harness = controlHarness({ issueStatus: status });
+    const adapter = createConfiguredWebsiteAnalysisAdapter(environment(), {
+      controlTransport: harness.transport, clock: () => now, ...networkControls(harness.expiresAt),
+    });
+    await assert.rejects(adapter({
+      id: `analysis-run-status-${status}`, organizationId: "organization-1", projectId: "project-1",
+      sourceType: "website", sourceUrl: "https://widgets.example/app", sourceConfiguration: { kind: "website" },
+    }, new AbortController().signal), new RegExp(`^Error: ${code}$`));
+  }
+});
+
 test("website gateway policy drift fails closed and still stops, reconciles, releases, and revokes", async () => {
   const harness = controlHarness({ badPolicyDigest: true });
   const adapter = createConfiguredWebsiteAnalysisAdapter(environment(), {
-    fetch: harness.fetch,
+    controlTransport: harness.transport,
     clock: () => now,
     ...networkControls(harness.expiresAt),
   });
@@ -343,19 +513,19 @@ test("website gateway policy drift fails closed and still stops, reconciles, rel
 test("website cleans an issued policy when proxy apply fails without exposing upstream values", async () => {
   const harness = controlHarness({ failApply: true });
   const adapter = createConfiguredWebsiteAnalysisAdapter(environment(), {
-    fetch: harness.fetch, clock: () => now, ...networkControls(harness.expiresAt),
+    controlTransport: harness.transport, clock: () => now, ...networkControls(harness.expiresAt),
   });
   await assert.rejects(adapter({
     id: "analysis-run-apply-failure", organizationId: "organization-1", projectId: "project-1",
     sourceType: "website", sourceUrl: "https://widgets.example/app", sourceConfiguration: { kind: "website" },
-  }, new AbortController().signal), /^Error: WEBSITE_CONTROL_REQUEST_FAILED$/);
+  }, new AbortController().signal), /^Error: WEBSITE_CONTROL_RETRYABLE$/);
   assert.equal(harness.calls.filter(({ url }) => url.endsWith("/v1/website-egress-policies/revoke")).length, 2);
 });
 
 test("website cleans a valid issued reference when the issue attestation is malformed", async () => {
   const harness = controlHarness({ badIssueAttestation: true });
   const adapter = createConfiguredWebsiteAnalysisAdapter(environment(), {
-    fetch: harness.fetch, clock: () => now, ...networkControls(harness.expiresAt),
+    controlTransport: harness.transport, clock: () => now, ...networkControls(harness.expiresAt),
   });
   await assert.rejects(adapter({
     id: "analysis-run-issue-drift", organizationId: "organization-1", projectId: "project-1",
@@ -367,7 +537,7 @@ test("website cleans a valid issued reference when the issue attestation is malf
 test("website gateway cleans a created session when a later gateway field is malformed", async () => {
   const harness = controlHarness({ badGatewayUrl: true });
   const adapter = createConfiguredWebsiteAnalysisAdapter(environment(), {
-    fetch: harness.fetch, clock: () => now, ...networkControls(harness.expiresAt),
+    controlTransport: harness.transport, clock: () => now, ...networkControls(harness.expiresAt),
   });
   await assert.rejects(adapter({
     id: "analysis-run-malformed-gateway", organizationId: "organization-1", projectId: "project-1",
@@ -379,13 +549,13 @@ test("website gateway cleans a created session when a later gateway field is mal
   const stopIndex = harness.calls.findIndex(({ url }) => url.endsWith(WEBSITE_LIVE_CONTROL_PATHS.browserStop));
   const reconcileIndex = harness.calls.findIndex(({ url }) => url.endsWith(WEBSITE_LIVE_CONTROL_PATHS.browserReconcile));
   assert.ok(stopIndex >= 0 && reconcileIndex > stopIndex);
-  assert.equal(harness.calls.filter(({ url }) => url.endsWith(WEBSITE_LIVE_CONTROL_PATHS.leaseRelease)).length, 1);
+  assert.equal(harness.calls.filter(({ url }) => url.endsWith(WEBSITE_LIVE_CONTROL_PATHS.leaseRelease)).length, 0);
 });
 
 test("website rejects a CDP observer that does not attest the enforced route policy", async () => {
   const harness = controlHarness({ badRoutePolicyDigest: true });
   const adapter = createConfiguredWebsiteAnalysisAdapter(environment(), {
-    fetch: harness.fetch, clock: () => now, ...networkControls(harness.expiresAt),
+    controlTransport: harness.transport, clock: () => now, ...networkControls(harness.expiresAt),
   });
   await assert.rejects(adapter({
     id: "analysis-run-observer-drift", organizationId: "organization-1", projectId: "project-1",

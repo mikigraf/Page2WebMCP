@@ -8,6 +8,7 @@ import { validateResolvedAddress } from "../../../packages/security/src/security
 import type { OpenApiProviderControls } from "../../../packages/providers/src/openapi.ts";
 
 const MAX_DNS_ANSWERS_PLUS_ONE = 17;
+const MAX_JSON_BYTES = 64 * 1_024;
 
 type ResolverBoundary = Readonly<{
   resolve4(hostname: string): Promise<readonly string[]>;
@@ -21,6 +22,29 @@ export type NodeHttpsRequest = (
   onResponse: (response: IncomingMessage) => void,
 ) => ClientRequest;
 type NodeLookupFunction = NonNullable<RequestOptions["lookup"]>;
+
+export type NodePinnedJsonRequest = Readonly<{
+  url: string;
+  method: "POST";
+  headers: Readonly<Record<string, string>>;
+  body: string;
+  signal: AbortSignal;
+}>;
+
+export type NodePinnedJsonResponse = Readonly<{
+  status: number;
+  url: string;
+  headers: Readonly<Record<string, string>>;
+  body: Uint8Array;
+}>;
+
+export type NodePinnedJsonTransport = Readonly<{
+  request(input: NodePinnedJsonRequest): Promise<NodePinnedJsonResponse>;
+}>;
+
+type PinnedJsonResolver = Readonly<{
+  resolve(hostname: string, signal: AbortSignal): Promise<readonly string[]>;
+}>;
 
 function abortReason(signal: AbortSignal): Error {
   return signal.reason instanceof Error ? signal.reason : new Error("OPENAPI_FETCH_ABORTED");
@@ -120,6 +144,180 @@ function normalizedHeaders(headers: IncomingMessage["headers"]): Record<string, 
     else if (Array.isArray(value)) result[name] = value.join(", ");
   }
   return result;
+}
+
+function websiteAbortReason(signal: AbortSignal): Error {
+  return signal.reason instanceof Error && signal.reason.message === "WEBSITE_CONTROL_TIMEOUT"
+    ? new Error("WEBSITE_CONTROL_TIMEOUT")
+    : new Error("WEBSITE_CONTROL_ABORTED");
+}
+
+function validPinnedJsonRequest(input: NodePinnedJsonRequest): URL | undefined {
+  if (!input || input.method !== "POST" || typeof input.body !== "string"
+    || Buffer.byteLength(input.body, "utf8") > MAX_JSON_BYTES || !input.headers
+    || Object.keys(input.headers).length === 0
+    || Object.entries(input.headers).some(([name, value]) => !/^[a-z0-9-]+$/.test(name)
+      || typeof value !== "string" || value.length === 0 || value.length > 4_096 || /[\r\n]/.test(value))) return undefined;
+  try {
+    const url = new URL(input.url);
+    if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash) return undefined;
+    return url;
+  } catch { return undefined; }
+}
+
+/** Resolves and validates every address before constructing a credential-bearing HTTPS request. */
+export function createNodePinnedJsonTransport(
+  dependencies: Readonly<{ resolver: PinnedJsonResolver; request: NodeHttpsRequest }> = {
+    resolver: createNodeOpenApiResolver(),
+    request: httpsRequest,
+  },
+): NodePinnedJsonTransport {
+  if (!dependencies || typeof dependencies.resolver?.resolve !== "function"
+    || typeof dependencies.request !== "function") throw new Error("WEBSITE_LIVE_CONFIGURATION_REQUIRED");
+  return {
+    async request(input) {
+      const url = validPinnedJsonRequest(input);
+      if (!url) throw new Error("WEBSITE_CONTROL_REQUEST_INVALID");
+      if (input.signal.aborted) throw websiteAbortReason(input.signal);
+      const hostname = url.hostname.replace(/^\[|\]$/g, "");
+      let resolved: readonly string[];
+      try { resolved = await dependencies.resolver.resolve(hostname, input.signal); }
+      catch {
+        if (input.signal.aborted) throw websiteAbortReason(input.signal);
+        throw new Error("WEBSITE_CONTROL_RETRYABLE");
+      }
+      if (resolved.length === 0) throw new Error("WEBSITE_CONTROL_RETRYABLE");
+      if (resolved.length > 16 || resolved.some((address) => typeof address !== "string"
+        || !validateResolvedAddress(normalizedAddress(address)).ok)) {
+        throw new Error("WEBSITE_CONTROL_HOST_BLOCKED");
+      }
+      const pins = [...new Set(resolved.map(normalizedAddress))];
+      if (pins.length === 0 || pins.length > 16) throw new Error("WEBSITE_CONTROL_HOST_BLOCKED");
+      return await new Promise<NodePinnedJsonResponse>((resolve, reject) => {
+        let request: ClientRequest;
+        let activeResponse: IncomingMessage | undefined;
+        let activeSocket: TLSSocket | undefined;
+        let settled = false;
+        let bodySent = false;
+        const finishReject = (error: Error) => {
+          if (settled) return;
+          settled = true;
+          input.signal.removeEventListener("abort", onAbort);
+          reject(error);
+        };
+        const destroy = (error: Error) => {
+          activeResponse?.once("error", () => undefined);
+          activeResponse?.destroy(error);
+          activeSocket?.destroy(error);
+          request?.destroy(error);
+        };
+        const onAbort = () => {
+          const error = websiteAbortReason(input.signal);
+          destroy(error);
+          finishReject(error);
+        };
+        const validatePeer = (socket: TLSSocket): Error | undefined => {
+          const connectedAddress = normalizedAddress(socket.remoteAddress ?? "");
+          const protocol = typeof socket.getProtocol === "function" ? socket.getProtocol() : null;
+          const servername = typeof socket.servername === "string" ? socket.servername : "";
+          if (socket.authorized !== true || servername !== hostname
+            || (protocol !== "TLSv1.2" && protocol !== "TLSv1.3")) return new Error("WEBSITE_CONTROL_TLS_FAILED");
+          if (!validateResolvedAddress(connectedAddress).ok || !pins.includes(connectedAddress)) {
+            return new Error("WEBSITE_CONTROL_HOST_BLOCKED");
+          }
+          return undefined;
+        };
+        try {
+          request = dependencies.request(url, {
+            method: "POST",
+            headers: {
+              ...input.headers,
+              "content-length": String(Buffer.byteLength(input.body, "utf8")),
+            },
+            agent: false,
+            rejectUnauthorized: true,
+            minVersion: "TLSv1.2",
+            servername: hostname,
+            lookup: lookupFor(hostname, pins),
+          }, (response) => {
+            activeResponse = response;
+            const socket = response.socket as TLSSocket;
+            activeSocket = socket;
+            const peerError = validatePeer(socket);
+            if (peerError) {
+              destroy(peerError);
+              finishReject(peerError);
+              return;
+            }
+            const declared = response.headers["content-length"];
+            if (typeof declared === "string" && (!/^\d+$/.test(declared) || Number(declared) > MAX_JSON_BYTES)) {
+              const error = new Error("WEBSITE_CONTROL_RESPONSE_TOO_LARGE");
+              destroy(error);
+              finishReject(error);
+              return;
+            }
+            const chunks: Buffer[] = [];
+            let length = 0;
+            response.on("data", (chunk: Buffer | Uint8Array | string) => {
+              if (settled) return;
+              const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+              length += bytes.byteLength;
+              if (length > MAX_JSON_BYTES) {
+                const error = new Error("WEBSITE_CONTROL_RESPONSE_TOO_LARGE");
+                destroy(error);
+                finishReject(error);
+                return;
+              }
+              chunks.push(bytes);
+            });
+            response.once("error", () => {
+              if (!settled) finishReject(input.signal.aborted
+                ? websiteAbortReason(input.signal) : new Error("WEBSITE_CONTROL_RETRYABLE"));
+            });
+            response.once("end", () => {
+              if (settled) return;
+              settled = true;
+              input.signal.removeEventListener("abort", onAbort);
+              resolve({
+                status: response.statusCode ?? 0,
+                url: input.url,
+                headers: normalizedHeaders(response.headers),
+                body: Buffer.concat(chunks, length),
+              });
+            });
+          });
+        } catch {
+          finishReject(new Error("WEBSITE_CONTROL_RETRYABLE"));
+          return;
+        }
+        input.signal.addEventListener("abort", onAbort, { once: true });
+        request.once("socket", (socket) => {
+          activeSocket = socket as TLSSocket;
+          socket.once("secureConnect", () => {
+            if (settled || bodySent) return;
+            const peerError = validatePeer(socket as TLSSocket);
+            if (peerError) {
+              destroy(peerError);
+              finishReject(peerError);
+              return;
+            }
+            bodySent = true;
+            request.end(input.body);
+          });
+        });
+        request.once("error", (error) => {
+          if (settled) return;
+          if (input.signal.aborted) finishReject(websiteAbortReason(input.signal));
+          else {
+            const code = error && typeof error === "object" && "code" in error ? String(error.code) : "";
+            finishReject(/^(?:CERT_|ERR_TLS_CERT_|DEPTH_ZERO_SELF_SIGNED_CERT|SELF_SIGNED_CERT_IN_CHAIN|UNABLE_TO_VERIFY_LEAF_SIGNATURE|ERR_TLS_)/.test(code)
+              ? new Error("WEBSITE_CONTROL_TLS_FAILED") : new Error("WEBSITE_CONTROL_RETRYABLE"));
+          }
+        });
+        if (input.signal.aborted) onAbort();
+      });
+    },
+  };
 }
 
 function stableTransportError(error: unknown): Error {

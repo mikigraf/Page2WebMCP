@@ -3,11 +3,16 @@ import { Resolver } from "node:dns/promises";
 import type { WebsiteEvidence, WebsiteObservationInput } from "../../../packages/providers/src/website-evidence.ts";
 import type { WebsiteOwnershipChallenge, WebsiteProviderControls } from "../../../packages/providers/src/website.ts";
 import { validateTargetUrl } from "../../../packages/security/src/security.ts";
-import { createNodeOpenApiResolver, createNodeOpenApiTransport } from "./node-network.ts";
+import {
+  createNodeOpenApiResolver,
+  createNodeOpenApiTransport,
+  createNodePinnedJsonTransport,
+  type NodePinnedJsonResponse,
+  type NodePinnedJsonTransport,
+} from "./node-network.ts";
 import { createWebsiteAnalysisAdapter, type AnalysisAdapter } from "./workflow.ts";
 
 type RuntimeEnvironment = Readonly<Record<string, string | undefined>>;
-type Fetch = typeof fetch;
 
 const MAX_CONTROL_BYTES = 64 * 1_024;
 const CONTROL_TIMEOUT_MS = 10_000;
@@ -121,7 +126,9 @@ function configuredEnvironment(environment: RuntimeEnvironment): WebsiteLiveEnvi
 }
 
 function abortReason(signal: AbortSignal): Error {
-  return signal.reason instanceof Error ? signal.reason : new Error("WEBSITE_CONTROL_ABORTED");
+  return signal.reason instanceof Error && signal.reason.message === "WEBSITE_CONTROL_TIMEOUT"
+    ? new Error("WEBSITE_CONTROL_TIMEOUT")
+    : new Error("WEBSITE_CONTROL_ABORTED");
 }
 
 function linkedSignal(parent: AbortSignal): Readonly<{ signal: AbortSignal; close(): void }> {
@@ -136,35 +143,15 @@ function linkedSignal(parent: AbortSignal): Readonly<{ signal: AbortSignal; clos
   };
 }
 
-async function boundedJson(response: Response, signal: AbortSignal): Promise<unknown> {
-  const declared = response.headers.get("content-length");
-  if (declared !== null && (!/^\d+$/.test(declared) || Number(declared) > MAX_CONTROL_BYTES)) {
+function boundedJson(response: NodePinnedJsonResponse): unknown {
+  const declared = response.headers["content-length"];
+  if (declared !== undefined && (!/^\d+$/.test(declared) || Number(declared) > MAX_CONTROL_BYTES)) {
     throw new Error("WEBSITE_CONTROL_RESPONSE_TOO_LARGE");
   }
-  if (!response.body) throw new Error("WEBSITE_CONTROL_RESPONSE_INVALID");
-  const reader = response.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let length = 0;
-  try {
-    for (;;) {
-      let item: ReadableStreamReadResult<Uint8Array>;
-      try { item = await reader.read(); }
-      catch {
-        if (signal.aborted) throw abortReason(signal);
-        throw new Error("WEBSITE_CONTROL_RESPONSE_INVALID");
-      }
-      if (item.done) break;
-      length += item.value.byteLength;
-      if (length > MAX_CONTROL_BYTES) throw new Error("WEBSITE_CONTROL_RESPONSE_TOO_LARGE");
-      chunks.push(item.value);
-    }
-  } finally {
-    try { await reader.cancel(); } catch { /* cancellation cannot weaken a stable error */ }
+  if (!(response.body instanceof Uint8Array) || response.body.byteLength > MAX_CONTROL_BYTES) {
+    throw new Error("WEBSITE_CONTROL_RESPONSE_TOO_LARGE");
   }
-  const bytes = new Uint8Array(length);
-  let offset = 0;
-  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
-  try { return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)); }
+  try { return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(response.body)); }
   catch { throw new Error("WEBSITE_CONTROL_RESPONSE_INVALID"); }
 }
 
@@ -190,7 +177,7 @@ type ControlClient = Readonly<{
   request(path: string, body: unknown, signal: AbortSignal): Promise<Record<string, unknown>>;
 }>;
 
-function controlClient(fetcher: Fetch, origin: string, headers: Readonly<Record<string, string>>): ControlClient {
+function controlClient(transport: NodePinnedJsonTransport, origin: string, headers: Readonly<Record<string, string>>): ControlClient {
   return {
     async request(path, body, signal) {
       const url = `${origin}${path}`;
@@ -200,32 +187,41 @@ function controlClient(fetcher: Fetch, origin: string, headers: Readonly<Record<
       }
       const lifecycle = linkedSignal(signal);
       try {
-        let response: Response;
+        let response: NodePinnedJsonResponse;
         try {
-          response = await fetcher(url, {
+          response = await transport.request({
+            url,
             method: "POST",
-            redirect: "error",
             signal: lifecycle.signal,
             headers: { ...headers, "content-type": "application/json" },
             body: encoded,
           });
         } catch (error) {
-          if (lifecycle.signal.aborted) throw abortReason(lifecycle.signal);
+          if (lifecycle.signal.aborted) {
+            const reason = abortReason(lifecycle.signal);
+            throw reason.message === "WEBSITE_CONTROL_TIMEOUT"
+              ? new Error("WEBSITE_CONTROL_RETRYABLE") : reason;
+          }
           if (error instanceof Error && /^WEBSITE_[A-Z0-9_]+$/.test(error.message)) throw error;
-          throw new Error("WEBSITE_CONTROL_REQUEST_FAILED");
+          throw new Error("WEBSITE_CONTROL_RETRYABLE");
         }
-        if (response.url !== url || response.status !== 200
-          || response.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase() !== "application/json") {
+        if (response.url !== url) throw new Error("WEBSITE_CONTROL_RESPONSE_INVALID");
+        if (response.status === 429 || response.status >= 500 && response.status <= 599) {
+          throw new Error("WEBSITE_CONTROL_RETRYABLE");
+        }
+        if (response.status >= 400 && response.status <= 499) throw new Error("WEBSITE_CONTROL_REJECTED");
+        if (response.status !== 200
+          || response.headers["content-type"]?.split(";", 1)[0]?.trim().toLowerCase() !== "application/json") {
           throw new Error("WEBSITE_CONTROL_RESPONSE_INVALID");
         }
-        return asRecord(await boundedJson(response, lifecycle.signal));
+        return asRecord(boundedJson(response));
       } finally { lifecycle.close(); }
     },
   };
 }
 
-function bearerClient(fetcher: Fetch, origin: string, token: string): ControlClient {
-  return controlClient(fetcher, origin, { authorization: `Bearer ${token}` });
+function bearerClient(transport: NodePinnedJsonTransport, origin: string, token: string): ControlClient {
+  return controlClient(transport, origin, { authorization: `Bearer ${token}` });
 }
 
 function cleanupSignal(): AbortSignal {
@@ -329,10 +325,11 @@ function configuredNetwork(
 }
 
 export type WebsiteLiveDependencies = Readonly<{
-  fetch: Fetch;
+  fetch?: typeof fetch;
   clock?: () => Date;
   resolver?: WebsiteProviderControls["resolver"];
   transport?: WebsiteProviderControls["transport"];
+  controlTransport?: NodePinnedJsonTransport;
 }>;
 
 export function createConfiguredWebsiteAnalysisAdapter(
@@ -340,20 +337,21 @@ export function createConfiguredWebsiteAnalysisAdapter(
   dependencies: WebsiteLiveDependencies,
 ): AnalysisAdapter {
   const environment = configuredEnvironment(environmentValue);
-  if (!dependencies || typeof dependencies.fetch !== "function" || dependencies.clock !== undefined
+  if (!dependencies || dependencies.clock !== undefined
     && typeof dependencies.clock !== "function") throw new Error("WEBSITE_LIVE_CONFIGURATION_REQUIRED");
   const clock = dependencies.clock ?? (() => new Date());
   const network = configuredNetwork(dependencies.resolver, dependencies.transport);
+  const controls = dependencies.controlTransport ?? createNodePinnedJsonTransport();
   const hostedScriptOrigin = new URL(environment.PAGE2WEBMCP_PUBLIC_ORIGIN).origin;
-  const ownership = bearerClient(dependencies.fetch, environment.PAGE2WEBMCP_OWNERSHIP_STORE_ORIGIN, environment.PAGE2WEBMCP_OWNERSHIP_STORE_TOKEN);
-  const policy = bearerClient(dependencies.fetch, environment.PAGE2WEBMCP_EGRESS_POLICY_ORIGIN, environment.PAGE2WEBMCP_EGRESS_POLICY_TOKEN);
-  const proxy = bearerClient(dependencies.fetch, environment.PAGE2WEBMCP_EGRESS_PROXY_ORIGIN, environment.PAGE2WEBMCP_EGRESS_PROXY_TOKEN);
-  const leases = bearerClient(dependencies.fetch, environment.PAGE2WEBMCP_BROWSER_LEASE_STORE_ORIGIN, environment.PAGE2WEBMCP_BROWSER_LEASE_STORE_TOKEN);
-  const secrets = bearerClient(dependencies.fetch, environment.PAGE2WEBMCP_SECRET_STORE_ORIGIN, environment.PAGE2WEBMCP_SECRET_STORE_TOKEN);
-  const auth = bearerClient(dependencies.fetch, environment.PAGE2WEBMCP_AUTH_HANDOFF_ORIGIN, environment.PAGE2WEBMCP_AUTH_HANDOFF_TOKEN);
-  const evidence = bearerClient(dependencies.fetch, environment.PAGE2WEBMCP_EVIDENCE_STORE_ORIGIN, environment.PAGE2WEBMCP_EVIDENCE_STORE_TOKEN);
-  const observer = bearerClient(dependencies.fetch, environment.PAGE2WEBMCP_CDP_OBSERVER_ORIGIN, environment.PAGE2WEBMCP_CDP_OBSERVER_TOKEN);
-  const browser = controlClient(dependencies.fetch, environment.PAGE2WEBMCP_BROWSER_USE_API_ORIGIN, {
+  const ownership = bearerClient(controls, environment.PAGE2WEBMCP_OWNERSHIP_STORE_ORIGIN, environment.PAGE2WEBMCP_OWNERSHIP_STORE_TOKEN);
+  const policy = bearerClient(controls, environment.PAGE2WEBMCP_EGRESS_POLICY_ORIGIN, environment.PAGE2WEBMCP_EGRESS_POLICY_TOKEN);
+  const proxy = bearerClient(controls, environment.PAGE2WEBMCP_EGRESS_PROXY_ORIGIN, environment.PAGE2WEBMCP_EGRESS_PROXY_TOKEN);
+  const leases = bearerClient(controls, environment.PAGE2WEBMCP_BROWSER_LEASE_STORE_ORIGIN, environment.PAGE2WEBMCP_BROWSER_LEASE_STORE_TOKEN);
+  const secrets = bearerClient(controls, environment.PAGE2WEBMCP_SECRET_STORE_ORIGIN, environment.PAGE2WEBMCP_SECRET_STORE_TOKEN);
+  const auth = bearerClient(controls, environment.PAGE2WEBMCP_AUTH_HANDOFF_ORIGIN, environment.PAGE2WEBMCP_AUTH_HANDOFF_TOKEN);
+  const evidence = bearerClient(controls, environment.PAGE2WEBMCP_EVIDENCE_STORE_ORIGIN, environment.PAGE2WEBMCP_EVIDENCE_STORE_TOKEN);
+  const observer = bearerClient(controls, environment.PAGE2WEBMCP_CDP_OBSERVER_ORIGIN, environment.PAGE2WEBMCP_CDP_OBSERVER_TOKEN);
+  const browser = controlClient(controls, environment.PAGE2WEBMCP_BROWSER_USE_API_ORIGIN, {
     "x-browser-use-api-key": environment.PAGE2WEBMCP_BROWSER_USE_API_KEY,
     "x-page2webmcp-browser-gateway-version": String(WEBSITE_LIVE_GATEWAY_PROTOCOL_VERSION),
   });
@@ -373,7 +371,6 @@ export function createConfiguredWebsiteAnalysisAdapter(
     const sourceUrl = new URL(source.sourceUrl);
     if (sourceUrl.search || sourceUrl.hash) throw new Error("WEBSITE_URL_BLOCKED");
     const targetOrigin = sourceUrl.origin;
-    const expiresAt = new Date(clock().getTime() + SESSION_TTL_MS).toISOString();
     const ownershipIdentity = {
       organizationId: source.organizationId,
       projectId: source.projectId,
@@ -381,7 +378,7 @@ export function createConfiguredWebsiteAnalysisAdapter(
     };
     const envelope = (operation: string, payload: Record<string, unknown>) => ({
       gatewayProtocolVersion: WEBSITE_LIVE_GATEWAY_PROTOCOL_VERSION,
-      idempotencyKey: `website:${source.id}:${operation}`,
+      idempotencyKey: `website:${source.id}:${operation}:${createHash("sha256").update(canonicalJson(payload), "utf8").digest("hex")}`,
       ownership: ownershipIdentity,
       ...payload,
     });
@@ -403,20 +400,27 @@ export function createConfiguredWebsiteAnalysisAdapter(
       return { request, response };
     };
     const routes = routePolicy(targetOrigin).routes;
-    const policyInput = { denyByDefault: true, expiresAt, routes, targetOrigin } as const;
+    const policyInput = { denyByDefault: true, ttlSeconds: SESSION_TTL_MS / 1_000, routes, targetOrigin } as const;
     let reference: string | undefined;
+    let expiresAt: string | undefined;
     let primaryError: unknown;
     try {
       const issuedRequest = envelope("policy-issue", policyInput);
       const issuedResponse = await policy.request(WEBSITE_LIVE_CONTROL_PATHS.policyIssue, issuedRequest, signal);
       assertReference(issuedResponse.reference);
       reference = issuedResponse.reference;
+      const issuedExpiry = typeof issuedResponse.expiresAt === "string" ? Date.parse(issuedResponse.expiresAt) : NaN;
+      const issuedAt = clock().getTime();
+      if (!Number.isFinite(issuedExpiry) || issuedExpiry <= issuedAt || issuedExpiry - issuedAt > SESSION_TTL_MS) {
+        throw new Error("WEBSITE_EGRESS_POLICY_ATTESTATION_FAILED");
+      }
+      expiresAt = issuedResponse.expiresAt as string;
       if (!validResponseMetadata(issuedResponse, issuedRequest)
-        || !same(issuedResponse, { ...issuedRequest, reference })) {
+        || !same(issuedResponse, { ...issuedRequest, reference, expiresAt })) {
         throw new Error("WEBSITE_EGRESS_POLICY_ATTESTATION_FAILED");
       }
       const appliedResult = await stateful(proxy, WEBSITE_LIVE_CONTROL_PATHS.policyApply, "policy-apply", {
-        ...policyInput, reference,
+        denyByDefault: true, expiresAt, routes, targetOrigin, reference,
       }, signal);
       if (!same(appliedResult.response, { ...appliedResult.request, enforced: true })) {
         throw new Error("WEBSITE_EGRESS_POLICY_ATTESTATION_FAILED");
@@ -431,7 +435,9 @@ export function createConfiguredWebsiteAnalysisAdapter(
         const result = await stateful(browser, WEBSITE_LIVE_CONTROL_PATHS.browserReconcile, "browser-reconcile", {
           providerSessionId,
         }, cleanupSignal());
-        if (!same(result.response, { ...result.request, reconciled: true })) throw new Error("WEBSITE_CONTROL_RESPONSE_INVALID");
+        if (!same(result.response, { ...result.request, reconciled: true, terminated: true })) {
+          throw new Error("WEBSITE_CONTROL_RESPONSE_INVALID");
+        }
       };
       const adapter = createWebsiteAnalysisAdapter({
         clock,
@@ -480,11 +486,13 @@ export function createConfiguredWebsiteAnalysisAdapter(
             },
             secretReferences: {
               put: async (input) => {
+                const valueDigest = createHash("sha256").update(input.value, "utf8").digest("hex");
                 const { response } = await stateful(secrets, WEBSITE_LIVE_CONTROL_PATHS.secretPut, `secret-put-${input.purpose}`, {
-                  ...input, kmsKeyId: environment.PAGE2WEBMCP_SECRET_STORE_KMS_KEY_ID,
+                  ...input, valueDigest, kmsKeyId: environment.PAGE2WEBMCP_SECRET_STORE_KMS_KEY_ID,
                 }, signal);
                 assertReference(response.reference);
                 if (response.expiresAt !== input.expiresAt || response.purpose !== input.purpose
+                  || response.valueDigest !== valueDigest || "value" in response
                   || response.kmsKeyId !== environment.PAGE2WEBMCP_SECRET_STORE_KMS_KEY_ID) {
                   throw new Error("WEBSITE_CONTROL_RESPONSE_INVALID");
                 }
@@ -535,6 +543,8 @@ export function createConfiguredWebsiteAnalysisAdapter(
             open: async (input) => {
               const { response } = await stateful(auth, WEBSITE_LIVE_CONTROL_PATHS.authOpen, "auth-open", input, signal);
               assertIdentifier(response.handoffId);
+              if (response.targetOrigin !== input.targetOrigin || response.liveReference !== input.liveReference
+                || response.expiresAt !== input.expiresAt) throw new Error("WEBSITE_CONTROL_RESPONSE_INVALID");
               return { handoffId: response.handoffId };
             },
             wait: async (handoffId, waitSignal) => {

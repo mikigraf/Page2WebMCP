@@ -104,6 +104,24 @@ test("analysis deadline aborts work and returns the durable job to the bounded r
   assert.equal(completed?.errorCode, "ANALYSIS_DEADLINE_EXCEEDED");
 });
 
+test("worker retries only the stable transient website control classification", async () => {
+  for (const [code, status] of [
+    ["WEBSITE_CONTROL_RETRYABLE", "queued"],
+    ["WEBSITE_CONTROL_REJECTED", "failed"],
+    ["WEBSITE_CONTROL_RESPONSE_INVALID", "failed"],
+  ] as const) {
+    const repository = new InMemoryControlPlaneRepository();
+    const { run } = await enqueue(repository, "website", "https://acme.example/");
+    const completed = await processNextAnalysis(repository, {
+      workerId: `classification-${code.toLowerCase()}`,
+      analyze: async () => { throw new Error(code); },
+    });
+    assert.equal(completed?.id, run.id);
+    assert.equal(completed?.status, status);
+    assert.equal(completed?.errorCode, code);
+  }
+});
+
 test("heartbeats are serialized and stop before completion", async () => {
   const repository = new InMemoryControlPlaneRepository();
   await enqueue(repository, "website", "https://acme.example/");

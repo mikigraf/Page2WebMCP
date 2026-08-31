@@ -182,5 +182,6 @@ function stableFailureCode(error: unknown): string {
 }
 
 function isRetryableFailure(code: string): boolean {
-  return code === "ANALYSIS_DEADLINE_EXCEEDED" || code === "ANALYSIS_FAILED";
+  return code === "ANALYSIS_DEADLINE_EXCEEDED" || code === "ANALYSIS_FAILED"
+    || code === "WEBSITE_CONTROL_RETRYABLE";
 }

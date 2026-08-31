@@ -242,11 +242,13 @@ export async function withBrowserUseCloudV4Session<T>(
   );
 
   let providerSessionId: string | undefined;
+  let providerStartAttempted = false;
   const references: string[] = [];
   let primaryError: unknown;
   let outcome: "completed" | "failed" | "cancelled" = "failed";
   try {
     if (deadline.signal.aborted) throw deadline.signal.reason;
+    providerStartAttempted = true;
     const started = await controls.transport.start(request, deadline.signal);
     providerSessionId = assertProviderSessionId(started);
     if (deadline.signal.aborted) throw deadline.signal.reason;
@@ -280,14 +282,26 @@ export async function withBrowserUseCloudV4Session<T>(
     throw normalized;
   } finally {
     const cleanupErrors: unknown[] = [];
+    let terminationProven = !providerStartAttempted;
     for (const reference of references.reverse()) {
       try { await controls.secretReferences.revoke(reference); } catch (error) { cleanupErrors.push(error); }
     }
     if (providerSessionId) {
-      try { await controls.transport.stop(providerSessionId, outcome); } catch (error) { cleanupErrors.push(error); }
-      try { await controls.transport.reconcile(providerSessionId); } catch (error) { cleanupErrors.push(error); }
+      try {
+        await controls.transport.stop(providerSessionId, outcome);
+        terminationProven = true;
+      } catch (error) { cleanupErrors.push(error); }
+      try {
+        await controls.transport.reconcile(providerSessionId);
+        terminationProven = true;
+      } catch (error) { cleanupErrors.push(error); }
     }
-    try { await controls.leases.release(lease.leaseId); } catch (error) { cleanupErrors.push(error); }
+    // An attempted start may have reached the provider even when its response was
+    // lost. Keep the exclusive durable lease until its TTL unless a terminal
+    // stop/reconciliation result was positively attested by the transport.
+    if (terminationProven) {
+      try { await controls.leases.release(lease.leaseId); } catch (error) { cleanupErrors.push(error); }
+    }
     deadline.dispose();
     if (primaryError === undefined && cleanupErrors.length > 0) throw new Error("BROWSER_SESSION_CLEANUP_FAILED");
   }

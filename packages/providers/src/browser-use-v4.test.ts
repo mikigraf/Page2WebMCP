@@ -172,6 +172,30 @@ test("Browser Use session claims once and cleans up/reconciles after failure and
   assert.deepEqual(events.slice(-3), ["cancel-stop:cancelled", "cancel-reconcile", "cancel-release"]);
 });
 
+test("Browser Use holds the exclusive lease when provider termination cannot be proven", async () => {
+  const events: string[] = [];
+  await assert.rejects(withBrowserUseCloudV4Session({
+    organizationId: "org-1", projectId: "project-1", runId: "run-ambiguous-stop", targetOrigin, expiresAt,
+    proxyPolicyReference: { reference: "secretref:proxy-policy", expiresAt },
+  }, controls({
+    leases: {
+      claim: async () => ({ leaseId: "lease-ambiguous-stop" }),
+      release: async () => { events.push("release"); },
+    },
+    transport: {
+      start: async (request) => ({
+        providerSessionId: "provider-ambiguous-stop",
+        liveUrl: "https://live.invalid/ambiguous",
+        cdpUrl: "wss://cdp.invalid/ambiguous",
+        appliedPolicyDigest: browserUseCloudV4PolicyDigest(request),
+      }),
+      stop: async () => { events.push("stop"); throw new Error("BROWSER_STOP_UNAVAILABLE"); },
+      reconcile: async () => { events.push("reconcile"); throw new Error("BROWSER_RECONCILE_UNAVAILABLE"); },
+    },
+  }), async () => "completed"), /^Error: BROWSER_SESSION_CLEANUP_FAILED$/);
+  assert.deepEqual(events, ["stop", "reconcile"]);
+});
+
 test("Browser Use reconciles a created provider session even when later start fields are invalid", async () => {
   const events: string[] = [];
   await assert.rejects(withBrowserUseCloudV4Session({
@@ -264,7 +288,7 @@ test("auth handoff expiry, MFA timeout, and cancellation close durable wait stat
   assert.deepEqual(closed, [["handoff-mfa", "failed"]]);
 });
 
-test("Browser Use provider startup receives cancellation and releases its durable lease", async () => {
+test("Browser Use provider startup cancellation holds its durable lease when start outcome is unknown", async () => {
   const controller = new AbortController();
   const events: string[] = [];
   const pending = withBrowserUseCloudV4Session({
@@ -287,7 +311,7 @@ test("Browser Use provider startup receives cancellation and releases its durabl
   }), async () => undefined);
   setImmediate(() => controller.abort());
   await assert.rejects(pending, /BROWSER_SESSION_ABORTED/);
-  assert.deepEqual(events, ["release"]);
+  assert.deepEqual(events, []);
 });
 
 test("Browser Use cleans a session created concurrently with cancellation", async () => {
