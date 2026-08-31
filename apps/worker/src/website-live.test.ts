@@ -90,10 +90,15 @@ function controlHarness(input: Readonly<{
   badAuthAttestation?: boolean;
   badSecretDigest?: boolean;
   issueStatus?: number;
+  ambiguousBrowserStartOnce?: boolean;
 }> = {}) {
   const calls: ControlCall[] = [];
   let currentExpiry = new Date(now.getTime() + 9 * 60_000).toISOString();
-  const issuedPolicies = new Map<string, Readonly<{ expiresAt: string; reference: string }>>();
+  const issuedPolicies = new Map<string, { active: boolean; expiresAt: string; reference: string }>();
+  const issuedLeases = new Map<string, string>();
+  const issuedBrowserSessions = new Map<string, string>();
+  const activeLeaseByRun = new Map<string, string>();
+  let browserStartAttempts = 0;
   let observationCount = 0;
   const fetcher: typeof fetch = async (rawUrl, init) => {
     const url = String(rawUrl);
@@ -108,8 +113,9 @@ function controlHarness(input: Readonly<{
       if (input.issueStatus !== undefined) return jsonResponse(url, { rejected: true }, input.issueStatus);
       const idempotencyKey = String(body.idempotencyKey);
       const issued = issuedPolicies.get(idempotencyKey) ?? {
-        expiresAt: new Date(now.getTime() + 9 * 60_000 + issuedPolicies.size * 60_000).toISOString(),
-        reference: `secretref:policy-${String((body.ownership as Record<string, unknown>).runId)}`,
+        active: true,
+        expiresAt: new Date(now.getTime() + 9 * 60_000).toISOString(),
+        reference: `secretref:policy-${String((body.ownership as Record<string, unknown>).runId)}-${issuedPolicies.size + 1}`,
       };
       issuedPolicies.set(idempotencyKey, issued);
       currentExpiry = issued.expiresAt;
@@ -122,9 +128,13 @@ function controlHarness(input: Readonly<{
     }
     if (url.endsWith("/v1/website-egress-policies/apply")) {
       if (input.failApply) throw new Error("proxy upstream token=must-not-leak");
+      const issued = [...issuedPolicies.values()].find(({ reference }) => reference === body.reference);
+      if (!issued?.active) return jsonResponse(url, { rejected: true }, 409);
       return jsonResponse(url, { ...body, enforced: true });
     }
     if (url.endsWith("/v1/website-egress-policies/revoke")) {
+      const issued = [...issuedPolicies.values()].find(({ reference }) => reference === body.reference);
+      if (issued) issued.active = false;
       return jsonResponse(url, { ...body, revoked: true });
     }
     if (url.endsWith("/v1/website-ownership/challenges/load")) {
@@ -140,23 +150,41 @@ function controlHarness(input: Readonly<{
       return jsonResponse(url, { ...body, consumed: true });
     }
     if (url.endsWith("/v1/browser-leases/claim")) {
-      return jsonResponse(url, { ...body, leaseId: `lease-${String(body.runId)}` });
+      const key = String(body.idempotencyKey);
+      const runId = String((body.ownership as Record<string, unknown>).runId);
+      if (activeLeaseByRun.has(runId) && !issuedLeases.has(key)) {
+        return jsonResponse(url, { rejected: true }, 409);
+      }
+      const leaseId = issuedLeases.get(key) ?? `lease-${String(body.runId)}-${issuedLeases.size + 1}`;
+      issuedLeases.set(key, leaseId);
+      activeLeaseByRun.set(runId, leaseId);
+      return jsonResponse(url, { ...body, leaseId });
     }
     if (url.endsWith("/v1/browser-leases/release")) {
+      for (const [runId, leaseId] of activeLeaseByRun) {
+        if (leaseId === body.leaseId) activeLeaseByRun.delete(runId);
+      }
       return jsonResponse(url, { ...body, released: true });
     }
     if (url.endsWith(WEBSITE_LIVE_CONTROL_PATHS.browserStart)) {
+      browserStartAttempts += 1;
+      if (input.ambiguousBrowserStartOnce && browserStartAttempts === 1) {
+        throw new Error("browser gateway response lost");
+      }
       assert.equal(headers.get("x-page2webmcp-browser-gateway-version"), String(WEBSITE_LIVE_GATEWAY_PROTOCOL_VERSION));
       assert.equal(headers.get("x-browser-use-api-key"), environment().PAGE2WEBMCP_BROWSER_USE_API_KEY);
       assert.equal(headers.has("authorization"), false);
       const request = body.request as BrowserUseCloudV4Request;
+      const key = String(body.idempotencyKey);
+      const providerSessionId = issuedBrowserSessions.get(key) ?? `provider-session-${issuedBrowserSessions.size + 1}`;
+      issuedBrowserSessions.set(key, providerSessionId);
       return jsonResponse(url, {
         gatewayProtocolVersion: 1,
         idempotencyKey: body.idempotencyKey,
         ownership: body.ownership,
         apiVersion: "v4",
         model: "browser-use-2.0",
-        providerSessionId: "provider-session-1",
+        providerSessionId,
         liveUrl: input.badGatewayUrl ? "not-an-https-url" : "https://browser-live.example/session/1",
         cdpUrl: "wss://browser-cdp.example/session/1",
         appliedPolicyDigest: input.badPolicyDigest ? "0".repeat(64) : browserUseCloudV4PolicyDigest(request),
@@ -250,7 +278,12 @@ function controlHarness(input: Readonly<{
       };
     },
   };
-  return { calls, fetch: fetcher, transport, expiresAt: () => currentExpiry };
+  return {
+    calls, fetch: fetcher, transport, expiresAt: () => currentExpiry,
+    policyReferences: () => [...issuedPolicies.values()].map(({ reference }) => reference),
+    leaseIds: () => [...issuedLeases.values()],
+    providerSessionIds: () => [...issuedBrowserSessions.values()],
+  };
 }
 
 test("website control inventory is exact, sorted, validates values, and never returns secrets", () => {
@@ -287,6 +320,7 @@ test("website adapter rejects noncanonical source configuration before issuing a
   await assert.rejects(adapter({
     id: "analysis-run-wrong-config", organizationId: "organization-1", projectId: "project-1",
     sourceType: "website", sourceUrl: "https://widgets.example/app",
+    leaseGeneration: 1,
     sourceConfiguration: { kind: "website", extra: true } as unknown as { kind: "website" },
   }, new AbortController().signal), /^Error: WEBSITE_SOURCE_CONFIGURATION_REQUIRED$/);
   assert.equal(harness.calls.length, 0);
@@ -307,6 +341,7 @@ test("configured website adapter issues fresh target-bound policies and sends th
       projectId: "project-1",
       sourceType: "website",
       sourceUrl: "https://widgets.example/app",
+      leaseGeneration: 1,
       sourceConfiguration: { kind: "website" },
     }, new AbortController().signal);
     clock = new Date(clock.getTime() + 60_000);
@@ -327,12 +362,12 @@ test("configured website adapter issues fresh target-bound policies and sends th
       routes: [{ methods: ["GET", "HEAD"], origin: "https://widgets.example", pathPrefix: "/" }],
       targetOrigin: "https://widgets.example",
     });
-    assert.match(String(call.body.idempotencyKey), new RegExp(`^website:analysis-run-${index + 1}:policy-issue:[a-f0-9]{64}$`));
+    assert.match(String(call.body.idempotencyKey), new RegExp(`^website:analysis-run-${index + 1}:1:policy-issue:[a-f0-9]{64}$`));
   }
   const starts = harness.calls.filter(({ url }) => url.endsWith("/v1/browser-use-v4/sessions/start"));
   assert.equal(starts.length, 2);
   for (const start of starts) {
-    const runId = String(start.body.idempotencyKey).startsWith("website:analysis-run-1:") ? "analysis-run-1" : "analysis-run-2";
+    const runId = String(start.body.idempotencyKey).startsWith("website:analysis-run-1:1:") ? "analysis-run-1" : "analysis-run-2";
     const ownership = { organizationId: "organization-1", projectId: "project-1", runId };
     assert.deepEqual(start.body, {
       gatewayProtocolVersion: 1,
@@ -356,7 +391,7 @@ test("configured website adapter issues fresh target-bound policies and sends th
       expiresAt: (start.body.request as Record<string, unknown>).expiresAt,
       },
     });
-    assert.match(String(start.body.idempotencyKey), new RegExp(`^website:${ownership.runId}:browser-start:[a-f0-9]{64}$`));
+    assert.match(String(start.body.idempotencyKey), new RegExp(`^website:${ownership.runId}:1:browser-start:[a-f0-9]{64}$`));
   }
   const cdpCalls = harness.calls.filter(({ url }) => url.endsWith("/v1/website-observations/observe"));
   assert.equal(cdpCalls.length, 2);
@@ -376,7 +411,7 @@ test("configured website adapter issues fresh target-bound policies and sends th
   assert.equal(harness.calls.filter(({ url }) => url.endsWith("/v1/website-egress-policies/revoke")).length, 4);
 });
 
-test("same website run never changes the payload behind a reused idempotency key", async () => {
+test("website delivery generation rotates cleaned resources without changing same-delivery requests", async () => {
   const harness = controlHarness();
   let clock = new Date(now);
   const adapter = createConfiguredWebsiteAnalysisAdapter(environment(), {
@@ -385,11 +420,13 @@ test("same website run never changes the payload behind a reused idempotency key
   const source = {
     id: "analysis-run-retry", organizationId: "organization-1", projectId: "project-1",
     sourceType: "website" as const, sourceUrl: "https://widgets.example/app",
-    sourceConfiguration: { kind: "website" as const },
+    sourceConfiguration: { kind: "website" as const }, leaseGeneration: 1,
   };
   await adapter(source, new AbortController().signal);
   clock = new Date(clock.getTime() + 30_000);
-  await adapter(source, new AbortController().signal);
+  await assert.rejects(adapter(source, new AbortController().signal), /^Error: WEBSITE_CONTROL_REJECTED$/);
+  clock = new Date(clock.getTime() + 30_000);
+  await adapter({ ...source, leaseGeneration: 2 }, new AbortController().signal);
   const byKey = new Map<string, string>();
   for (const { body } of harness.calls) {
     const key = String(body.idempotencyKey);
@@ -398,10 +435,57 @@ test("same website run never changes the payload behind a reused idempotency key
     else byKey.set(key, serialized);
   }
   const issues = harness.calls.filter(({ url }) => url.endsWith(WEBSITE_LIVE_CONTROL_PATHS.policyIssue));
-  assert.equal(issues.length, 2);
+  assert.equal(issues.length, 3);
   assert.deepEqual(issues[0]!.body, issues[1]!.body);
+  assert.notEqual(issues[2]!.body.idempotencyKey, issues[0]!.body.idempotencyKey);
+  assert.equal(String(issues[2]!.body.idempotencyKey).split(":").at(-1),
+    String(issues[0]!.body.idempotencyKey).split(":").at(-1));
   assert.equal(issues[0]!.body.ttlSeconds, 540);
   assert.equal("expiresAt" in issues[0]!.body, false);
+  assert.deepEqual(harness.policyReferences(), [
+    "secretref:policy-analysis-run-retry-1",
+    "secretref:policy-analysis-run-retry-2",
+  ]);
+  assert.deepEqual(harness.leaseIds(), [
+    "lease-analysis-run-retry-1",
+    "lease-analysis-run-retry-2",
+  ]);
+  assert.deepEqual(harness.providerSessionIds(), ["provider-session-1", "provider-session-2"]);
+});
+
+test("website live input requires a positive claimed delivery generation before controls", async () => {
+  for (const leaseGeneration of [undefined, 0, -1, 1.5]) {
+    const harness = controlHarness();
+    const adapter = createConfiguredWebsiteAnalysisAdapter(environment(), {
+      controlTransport: harness.transport, clock: () => now, ...networkControls(harness.expiresAt),
+    });
+    await assert.rejects(adapter({
+      id: "analysis-run-generation", organizationId: "organization-1", projectId: "project-1",
+      sourceType: "website", sourceUrl: "https://widgets.example/app", sourceConfiguration: { kind: "website" },
+      ...(leaseGeneration === undefined ? {} : { leaseGeneration }),
+    }, new AbortController().signal), /^Error: WEBSITE_SOURCE_DELIVERY_REQUIRED$/);
+    assert.equal(harness.calls.length, 0);
+  }
+});
+
+test("a new website delivery cannot bypass an ambiguous prior delivery lease", async () => {
+  const harness = controlHarness({ ambiguousBrowserStartOnce: true });
+  const adapter = createConfiguredWebsiteAnalysisAdapter(environment(), {
+    controlTransport: harness.transport, clock: () => now, ...networkControls(harness.expiresAt),
+  });
+  const source = {
+    id: "analysis-run-ambiguous-delivery", organizationId: "organization-1", projectId: "project-1",
+    sourceType: "website" as const, sourceUrl: "https://widgets.example/app",
+    sourceConfiguration: { kind: "website" as const }, leaseGeneration: 1,
+  };
+  await assert.rejects(adapter(source, new AbortController().signal), /^Error: WEBSITE_CONTROL_RETRYABLE$/);
+  await assert.rejects(adapter({ ...source, leaseGeneration: 2 }, new AbortController().signal),
+    /^Error: WEBSITE_CONTROL_REJECTED$/);
+  const claims = harness.calls.filter(({ url }) => url.endsWith(WEBSITE_LIVE_CONTROL_PATHS.leaseClaim));
+  assert.equal(claims.length, 2);
+  assert.notEqual(claims[0]!.body.idempotencyKey, claims[1]!.body.idempotencyKey);
+  assert.equal(harness.calls.filter(({ url }) => url.endsWith(WEBSITE_LIVE_CONTROL_PATHS.leaseRelease)).length, 0);
+  assert.equal(harness.calls.filter(({ url }) => url.endsWith(WEBSITE_LIVE_CONTROL_PATHS.browserStart)).length, 1);
 });
 
 test("website control aborts redact arbitrary caller reasons", async () => {
@@ -415,7 +499,7 @@ test("website control aborts redact arbitrary caller reasons", async () => {
   });
   const error = await adapter({
     id: "analysis-run-abort", organizationId: "organization-1", projectId: "project-1",
-    sourceType: "website", sourceUrl: "https://widgets.example/app", sourceConfiguration: { kind: "website" },
+    sourceType: "website", sourceUrl: "https://widgets.example/app", sourceConfiguration: { kind: "website" }, leaseGeneration: 1,
   }, controller.signal).catch((reason: unknown) => reason);
   assert.equal(error instanceof Error && error.message, "WEBSITE_CONTROL_ABORTED");
   assert.doesNotMatch(String(error), /should-never-escape/);
@@ -432,7 +516,7 @@ test("website default controls never fall back to the injected loose fetch funct
   });
   await assert.rejects(adapter({
     id: "analysis-run-default-transport", organizationId: "organization-1", projectId: "project-1",
-    sourceType: "website", sourceUrl: "https://widgets.example/app", sourceConfiguration: { kind: "website" },
+    sourceType: "website", sourceUrl: "https://widgets.example/app", sourceConfiguration: { kind: "website" }, leaseGeneration: 1,
   }, controller.signal), /^Error: WEBSITE_CONTROL_ABORTED$/);
   assert.equal(looseFetchCalls, 0);
 });
@@ -444,7 +528,7 @@ test("website TTL secrets and auth-open require exact non-secret attestations", 
   });
   await adapter({
     id: "analysis-run-auth", organizationId: "organization-1", projectId: "project-1",
-    sourceType: "website", sourceUrl: "https://widgets.example/app", sourceConfiguration: { kind: "website" },
+    sourceType: "website", sourceUrl: "https://widgets.example/app", sourceConfiguration: { kind: "website" }, leaseGeneration: 1,
   }, new AbortController().signal);
   for (const call of harness.calls.filter(({ url }) => url.endsWith(WEBSITE_LIVE_CONTROL_PATHS.secretPut))) {
     assert.equal(call.body.valueDigest, createHash("sha256").update(String(call.body.value), "utf8").digest("hex"));
@@ -461,7 +545,7 @@ test("website TTL secrets and auth-open require exact non-secret attestations", 
   });
   await assert.rejects(malformedAdapter({
     id: "analysis-run-auth-drift", organizationId: "organization-1", projectId: "project-1",
-    sourceType: "website", sourceUrl: "https://widgets.example/app", sourceConfiguration: { kind: "website" },
+    sourceType: "website", sourceUrl: "https://widgets.example/app", sourceConfiguration: { kind: "website" }, leaseGeneration: 1,
   }, new AbortController().signal), /^Error: WEBSITE_CONTROL_RESPONSE_INVALID$/);
 
   const malformedSecret = controlHarness({ badSecretDigest: true });
@@ -470,7 +554,7 @@ test("website TTL secrets and auth-open require exact non-secret attestations", 
   });
   await assert.rejects(malformedSecretAdapter({
     id: "analysis-run-secret-drift", organizationId: "organization-1", projectId: "project-1",
-    sourceType: "website", sourceUrl: "https://widgets.example/app", sourceConfiguration: { kind: "website" },
+    sourceType: "website", sourceUrl: "https://widgets.example/app", sourceConfiguration: { kind: "website" }, leaseGeneration: 1,
   }, new AbortController().signal), /^Error: WEBSITE_CONTROL_RESPONSE_INVALID$/);
 });
 
@@ -482,7 +566,7 @@ test("website control status classification retries only 429 and 5xx", async () 
     });
     await assert.rejects(adapter({
       id: `analysis-run-status-${status}`, organizationId: "organization-1", projectId: "project-1",
-      sourceType: "website", sourceUrl: "https://widgets.example/app", sourceConfiguration: { kind: "website" },
+      sourceType: "website", sourceUrl: "https://widgets.example/app", sourceConfiguration: { kind: "website" }, leaseGeneration: 1,
     }, new AbortController().signal), new RegExp(`^Error: ${code}$`));
   }
 });
@@ -500,6 +584,7 @@ test("website gateway policy drift fails closed and still stops, reconciles, rel
     projectId: "project-1",
     sourceType: "website",
     sourceUrl: "https://widgets.example/app",
+    leaseGeneration: 1,
     sourceConfiguration: { kind: "website" },
   }, new AbortController().signal), /^Error: BROWSER_PROVIDER_CONTROL_ATTESTATION_FAILED$/);
   for (const endpoint of [
@@ -517,7 +602,7 @@ test("website cleans an issued policy when proxy apply fails without exposing up
   });
   await assert.rejects(adapter({
     id: "analysis-run-apply-failure", organizationId: "organization-1", projectId: "project-1",
-    sourceType: "website", sourceUrl: "https://widgets.example/app", sourceConfiguration: { kind: "website" },
+    sourceType: "website", sourceUrl: "https://widgets.example/app", sourceConfiguration: { kind: "website" }, leaseGeneration: 1,
   }, new AbortController().signal), /^Error: WEBSITE_CONTROL_RETRYABLE$/);
   assert.equal(harness.calls.filter(({ url }) => url.endsWith("/v1/website-egress-policies/revoke")).length, 2);
 });
@@ -529,7 +614,7 @@ test("website cleans a valid issued reference when the issue attestation is malf
   });
   await assert.rejects(adapter({
     id: "analysis-run-issue-drift", organizationId: "organization-1", projectId: "project-1",
-    sourceType: "website", sourceUrl: "https://widgets.example/app", sourceConfiguration: { kind: "website" },
+    sourceType: "website", sourceUrl: "https://widgets.example/app", sourceConfiguration: { kind: "website" }, leaseGeneration: 1,
   }, new AbortController().signal), /^Error: WEBSITE_EGRESS_POLICY_ATTESTATION_FAILED$/);
   assert.equal(harness.calls.filter(({ url }) => url.endsWith(WEBSITE_LIVE_CONTROL_PATHS.policyRevoke)).length, 2);
 });
@@ -541,7 +626,7 @@ test("website gateway cleans a created session when a later gateway field is mal
   });
   await assert.rejects(adapter({
     id: "analysis-run-malformed-gateway", organizationId: "organization-1", projectId: "project-1",
-    sourceType: "website", sourceUrl: "https://widgets.example/app", sourceConfiguration: { kind: "website" },
+    sourceType: "website", sourceUrl: "https://widgets.example/app", sourceConfiguration: { kind: "website" }, leaseGeneration: 1,
   }, new AbortController().signal), /^Error: BROWSER_PROVIDER_RESPONSE_INVALID$/);
   for (const endpoint of [WEBSITE_LIVE_CONTROL_PATHS.browserStop, WEBSITE_LIVE_CONTROL_PATHS.browserReconcile]) {
     assert.equal(harness.calls.filter(({ url }) => url.endsWith(endpoint)).length, 1);
@@ -559,7 +644,7 @@ test("website rejects a CDP observer that does not attest the enforced route pol
   });
   await assert.rejects(adapter({
     id: "analysis-run-observer-drift", organizationId: "organization-1", projectId: "project-1",
-    sourceType: "website", sourceUrl: "https://widgets.example/app", sourceConfiguration: { kind: "website" },
+    sourceType: "website", sourceUrl: "https://widgets.example/app", sourceConfiguration: { kind: "website" }, leaseGeneration: 1,
   }, new AbortController().signal), /^Error: WEBSITE_CONTROL_RESPONSE_INVALID$/);
   assert.equal(harness.calls.filter(({ url }) => url.endsWith(WEBSITE_LIVE_CONTROL_PATHS.evidencePut)).length, 0);
 });

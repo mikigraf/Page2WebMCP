@@ -362,6 +362,10 @@ export function createConfiguredWebsiteAnalysisAdapter(
       || ![source.organizationId, source.projectId, source.id].every((value) => identifierPattern.test(value))) {
       throw new Error("WEBSITE_SOURCE_OWNERSHIP_REQUIRED");
     }
+    if (!Number.isSafeInteger(source.leaseGeneration) || (source.leaseGeneration ?? 0) < 1) {
+      throw new Error("WEBSITE_SOURCE_DELIVERY_REQUIRED");
+    }
+    const deliveryGeneration = source.leaseGeneration as number;
     if (!source.sourceConfiguration || typeof source.sourceConfiguration !== "object"
       || Array.isArray(source.sourceConfiguration)
       || !same(source.sourceConfiguration, { kind: "website" })) {
@@ -378,7 +382,7 @@ export function createConfiguredWebsiteAnalysisAdapter(
     };
     const envelope = (operation: string, payload: Record<string, unknown>) => ({
       gatewayProtocolVersion: WEBSITE_LIVE_GATEWAY_PROTOCOL_VERSION,
-      idempotencyKey: `website:${source.id}:${operation}:${createHash("sha256").update(canonicalJson(payload), "utf8").digest("hex")}`,
+      idempotencyKey: `website:${source.id}:${deliveryGeneration}:${operation}:${createHash("sha256").update(canonicalJson(payload), "utf8").digest("hex")}`,
       ownership: ownershipIdentity,
       ...payload,
     });

@@ -48,8 +48,9 @@ export type OpenApiAnalysisConfiguration = Readonly<{
   groupingPort?: OpenApiGroupingPort;
 }>;
 
-type AnalysisSource = Pick<ClaimedAnalysisRunRecord, "sourceType" | "sourceUrl">
-  & Partial<Pick<ClaimedAnalysisRunRecord, "id" | "organizationId" | "projectId" | "sourceConfiguration">>;
+export type AnalysisSource = Pick<ClaimedAnalysisRunRecord, "sourceType" | "sourceUrl">
+  & Partial<Pick<ClaimedAnalysisRunRecord,
+    "id" | "organizationId" | "projectId" | "sourceConfiguration" | "leaseGeneration">>;
 export type AnalysisAdapter = (source: AnalysisSource, signal: AbortSignal) => Promise<AnalysisResult>;
 
 export type GitHubAnalysisConfiguration = Readonly<{
