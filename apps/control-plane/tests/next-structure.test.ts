@@ -41,3 +41,18 @@ test("auth/project UI exposes actionable SSR states without trusting browser rol
   assert.match(proxy, /getAuthService\(\)\.refreshForProxy/);
   assert.doesNotMatch(proxy, /role|organizationId/);
 });
+
+test("project entry offers all source paths and describes OpenAPI verification context", async () => {
+  const entry = await readFile(new URL("../app/project-entry.tsx", import.meta.url), "utf8");
+  assert.match(entry, /<option value="website">Website URL<\/option>/);
+  assert.match(entry, /<option value="openapi">OpenAPI URL<\/option>/);
+  assert.match(entry, /<option value="github">GitHub repository<\/option>/);
+  assert.match(entry, /OpenAPI source URL/);
+  assert.match(entry, /Target origin/);
+  assert.match(entry, /Same-origin test page URL/);
+  assert.match(entry, /Environment/);
+  assert.match(entry, /sourceConfiguration/);
+  assert.match(entry, /body\.source\.sourceConfiguration/);
+  assert.match(entry, /PROVIDER_UNAVAILABLE/);
+  assert.doesNotMatch(entry, /Analysis complete for \$\{sourceType\}.*PROVIDER_UNAVAILABLE/);
+});

@@ -1,8 +1,19 @@
 export type SourceType = "website" | "openapi" | "github";
 
+export type SourceConfiguration =
+  | { kind: "website" }
+  | { kind: "github" }
+  | {
+    kind: "openapi";
+    targetOrigin: string;
+    testPageUrl: string;
+    environment: "test" | "staging" | "production";
+  };
+
 export type PersistedWorkflow = {
   sourceType: SourceType;
   url: string;
+  sourceConfiguration?: SourceConfiguration;
   projectId?: string;
   analysisRunId?: string;
   workflowRunId?: string;
@@ -19,7 +30,11 @@ export function loadWorkflow(storage: Storage): PersistedWorkflow | undefined {
     const raw = storage.getItem(WORKFLOW_KEY);
     if (!raw) return undefined;
     const value = JSON.parse(raw) as Partial<PersistedWorkflow>;
-    if (!isSourceType(value.sourceType) || typeof value.url !== "string" || value.url.length > 2_048) {
+    if (!isSourceType(value.sourceType) || !isBoundedUrl(value.url)) {
+      try { storage.removeItem(WORKFLOW_KEY); } catch { /* Ignore unavailable browser storage. */ }
+      return undefined;
+    }
+    if (value.sourceConfiguration !== undefined && !isSourceConfiguration(value.sourceType, value.sourceConfiguration)) {
       try { storage.removeItem(WORKFLOW_KEY); } catch { /* Ignore unavailable browser storage. */ }
       return undefined;
     }
@@ -87,4 +102,27 @@ export function clearClientWorkflow(storage: Storage): void {
 
 function isSourceType(value: unknown): value is SourceType {
   return value === "website" || value === "openapi" || value === "github";
+}
+
+function isSourceConfiguration(sourceType: SourceType, value: unknown): value is SourceConfiguration {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const configuration = value as Record<string, unknown>;
+  if (configuration.kind !== sourceType) return false;
+  if (sourceType !== "openapi") return Object.keys(configuration).length === 1;
+  if (!isBoundedUrl(configuration.targetOrigin) || !isBoundedUrl(configuration.testPageUrl)
+    || !["test", "staging", "production"].includes(String(configuration.environment))) return false;
+  try {
+    return new URL(String(configuration.targetOrigin)).origin === new URL(String(configuration.testPageUrl)).origin;
+  } catch {
+    return false;
+  }
+}
+
+function isBoundedUrl(value: unknown): value is string {
+  if (typeof value !== "string" || value.length === 0 || value.length > 2_048) return false;
+  try {
+    return new URL(value).protocol === "https:";
+  } catch {
+    return false;
+  }
 }

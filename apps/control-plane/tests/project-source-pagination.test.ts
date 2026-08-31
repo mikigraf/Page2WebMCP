@@ -114,3 +114,32 @@ test("project list/detail APIs resume durable state across reloads with opaque c
   assert.equal(body.latestAnalysis.id, run.id);
   assert.equal(body.latestAnalysis.status, "queued");
 });
+
+test("project detail returns OpenAPI verification context as the authoritative source after refresh", async () => {
+  const repository = installTestRepository();
+  const project = await repository.createProject(owner, {
+    name: "Authoritative OpenAPI context",
+    sourceType: "openapi",
+    url: "https://api.widgets.example/openapi.json",
+    sourceConfiguration: {
+      kind: "openapi",
+      targetOrigin: "https://app.widgets.example",
+      testPageUrl: "https://app.widgets.example/checkout",
+      environment: "staging"
+    },
+    idempotencyKey: "authoritative-openapi-context",
+    inputHash: "authoritative-openapi-context"
+  });
+  const detail = await projectDetail(
+    new Request(`https://control.example/api/projects/${project.id}`, { headers: authenticatedHeaders(owner) }),
+    { params: Promise.resolve({ projectId: project.id }) }
+  );
+  assert.equal(detail.status, 200);
+  const body = await detail.json();
+  assert.deepEqual(body.source.sourceConfiguration, {
+    kind: "openapi",
+    targetOrigin: "https://app.widgets.example",
+    testPageUrl: "https://app.widgets.example/checkout",
+    environment: "staging"
+  });
+});

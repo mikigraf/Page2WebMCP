@@ -11,6 +11,7 @@ import {
   operationKey,
   saveWorkflow,
   type PersistedWorkflow,
+  type SourceConfiguration,
   type SourceType
 } from "../src/client-workflow.ts";
 
@@ -39,6 +40,11 @@ type ProjectSummary = {
   url: string;
   status: string;
 };
+type ProjectSource = {
+  sourceType: SourceType;
+  sourceUrl: string;
+  sourceConfiguration: SourceConfiguration;
+};
 type ReleaseResult = {
   id: string;
   url: string;
@@ -66,6 +72,9 @@ const anonymousCsrfRoutes = new Set([
 export function ProjectEntry({ authState }: Readonly<{ authState?: "verified" | "recovery" }> = {}) {
   const [sourceType, setSourceType] = useState<SourceType>("website");
   const [url, setUrl] = useState(DEFAULT_URLS.website);
+  const [targetOrigin, setTargetOrigin] = useState("https://api.example");
+  const [testPageUrl, setTestPageUrl] = useState("https://api.example/");
+  const [environment, setEnvironment] = useState<"test" | "staging" | "production">("test");
   const [message, setMessage] = useState(authState === "recovery"
     ? "Choose a new password to finish recovery."
     : authState === "verified"
@@ -95,12 +104,18 @@ export function ProjectEntry({ authState }: Readonly<{ authState?: "verified" | 
     const controller = new AbortController();
     queueMicrotask(() => {
       if (controller.signal.aborted) return;
-      setSourceType(restored.sourceType);
-      setUrl(restored.url);
+      applySource({
+        sourceType: restored.sourceType,
+        sourceUrl: restored.url,
+        sourceConfiguration: restored.sourceConfiguration ?? defaultSourceConfiguration(restored.sourceType, restored.url)
+      });
       setProjectId(restored.projectId);
       setAnalysisRunId(restored.analysisRunId);
       setWorkflowRunId(restored.workflowRunId);
       setReleaseUrl(restored.releaseUrl);
+      if (restored.projectId) void refreshProject(restored.projectId, controller.signal).catch((error: unknown) => {
+        if (!controller.signal.aborted) setMessage(`Project recovery failed: ${errorCode(error)}`);
+      });
       if (!restored.analysisRunId) return;
       setBusy(true);
       void waitForAnalysis(restored.analysisRunId, controller.signal)
@@ -306,13 +321,18 @@ export function ProjectEntry({ authState }: Readonly<{ authState?: "verified" | 
 
   async function createProject(event: FormEvent) {
     event.preventDefault();
+    const sourceValidationError = validateSourceConfiguration(activeSourceConfiguration());
+    if (sourceValidationError) {
+      setMessage(sourceValidationError);
+      return;
+    }
     setBusy(true);
     clearWorkflowView();
     removePersistedWorkflow();
     try {
       const { response, body } = await postIdempotent<{ id?: string } & ApiFailure>(
         "/api/projects",
-        { sourceType, url },
+        { sourceType, url, sourceConfiguration: activeSourceConfiguration() },
         "create-project"
       );
       if (!response.ok || !body.id) throw new Error(body.code ?? "PROJECT_CREATE_FAILED");
@@ -324,7 +344,7 @@ export function ProjectEntry({ authState }: Readonly<{ authState?: "verified" | 
         url,
         status: "created"
       }, ...current.filter((project) => project.id !== body.id)]);
-      persistWorkflow({ sourceType, url, projectId: body.id });
+      persistWorkflow({ sourceType, url, sourceConfiguration: activeSourceConfiguration(), projectId: body.id });
       setMessage(`Project ${body.id} created`);
     } catch (error) {
       setMessage(`Project creation failed: ${errorCode(error)}`);
@@ -333,26 +353,32 @@ export function ProjectEntry({ authState }: Readonly<{ authState?: "verified" | 
     }
   }
 
+  async function refreshProject(id: string, signal?: AbortSignal) {
+    const { response, body } = await requestJson<{
+      project?: ProjectSummary;
+      source?: ProjectSource;
+      latestAnalysis?: { id: string; status: AnalysisStatus["run"]["status"] };
+      capabilities?: Capability[];
+    } & ApiFailure>(`/api/projects/${encodeURIComponent(id)}`, { cache: "no-store", ...(signal ? { signal } : {}) });
+    if (!response.ok || !body.project || !body.source) throw new Error(body.code ?? "PROJECT_LOAD_FAILED");
+    applySource(body.source);
+    setProjectId(body.project.id);
+    setAnalysisRunId(body.latestAnalysis?.id);
+    setCapabilities(body.capabilities ?? []);
+    persistWorkflow({
+      sourceType: body.source.sourceType,
+      url: body.source.sourceUrl,
+      sourceConfiguration: body.source.sourceConfiguration,
+      projectId: body.project.id,
+      analysisRunId: body.latestAnalysis?.id
+    });
+    return { ...body, project: body.project, source: body.source };
+  }
+
   async function resumeProject(id: string) {
     setBusy(true);
     try {
-      const { response, body } = await requestJson<{
-        project?: ProjectSummary;
-        latestAnalysis?: { id: string; status: AnalysisStatus["run"]["status"] };
-        capabilities?: Capability[];
-      } & ApiFailure>(`/api/projects/${encodeURIComponent(id)}`, { cache: "no-store" });
-      if (!response.ok || !body.project) throw new Error(body.code ?? "PROJECT_LOAD_FAILED");
-      setSourceType(body.project.sourceType);
-      setUrl(body.project.url);
-      setProjectId(body.project.id);
-      setAnalysisRunId(body.latestAnalysis?.id);
-      setCapabilities(body.capabilities ?? []);
-      persistWorkflow({
-        sourceType: body.project.sourceType,
-        url: body.project.url,
-        projectId: body.project.id,
-        analysisRunId: body.latestAnalysis?.id
-      });
+      const body = await refreshProject(id);
       setMessage(body.latestAnalysis ? `Resumed ${body.project.name}` : `Loaded ${body.project.name}`);
     } catch (error) {
       setMessage(`Project load failed: ${errorCode(error)}`);
@@ -386,7 +412,7 @@ export function ProjectEntry({ authState }: Readonly<{ authState?: "verified" | 
         }
         runId = accepted.body.runId;
         setAnalysisRunId(runId);
-        persistWorkflow({ sourceType, url, projectId, analysisRunId: runId });
+        persistWorkflow({ sourceType, url, sourceConfiguration: activeSourceConfiguration(), projectId, analysisRunId: runId });
       }
       const completed = await waitForAnalysis(runId);
       setCapabilities(completed.capabilities);
@@ -394,9 +420,9 @@ export function ProjectEntry({ authState }: Readonly<{ authState?: "verified" | 
     } catch (error) {
       if (error instanceof AnalysisRunError && error.terminal) {
         setAnalysisRunId(undefined);
-        persistWorkflow({ sourceType, url, projectId });
+        persistWorkflow({ sourceType, url, sourceConfiguration: activeSourceConfiguration(), projectId });
       }
-      setMessage(`Analysis failed: ${errorCode(error)}`);
+      setMessage(analysisFailureMessage(error));
     } finally {
       setBusy(false);
     }
@@ -459,11 +485,11 @@ export function ProjectEntry({ authState }: Readonly<{ authState?: "verified" | 
           runId = started.body.workflow.id;
           setWorkflowRunId(runId);
           setGitHubOutcome(started.body.outcome);
-          persistWorkflow({ sourceType, url, projectId, analysisRunId, workflowRunId: runId });
+          persistWorkflow({ sourceType, url, sourceConfiguration: activeSourceConfiguration(), projectId, analysisRunId, workflowRunId: runId });
         }
         const completed = await waitForGitHubWorkflow(runId);
         setGitHubOutcome(completed.outcome);
-        persistWorkflow({ sourceType, url, projectId, analysisRunId, workflowRunId: runId });
+        persistWorkflow({ sourceType, url, sourceConfiguration: activeSourceConfiguration(), projectId, analysisRunId, workflowRunId: runId });
         setMessage("Tested patch and draft pull request/check/preview reconciled; no merge or installation was performed");
         return;
       }
@@ -477,7 +503,7 @@ export function ProjectEntry({ authState }: Readonly<{ authState?: "verified" | 
       }
       setReleaseUrl(published.body.release.url);
       setRelease(published.body.release);
-      persistWorkflow({ sourceType, url, projectId, analysisRunId, releaseUrl: published.body.release.url });
+      persistWorkflow({ sourceType, url, sourceConfiguration: activeSourceConfiguration(), projectId, analysisRunId, releaseUrl: published.body.release.url });
       setMessage("Immutable release published");
     } catch (error) {
       setMessage(`${sourceType === "github" ? "GitHub workflow" : "Publication"} failed: ${errorCode(error)}`);
@@ -540,6 +566,22 @@ export function ProjectEntry({ authState }: Readonly<{ authState?: "verified" | 
     setMessage("");
   }
 
+  function activeSourceConfiguration(): SourceConfiguration {
+    return sourceType === "openapi"
+      ? { kind: "openapi", targetOrigin, testPageUrl, environment }
+      : { kind: sourceType };
+  }
+
+  function applySource(source: ProjectSource) {
+    setSourceType(source.sourceType);
+    setUrl(source.sourceUrl);
+    if (source.sourceConfiguration.kind === "openapi") {
+      setTargetOrigin(source.sourceConfiguration.targetOrigin);
+      setTestPageUrl(source.sourceConfiguration.testPageUrl);
+      setEnvironment(source.sourceConfiguration.environment);
+    }
+  }
+
   function resetWorkflow() {
     const storage = browserStorage();
     if (storage) {
@@ -586,7 +628,17 @@ export function ProjectEntry({ authState }: Readonly<{ authState?: "verified" | 
         <option value="openapi">OpenAPI URL</option>
         <option value="github">GitHub repository</option>
       </select></label>
-      <label>Public source URL <input type="url" value={url} onChange={(event) => { setUrl(event.target.value); resetWorkflow(); }} required /></label>
+      <p id="source-guidance">Choose a public source you are authorized to inspect. Browser recovery is only an aid; reopening a project reloads its source configuration from the server.</p>
+      <label>{sourceType === "openapi" ? "OpenAPI source URL" : sourceType === "github" ? "GitHub repository URL" : "Website URL"} <input type="url" value={url} onChange={(event) => { setUrl(event.target.value); resetWorkflow(); }} required /></label>
+      {sourceType === "openapi" && <fieldset aria-describedby="openapi-guidance">
+        <legend>OpenAPI verification context</legend>
+        <p id="openapi-guidance">Use a same-origin test page for local or staging analysis. Production selections require explicit verification before publication.</p>
+        <label>Target origin <input type="url" value={targetOrigin} onChange={(event) => { setTargetOrigin(event.target.value); resetWorkflow(); }} required /></label>
+        <label>Same-origin test page URL <input type="url" value={testPageUrl} onChange={(event) => { setTestPageUrl(event.target.value); resetWorkflow(); }} required /></label>
+        <label>Environment <select value={environment} onChange={(event) => { setEnvironment(event.target.value as "test" | "staging" | "production"); resetWorkflow(); }}>
+          <option value="test">Test</option><option value="staging">Staging</option><option value="production">Production</option>
+        </select></label>
+      </fieldset>}
       <button type="submit" disabled={busy || !signedInRole}>Create project</button>
     </form>
     <button type="button" onClick={analyze} disabled={busy || !projectId}>{analysisRunId ? "Resume analysis" : `Analyze ${sourceType}`}</button>
@@ -786,4 +838,29 @@ function errorCode(error: unknown): string {
   return error instanceof Error && /^[A-Z0-9_]{1,64}$/.test(error.message)
     ? error.message
     : "REQUEST_FAILED";
+}
+
+function analysisFailureMessage(error: unknown): string {
+  const code = errorCode(error);
+  return code === "PROVIDER_UNAVAILABLE" ? `Source provider unavailable: ${code}` : `Analysis failed: ${code}`;
+}
+
+function defaultSourceConfiguration(sourceType: SourceType, sourceUrl: string): SourceConfiguration {
+  if (sourceType !== "openapi") return { kind: sourceType };
+  const origin = new URL(sourceUrl).origin;
+  return { kind: "openapi", targetOrigin: origin, testPageUrl: `${origin}/`, environment: "test" };
+}
+
+function validateSourceConfiguration(configuration: SourceConfiguration): string | undefined {
+  if (configuration.kind !== "openapi") return undefined;
+  try {
+    const target = new URL(configuration.targetOrigin);
+    const testPage = new URL(configuration.testPageUrl);
+    if (target.protocol !== "https:" || testPage.protocol !== "https:" || target.origin !== testPage.origin) {
+      return "OpenAPI verification context invalid: TEST_PAGE_SAME_ORIGIN_REQUIRED";
+    }
+  } catch {
+    return "OpenAPI verification context invalid: TEST_PAGE_SAME_ORIGIN_REQUIRED";
+  }
+  return undefined;
 }
