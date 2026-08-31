@@ -10,7 +10,10 @@ import {
   parsePersistedSourceConfiguration,
   RELEASE_VERIFICATION_CHECK_NAMES,
   RepositoryError,
-  type RepositoryActor
+  type CandidateRelease,
+  type ControlPlaneRepository,
+  type RepositoryActor,
+  type VerificationRequest,
 } from "./control-plane.ts";
 
 function passedVerificationChecks() {
@@ -65,6 +68,43 @@ function hostedArtifactIdentity(contentHash: string) {
     downloadUrl: `${artifactUrl}?download=page2webmcp-${contentHash}.js`,
     localOnly: false,
   } as const;
+}
+
+function verificationEvidence(candidate: CandidateRelease, mode: VerificationRequest["verificationMode"]) {
+  const manifest = candidate.manifest as {
+    releaseId: string;
+    plans: ReadonlyArray<{ tool: { name: string } }>;
+  };
+  return {
+    verifierIdentity: {
+      protocolVersion: 1 as const,
+      mode,
+      webMcpImplementation: "native" as const,
+      verifierOriginDigest: "b".repeat(64),
+    },
+    observation: {
+      observedContentHash: candidate.contentHash,
+      observedIntegrity: `sha384-${createHash("sha384").update(candidate.code).digest("base64")}`,
+      observedReleaseId: manifest.releaseId,
+      observedTargetOrigin: candidate.allowedOrigin,
+      registeredTools: manifest.plans.map(({ tool }) => tool.name).sort(),
+      trustedLoader: { enforcedBeforeEvaluation: true, evaluatedContentHash: candidate.contentHash },
+      controlPlaneRequestsDuringExecution: 0,
+      modelRequestsDuringExecution: 0,
+    },
+  } as const;
+}
+
+function saveVerification(
+  repository: Pick<ControlPlaneRepository, "saveVerification">,
+  actor: RepositoryActor,
+  projectId: string,
+  input: Omit<VerificationRequest, "verifierIdentity" | "observation">,
+) {
+  return repository.saveVerification(actor, projectId, {
+    ...input,
+    ...verificationEvidence(input.candidate, input.verificationMode),
+  });
 }
 
 test("capability-state digests use locale-independent canonical ordering", () => {
@@ -174,6 +214,65 @@ test("analysis enqueue is idempotent and leased jobs recover after expiry", asyn
   const recovered = await repository.claimAnalysis("worker-b", 60_000);
   assert.equal(recovered?.id, first.id);
   assert.equal(recovered?.attempts, 2);
+});
+
+test("analysis completion persists only the exact source-compatible provider provenance tuple", async () => {
+  const repository = new InMemoryControlPlaneRepository();
+  const project = await repository.createProject(owner, {
+    name: "Provider provenance",
+    sourceType: "openapi",
+    url: "https://widgets.example/openapi.json",
+    sourceConfiguration: {
+      kind: "openapi", targetOrigin: "https://widgets.example",
+      testPageUrl: "https://widgets.example/", environment: "test",
+    },
+    idempotencyKey: "provider-provenance-project",
+    inputHash: "provider-provenance-project",
+  });
+  const run = await repository.enqueueAnalysis(owner, {
+    projectId: project.id,
+    idempotencyKey: "provider-provenance-analysis",
+    inputHash: "provider-provenance-analysis",
+  });
+  const claim = await repository.claimAnalysis("provider-provenance-worker", 60_000);
+  assert.equal(claim?.id, run.id);
+  const providerProvenance = {
+    mode: "openapi" as const,
+    adapter: "bounded-openapi" as const,
+    adapterVersion: 1 as const,
+    fixture: false as const,
+  };
+  const completed = await repository.completeAnalysis("provider-provenance-worker", run.id, {
+    capabilities: [],
+    diagnostics: [{ code: "NO_SUPPORTED_OPERATIONS", operationKey: "document" }],
+    evidence: [{
+      source: "openapi",
+      content: "{}",
+      reference: `urn:sha256:${createHash("sha256").update("{}").digest("hex")}`,
+    }],
+    providerProvenance,
+  }, claim!.leaseGeneration);
+  assert.deepEqual(completed.providerProvenance, providerProvenance);
+
+  const invalidProject = await repository.createProject(owner, {
+    name: "Invalid provider provenance",
+    sourceType: "website",
+    url: "https://widgets.example",
+    idempotencyKey: "invalid-provider-provenance-project",
+    inputHash: "invalid-provider-provenance-project",
+  });
+  const invalidRun = await repository.enqueueAnalysis(owner, {
+    projectId: invalidProject.id,
+    idempotencyKey: "invalid-provider-provenance-analysis",
+    inputHash: "invalid-provider-provenance-analysis",
+  });
+  const invalidClaim = await repository.claimAnalysis("invalid-provider-provenance-worker", 60_000);
+  assert.equal(invalidClaim?.id, invalidRun.id);
+  await assert.rejects(repository.completeAnalysis("invalid-provider-provenance-worker", invalidRun.id, {
+    capabilities: [], diagnostics: [], evidence: [],
+    providerProvenance: providerProvenance as never,
+  }, invalidClaim!.leaseGeneration), (error: unknown) => error instanceof RepositoryError
+    && error.code === "INVALID_STATE");
 });
 
 test("OpenAPI verification context is canonical, changes source identity, and is copied immutably to claimed jobs", async () => {
@@ -404,23 +503,32 @@ test("eligible publication is content addressed and idempotent", async () => {
     csp: { hosted: "allowed" as const },
     verificationMode: "hermetic" as const
   };
-  const verification = await repository.saveVerification(owner, project.id, verificationInput);
+  const verification = await saveVerification(repository, owner, project.id, verificationInput);
 
   const request = {
     projectId: project.id,
     analysisRunId: run.id,
     capabilityStateDigest: capabilityState,
     candidateContentHash: verification.candidateContentHash,
+    verificationRunId: verification.id,
     ...hostedArtifactIdentity(verification.candidateContentHash),
     idempotencyKey: "publish-one",
     inputHash: "publish-input"
   };
+  await assert.rejects(repository.publishRelease(owner, {
+    ...request,
+    verificationRunId: "22222222-2222-4222-8222-222222222222",
+    idempotencyKey: "publish-wrong-verification",
+  }), (error: unknown) => error instanceof RepositoryError
+    && error.code === "RELEASE_GATE_FAILED"
+    && error.details?.includes("CANDIDATE_CHANGED"));
   const release = await repository.publishRelease(owner, request);
-  const retriedVerification = await repository.saveVerification(owner, project.id, verificationInput);
+  const retriedVerification = await saveVerification(repository, owner, project.id, verificationInput);
   assert.equal(retriedVerification.id, verification.id);
   const duplicate = await repository.publishRelease(owner, request);
   assert.equal(duplicate.id, release.id);
   assert.equal(release.capabilityStateDigest, capabilityState);
+  assert.equal(release.verificationRunId, verification.id);
   assert.match(release.contentHash, /^[0-9a-f]{64}$/);
   assert.match(release.sri, /^sha384-/);
   assert.deepEqual({
@@ -434,6 +542,8 @@ test("eligible publication is content addressed and idempotent", async () => {
     releaseId: release.id,
     pageUrl: "https://acme.example/account",
     artifactUrl: release.artifactUrl,
+    downloadUrl: release.downloadUrl!,
+    localOnly: false,
     targetOrigin: release.allowedOrigin,
     artifactContentHash: release.contentHash,
     integrity: release.sri,
@@ -442,12 +552,58 @@ test("eligible publication is content addressed and idempotent", async () => {
     delivery: "hosted" as const,
     csp: { hosted: "allowed" as const },
     webMcpImplementation: "native" as const,
-    attestation: { servedContentHash: release.contentHash, executedContentHash: release.contentHash },
+    verifierIdentity: {
+      protocolVersion: 1 as const,
+      mode: "hermetic" as const,
+      webMcpImplementation: "native" as const,
+      verifierOriginDigest: "b".repeat(64),
+    },
+    attestation: {
+      observedArtifactUrl: release.artifactUrl,
+      observedDownloadUrl: release.downloadUrl!,
+      observedLocalOnly: false,
+      observedIntegrity: release.sri,
+      executedArtifactUrl: release.artifactUrl,
+      servedContentHash: release.contentHash,
+      executedContentHash: release.contentHash,
+      observedTargetOrigin: release.allowedOrigin,
+      registeredTools: ["find_order"],
+      webMcpImplementation: "native" as const,
+      normalPageLoad: true,
+      routeInterception: false,
+      injectedRegistration: false,
+      syntheticHarness: false,
+      duplicateLoadHarmless: true,
+      csp: { hosted: "allowed" as const },
+    },
     idempotencyKey: "install-one",
     inputHash: "a".repeat(64),
   };
+  const pendingInstallationInput = {
+    ...installationInput,
+    status: "pending_self_host" as const,
+    csp: { hosted: "blocked" as const },
+    attestation: {
+      ...installationInput.attestation,
+      executedArtifactUrl: null,
+      executedContentHash: null,
+      registeredTools: [],
+      duplicateLoadHarmless: null,
+      csp: { hosted: "blocked" as const },
+    },
+    idempotencyKey: "install-pending",
+    inputHash: "f".repeat(64),
+  };
+  const pendingInstallation = await repository.saveReleaseInstallation(
+    owner, project.id, pendingInstallationInput,
+  );
+  assert.equal(pendingInstallation.status, "pending_self_host");
+  assert.equal((await repository.saveReleaseInstallation(
+    owner, project.id, pendingInstallationInput,
+  )).id, pendingInstallation.id);
   const installation = await repository.saveReleaseInstallation(owner, project.id, installationInput);
   assert.equal(installation.status, "verified");
+  assert.notEqual(installation.id, pendingInstallation.id);
   assert.equal((await repository.saveReleaseInstallation(owner, project.id, installationInput)).id, installation.id);
   await assert.rejects(repository.saveReleaseInstallation(editor, project.id, {
     ...installationInput,
@@ -481,7 +637,7 @@ test("eligible publication is content addressed and idempotent", async () => {
     downloadUrl: `https://unrelated.example/${release.contentHash}.js?download=page2webmcp-${release.contentHash}.js`,
     idempotencyKey: "publish-other-artifact",
   }), (error: unknown) => error instanceof RepositoryError && error.code === "INVALID_STATE");
-  await assert.rejects(repository.saveVerification(owner, project.id, {
+  await assert.rejects(saveVerification(repository, owner, project.id, {
     ...verificationInput,
     candidate: releaseCandidate("export const changedAfterPublish = true;")
   }), (error: unknown) => error instanceof RepositoryError
@@ -690,7 +846,7 @@ test("publication atomically rejects a stale capability-state verification", asy
   });
   const [capability] = await repository.listAnalysisCapabilities(owner, run.id);
   const staleDigest = capabilityStateDigest([capability]);
-  const verification = await repository.saveVerification(owner, project.id, {
+  const verification = await saveVerification(repository, owner, project.id, {
     analysisRunId: run.id,
     capabilityStateDigest: staleDigest,
     candidate: releaseCandidate("export const state = true;", plans("create_support_ticket")),
@@ -712,6 +868,7 @@ test("publication atomically rejects a stale capability-state verification", asy
       analysisRunId: run.id,
       capabilityStateDigest: staleDigest,
       candidateContentHash: verification.candidateContentHash,
+      verificationRunId: verification.id,
       ...hostedArtifactIdentity(verification.candidateContentHash),
       idempotencyKey: "stale-release",
       inputHash: "stale-release"
@@ -754,7 +911,7 @@ test("a blocked capability publishes reviewed bytes without mutating the worker 
   const reviewed = await repository.listAnalysisCapabilities(owner, run.id);
   const digest = capabilityStateDigest(reviewed);
   const candidate = releaseCandidate("export const reviewedSubset = ['find_order'];", plans("find_order"));
-  const verification = await repository.saveVerification(owner, project.id, {
+  const verification = await saveVerification(repository, owner, project.id, {
     analysisRunId: run.id,
     capabilityStateDigest: digest,
     candidate,
@@ -773,6 +930,7 @@ test("a blocked capability publishes reviewed bytes without mutating the worker 
     analysisRunId: run.id,
     capabilityStateDigest: digest,
     candidateContentHash: verification.candidateContentHash,
+    verificationRunId: verification.id,
     ...hostedArtifactIdentity(verification.candidateContentHash),
     idempotencyKey: "publish-reviewed-subset",
     inputHash: "publish-reviewed-subset"
@@ -805,7 +963,7 @@ test("candidate hashes are validated and a later verification cannot be overwrit
     release: releaseCandidate("export const initial = true;")
   });
   const digest = capabilityStateDigest(await repository.listAnalysisCapabilities(owner, run.id));
-  await assert.rejects(repository.saveVerification(owner, project.id, {
+  await assert.rejects(saveVerification(repository, owner, project.id, {
     analysisRunId: run.id,
     capabilityStateDigest: digest,
     candidate: { ...releaseCandidate("export const bad = true;"), contentHash: "0".repeat(64) },
@@ -822,7 +980,7 @@ test("candidate hashes are validated and a later verification cannot be overwrit
     && error.code === "RELEASE_GATE_FAILED"
     && error.details?.includes("CANDIDATE_HASH_MISMATCH"));
 
-  const first = await repository.saveVerification(owner, project.id, {
+  const first = await saveVerification(repository, owner, project.id, {
     analysisRunId: run.id,
     capabilityStateDigest: digest,
     candidate: releaseCandidate("export const candidate = 'first';"),
@@ -836,7 +994,7 @@ test("candidate hashes are validated and a later verification cannot be overwrit
     csp: { hosted: "allowed" as const },
     verificationMode: "hermetic" as const
   });
-  const second = await repository.saveVerification(owner, project.id, {
+  const second = await saveVerification(repository, owner, project.id, {
     analysisRunId: run.id,
     capabilityStateDigest: digest,
     candidate: releaseCandidate("export const candidate = 'second';"),
@@ -855,6 +1013,7 @@ test("candidate hashes are validated and a later verification cannot be overwrit
     analysisRunId: run.id,
     capabilityStateDigest: digest,
     candidateContentHash: first.candidateContentHash,
+    verificationRunId: first.id,
     ...hostedArtifactIdentity(first.candidateContentHash),
     idempotencyKey: "publish-old-candidate",
     inputHash: "publish-old-candidate"
@@ -867,6 +1026,7 @@ test("candidate hashes are validated and a later verification cannot be overwrit
     analysisRunId: run.id,
     capabilityStateDigest: digest,
     candidateContentHash: second.candidateContentHash,
+    verificationRunId: second.id,
     ...hostedArtifactIdentity(second.candidateContentHash),
     idempotencyKey: "publish-new-candidate",
     inputHash: "publish-new-candidate"
@@ -899,7 +1059,7 @@ test("latest published release recovery is tenant scoped and carries its exact v
       release: releaseCandidate("export const same = true;")
     });
     const digest = capabilityStateDigest(await repository.listAnalysisCapabilities(owner, run.id));
-    const verification = await repository.saveVerification(owner, project.id, {
+    const verification = await saveVerification(repository, owner, project.id, {
       analysisRunId: run.id,
       capabilityStateDigest: digest,
       candidate: releaseCandidate("export const same = true;"),
@@ -918,6 +1078,7 @@ test("latest published release recovery is tenant scoped and carries its exact v
       analysisRunId: run.id,
       capabilityStateDigest: digest,
       candidateContentHash: verification.candidateContentHash,
+      verificationRunId: verification.id,
       ...hostedArtifactIdentity(verification.candidateContentHash),
       idempotencyKey: `release-${index}`,
       inputHash: `release-${index}`

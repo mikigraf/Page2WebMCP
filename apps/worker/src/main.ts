@@ -6,11 +6,30 @@ import {
   shutdownObservability
 } from "../../../packages/observability/src/server.ts";
 import { randomUUID } from "node:crypto";
+import { pathToFileURL } from "node:url";
 import {
-  createProductionWorkerRuntime,
+  createProductionProvider,
+  createProductionWorkerRuntimeFromProvider,
   inspectProductionProviderConfiguration,
   processProductionWorkerIteration,
+  type ProductionProvider,
+  type ProductionWorkerRuntime,
 } from "./production-runtime.ts";
+
+type RuntimeEnvironment = Record<string, string | undefined>;
+
+export type ProductionWorkerMainDependencies = Readonly<{
+  signal?: AbortSignal;
+  constructProvider?: (environment: RuntimeEnvironment) => ProductionProvider;
+  validateConfiguration?: (environment: RuntimeEnvironment) => void;
+  getRepository?: () => ControlPlaneRepository;
+  createRuntime?: (repository: ControlPlaneRepository, provider: ProductionProvider) => ProductionWorkerRuntime;
+  registerObservability?: () => Promise<void>;
+  shutdownObservability?: () => Promise<void>;
+  processIteration?: typeof processProductionWorkerIteration;
+  closeRepository?: (repository: ControlPlaneRepository) => Promise<void>;
+  workerId?: string;
+}>;
 
 class WorkerStartupConfigurationError extends Error {
   constructor(readonly code: string, readonly missingEnvironment: readonly string[]) {
@@ -19,53 +38,75 @@ class WorkerStartupConfigurationError extends Error {
   }
 }
 
-const shutdown = new AbortController();
-const workerId = `worker-${randomUUID()}`;
-const pollMs = boundedInteger(process.env.PAGE2WEBMCP_WORKER_POLL_MS, 1_000, 100, 30_000);
-let consecutiveFailures = 0;
-let repository: ControlPlaneRepository | undefined;
-let observabilityRegistered = false;
-
-for (const signal of ["SIGINT", "SIGTERM"] as const) {
-  process.once(signal, () => shutdown.abort());
+export async function runProductionWorker(
+  environment: RuntimeEnvironment = process.env,
+  dependencies: ProductionWorkerMainDependencies = {},
+): Promise<void> {
+  const signal = dependencies.signal ?? new AbortController().signal;
+  const workerId = dependencies.workerId ?? `worker-${randomUUID()}`;
+  const pollMs = boundedInteger(environment.PAGE2WEBMCP_WORKER_POLL_MS, 1_000, 100, 30_000);
+  let consecutiveFailures = 0;
+  let repository: ControlPlaneRepository | undefined;
+  let observabilityRegistered = false;
+  try {
+    let provider: ProductionProvider;
+    try {
+      provider = (dependencies.constructProvider ?? createProductionProvider)(environment);
+    } catch (error) {
+      const inspection = inspectProductionProviderConfiguration(environment);
+      if (inspection.code !== "PRODUCTION_PROVIDER_CONFIGURATION_READY") {
+        throw new WorkerStartupConfigurationError(inspection.code, inspection.keys);
+      }
+      throw error;
+    }
+    (dependencies.validateConfiguration ?? validateWorkerRuntimeConfiguration)(environment);
+    repository = (dependencies.getRepository ?? getControlPlaneRepository)();
+    const runtime = (dependencies.createRuntime ?? createProductionWorkerRuntimeFromProvider)(repository, provider);
+    await (dependencies.registerObservability ?? registerObservability)();
+    observabilityRegistered = true;
+    while (!signal.aborted) {
+      try {
+        const processed = await (dependencies.processIteration ?? processProductionWorkerIteration)(
+          repository, runtime, workerId, signal,
+        );
+        consecutiveFailures = 0;
+        if (!processed) await delay(pollMs, signal);
+      } catch (error) {
+        consecutiveFailures += 1;
+        console.error(JSON.stringify({
+          level: "error",
+          event: "worker_loop_failed",
+          code: stableCode(error),
+          consecutive_failures: consecutiveFailures
+        }));
+        const backoffMs = Math.min(pollMs * (2 ** Math.min(consecutiveFailures, 5)), 30_000);
+        await delay(backoffMs, signal);
+      }
+    }
+  } finally {
+    await Promise.allSettled([
+      repository
+        ? (dependencies.closeRepository ?? closeRepository)(repository)
+        : Promise.resolve(),
+      observabilityRegistered
+        ? (dependencies.shutdownObservability ?? shutdownObservability)()
+        : Promise.resolve(),
+    ]);
+  }
 }
 
-try {
-  const provider = inspectProductionProviderConfiguration(process.env);
-  if (provider.code !== "PRODUCTION_PROVIDER_CONFIGURATION_READY") {
-    throw new WorkerStartupConfigurationError(provider.code, provider.keys);
+async function main(): Promise<void> {
+  const shutdown = new AbortController();
+  const stop = () => shutdown.abort();
+  for (const signal of ["SIGINT", "SIGTERM"] as const) process.once(signal, stop);
+  try {
+    await runProductionWorker(process.env, { signal: shutdown.signal });
+  } catch (error) {
+    console.error(JSON.stringify(startupFailure(error)));
+    process.exitCode = 1;
+  } finally {
+    for (const signal of ["SIGINT", "SIGTERM"] as const) process.removeListener(signal, stop);
   }
-  validateWorkerRuntimeConfiguration();
-  repository = getControlPlaneRepository();
-  const runtime = createProductionWorkerRuntime(repository);
-  await registerObservability();
-  observabilityRegistered = true;
-  while (!shutdown.signal.aborted) {
-    try {
-      const processed = await processProductionWorkerIteration(repository, runtime, workerId, shutdown.signal);
-      consecutiveFailures = 0;
-      if (!processed) await delay(pollMs, shutdown.signal);
-    } catch (error) {
-      consecutiveFailures += 1;
-      console.error(JSON.stringify({
-        level: "error",
-        event: "worker_loop_failed",
-        code: stableCode(error),
-        consecutive_failures: consecutiveFailures
-      }));
-      const backoffMs = Math.min(pollMs * (2 ** Math.min(consecutiveFailures, 5)), 30_000);
-      await delay(backoffMs, shutdown.signal);
-    }
-  }
-} catch (error) {
-  const failure = startupFailure(error);
-  console.error(JSON.stringify(failure));
-  process.exitCode = 1;
-} finally {
-  await Promise.allSettled([
-    repository ? closeRepository(repository) : Promise.resolve(),
-    observabilityRegistered ? shutdownObservability() : Promise.resolve(),
-  ]);
 }
 
 function startupFailure(error: unknown): Readonly<{ code: string; missingEnvironment: readonly string[] }> {
@@ -116,3 +157,5 @@ async function closeRepository(value: ControlPlaneRepository): Promise<void> {
   const close = (value as ControlPlaneRepository & { close?: () => Promise<void> }).close;
   if (typeof close === "function") await close.call(value);
 }
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) await main();

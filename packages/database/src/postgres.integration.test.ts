@@ -11,7 +11,10 @@ import {
   capabilityStateDigest,
   RELEASE_VERIFICATION_CHECK_NAMES,
   RepositoryError,
-  type RepositoryActor
+  type CandidateRelease,
+  type ControlPlaneRepository,
+  type RepositoryActor,
+  type VerificationRequest,
 } from "./control-plane.ts";
 
 function passedVerificationChecks() {
@@ -53,6 +56,43 @@ function hostedArtifactIdentity(contentHash: string) {
     downloadUrl: `${artifactUrl}?download=page2webmcp-${contentHash}.js`,
     localOnly: false,
   } as const;
+}
+
+function verificationEvidence(candidate: CandidateRelease, mode: VerificationRequest["verificationMode"]) {
+  const manifest = candidate.manifest as {
+    releaseId: string;
+    plans: ReadonlyArray<{ tool: { name: string } }>;
+  };
+  return {
+    verifierIdentity: {
+      protocolVersion: 1 as const,
+      mode,
+      webMcpImplementation: "native" as const,
+      verifierOriginDigest: "b".repeat(64),
+    },
+    observation: {
+      observedContentHash: candidate.contentHash,
+      observedIntegrity: `sha384-${createHash("sha384").update(candidate.code).digest("base64")}`,
+      observedReleaseId: manifest.releaseId,
+      observedTargetOrigin: candidate.allowedOrigin,
+      registeredTools: manifest.plans.map(({ tool }) => tool.name).sort(),
+      trustedLoader: { enforcedBeforeEvaluation: true, evaluatedContentHash: candidate.contentHash },
+      controlPlaneRequestsDuringExecution: 0,
+      modelRequestsDuringExecution: 0,
+    },
+  } as const;
+}
+
+function saveVerification(
+  repository: Pick<ControlPlaneRepository, "saveVerification">,
+  actor: RepositoryActor,
+  projectId: string,
+  input: Omit<VerificationRequest, "verifierIdentity" | "observation">,
+) {
+  return repository.saveVerification(actor, projectId, {
+    ...input,
+    ...verificationEvidence(input.candidate, input.verificationMode),
+  });
 }
 
 test("Postgres personal organization provisioning converges and revoked sessions fail closed", {
@@ -339,11 +379,17 @@ test("Postgres repository persists and recovers the fixture lifecycle", { skip: 
       capabilities: capabilities("find_order"),
       diagnostics: [{ code: "SERVER_ADAPTER_REQUIRED", operationKey: "GET /private", reason: "api_key_header" }],
       evidence: evidenceFor(plans("find_order")),
-      release: releaseCandidate("export const persisted = true;")
+      release: releaseCandidate("export const persisted = true;"),
+      providerProvenance: {
+        mode: "local", adapter: "local-fixture", adapterVersion: 1, fixture: true,
+      },
     });
     assert.equal(completed.status, "succeeded");
     assert.equal(completed.leaseOwner, undefined);
     assert.equal(completed.leaseExpiresAt, undefined);
+    assert.deepEqual(completed.providerProvenance, {
+      mode: "local", adapter: "local-fixture", adapterVersion: 1, fixture: true,
+    });
     assert.equal((await repository.getAnalysis(actor, run.id)).status, "succeeded");
     assert.equal((await repository.listCapabilities(actor, project.id)).length, 1);
     assert.deepEqual((await repository.getAnalysisResult(actor, run.id))?.diagnostics, [{
@@ -367,16 +413,24 @@ test("Postgres repository persists and recovers the fixture lifecycle", { skip: 
       csp: { hosted: "allowed" as const },
       verificationMode: "hermetic" as const
     };
-    const verification = await repository.saveVerification(actor, project.id, verificationInput);
+    const verification = await saveVerification(repository, actor, project.id, verificationInput);
     const publishInput = {
       projectId: project.id,
       analysisRunId: run.id,
       capabilityStateDigest: capabilityDigest,
       candidateContentHash: verification.candidateContentHash,
+      verificationRunId: verification.id,
       ...hostedArtifactIdentity(verification.candidateContentHash),
       idempotencyKey: "postgres-publish",
       inputHash: "publish-input"
     } as const;
+    await assert.rejects(repository.publishRelease(actor, {
+      ...publishInput,
+      verificationRunId: "22222222-2222-4222-8222-222222222222",
+      idempotencyKey: "postgres-publish-wrong-verification",
+    }), (error: unknown) => error instanceof RepositoryError
+      && error.code === "RELEASE_GATE_FAILED"
+      && error.details?.includes("CANDIDATE_CHANGED"));
     const [release, concurrentRelease] = await Promise.all([
       repository.publishRelease(actor, publishInput),
       repository.publishRelease(actor, {
@@ -386,6 +440,7 @@ test("Postgres repository persists and recovers the fixture lifecycle", { skip: 
     ]);
     assert.equal(concurrentRelease.id, release.id);
     assert.equal(release.capabilityStateDigest, capabilityDigest);
+    assert.equal(release.verificationRunId, verification.id);
     assert.deepEqual({
       artifactUrl: release.artifactUrl,
       downloadUrl: release.downloadUrl,
@@ -406,6 +461,8 @@ test("Postgres repository persists and recovers the fixture lifecycle", { skip: 
       releaseId: release.id,
       pageUrl: "https://acme.example/account",
       artifactUrl: release.artifactUrl,
+      downloadUrl: release.downloadUrl!,
+      localOnly: false,
       targetOrigin: release.allowedOrigin,
       artifactContentHash: release.contentHash,
       integrity: release.sri,
@@ -414,12 +471,57 @@ test("Postgres repository persists and recovers the fixture lifecycle", { skip: 
       delivery: "hosted" as const,
       csp: { hosted: "allowed" as const },
       webMcpImplementation: "native" as const,
-      attestation: { servedContentHash: release.contentHash, executedContentHash: release.contentHash },
+      verifierIdentity: {
+        protocolVersion: 1 as const,
+        mode: "hermetic" as const,
+        webMcpImplementation: "native" as const,
+        verifierOriginDigest: "b".repeat(64),
+      },
+      attestation: {
+        observedArtifactUrl: release.artifactUrl,
+        observedDownloadUrl: release.downloadUrl!,
+        observedLocalOnly: false,
+        observedIntegrity: release.sri,
+        executedArtifactUrl: release.artifactUrl,
+        servedContentHash: release.contentHash,
+        executedContentHash: release.contentHash,
+        observedTargetOrigin: release.allowedOrigin,
+        registeredTools: ["find_order"],
+        webMcpImplementation: "native" as const,
+        normalPageLoad: true,
+        routeInterception: false,
+        injectedRegistration: false,
+        syntheticHarness: false,
+        duplicateLoadHarmless: true,
+        csp: { hosted: "allowed" as const },
+      },
       idempotencyKey: "postgres-installation",
       inputHash: "c".repeat(64),
     };
+    const pendingInstallationInput = {
+      ...installationInput,
+      status: "pending_self_host" as const,
+      csp: { hosted: "blocked" as const },
+      attestation: {
+        ...installationInput.attestation,
+        executedArtifactUrl: null,
+        executedContentHash: null,
+        registeredTools: [],
+        duplicateLoadHarmless: null,
+        csp: { hosted: "blocked" as const },
+      },
+      idempotencyKey: "postgres-installation-pending",
+      inputHash: "f".repeat(64),
+    };
+    const pendingInstallation = await repository.saveReleaseInstallation(
+      actor, project.id, pendingInstallationInput,
+    );
+    assert.equal((await repository.saveReleaseInstallation(
+      actor, project.id, pendingInstallationInput,
+    )).id, pendingInstallation.id);
     const installation = await repository.saveReleaseInstallation(actor, project.id, installationInput);
     assert.equal(installation.artifactUrl, release.artifactUrl);
+    assert.notEqual(installation.id, pendingInstallation.id);
     await assert.rejects(repository.saveReleaseInstallation(actor, project.id, {
       ...installationInput,
       artifactUrl: `https://unrelated.example/${release.contentHash}.js`,
@@ -432,8 +534,8 @@ test("Postgres repository persists and recovers the fixture lifecycle", { skip: 
       idempotencyKey: "postgres-installation-contradictory-csp",
       inputHash: "e".repeat(64),
     }), (error: unknown) => error instanceof RepositoryError && error.code === "INVALID_STATE");
-    assert.equal((await repository.saveVerification(actor, project.id, verificationInput)).id, verification.id);
-    await assert.rejects(repository.saveVerification(actor, project.id, {
+    assert.equal((await saveVerification(repository, actor, project.id, verificationInput)).id, verification.id);
+    await assert.rejects(saveVerification(repository, actor, project.id, {
       ...verificationInput,
       candidate: releaseCandidate("export const changedAfterPublish = true;")
     }), (error: unknown) => error instanceof RepositoryError
@@ -455,7 +557,7 @@ test("Postgres repository persists and recovers the fixture lifecycle", { skip: 
       release: releaseCandidate("export const persisted = true;")
     });
     const secondDigest = capabilityStateDigest(await repository.listAnalysisCapabilities(actor, secondRun.id));
-    const secondVerification = await repository.saveVerification(actor, project.id, {
+    const secondVerification = await saveVerification(repository, actor, project.id, {
       analysisRunId: secondRun.id,
       capabilityStateDigest: secondDigest,
       candidate: releaseCandidate("export const persisted = true;"),
@@ -474,6 +576,7 @@ test("Postgres repository persists and recovers the fixture lifecycle", { skip: 
       analysisRunId: secondRun.id,
       capabilityStateDigest: secondDigest,
       candidateContentHash: secondVerification.candidateContentHash,
+      verificationRunId: secondVerification.id,
       ...hostedArtifactIdentity(secondVerification.candidateContentHash),
       idempotencyKey: "postgres-publish-two",
       inputHash: "publish-input-two"
@@ -942,7 +1045,7 @@ test("Postgres queue exhaustion and stale release gates match the in-memory cont
     assert.ok(capability);
     assert.ok(blockedCapability);
     const staleDigest = capabilityStateDigest(initialCapabilities);
-    const verification = await repository.saveVerification(actor, publishProject.id, {
+    const verification = await saveVerification(repository, actor, publishProject.id, {
       analysisRunId: publishRun.id,
       capabilityStateDigest: staleDigest,
       candidate: releaseCandidate("export const stale = true;", plans("create_support_ticket", "find_order")),
@@ -962,6 +1065,7 @@ test("Postgres queue exhaustion and stale release gates match the in-memory cont
       analysisRunId: publishRun.id,
       capabilityStateDigest: staleDigest,
       candidateContentHash: verification.candidateContentHash,
+      verificationRunId: verification.id,
       ...hostedArtifactIdentity(verification.candidateContentHash),
       idempotencyKey: "stale-publish",
       inputHash: "stale-publish"
@@ -970,7 +1074,7 @@ test("Postgres queue exhaustion and stale release gates match the in-memory cont
       && error.details?.includes("CAPABILITIES_CHANGED"));
 
     const reviewedDigest = capabilityStateDigest(await repository.listAnalysisCapabilities(actor, publishRun.id));
-    await assert.rejects(repository.saveVerification(actor, publishProject.id, {
+    await assert.rejects(saveVerification(repository, actor, publishProject.id, {
       analysisRunId: publishRun.id,
       capabilityStateDigest: reviewedDigest,
       candidate: { ...releaseCandidate("export const mismatch = true;"), contentHash: "0".repeat(64) },
@@ -987,7 +1091,7 @@ test("Postgres queue exhaustion and stale release gates match the in-memory cont
       && error.code === "RELEASE_GATE_FAILED"
       && error.details?.includes("CANDIDATE_HASH_MISMATCH"));
 
-    const firstCandidate = await repository.saveVerification(actor, publishProject.id, {
+    const firstCandidate = await saveVerification(repository, actor, publishProject.id, {
       analysisRunId: publishRun.id,
       capabilityStateDigest: reviewedDigest,
       candidate: releaseCandidate("export const subset = 'first';"),
@@ -1001,7 +1105,7 @@ test("Postgres queue exhaustion and stale release gates match the in-memory cont
       csp: { hosted: "allowed" as const },
       verificationMode: "hermetic" as const
     });
-    const latestCandidate = await repository.saveVerification(actor, publishProject.id, {
+    const latestCandidate = await saveVerification(repository, actor, publishProject.id, {
       analysisRunId: publishRun.id,
       capabilityStateDigest: reviewedDigest,
       candidate: releaseCandidate("export const subset = 'latest';"),
@@ -1025,6 +1129,7 @@ test("Postgres queue exhaustion and stale release gates match the in-memory cont
       analysisRunId: publishRun.id,
       capabilityStateDigest: reviewedDigest,
       candidateContentHash: latestCandidate.candidateContentHash,
+      verificationRunId: latestCandidate.id,
       ...hostedArtifactIdentity(latestCandidate.candidateContentHash),
       idempotencyKey: "publish-expired-evidence",
       inputHash: "publish-expired-evidence"
@@ -1041,6 +1146,7 @@ test("Postgres queue exhaustion and stale release gates match the in-memory cont
       analysisRunId: publishRun.id,
       capabilityStateDigest: reviewedDigest,
       candidateContentHash: firstCandidate.candidateContentHash,
+      verificationRunId: firstCandidate.id,
       ...hostedArtifactIdentity(firstCandidate.candidateContentHash),
       idempotencyKey: "publish-old-subset",
       inputHash: "publish-old-subset"
@@ -1052,6 +1158,7 @@ test("Postgres queue exhaustion and stale release gates match the in-memory cont
       analysisRunId: publishRun.id,
       capabilityStateDigest: reviewedDigest,
       candidateContentHash: latestCandidate.candidateContentHash,
+      verificationRunId: latestCandidate.id,
       ...hostedArtifactIdentity(latestCandidate.candidateContentHash),
       idempotencyKey: "publish-latest-subset",
       inputHash: "publish-latest-subset"
@@ -1106,7 +1213,7 @@ test("Postgres preserves the worker candidate across capability changes and publ
       expectedVersion: ticket.version
     });
     const blockedDigest = capabilityStateDigest(await repository.listAnalysisCapabilities(actor, run.id));
-    const subsetVerification = await repository.saveVerification(actor, project.id, {
+    const subsetVerification = await saveVerification(repository, actor, project.id, {
       analysisRunId: run.id,
       capabilityStateDigest: blockedDigest,
       candidate: subset,
@@ -1131,6 +1238,7 @@ test("Postgres preserves the worker candidate across capability changes and publ
       analysisRunId: run.id,
       capabilityStateDigest: blockedDigest,
       candidateContentHash: subsetVerification.candidateContentHash,
+      verificationRunId: subsetVerification.id,
       ...hostedArtifactIdentity(subsetVerification.candidateContentHash),
       idempotencyKey: "immutable-source-publish",
       inputHash: "immutable-source-publish-stale"
@@ -1139,7 +1247,7 @@ test("Postgres preserves the worker candidate across capability changes and publ
       && error.details?.includes("CAPABILITIES_CHANGED"));
 
     const approvedDigest = capabilityStateDigest(await repository.listAnalysisCapabilities(actor, run.id));
-    const fullVerification = await repository.saveVerification(actor, project.id, {
+    const fullVerification = await saveVerification(repository, actor, project.id, {
       analysisRunId: run.id,
       capabilityStateDigest: approvedDigest,
       candidate: source,
@@ -1158,6 +1266,7 @@ test("Postgres preserves the worker candidate across capability changes and publ
       analysisRunId: run.id,
       capabilityStateDigest: approvedDigest,
       candidateContentHash: fullVerification.candidateContentHash,
+      verificationRunId: fullVerification.id,
       ...hostedArtifactIdentity(fullVerification.candidateContentHash),
       idempotencyKey: "immutable-source-publish",
       inputHash: "immutable-source-publish-fresh"
@@ -1231,7 +1340,7 @@ test("publication evidence locking serializes with retention cleanup", {
       release: releaseCandidate("export const retentionRace = true;")
     });
     const digest = capabilityStateDigest(await repository.listAnalysisCapabilities(actor, run.id));
-    const verification = await repository.saveVerification(actor, project.id, {
+    const verification = await saveVerification(repository, actor, project.id, {
       analysisRunId: run.id,
       capabilityStateDigest: digest,
       candidate: releaseCandidate("export const retentionRace = true;"),
@@ -1254,6 +1363,7 @@ test("publication evidence locking serializes with retention cleanup", {
       analysisRunId: run.id,
       capabilityStateDigest: digest,
       candidateContentHash: verification.candidateContentHash,
+      verificationRunId: verification.id,
       ...hostedArtifactIdentity(verification.candidateContentHash),
       idempotencyKey: "retention-race-publish",
       inputHash: "retention-race-publish"

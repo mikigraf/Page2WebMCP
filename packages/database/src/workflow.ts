@@ -79,6 +79,7 @@ export type SourceSnapshotRecord = Readonly<{
   sourceIdentityHash: string;
   artifactReference?: string;
   contentHash?: string;
+  isFixture: boolean;
   createdAt: string;
 }>;
 

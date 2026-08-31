@@ -45,13 +45,82 @@ export function checkPackageVersionDrift(manifest: PackageManifest): VersionDrif
   });
 }
 
-type DeploymentReadinessInput = Readonly<{
-  mode: "hermetic" | "live";
+export type ReadinessMode = "hermetic" | "local-live" | "live";
+
+export type ReadinessVerifierIdentity = Readonly<{
+  protocolVersion: number;
+  mode: "hermetic" | "local_live" | "live";
+  webMcpImplementation: "native";
+  verifierOriginDigest: string;
+}>;
+
+export type ProductionProviderProvenance =
+  | Readonly<{ mode: "openapi"; adapter: "bounded-openapi"; adapterVersion: 1; fixture: false }>
+  | Readonly<{ mode: "website"; adapter: "browser-use-v4"; adapterVersion: 4; fixture: false }>
+  | Readonly<{ mode: "github"; adapter: "github-app"; adapterVersion: 20260310; fixture: false }>;
+
+export type NativeInstallationProof = Readonly<{
+  selectedReleaseHash: string;
+  releaseContentHash: string;
+  releaseIntegrity: string;
+  candidateObservedIntegrity: string;
+  installationObservedIntegrity: string;
+  servedContentHash: string;
+  executedContentHash: string;
+  trustedLoaderContentHash: string;
+  releaseVerificationRunId: string;
+  candidateVerificationRunId: string;
+  candidateMode: "hermetic" | "local_live" | "live";
+  installationMode: "hermetic" | "local_live" | "live";
+  candidateProtocolVersion: number;
+  installationProtocolVersion: number;
+  candidateVerifierOriginDigest: string;
+  installationVerifierOriginDigest: string;
+  candidateWebMcpImplementation: "native";
+  installationWebMcpImplementation: "native";
+  providerMode: "openapi" | "website" | "github" | "local";
+  providerAdapter: string;
+  providerAdapterVersion: number;
+  sourceType: "openapi" | "website" | "github";
+  providerFixture: boolean;
+  sourceFixture: boolean;
+  localOnly: boolean;
+  targetIdentityMatches: boolean;
+  artifactIdentityMatches: boolean;
+  capabilityDigestMatches: boolean;
+  expectedToolsDigest: string;
+  registeredToolsDigest: string;
+  expectedToolCount: number;
+  registeredToolCount: number;
+  normalPageLoad: boolean;
+  routeInterception: boolean;
+  injectedRegistration: boolean;
+  syntheticHarness: boolean;
+  duplicateLoadHarmless: boolean;
+  zeroControlPlaneCalls: boolean;
+  zeroModelCalls: boolean;
+  trustedLoaderEnforced: boolean;
+  candidateChecksPassed: boolean;
+}>;
+
+export type DeploymentReadinessInput = Readonly<{
+  mode: ReadinessMode;
   versionDrift: readonly VersionDrift[];
   migrationsCurrent: boolean;
   rlsVerified: boolean;
   artifactIntegrityVerified: boolean;
+  persistedJourneyVerified?: boolean;
   liveControlsConfigured?: boolean;
+  selectedReleaseHash?: string;
+  provider?: ProductionProviderProvenance & Readonly<{ constructed: boolean }>;
+  storage?: Readonly<{
+    contentHash: string;
+    integrity: string;
+    localOnly: boolean;
+    publicOrigin: string;
+  }>;
+  verifier?: ReadinessVerifierIdentity;
+  installationProof?: NativeInstallationProof;
 }>;
 
 export type DeploymentReadiness = Readonly<{
@@ -66,8 +135,102 @@ export function evaluateDeploymentReadiness(input: DeploymentReadinessInput): De
   if (!input.rlsVerified) return { status: "failed", code: "RLS_NOT_VERIFIED", liveSuccess: false };
   if (!input.artifactIntegrityVerified) return { status: "failed", code: "ARTIFACT_INTEGRITY_FAILED", liveSuccess: false };
   if (input.mode === "hermetic") return { status: "passed", code: "HERMETIC_READINESS_PASSED", liveSuccess: false };
-  if (input.liveControlsConfigured !== true) return { status: "skipped", code: "LIVE_CONTROLS_REQUIRED", liveSuccess: false };
+  if (input.mode === "local-live") {
+    if (input.persistedJourneyVerified !== true) {
+      return { status: "skipped", code: "LIVE_INSTALLATION_EVIDENCE_REQUIRED", liveSuccess: false };
+    }
+    return { status: "passed", code: "LOCAL_LIVE_READINESS_PASSED", liveSuccess: false };
+  }
+  if (input.liveControlsConfigured !== true) {
+    return { status: "skipped", code: "LIVE_CONTROLS_REQUIRED", liveSuccess: false };
+  }
+  if (!exactNativeInstallationProof(input)) {
+    return { status: "skipped", code: "LIVE_INSTALLATION_EVIDENCE_REQUIRED", liveSuccess: false };
+  }
   return { status: "passed", code: "LIVE_READINESS_PASSED", liveSuccess: true };
+}
+
+const SHA256 = /^[0-9a-f]{64}$/;
+const SRI = /^sha384-[A-Za-z0-9+/]+={0,2}$/;
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const HOSTED_PUBLIC_ORIGIN =
+  "https://bimqgiedckdurqiywctl.supabase.co/storage/v1/object/public/page2webmcp-releases";
+
+function exactNativeInstallationProof(input: DeploymentReadinessInput): boolean {
+  const selected = input.selectedReleaseHash;
+  const provider = input.provider;
+  const storage = input.storage;
+  const verifier = input.verifier;
+  const proof = input.installationProof;
+  if (input.persistedJourneyVerified !== true
+    || !selected || !SHA256.test(selected) || !provider || provider.constructed !== true
+    || !storage || !verifier || !proof) return false;
+  return exactProductionProvider(provider)
+    && storage.publicOrigin === HOSTED_PUBLIC_ORIGIN
+    && storage.localOnly === false
+    && storage.contentHash === selected
+    && SRI.test(storage.integrity)
+    && verifier.protocolVersion === 1
+    && verifier.mode === "live"
+    && verifier.webMcpImplementation === "native"
+    && SHA256.test(verifier.verifierOriginDigest)
+    && proof.selectedReleaseHash === selected
+    && proof.releaseContentHash === selected
+    && proof.servedContentHash === selected
+    && proof.executedContentHash === selected
+    && proof.trustedLoaderContentHash === selected
+    && proof.releaseIntegrity === storage.integrity
+    && proof.candidateObservedIntegrity === storage.integrity
+    && proof.installationObservedIntegrity === storage.integrity
+    && SRI.test(proof.releaseIntegrity)
+    && UUID.test(proof.releaseVerificationRunId)
+    && proof.candidateVerificationRunId === proof.releaseVerificationRunId
+    && proof.candidateMode === "live"
+    && proof.installationMode === "live"
+    && proof.candidateProtocolVersion === verifier.protocolVersion
+    && proof.installationProtocolVersion === verifier.protocolVersion
+    && proof.candidateVerifierOriginDigest === verifier.verifierOriginDigest
+    && proof.installationVerifierOriginDigest === verifier.verifierOriginDigest
+    && proof.candidateWebMcpImplementation === "native"
+    && proof.installationWebMcpImplementation === "native"
+    && proof.providerMode === provider.mode
+    && proof.providerAdapter === provider.adapter
+    && proof.providerAdapterVersion === provider.adapterVersion
+    && proof.sourceType === provider.mode
+    && proof.providerFixture === false
+    && proof.sourceFixture === false
+    && proof.localOnly === false
+    && proof.targetIdentityMatches === true
+    && proof.artifactIdentityMatches === true
+    && proof.capabilityDigestMatches === true
+    && SHA256.test(proof.expectedToolsDigest)
+    && proof.registeredToolsDigest === proof.expectedToolsDigest
+    && Number.isInteger(proof.expectedToolCount)
+    && proof.expectedToolCount >= 1
+    && proof.expectedToolCount <= 100
+    && proof.registeredToolCount === proof.expectedToolCount
+    && proof.normalPageLoad === true
+    && proof.routeInterception === false
+    && proof.injectedRegistration === false
+    && proof.syntheticHarness === false
+    && proof.duplicateLoadHarmless === true
+    && proof.zeroControlPlaneCalls === true
+    && proof.zeroModelCalls === true
+    && proof.trustedLoaderEnforced === true
+    && proof.candidateChecksPassed === true;
+}
+
+function exactProductionProvider(provider: ProductionProviderProvenance): boolean {
+  if (provider.fixture !== false) return false;
+  if (provider.mode === "openapi") {
+    return provider.adapter === "bounded-openapi" && provider.adapterVersion === 1;
+  }
+  if (provider.mode === "website") {
+    return provider.adapter === "browser-use-v4" && provider.adapterVersion === 4;
+  }
+  return provider.mode === "github"
+    && provider.adapter === "github-app"
+    && provider.adapterVersion === 20260310;
 }
 
 export const RECOVERY_SCENARIOS = Object.freeze([

@@ -3,6 +3,8 @@ import { execFile } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import test from "node:test";
+import { InMemoryControlPlaneRepository } from "../../../packages/database/src/control-plane.ts";
+import { runProductionWorker } from "./main.ts";
 
 const run = promisify(execFile);
 const root = fileURLToPath(new URL("../../../", import.meta.url));
@@ -31,6 +33,43 @@ const websiteMissingEnvironment = [
   "PAGE2WEBMCP_SECRET_STORE_ORIGIN",
   "PAGE2WEBMCP_SECRET_STORE_TOKEN",
 ] as const;
+
+test("actual provider construction precedes repository creation and the exact instance is reused", async () => {
+  const order: string[] = [];
+  const repository = new InMemoryControlPlaneRepository();
+  const provider = {
+    analysisSourceTypes: ["openapi"] as const,
+    provenance: {
+      mode: "openapi" as const,
+      adapter: "bounded-openapi" as const,
+      adapterVersion: 1 as const,
+      fixture: false as const,
+    },
+    analyze: async () => ({ capabilities: [], diagnostics: [], evidence: [] }),
+  };
+  await runProductionWorker({ PAGE2WEBMCP_PROVIDER_MODE: "openapi" }, {
+    signal: AbortSignal.abort(),
+    constructProvider: () => { order.push("provider"); return provider; },
+    validateConfiguration: () => { order.push("configuration"); },
+    getRepository: () => { order.push("repository"); return repository; },
+    createRuntime: (_repository, actualProvider) => {
+      order.push("runtime");
+      assert.equal(actualProvider, provider);
+      return {
+        analyze: actualProvider.analyze,
+        analysisSourceTypes: actualProvider.analysisSourceTypes,
+        providerProvenance: actualProvider.provenance,
+      };
+    },
+    registerObservability: async () => { order.push("observability"); },
+    shutdownObservability: async () => { order.push("observability-close"); },
+    closeRepository: async () => { order.push("repository-close"); },
+  });
+  assert.deepEqual(order, [
+    "provider", "configuration", "repository", "runtime", "observability",
+    "repository-close", "observability-close",
+  ]);
+});
 
 test("website controls fail startup with sorted operator key names before repository construction", async () => {
   const failure = await runFailure({

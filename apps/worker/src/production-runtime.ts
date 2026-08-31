@@ -1,4 +1,9 @@
-import type { ControlPlaneRepository, SourceType } from "../../../packages/database/src/control-plane.ts";
+import type {
+  AnalysisResult,
+  ControlPlaneRepository,
+  ProviderProvenance,
+  SourceType,
+} from "../../../packages/database/src/control-plane.ts";
 import { createHash } from "node:crypto";
 import { WorkflowController } from "../../../packages/database/src/workflow.ts";
 import { createConfiguredGitHubWorkflow, githubConfigurationInvalidKeys } from "./github-live.ts";
@@ -17,7 +22,15 @@ type RuntimeEnvironment = Record<string, string | undefined>;
 export type ProductionWorkerRuntime = Readonly<{
   analyze: AnalysisAdapter;
   analysisSourceTypes: readonly SourceType[];
+  providerProvenance?: Exclude<ProviderProvenance, { mode: "local" }>;
   workflows?: WorkflowController;
+}>;
+
+export type ProductionProvider = Readonly<{
+  analyze: AnalysisAdapter;
+  analysisSourceTypes: readonly [SourceType];
+  provenance: Exclude<ProviderProvenance, { mode: "local" }>;
+  github?: ReturnType<typeof createConfiguredGitHubWorkflow>;
 }>;
 
 export type ProductionProviderInspection = Readonly<{
@@ -58,23 +71,23 @@ export function createProductionWorkerRuntime(
   environment: RuntimeEnvironment = process.env,
   dependencies: Readonly<{ fetch: typeof fetch; clock?: () => Date }> = { fetch },
 ): ProductionWorkerRuntime {
-  const inspection = inspectProductionProviderConfiguration(environment);
-  if (inspection.code === "WORKER_PROVIDER_MODE_REQUIRED" || inspection.code === "INVALID_PROVIDER_MODE") {
-    throw new Error(inspection.code);
-  }
-  if (environment.PAGE2WEBMCP_PROVIDER_MODE === "openapi") {
+  const provider = createProductionProvider(environment, dependencies);
+  return createProductionWorkerRuntimeFromProvider(repository, provider, dependencies);
+}
+
+export function createProductionWorkerRuntimeFromProvider(
+  repository: ControlPlaneRepository,
+  provider: ProductionProvider,
+  dependencies: Readonly<{ fetch: typeof fetch; clock?: () => Date }> = { fetch },
+): ProductionWorkerRuntime {
+  if (!provider.github) {
     return {
-      analyze: createConfiguredOpenApiAnalysisAdapter(environment, {}),
-      analysisSourceTypes: ["openapi"],
+      analyze: provider.analyze,
+      analysisSourceTypes: provider.analysisSourceTypes,
+      providerProvenance: provider.provenance,
     };
   }
-  if (environment.PAGE2WEBMCP_PROVIDER_MODE === "website") {
-    return {
-      analyze: createConfiguredWebsiteAnalysisAdapter(environment, dependencies),
-      analysisSourceTypes: ["website"],
-    };
-  }
-  const github = createConfiguredGitHubWorkflow(environment, dependencies);
+  const github = provider.github;
   const sideEffect = createGitHubProductionWorkflowSideEffect({
     repository,
     bindings: github.bindings,
@@ -87,8 +100,9 @@ export function createProductionWorkerRuntime(
   });
   const sideEffects = Object.fromEntries(GITHUB_PRODUCTION_EFFECT_KINDS.map((kind) => [kind, sideEffect]));
   return {
-    analyze: github.analyze,
-    analysisSourceTypes: ["github"],
+    analyze: provider.analyze,
+    analysisSourceTypes: provider.analysisSourceTypes,
+    providerProvenance: provider.provenance,
     workflows: new WorkflowController(repository, {
       handlers: createGitHubWorkflowPhaseHandlers({
         inputHash: (phase, task) => createHash("sha256").update(`${task.inputHash}\0${phase}`, "utf8").digest("hex"),
@@ -96,6 +110,57 @@ export function createProductionWorkerRuntime(
       sideEffects,
     }),
   };
+}
+
+export function createProductionProvider(
+  environment: RuntimeEnvironment = process.env,
+  dependencies: Readonly<{ fetch: typeof fetch; clock?: () => Date }> = { fetch },
+): ProductionProvider {
+  const inspection = inspectProductionProviderConfiguration(environment);
+  if (inspection.code === "WORKER_PROVIDER_MODE_REQUIRED" || inspection.code === "INVALID_PROVIDER_MODE"
+    || inspection.code === "WEBSITE_LIVE_CONFIGURATION_REQUIRED") {
+    throw new Error(inspection.code);
+  }
+  if (environment.PAGE2WEBMCP_PROVIDER_MODE === "openapi") {
+    const provenance = {
+      mode: "openapi", adapter: "bounded-openapi", adapterVersion: 1, fixture: false,
+    } as const;
+    return {
+      analyze: stampProviderProvenance(createConfiguredOpenApiAnalysisAdapter(environment, {}), provenance),
+      analysisSourceTypes: ["openapi"],
+      provenance,
+    };
+  }
+  if (environment.PAGE2WEBMCP_PROVIDER_MODE === "website") {
+    const provenance = {
+      mode: "website", adapter: "browser-use-v4", adapterVersion: 4, fixture: false,
+    } as const;
+    return {
+      analyze: stampProviderProvenance(createConfiguredWebsiteAnalysisAdapter(environment, dependencies), provenance),
+      analysisSourceTypes: ["website"],
+      provenance,
+    };
+  }
+  const github = createConfiguredGitHubWorkflow(environment, dependencies);
+  const provenance = {
+    mode: "github", adapter: "github-app", adapterVersion: 20260310, fixture: false,
+  } as const;
+  return {
+    analyze: stampProviderProvenance(github.analyze, provenance),
+    analysisSourceTypes: ["github"],
+    provenance,
+    github,
+  };
+}
+
+function stampProviderProvenance(
+  analyze: AnalysisAdapter,
+  provenance: Exclude<ProviderProvenance, { mode: "local" }>,
+): AnalysisAdapter {
+  return async (source, signal): Promise<AnalysisResult> => ({
+    ...await analyze(source, signal),
+    providerProvenance: provenance,
+  });
 }
 
 export async function processProductionWorkerIteration(

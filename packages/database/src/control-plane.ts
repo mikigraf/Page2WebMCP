@@ -37,6 +37,49 @@ export type RepositoryActor = { id: string; organizationId: string; role: Reposi
 export type AuthenticatedIdentity = { id: string; email?: string };
 export type SourceType = "website" | "openapi" | "github";
 
+export type ProviderProvenance =
+  | Readonly<{ mode: "local"; adapter: "local-fixture"; adapterVersion: 1; fixture: true }>
+  | Readonly<{ mode: "openapi"; adapter: "bounded-openapi"; adapterVersion: 1; fixture: false }>
+  | Readonly<{ mode: "website"; adapter: "browser-use-v4"; adapterVersion: 4; fixture: false }>
+  | Readonly<{ mode: "github"; adapter: "github-app"; adapterVersion: 20260310; fixture: false }>;
+
+export type VerifierIdentityRecord = Readonly<{
+  protocolVersion: 1;
+  mode: "hermetic" | "local_live" | "live";
+  webMcpImplementation: "native";
+  verifierOriginDigest: string;
+}>;
+
+export type CandidateVerificationObservation = Readonly<{
+  observedContentHash: string;
+  observedIntegrity: string;
+  observedReleaseId: string;
+  observedTargetOrigin: string;
+  registeredTools: readonly string[];
+  trustedLoader: Readonly<{ enforcedBeforeEvaluation: boolean; evaluatedContentHash: string }>;
+  controlPlaneRequestsDuringExecution: number;
+  modelRequestsDuringExecution: number;
+}>;
+
+export type InstalledVerificationObservation = Readonly<{
+  observedArtifactUrl: string;
+  observedDownloadUrl: string;
+  observedLocalOnly: boolean;
+  observedIntegrity: string;
+  executedArtifactUrl: string | null;
+  servedContentHash: string;
+  executedContentHash: string | null;
+  observedTargetOrigin: string;
+  registeredTools: readonly string[];
+  webMcpImplementation: "native" | "compatibility_shim";
+  normalPageLoad: boolean;
+  routeInterception: boolean;
+  injectedRegistration: boolean;
+  syntheticHarness: boolean;
+  duplicateLoadHarmless: boolean | null;
+  csp: Readonly<{ hosted: "allowed" | "blocked"; directive?: string }>;
+}>;
+
 export type ProjectRecord = {
   id: string;
   organizationId: string;
@@ -58,6 +101,7 @@ export type AnalysisRunRecord = {
   leaseOwner?: string;
   leaseExpiresAt?: string;
   errorCode?: string;
+  providerProvenance?: ProviderProvenance;
   createdAt: string;
   updatedAt: string;
 };
@@ -114,6 +158,7 @@ export type AnalysisResult = {
   evidence: AnalysisEvidence[];
   release?: CandidateRelease;
   draftPullRequest?: { draft: boolean; url?: string; files?: string[] };
+  providerProvenance?: ProviderProvenance;
 };
 
 export type WorkflowExecutionMaterial = Readonly<{
@@ -141,7 +186,9 @@ export type VerificationRecord = {
   selectionScore: number;
   checks: ReleaseVerificationCheckRecord[];
   csp: { hosted: "allowed" | "blocked"; directive?: string };
-  verificationMode: "live" | "hermetic";
+  verificationMode: "live" | "local_live" | "hermetic";
+  verifierIdentity?: VerifierIdentityRecord;
+  observation?: CandidateVerificationObservation;
   eligible: boolean;
   failures: string[];
   createdAt: string;
@@ -201,6 +248,7 @@ export type ReleaseRecord = {
   code: string;
   allowedOrigin: string;
   manifest?: unknown;
+  verificationRunId?: string;
   status: "published";
   createdAt: string;
 } & ReleaseArtifactIdentity;
@@ -218,6 +266,8 @@ export type ReleaseInstallationRecord = {
   actorId: string;
   pageUrl: string;
   artifactUrl: string;
+  downloadUrl: string;
+  localOnly: boolean;
   selfHostedUrl?: string;
   targetOrigin: string;
   artifactContentHash: string;
@@ -227,7 +277,8 @@ export type ReleaseInstallationRecord = {
   delivery: "hosted" | "self_hosted";
   csp: { hosted: "allowed" | "blocked"; directive?: string };
   webMcpImplementation: "native" | "compatibility_shim";
-  attestation: unknown;
+  verifierIdentity?: VerifierIdentityRecord;
+  attestation: InstalledVerificationObservation;
   idempotencyKey: string;
   inputHash: string;
   createdAt: string;
@@ -235,7 +286,8 @@ export type ReleaseInstallationRecord = {
 };
 
 export type ReleaseInstallationRequest = Omit<ReleaseInstallationRecord,
-  "id" | "organizationId" | "projectId" | "actorId" | "createdAt" | "verifiedAt">;
+  "id" | "organizationId" | "projectId" | "actorId" | "createdAt" | "verifiedAt" | "verifierIdentity">
+  & Readonly<{ verifierIdentity: VerifierIdentityRecord }>;
 
 export type AuditEventRecord = {
   id: string;
@@ -259,12 +311,13 @@ export type ProjectPage = Readonly<{ projects: ProjectRecord[]; nextCursor?: str
 export type IdempotentRequest = { projectId: string } & IdempotencyInput;
 export type VerificationRequest = Omit<
   VerificationRecord,
-  "id" | "projectId" | "candidateContentHash" | "eligible" | "failures" | "createdAt"
-> & { candidate: CandidateRelease };
+  "id" | "projectId" | "candidateContentHash" | "eligible" | "failures" | "createdAt" | "verifierIdentity" | "observation"
+> & { candidate: CandidateRelease; verifierIdentity: VerifierIdentityRecord; observation: CandidateVerificationObservation };
 export type PublishRequest = IdempotentRequest & {
   analysisRunId: string;
   capabilityStateDigest: string;
   candidateContentHash: string;
+  verificationRunId: string;
 } & Extract<ReleaseArtifactIdentity, { artifactUrl: string }>;
 
 export type RepositoryErrorCode =
@@ -519,7 +572,8 @@ export function capabilityPlanDigest(plan: CapabilityPlan): string {
 
 export function releaseFailures(input: VerificationRequest): string[] {
   const typedFailures = verificationCheckFailures(input.checks);
-  if (typedFailures.includes("VERIFICATION_REPORT_INVALID") || !verificationSummaryMatches(input)) {
+  if (typedFailures.includes("VERIFICATION_REPORT_INVALID") || !verificationSummaryMatches(input)
+    || !candidateObservationMatches(input)) {
     return ["VERIFICATION_REPORT_INVALID"];
   }
   return [...new Set(typedFailures)].sort(compareCodePoints);
@@ -527,7 +581,12 @@ export function releaseFailures(input: VerificationRequest): string[] {
 
 function verificationSummaryMatches(input: VerificationRequest): boolean {
   const passed = new Set(input.checks.filter(({ status }) => status === "passed").map(({ name }) => name));
-  return (input.verificationMode === "live" || input.verificationMode === "hermetic")
+  return (input.verificationMode === "live" || input.verificationMode === "local_live"
+      || input.verificationMode === "hermetic")
+    && input.verifierIdentity.mode === input.verificationMode
+    && input.verifierIdentity.protocolVersion === 1
+    && input.verifierIdentity.webMcpImplementation === "native"
+    && /^[0-9a-f]{64}$/.test(input.verifierIdentity.verifierOriginDigest)
     && (input.csp.hosted === "allowed" || input.csp.hosted === "blocked")
     && (input.csp.directive === undefined || input.csp.directive.length <= 512 && !/[\r\n]/.test(input.csp.directive))
     && input.schema === (passed.has("schema") && passed.has("trusted_loader"))
@@ -536,6 +595,48 @@ function verificationSummaryMatches(input: VerificationRequest): boolean {
     && input.noSecretLeakage === (passed.has("secret_leakage") && passed.has("no_control_plane_or_model_calls"))
     && input.browserExecution === (passed.size === RELEASE_VERIFICATION_CHECK_NAMES.length)
     && input.selectionScore === (passed.has("tool_selection") ? 20 : 0);
+}
+
+export function normalizeProviderProvenance(
+  value: ProviderProvenance,
+  sourceType: SourceType,
+): ProviderProvenance {
+  if (!isPlainRecord(value) || Object.keys(value).sort(compareCodePoints).join(",")
+    !== "adapter,adapterVersion,fixture,mode") throw new RepositoryError("INVALID_STATE");
+  const exact = value.mode === "local"
+    ? value.adapter === "local-fixture" && value.adapterVersion === 1 && value.fixture === true
+    : value.mode === "openapi"
+      ? value.adapter === "bounded-openapi" && value.adapterVersion === 1 && value.fixture === false
+      : value.mode === "website"
+        ? value.adapter === "browser-use-v4" && value.adapterVersion === 4 && value.fixture === false
+        : value.mode === "github" && value.adapter === "github-app"
+          && value.adapterVersion === 20260310 && value.fixture === false;
+  if (!exact || value.mode !== "local" && value.mode !== sourceType) throw new RepositoryError("INVALID_STATE");
+  return copy(value);
+}
+
+function candidateObservationMatches(input: VerificationRequest): boolean {
+  const observation = input.observation;
+  const manifest = input.candidate.manifest;
+  const plans = plansFromManifest(manifest);
+  const releaseId = isPlainRecord(manifest) && typeof manifest.releaseId === "string" ? manifest.releaseId : undefined;
+  const expectedTools = plans?.map(({ tool }) => tool.name).sort(compareCodePoints);
+  const integrity = `sha384-${createHash("sha384").update(input.candidate.code).digest("base64")}`;
+  return isPlainRecord(observation)
+    && Object.keys(observation).sort(compareCodePoints).join(",") === [
+      "controlPlaneRequestsDuringExecution", "modelRequestsDuringExecution", "observedContentHash",
+      "observedIntegrity", "observedReleaseId", "observedTargetOrigin", "registeredTools", "trustedLoader",
+    ].sort(compareCodePoints).join(",")
+    && observation.observedContentHash === input.candidate.contentHash
+    && observation.observedIntegrity === integrity
+    && observation.observedReleaseId === releaseId
+    && observation.observedTargetOrigin === input.candidate.allowedOrigin
+    && expectedTools !== undefined && equalStringArrays(observation.registeredTools, expectedTools)
+    && isPlainRecord(observation.trustedLoader)
+    && observation.trustedLoader.enforcedBeforeEvaluation === true
+    && observation.trustedLoader.evaluatedContentHash === input.candidate.contentHash
+    && observation.controlPlaneRequestsDuringExecution === 0
+    && observation.modelRequestsDuringExecution === 0;
 }
 
 export function verificationCheckFailures(checks: readonly ReleaseVerificationCheckRecord[]): string[] {
@@ -563,6 +664,7 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
   readonly #results = new Map<string, AnalysisResult>();
   readonly #capabilities = new Map<string, CapabilityRecord>();
   readonly #verifications = new Map<string, VerificationRecord>();
+  readonly #verificationIdsByRun = new Map<string, string[]>();
   readonly #verificationCandidates = new Map<string, CandidateRelease>();
   readonly #releases = new Map<string, ReleaseRecord>();
   readonly #releaseByHash = new Map<string, string[]>();
@@ -846,6 +948,7 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
       projectId: project.id,
       projectSourceId: projectSource.id,
       sourceIdentityHash: stableHash(sourceIdentityMaterial(project.sourceType, project.url, sourceConfiguration)),
+      isFixture: false,
       createdAt: project.createdAt,
     };
     this.#sourceSnapshots.set(snapshot.id, snapshot);
@@ -1529,6 +1632,10 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
       throw new RepositoryError("INVALID_STATE");
     }
     const normalizedDiagnostics = normalizeAnalysisDiagnostics(result.diagnostics);
+    const analysisSource = this.#analysisSources.get(run.id);
+    if (!analysisSource) throw new RepositoryError("INVALID_STATE");
+    const providerProvenance = result.providerProvenance === undefined
+      ? undefined : normalizeProviderProvenance(result.providerProvenance, analysisSource.sourceType);
     if (canonicalPlans.length === 0) {
       if (normalizedDiagnostics.length === 0 || result.evidence.length === 0 || result.release !== undefined) {
         throw new RepositoryError("INVALID_STATE");
@@ -1564,6 +1671,7 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
         contentHash: createHash("sha256").update(releaseCode).digest("hex"),
         manifest: structuredClone(result.release.manifest ?? {})
       },
+      ...(providerProvenance ? { providerProvenance } : {}),
     };
     this.#results.set(run.id, normalizedResult);
     const insertedCapabilities: CapabilityRecord[] = [];
@@ -1593,6 +1701,7 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
       leaseOwner: undefined,
       leaseExpiresAt: undefined,
       errorCode: undefined,
+      ...(providerProvenance ? { providerProvenance } : {}),
       updatedAt: now
     };
     this.#runs.set(run.id, completed);
@@ -1803,8 +1912,10 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
     const publishedReleaseId = this.#releaseByRun.get(run.id);
     if (publishedReleaseId) {
       const publishedRelease = this.#releases.get(publishedReleaseId);
-      const verification = this.#verifications.get(run.id);
-      const verifiedCandidate = this.#verificationCandidates.get(run.id);
+      const verification = publishedRelease?.verificationRunId
+        ? this.#verifications.get(publishedRelease.verificationRunId) : undefined;
+      const verifiedCandidate = publishedRelease?.verificationRunId
+        ? this.#verificationCandidates.get(publishedRelease.verificationRunId) : undefined;
       if (publishedRelease
         && verification?.eligible
         && verifiedCandidate
@@ -1828,12 +1939,14 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
       eligible: failures.length === 0,
       createdAt: this.#now()
     };
-    this.#verificationCandidates.set(run.id, {
+    this.#verificationCandidates.set(record.id, {
       ...structuredClone(candidate),
       contentHash: candidateContentHash,
       manifest: structuredClone(candidate.manifest ?? {})
     });
-    this.#verifications.set(input.analysisRunId, record);
+    this.#verifications.set(record.id, record);
+    this.#verificationIdsByRun.set(input.analysisRunId,
+      [...(this.#verificationIdsByRun.get(input.analysisRunId) ?? []), record.id]);
     return copy(record);
   }
 
@@ -1854,8 +1967,13 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
     if (!run || run.organizationId !== actor.organizationId || run.projectId !== input.projectId || run.status !== "succeeded") {
       throw new RepositoryError("INVALID_STATE");
     }
-    const verification = this.#verifications.get(input.analysisRunId);
-    if (verification?.projectId !== input.projectId || !verification.eligible
+    const latestVerificationId = this.#verificationIdsByRun.get(input.analysisRunId)?.at(-1);
+    if (latestVerificationId !== input.verificationRunId) {
+      throw new RepositoryError("RELEASE_GATE_FAILED", ["CANDIDATE_CHANGED"]);
+    }
+    const verification = this.#verifications.get(input.verificationRunId);
+    if (verification?.projectId !== input.projectId || verification?.analysisRunId !== input.analysisRunId
+      || !verification.eligible
       || verification.capabilityStateDigest !== input.capabilityStateDigest) {
       throw new RepositoryError("RELEASE_GATE_FAILED", verification?.failures ?? ["VERIFICATION_MISSING"]);
     }
@@ -1883,7 +2001,7 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
     });
     if (reviewFailures.length > 0) throw new RepositoryError("RELEASE_GATE_FAILED", [...new Set(reviewFailures)]);
     const result = this.#results.get(verification.analysisRunId);
-    const candidate = this.#verificationCandidates.get(verification.analysisRunId);
+    const candidate = this.#verificationCandidates.get(verification.id);
     if (!result || !candidate) throw new RepositoryError("INVALID_STATE");
     const candidatePlans = plansFromManifest(candidate.manifest);
     if (!candidatePlans
@@ -1916,6 +2034,7 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
       code: candidate.code,
       allowedOrigin: candidate.allowedOrigin,
       manifest: candidate.manifest,
+      verificationRunId: verification.id,
       ...artifactIdentity,
       status: "published",
       createdAt: this.#now()
@@ -1954,8 +2073,8 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
       .sort((left, right) => compareCodePoints(right.createdAt, left.createdAt)
         || compareCodePoints(right.id, left.id))[0];
     if (!release) return undefined;
-    const verification = this.#verifications.get(release.analysisRunId);
-    const candidate = this.#verificationCandidates.get(release.analysisRunId);
+    const verification = release.verificationRunId ? this.#verifications.get(release.verificationRunId) : undefined;
+    const candidate = release.verificationRunId ? this.#verificationCandidates.get(release.verificationRunId) : undefined;
     if (!verification?.eligible || !candidate || verification.projectId !== projectId
       || verification.analysisRunId !== release.analysisRunId
       || verification.capabilityStateDigest !== release.capabilityStateDigest
@@ -2027,6 +2146,7 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
     this.#results.clear();
     this.#capabilities.clear();
     this.#verifications.clear();
+    this.#verificationIdsByRun.clear();
     this.#verificationCandidates.clear();
     this.#releases.clear();
     this.#releaseByHash.clear();
@@ -2066,11 +2186,14 @@ export function normalizeReleaseInstallation(
   }
   const selfHosted = input.selfHostedUrl ? safeUrl(input.selfHostedUrl) : undefined;
   const canonicalAttestation = canonicalJson(input.attestation);
+  const attestation = canonicalAttestation === "__INVALID_JSON__"
+    ? undefined : JSON.parse(canonicalAttestation) as InstalledVerificationObservation;
   if (!expectedTools || expectedTools.length === 0
     || !releaseArtifactIdentity
     || page.origin !== release.allowedOrigin || page.protocol !== "https:" || page.username || page.password
     || page.search || page.hash
     || artifact.toString() !== releaseArtifactIdentity.artifactUrl || input.artifactUrl !== releaseArtifactIdentity.artifactUrl
+    || input.downloadUrl !== releaseArtifactIdentity.downloadUrl || input.localOnly !== releaseArtifactIdentity.localOnly
     || input.targetOrigin !== release.allowedOrigin || input.artifactContentHash !== release.contentHash
     || input.integrity !== release.sri || !equalStringArrays(input.expectedTools, expectedTools)
     || input.delivery === "self_hosted" && (!selfHosted || selfHosted.origin !== release.allowedOrigin)
@@ -2080,13 +2203,54 @@ export function normalizeReleaseInstallation(
     || input.status === "pending_self_host" && (input.delivery !== "hosted" || input.csp.hosted !== "blocked")
     || input.csp.directive !== undefined && (input.csp.directive.length > 512 || /[\r\n]/.test(input.csp.directive))
     || canonicalAttestation === "__INVALID_JSON__" || Buffer.byteLength(canonicalAttestation) > 16_384
+    || !validVerifierIdentity(input.verifierIdentity, input.verifierIdentity.mode)
+    || !attestation || !installedObservationMatches(input, releaseArtifactIdentity, expectedTools, attestation)
     || !/^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/.test(input.idempotencyKey)
     || !/^[0-9a-f]{64}$/.test(input.inputHash)) throw new RepositoryError("INVALID_STATE");
   return {
     ...copy(input),
     expectedTools,
-    attestation: JSON.parse(canonicalAttestation),
+    verifierIdentity: copy(input.verifierIdentity),
+    attestation,
   };
+}
+
+function validVerifierIdentity(
+  identity: VerifierIdentityRecord,
+  mode: VerifierIdentityRecord["mode"],
+): boolean {
+  return isPlainRecord(identity)
+    && Object.keys(identity).sort(compareCodePoints).join(",")
+      === "mode,protocolVersion,verifierOriginDigest,webMcpImplementation"
+    && identity.protocolVersion === 1
+    && identity.mode === mode
+    && identity.webMcpImplementation === "native"
+    && /^[0-9a-f]{64}$/.test(identity.verifierOriginDigest);
+}
+
+function installedObservationMatches(
+  input: ReleaseInstallationRequest,
+  identity: Extract<ReleaseArtifactIdentity, { artifactUrl: string }>,
+  expectedTools: readonly string[],
+  report: InstalledVerificationObservation,
+): boolean {
+  if (!isPlainRecord(report) || report.observedArtifactUrl !== identity.artifactUrl
+    || report.observedDownloadUrl !== identity.downloadUrl || report.observedLocalOnly !== identity.localOnly
+    || report.observedIntegrity !== input.integrity || report.observedTargetOrigin !== input.targetOrigin
+    || report.servedContentHash !== input.artifactContentHash || report.normalPageLoad !== true
+    || report.routeInterception !== false || report.injectedRegistration !== false
+    || report.syntheticHarness !== false || report.webMcpImplementation !== input.webMcpImplementation
+    || !isPlainRecord(report.csp) || report.csp.hosted !== input.csp.hosted
+    || report.csp.directive !== input.csp.directive) return false;
+  if (input.status === "pending_self_host") {
+    return report.executedArtifactUrl === null && report.executedContentHash === null
+      && report.duplicateLoadHarmless === null && Array.isArray(report.registeredTools)
+      && report.registeredTools.length === 0;
+  }
+  return report.executedArtifactUrl === (input.selfHostedUrl ?? identity.artifactUrl)
+    && report.executedContentHash === input.artifactContentHash
+    && report.duplicateLoadHarmless === true
+    && equalStringArrays(report.registeredTools, expectedTools);
 }
 
 const HOSTED_RELEASE_ARTIFACT_PREFIX =
@@ -2138,6 +2302,7 @@ function releaseMatchesPublication(release: ReleaseRecord, input: PublishRequest
     && release.analysisRunId === input.analysisRunId
     && release.capabilityStateDigest === input.capabilityStateDigest
     && release.contentHash === input.candidateContentHash
+    && release.verificationRunId === input.verificationRunId
     && artifactIdentity !== undefined
     && artifactIdentity.artifactUrl === input.artifactUrl
     && artifactIdentity.downloadUrl === input.downloadUrl

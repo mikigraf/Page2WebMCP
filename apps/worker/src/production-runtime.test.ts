@@ -5,6 +5,8 @@ import { InMemoryControlPlaneRepository, type AnalysisResult, type RepositoryAct
 import { WorkflowController } from "../../../packages/database/src/workflow.ts";
 import {
   createProductionWorkerRuntime,
+  createProductionWorkerRuntimeFromProvider,
+  createProductionProvider,
   inspectProductionProviderConfiguration,
   processProductionWorkerIteration,
   type ProductionWorkerRuntime,
@@ -114,6 +116,33 @@ test("pure selected-provider inspection returns sorted key names and never value
   assert.deepEqual(inspectProductionProviderConfiguration({ PAGE2WEBMCP_PROVIDER_MODE: "local" }), {
     code: "WORKER_PROVIDER_MODE_REQUIRED", keys: ["PAGE2WEBMCP_PROVIDER_MODE"],
   });
+});
+
+test("provider-only construction returns an exact non-fixture provenance tuple without a repository", () => {
+  assert.deepEqual(createProductionProvider({ PAGE2WEBMCP_PROVIDER_MODE: "openapi" }, {
+    fetch: async () => { throw new Error("NO_NETWORK_DURING_CONSTRUCTION"); },
+  }).provenance, {
+    mode: "openapi", adapter: "bounded-openapi", adapterVersion: 1, fixture: false,
+  });
+  assert.deepEqual(createProductionProvider(configuredWebsiteEnvironment(), {
+    fetch: async () => { throw new Error("NO_NETWORK_DURING_CONSTRUCTION"); },
+  }).provenance, {
+    mode: "website", adapter: "browser-use-v4", adapterVersion: 4, fixture: false,
+  });
+});
+
+test("a provider constructed before repository creation is reused without reconstruction", () => {
+  const provider = createProductionProvider({ PAGE2WEBMCP_PROVIDER_MODE: "openapi" }, {
+    fetch: async () => { throw new Error("NO_NETWORK_DURING_CONSTRUCTION"); },
+  });
+  const runtime = createProductionWorkerRuntimeFromProvider(
+    new InMemoryControlPlaneRepository(),
+    provider,
+    { fetch: async () => { throw new Error("PROVIDER_MUST_NOT_BE_RECONSTRUCTED"); } },
+  );
+  assert.equal(runtime.analyze, provider.analyze);
+  assert.equal(runtime.providerProvenance, provider.provenance);
+  assert.equal(runtime.analysisSourceTypes, provider.analysisSourceTypes);
 });
 
 test("missing selected website controls fail before every repository claim path", () => {

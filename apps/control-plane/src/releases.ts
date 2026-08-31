@@ -106,6 +106,7 @@ export async function publishPersistedRelease(
       projectId,
       capabilityStateDigest: verification.capabilityStateDigest,
       candidateContentHash: verification.candidateContentHash,
+      verificationRunId: verification.id,
       artifactUrl: artifactIdentity.artifactUrl,
       downloadUrl: artifactIdentity.downloadUrl,
       localOnly: artifactIdentity.localOnly,
@@ -116,6 +117,7 @@ export async function publishPersistedRelease(
     analysisRunId,
     capabilityStateDigest: verification.capabilityStateDigest,
     candidateContentHash: verification.candidateContentHash,
+    verificationRunId: verification.id,
     ...artifactIdentity,
     idempotencyKey,
     inputHash
@@ -130,6 +132,7 @@ export async function publishPersistedRelease(
     projectId,
     analysisRunId,
     capabilityStateDigest: verification.capabilityStateDigest,
+    verificationRunId: verification.id,
   });
   const previous = await repository.getPreviousRelease(actor, project.id, release.id);
   return {
@@ -149,6 +152,7 @@ function assertPublishedReleaseConvergence(input: Readonly<{
   projectId: string;
   analysisRunId: string;
   capabilityStateDigest: string;
+  verificationRunId: string;
 }>): ReturnType<typeof normalizeReleaseArtifactIdentity> {
   const { release, candidate } = input;
   const persistedIdentity = persistedReleaseArtifactIdentity(release);
@@ -160,6 +164,7 @@ function assertPublishedReleaseConvergence(input: Readonly<{
     || release.organizationId !== input.organizationId || release.projectId !== input.projectId
     || release.analysisRunId !== input.analysisRunId
     || release.capabilityStateDigest !== input.capabilityStateDigest
+    || release.verificationRunId !== input.verificationRunId
     || release.code !== candidate.code || release.contentHash !== candidate.contentHash
     || codeHash !== candidate.contentHash || release.sri !== input.integrity || codeIntegrity !== input.integrity
     || release.allowedOrigin !== input.targetOrigin || candidate.allowedOrigin !== input.targetOrigin
@@ -344,6 +349,8 @@ export async function verifyInstalledRelease(
     releaseId,
     pageUrl,
     artifactUrl: artifactIdentity.artifactUrl,
+    downloadUrl: artifactIdentity.downloadUrl,
+    localOnly: artifactIdentity.localOnly,
     ...(selfHostedUrl ? { selfHostedUrl } : {}),
     targetOrigin: release.allowedOrigin,
     artifactContentHash: release.contentHash,
@@ -353,6 +360,7 @@ export async function verifyInstalledRelease(
     delivery: attestation.delivery,
     csp: attestation.csp,
     webMcpImplementation: attestation.webMcpImplementation,
+    verifierIdentity: attestation.verifierIdentity,
     attestation: attestation.report,
     idempotencyKey,
     inputHash,
@@ -414,7 +422,9 @@ async function deriveTrustedVerification(
 ): Promise<VerificationRequest> {
   const prepared = deriveVerification(analysisRunId, targetOrigin, result, capabilities);
   const manifest = ManifestSchema.safeParse(prepared.candidate.manifest);
-  if (!manifest.success || safeOrigin(targetOrigin) !== targetOrigin) return prepared;
+  if (!manifest.success || safeOrigin(targetOrigin) !== targetOrigin) {
+    throw new ApiError("RELEASE_GATE_FAILED", 409, false, ["CANDIDATE_INVALID"]);
+  }
   const integrity = `sha384-${createHash("sha384").update(prepared.candidate.code).digest("base64")}`;
   const expectedTools = capabilities.filter(({ status }) => status !== "blocked")
     .map(({ stableName }) => stableName).sort(compareStrings);
@@ -429,7 +439,9 @@ async function deriveTrustedVerification(
   return applyAttestation(prepared, attestation);
 }
 
-function applyAttestation(prepared: VerificationRequest, attestation: CandidateAttestation): VerificationRequest {
+type PreparedVerification = Omit<VerificationRequest, "verifierIdentity" | "observation">;
+
+function applyAttestation(prepared: PreparedVerification, attestation: CandidateAttestation): VerificationRequest {
   return {
     ...prepared,
     schema: prepared.schema && attestation.schema,
@@ -441,6 +453,17 @@ function applyAttestation(prepared: VerificationRequest, attestation: CandidateA
     checks: [...attestation.checks],
     csp: attestation.csp,
     verificationMode: attestation.verificationMode,
+    verifierIdentity: attestation.verifierIdentity,
+    observation: {
+      observedContentHash: attestation.report.observedContentHash,
+      observedIntegrity: attestation.report.observedIntegrity,
+      observedReleaseId: attestation.report.observedReleaseId,
+      observedTargetOrigin: attestation.report.observedTargetOrigin,
+      registeredTools: [...attestation.report.registeredTools],
+      trustedLoader: { ...attestation.report.trustedLoader },
+      controlPlaneRequestsDuringExecution: attestation.report.controlPlaneRequestsDuringExecution,
+      modelRequestsDuringExecution: attestation.report.modelRequestsDuringExecution,
+    },
   };
 }
 
@@ -449,7 +472,7 @@ export function deriveVerification(
   projectUrl: string,
   result: AnalysisResult,
   capabilities: CapabilityRecord[]
-): VerificationRequest {
+): PreparedVerification {
   if (result.release === undefined) throw new ApiError("INVALID_STATE", 409);
   const parsedSourceManifest = ManifestSchema.safeParse(result.release.manifest);
   const targetOrigin = safeOrigin(projectUrl);

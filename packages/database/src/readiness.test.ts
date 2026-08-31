@@ -1,0 +1,226 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import {
+  createMaintenanceReadinessRepository,
+  type MaintenanceReadinessPool,
+} from "./readiness.ts";
+
+const selectedHash = "a".repeat(64);
+
+function proofRow() {
+  return {
+    selected_release_hash: selectedHash,
+    release_content_hash: selectedHash,
+    release_integrity: "sha384-AAAA",
+    candidate_observed_integrity: "sha384-AAAA",
+    installation_observed_integrity: "sha384-AAAA",
+    served_content_hash: selectedHash,
+    executed_content_hash: selectedHash,
+    trusted_loader_content_hash: selectedHash,
+    release_verification_run_id: "11111111-1111-4111-8111-111111111111",
+    candidate_verification_run_id: "11111111-1111-4111-8111-111111111111",
+    candidate_mode: "live",
+    installation_mode: "live",
+    candidate_protocol_version: 1,
+    installation_protocol_version: 1,
+    candidate_verifier_origin_digest: "b".repeat(64),
+    installation_verifier_origin_digest: "b".repeat(64),
+    candidate_webmcp_implementation: "native",
+    installation_webmcp_implementation: "native",
+    provider_mode: "openapi",
+    provider_adapter: "bounded-openapi",
+    provider_adapter_version: 1,
+    source_type: "openapi",
+    provider_fixture: false,
+    source_fixture: false,
+    local_only: false,
+    target_identity_matches: true,
+    artifact_identity_matches: true,
+    capability_digest_matches: true,
+    expected_tools_digest: "c".repeat(64),
+    registered_tools_digest: "c".repeat(64),
+    expected_tool_count: 1,
+    registered_tool_count: 1,
+    normal_page_load: true,
+    route_interception: false,
+    injected_registration: false,
+    synthetic_harness: false,
+    duplicate_load_harmless: true,
+    zero_control_plane_calls: true,
+    zero_model_calls: true,
+    trusted_loader_enforced: true,
+    candidate_checks_passed: true,
+  };
+}
+
+function topologyRow() {
+  return {
+    migrations_current: true,
+    rls_verified: true,
+    local_openapi_release: true,
+    local_website_release: false,
+    local_github_release: false,
+    hosted_openapi_release: false,
+    hosted_website_release: false,
+    hosted_github_release: false,
+  };
+}
+
+function fakePool(roleOverrides: Record<string, unknown> = {}, rows = [proofRow()]) {
+  const queries: Array<{ text: string; values?: readonly unknown[] }> = [];
+  let released = 0;
+  let ended = 0;
+  const pool: MaintenanceReadinessPool = {
+    connect: async () => ({
+      query: async (text, values) => {
+        queries.push({ text, values });
+        if (text.includes("session_relevant_roles")) return { rows: [{
+          current_role: "page2webmcp_maintenance",
+          session_role: "page2webmcp_readiness_login",
+          session_superuser: false,
+          session_bypass_rls: false,
+          session_can_login: true,
+          session_relevant_roles: ["page2webmcp_maintenance"],
+          ...roleOverrides,
+        }] };
+        if (text.includes("private.selected_release_readiness_topology")) return { rows: [topologyRow()] };
+        if (text.includes("private.selected_native_installation_proof")) return { rows };
+        return { rows: [] };
+      },
+      release: () => { released += 1; },
+    }),
+    end: async () => { ended += 1; },
+  };
+  return { pool, queries, released: () => released, ended: () => ended };
+}
+
+test("maintenance readiness actively checks the selected provider, migration ledger, and forced RLS", async () => {
+  const fake = fakePool();
+  const repository = createMaintenanceReadinessRepository({
+    connectionString: "postgresql://redacted.invalid/db",
+    mode: "local-live",
+    pool: fake.pool,
+  });
+  assert.deepEqual(await repository.inspectSelectedReleaseTopology(selectedHash, {
+    mode: "openapi", adapter: "bounded-openapi", adapterVersion: 1, fixture: false,
+  }, true), {
+    migrationsCurrent: true,
+    rlsVerified: true,
+    selectedReleasePersisted: true,
+  });
+  assert.deepEqual(fake.queries.filter(({ text }) => text.includes("selected_release_readiness_topology")), [{
+    text: "select * from private.selected_release_readiness_topology($1)", values: [selectedHash],
+  }]);
+  assert.equal(fake.queries.some(({ text }) => /public\.releases|supabase_migrations|pg_class/i.test(text)), false);
+});
+
+test("maintenance readiness reads only the exact selected hash through the bounded function", async () => {
+  const fake = fakePool();
+  const repository = createMaintenanceReadinessRepository({
+    connectionString: "postgresql://redacted.invalid/db",
+    mode: "live",
+    pool: fake.pool,
+  });
+  assert.deepEqual(await repository.findSelectedNativeInstallationProof(selectedHash), {
+    selectedReleaseHash: selectedHash,
+    releaseContentHash: selectedHash,
+    releaseIntegrity: "sha384-AAAA",
+    candidateObservedIntegrity: "sha384-AAAA",
+    installationObservedIntegrity: "sha384-AAAA",
+    servedContentHash: selectedHash,
+    executedContentHash: selectedHash,
+    trustedLoaderContentHash: selectedHash,
+    releaseVerificationRunId: "11111111-1111-4111-8111-111111111111",
+    candidateVerificationRunId: "11111111-1111-4111-8111-111111111111",
+    candidateMode: "live",
+    installationMode: "live",
+    candidateProtocolVersion: 1,
+    installationProtocolVersion: 1,
+    candidateVerifierOriginDigest: "b".repeat(64),
+    installationVerifierOriginDigest: "b".repeat(64),
+    candidateWebMcpImplementation: "native",
+    installationWebMcpImplementation: "native",
+    providerMode: "openapi",
+    providerAdapter: "bounded-openapi",
+    providerAdapterVersion: 1,
+    sourceType: "openapi",
+    providerFixture: false,
+    sourceFixture: false,
+    localOnly: false,
+    targetIdentityMatches: true,
+    artifactIdentityMatches: true,
+    capabilityDigestMatches: true,
+    expectedToolsDigest: "c".repeat(64),
+    registeredToolsDigest: "c".repeat(64),
+    expectedToolCount: 1,
+    registeredToolCount: 1,
+    normalPageLoad: true,
+    routeInterception: false,
+    injectedRegistration: false,
+    syntheticHarness: false,
+    duplicateLoadHarmless: true,
+    zeroControlPlaneCalls: true,
+    zeroModelCalls: true,
+    trustedLoaderEnforced: true,
+    candidateChecksPassed: true,
+  });
+  assert.deepEqual(fake.queries.filter(({ text }) => text.includes("selected_native_installation_proof")), [{
+    text: "select * from private.selected_native_installation_proof($1)", values: [selectedHash],
+  }]);
+  assert.equal(fake.queries.some(({ text }) => /\blatest\b|public\.releases|private\.analysis_jobs/i.test(text)), false);
+  assert.ok(fake.queries.some(({ text }) => text === "set local role page2webmcp_maintenance"));
+  assert.ok(fake.queries.some(({ text }) => text.includes("statement_timeout")));
+  assert.equal(fake.released(), 1);
+  await repository.close();
+  assert.equal(fake.ended(), 1);
+});
+
+test("maintenance readiness rejects superuser, bypass, wrong role, or additional service memberships", async () => {
+  for (const override of [
+    { current_role: "page2webmcp_app" },
+    { session_superuser: true },
+    { session_bypass_rls: true },
+    { session_can_login: false },
+    { session_relevant_roles: ["page2webmcp_app", "page2webmcp_maintenance"] },
+  ]) {
+    const fake = fakePool(override);
+    const repository = createMaintenanceReadinessRepository({
+      connectionString: "postgresql://redacted.invalid/db", mode: "live", pool: fake.pool,
+    });
+    await assert.rejects(repository.findSelectedNativeInstallationProof(selectedHash),
+      /^Error: MAINTENANCE_DATABASE_ROLE_REQUIRED$/);
+    assert.equal(fake.queries.some(({ text }) => text.includes("selected_native_installation_proof")), false);
+  }
+});
+
+test("maintenance readiness validates the selected hash before opening a connection", async () => {
+  const fake = fakePool();
+  let connections = 0;
+  const repository = createMaintenanceReadinessRepository({
+    connectionString: "postgresql://redacted.invalid/db",
+    mode: "live",
+    pool: { ...fake.pool, connect: async () => { connections += 1; return fake.pool.connect(); } },
+  });
+  await assert.rejects(repository.findSelectedNativeInstallationProof("A".repeat(64)),
+    /^Error: READINESS_RELEASE_HASH_INVALID$/);
+  assert.equal(connections, 0);
+});
+
+test("maintenance pool bounds every query before server-local timeouts exist", async () => {
+  const fake = fakePool();
+  let configuration: Record<string, unknown> | undefined;
+  const repository = createMaintenanceReadinessRepository({
+    connectionString: "postgresql://readiness:secret@database.example/page2webmcp",
+    mode: "live",
+    statementTimeoutMs: 1_250,
+    poolFactory: (value) => {
+      configuration = value as Record<string, unknown>;
+      return fake.pool;
+    },
+  });
+  assert.equal(configuration?.query_timeout, 1_250);
+  assert.equal(configuration?.statement_timeout, 1_250);
+  assert.equal(configuration?.connectionTimeoutMillis, 5_000);
+  assert.deepEqual(configuration?.ssl, { rejectUnauthorized: true });
+  await repository.close();
+});
