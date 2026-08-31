@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
 import { compileWebMcpRelease } from "../../../packages/compiler/src/compiler.ts";
 import { acmeCapabilityPlans } from "../../acme-support/src/capability-plans.ts";
@@ -73,6 +74,15 @@ function httpResponse(
     body: Buffer.from(JSON.stringify(body)),
     ...overrides,
   };
+}
+
+function fetchJsonResponse(url: string, body: unknown): Response {
+  const response = new Response(JSON.stringify(body), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
+  Object.defineProperty(response, "url", { value: url });
+  return response;
 }
 
 test("candidate verification sends and accepts only the exact reviewed bytes under a trusted loader", async () => {
@@ -182,6 +192,80 @@ test("configured live verification authenticates readiness immediately before ca
     verifierOriginDigest: "d1b8790504951c2f3c74c61299b9cfb8634ca1b0dc8e3b6ae57475bc37790a25",
   });
   assert.deepEqual(attestation.report, report());
+});
+
+test("configured verification carries an exact 64KiB candidate inside a separately bounded JSON envelope", async () => {
+  const origin = "https://verifier.example";
+  const code = `/*${"x".repeat(65_532)}*/`;
+  const contentHash = createHash("sha256").update(code).digest("hex");
+  const integrity = `sha384-${createHash("sha384").update(code).digest("base64")}`;
+  const input = {
+    code,
+    contentHash,
+    integrity,
+    manifest: { releaseId: contentHash },
+    targetOrigin: "https://boundary.example",
+    expectedTools: ["boundary_tool"],
+  };
+  let candidateEnvelopeBytes = 0;
+  const port = configuredReleaseVerificationPort({
+    PAGE2WEBMCP_RELEASE_VERIFIER_ORIGIN: origin,
+    PAGE2WEBMCP_RELEASE_VERIFIER_TOKEN: "v".repeat(32),
+  }, {
+    mode: "live",
+    fetch: async (request, init) => {
+      const url = String(request);
+      if (url.endsWith("/v1/readiness")) {
+        return fetchJsonResponse(url, {
+          protocolVersion: 1,
+          mode: "live",
+          webMcpImplementation: "native",
+        });
+      }
+      candidateEnvelopeBytes = Buffer.byteLength(String(init?.body));
+      return fetchJsonResponse(url, {
+        observedContentHash: contentHash,
+        observedIntegrity: integrity,
+        observedReleaseId: contentHash,
+        observedTargetOrigin: input.targetOrigin,
+        registeredTools: input.expectedTools,
+        trustedLoader: { enforcedBeforeEvaluation: true, evaluatedContentHash: contentHash },
+        controlPlaneRequestsDuringExecution: 0,
+        modelRequestsDuringExecution: 0,
+        checks: REQUIRED_CANDIDATE_CHECKS.map((name) => ({ name, status: "passed" as const })),
+        csp: { hosted: "allowed" },
+      });
+    },
+  });
+
+  const attestation = await attestReleaseCandidate(input, port, new AbortController().signal);
+  assert.equal(Buffer.byteLength(code), 65_536);
+  assert.ok(candidateEnvelopeBytes > 65_536);
+  assert.equal(attestation.report.observedContentHash, contentHash);
+});
+
+test("candidate verification rejects an over-cap JSON envelope before readiness or execution", async () => {
+  let calls = 0;
+  const port: ReleaseVerificationPort = {
+    mode: "hermetic",
+    readiness: async () => {
+      calls += 1;
+      throw new Error("READINESS_MUST_NOT_RUN");
+    },
+    verifyCandidate: async () => {
+      calls += 1;
+      return report();
+    },
+    verifyInstalled: async () => { throw new Error("UNUSED"); },
+  };
+  await assert.rejects(attestReleaseCandidate({
+    ...candidateInput(),
+    manifest: {
+      ...candidateInput().manifest,
+      padding: "x".repeat(160 * 1_024),
+    },
+  }, port, new AbortController().signal), /CANDIDATE_VERIFICATION_INVALID/);
+  assert.equal(calls, 0);
 });
 
 test("configured installation performs a fresh readiness handshake and returns its identity", async () => {

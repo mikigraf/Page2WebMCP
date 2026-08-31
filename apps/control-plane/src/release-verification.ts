@@ -13,6 +13,7 @@ import {
 const HASH = /^[0-9a-f]{64}$/;
 const SRI = /^sha384-[A-Za-z0-9+/]+={0,2}$/;
 const MAX_REPORT_BYTES = 64 * 1_024;
+const MAX_VERIFIER_REQUEST_BYTES = 160 * 1_024;
 const VERIFICATION_DEADLINE_MS = 120_000;
 const HERMETIC_VERIFIER_IDENTIFIER = "page2webmcp:hermetic-release-verifier:v1";
 
@@ -328,6 +329,7 @@ function pinnedReleaseVerifierTransport(): ReleaseVerifierHttpTransport {
         method: input.method,
         headers: input.headers,
         body: input.body,
+        maxBodyBytes: MAX_VERIFIER_REQUEST_BYTES,
         signal: input.signal,
       });
     },
@@ -366,7 +368,7 @@ function assertVerifierHttpRequest(input: ReleaseVerifierHttpRequest, protocol?:
   catch { throw new Error("RELEASE_VERIFIER_CONFIGURATION_REQUIRED"); }
   if (input.method !== "POST" || input.redirect !== "error" || input.credentials !== "omit"
     || protocol && url.protocol !== protocol || url.username || url.password || url.search || url.hash
-    || typeof input.body !== "string" || Buffer.byteLength(input.body) > MAX_REPORT_BYTES
+    || typeof input.body !== "string" || Buffer.byteLength(input.body) > MAX_VERIFIER_REQUEST_BYTES
     || input.signal.aborted) throw new Error("RELEASE_VERIFIER_RESPONSE_INVALID");
 }
 
@@ -465,11 +467,22 @@ function hermeticVerifierIdentity(): VerifierIdentity {
   };
 }
 
+function jsonByteLength(value: unknown): number {
+  try {
+    const encoded = JSON.stringify(value);
+    return typeof encoded === "string" ? Buffer.byteLength(encoded) : Number.POSITIVE_INFINITY;
+  } catch {
+    return Number.POSITIVE_INFINITY;
+  }
+}
+
 function assertCandidateInput(input: CandidateVerificationInput): void {
   if (!input || typeof input.code !== "string" || Buffer.byteLength(input.code) > 65_536
     || !HASH.test(input.contentHash) || !SRI.test(input.integrity)
     || !HASH.test(input.manifest?.releaseId) || exactHttpsOrigin(input.targetOrigin) !== input.targetOrigin
-    || !validTools(input.expectedTools)) throw new Error("CANDIDATE_VERIFICATION_INVALID");
+    || !validTools(input.expectedTools) || jsonByteLength(input) > MAX_VERIFIER_REQUEST_BYTES) {
+    throw new Error("CANDIDATE_VERIFICATION_INVALID");
+  }
 }
 
 function assertInstalledInput(input: InstalledVerificationInput, mode: ReleaseVerificationPort["mode"]): void {

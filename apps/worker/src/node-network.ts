@@ -8,7 +8,9 @@ import { validateResolvedAddress } from "../../../packages/security/src/security
 import type { OpenApiProviderControls } from "../../../packages/providers/src/openapi.ts";
 
 const MAX_DNS_ANSWERS_PLUS_ONE = 17;
-const MAX_JSON_BYTES = 64 * 1_024;
+const DEFAULT_MAX_JSON_REQUEST_BYTES = 64 * 1_024;
+const MAX_JSON_REQUEST_BYTES = 160 * 1_024;
+const MAX_JSON_RESPONSE_BYTES = 64 * 1_024;
 const MAX_PINNED_HEADER_COUNT = 16;
 const MAX_PINNED_HEADER_VALUE_BYTES = 4_096;
 const MAX_PINNED_AUTHORIZATION_BYTES = "Bearer ".length + 4_096;
@@ -32,6 +34,7 @@ export type NodePinnedJsonRequest = Readonly<{
   method: "POST";
   headers: Readonly<Record<string, string>>;
   body: string;
+  maxBodyBytes?: number;
   signal: AbortSignal;
 }>;
 
@@ -157,8 +160,10 @@ function websiteAbortReason(signal: AbortSignal): Error {
 }
 
 function validPinnedJsonRequest(input: NodePinnedJsonRequest): URL | undefined {
+  const maxBodyBytes = input?.maxBodyBytes ?? DEFAULT_MAX_JSON_REQUEST_BYTES;
   if (!input || input.method !== "POST" || typeof input.body !== "string"
-    || Buffer.byteLength(input.body, "utf8") > MAX_JSON_BYTES || !input.headers
+    || !Number.isInteger(maxBodyBytes) || maxBodyBytes < 1 || maxBodyBytes > MAX_JSON_REQUEST_BYTES
+    || Buffer.byteLength(input.body, "utf8") > maxBodyBytes || !input.headers
     || !validPinnedJsonHeaders(input.headers)) return undefined;
   try {
     const url = new URL(input.url);
@@ -270,7 +275,8 @@ export function createNodePinnedJsonTransport(
               return;
             }
             const declared = response.headers["content-length"];
-            if (typeof declared === "string" && (!/^\d+$/.test(declared) || Number(declared) > MAX_JSON_BYTES)) {
+            if (typeof declared === "string"
+              && (!/^\d+$/.test(declared) || Number(declared) > MAX_JSON_RESPONSE_BYTES)) {
               const error = new Error("WEBSITE_CONTROL_RESPONSE_TOO_LARGE");
               destroy(error);
               finishReject(error);
@@ -282,7 +288,7 @@ export function createNodePinnedJsonTransport(
               if (settled) return;
               const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
               length += bytes.byteLength;
-              if (length > MAX_JSON_BYTES) {
+              if (length > MAX_JSON_RESPONSE_BYTES) {
                 const error = new Error("WEBSITE_CONTROL_RESPONSE_TOO_LARGE");
                 destroy(error);
                 finishReject(error);

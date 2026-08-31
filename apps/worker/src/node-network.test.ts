@@ -382,6 +382,27 @@ test("pinned JSON transport permits a 4096-byte bearer token without relaxing ot
   }), /^Error: WEBSITE_CONTROL_REQUEST_INVALID$/);
 });
 
+test("pinned JSON transport keeps the 64KiB body default and permits only the bounded verifier override", async () => {
+  const transport = createNodePinnedJsonTransport({
+    resolver: { resolve: async () => [] },
+    request: () => { throw new Error("UNUSED"); },
+  });
+  const request = (body: string, maxBodyBytes?: number) => transport.request({
+    url: "https://control.widgets.example/v1/candidates/verify",
+    method: "POST",
+    headers: { authorization: "Bearer bounded-token", "content-type": "application/json" },
+    body,
+    signal: new AbortController().signal,
+    ...(maxBodyBytes === undefined ? {} : { maxBodyBytes }),
+  });
+
+  await assert.rejects(request("x".repeat(65_537)), /^Error: WEBSITE_CONTROL_REQUEST_INVALID$/);
+  await assert.rejects(request("x".repeat(160 * 1_024), 160 * 1_024), /^Error: WEBSITE_CONTROL_RETRYABLE$/);
+  await assert.rejects(request("x".repeat(160 * 1_024 + 1), 160 * 1_024),
+    /^Error: WEBSITE_CONTROL_REQUEST_INVALID$/);
+  await assert.rejects(request("{}", 160 * 1_024 + 1), /^Error: WEBSITE_CONTROL_REQUEST_INVALID$/);
+});
+
 test("pinned JSON transport writes credentials only after pinned TLS peer verification", async () => {
   let sentBody: string | undefined;
   let capturedOptions: RequestOptions | undefined;
