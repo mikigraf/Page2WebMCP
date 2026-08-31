@@ -40,18 +40,37 @@ begin
 end
 $$;
 
-create function private.canonical_https_test_page(origin text, page_url text)
+create function private.canonical_https_test_page_segment(segment text)
 returns boolean
 language sql
 immutable
 security invoker
 set search_path = pg_catalog
 as $$
-  select private.canonical_https_origin(origin)
-    and page_url is not null
-    and position('#' in page_url) = 0
-    and position(' ' in page_url) = 0
-    and left(page_url, char_length(origin) + 1) = origin || '/';
+  select lower(segment) not in ('.', '..', '%2e', '.%2e', '%2e.', '%2e%2e');
+$$;
+
+create function private.canonical_https_test_page(origin text, page_url text)
+returns boolean
+language plpgsql
+immutable
+security invoker
+set search_path = pg_catalog
+as $$
+declare
+  path text;
+  segment text;
+begin
+  if not private.canonical_https_origin(origin) or page_url is null
+    or position('#' in page_url) > 0 or position(' ' in page_url) > 0
+    or left(page_url, char_length(origin) + 1) <> origin || '/' then return false; end if;
+  path := split_part(substring(page_url from char_length(origin) + 1), '?', 1);
+  if position(E'\\' in path) > 0 then return false; end if;
+  foreach segment in array string_to_array(path, '/') loop
+    if not private.canonical_https_test_page_segment(segment) then return false; end if;
+  end loop;
+  return true;
+end
 $$;
 
 create function private.valid_source_configuration(source_type text, value jsonb)
@@ -78,9 +97,10 @@ as $$
 $$;
 
 revoke all on function private.canonical_https_origin(text) from public;
+revoke all on function private.canonical_https_test_page_segment(text) from public;
 revoke all on function private.canonical_https_test_page(text, text) from public;
 revoke all on function private.valid_source_configuration(text, jsonb) from public;
-grant execute on function private.canonical_https_origin(text), private.canonical_https_test_page(text, text),
+grant execute on function private.canonical_https_origin(text), private.canonical_https_test_page_segment(text), private.canonical_https_test_page(text, text),
   private.valid_source_configuration(text, jsonb) to page2webmcp_app, page2webmcp_worker;
 
 alter table public.project_sources

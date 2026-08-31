@@ -28,5 +28,26 @@ test("source-configuration migration binds each JSON kind to its source type and
   assert.match(sql, /canonical_https_origin/);
   assert.match(sql, /port < 1 or port > 65535/);
   assert.match(sql, /translate\(port_text, '0123456789', ''\)/);
-  assert.match(sql, /left\(page_url, char_length\(origin\) \+ 1\) = origin \|\| '\/'/);
+  assert.match(sql, /left\(page_url, char_length\(origin\) \+ 1\) <> origin \|\| '\/'/);
+});
+
+test("source-configuration migration rejects test-page spellings that the URL parser canonicalizes", async () => {
+  const sql = await readFile(migrationUrl, "utf8");
+  const origin = "https://example.com";
+  for (const pageUrl of [
+    `${origin}/a/../page`,
+    `${origin}/./page`,
+    `${origin}/a/%2e%2e/page`,
+    `${origin}/a/.%2e/page`,
+    `${origin}/a\\..\\page`,
+  ]) {
+    assert.notEqual(new URL(pageUrl).toString(), pageUrl);
+  }
+  const canonicalWithPathAndQuery = `${origin}/docs/page?environment=test`;
+  assert.equal(new URL(canonicalWithPathAndQuery).toString(), canonicalWithPathAndQuery);
+  assert.match(sql, /create function private\.canonical_https_test_page_segment\(segment text\)/);
+  assert.match(sql, /lower\(segment\) not in \('\.', '\.\.', '%2e', '\.%2e', '%2e\.', '%2e%2e'\)/);
+  assert.match(sql, /position\(E'\\\\' in path\) > 0/);
+  assert.match(sql, /path := split_part\(substring\(page_url from char_length\(origin\) \+ 1\), '\?', 1\)/);
+  assert.match(sql, /position\('#' in page_url\) > 0/);
 });
