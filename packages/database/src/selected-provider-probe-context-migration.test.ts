@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFile, readdir } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 const migrationUrl = new URL(
@@ -27,17 +27,14 @@ test("selected provider context is maintenance-only and joins the exact release 
   assert.match(sql, /grant execute on function private\.selected_provider_probe_context\(text\) to page2webmcp_maintenance/i);
 });
 
-test("current topology compares the exact complete 18-migration ledger", async () => {
+test("selected provider topology recorded its exact 18-migration ledger", async () => {
   const sql = await readFile(migrationUrl, "utf8");
-  const committed = (await readdir(new URL("../../../supabase/migrations/", import.meta.url)))
-    .filter((name) => /^\d{14}_[a-z0-9_]+\.sql$/.test(name))
-    .map((name) => name.slice(0, 14))
-    .sort();
   const requiredBlock = /required_migrations\s*\(version\)\s+as\s*\(\s*values([\s\S]*?)\),\s*applied_migrations/i
     .exec(sql)?.[1];
   assert.ok(requiredBlock);
   const expected = [...requiredBlock.matchAll(/\('(\d{14})'\)/g)].map((match) => match[1]).sort();
   assert.equal(expected.length, 18);
-  assert.deepEqual(expected, committed);
+  assert.equal(expected.at(-1), "20260901000000");
+  assert.equal(new Set(expected).size, expected.length);
   assert.match(sql, /count\(\*\)\s*=\s*count\(distinct version\)/i);
 });

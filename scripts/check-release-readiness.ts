@@ -336,8 +336,8 @@ function inspectControls(environment: Environment, mode: Exclude<ReadinessMode, 
 async function localFacts() {
   const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
   const migrations = await readdir(new URL("../supabase/migrations/", import.meta.url));
-  const installedExecution = await readFile(new URL(
-    "../supabase/migrations/20260831211329_installed_execution_evidence.sql", import.meta.url,
+  const singleInstallationProof = await readFile(new URL(
+    "../supabase/migrations/20260901010000_single_installation_proof.sql", import.meta.url,
   ), "utf8");
   const selectedProviderContext = await readFile(new URL(
     "../supabase/migrations/20260901000000_selected_provider_probe_context.sql", import.meta.url,
@@ -348,10 +348,11 @@ async function localFacts() {
   return {
     versionDrift: checkPackageVersionDrift(packageJson),
     migrationsCurrent: migrations.includes("20260831211329_installed_execution_evidence.sql")
-      && migrations.includes("20260901000000_selected_provider_probe_context.sql"),
-    rlsVerified: /selected_native_installation_proof/i.test(installedExecution)
-      && /confirmed_mutation_effect_count\s*=\s*1/i.test(installedExecution)
-      && /grant execute[^;]+page2webmcp_maintenance/is.test(installedExecution)
+      && migrations.includes("20260901000000_selected_provider_probe_context.sql")
+      && migrations.includes("20260901010000_single_installation_proof.sql"),
+    rlsVerified: /selected_native_installation_proof/i.test(singleInstallationProof)
+      && /confirmed_mutation_effect_count\s*=\s*1/i.test(singleInstallationProof)
+      && /grant execute[^;]+page2webmcp_maintenance/is.test(singleInstallationProof)
       && /selected_provider_probe_context/i.test(selectedProviderContext)
       && /grant execute[^;]+page2webmcp_maintenance/is.test(selectedProviderContext)
       && /force row level security/i.test(task6),
