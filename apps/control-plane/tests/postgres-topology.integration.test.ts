@@ -14,8 +14,14 @@ import { GET as getArtifact } from "../app/api/releases/[artifact]/route.ts";
 import { setControlPlaneRepositoryForTest } from "../../../packages/database/src/factory.ts";
 import { createPostgresRepository } from "../../../packages/database/src/postgres.ts";
 import { issueCsrfChallenge } from "../src/api.ts";
+import { setReleaseArtifactStoreForTest } from "../src/artifact-storage.ts";
 import { setAuthServiceForTest } from "../src/auth.ts";
 import { createFixtureAuthService, fixtureSessionId } from "../src/auth-fixture.ts";
+import { setReleaseVerificationPortForTest } from "../src/release-verification.ts";
+import {
+  hermeticReleaseArtifactStore,
+  hermeticReleaseVerificationPort,
+} from "./auth-test-helpers.ts";
 
 const appConnectionString = process.env.PAGE2WEBMCP_TEST_APP_DATABASE_URL;
 const workerConnectionString = process.env.PAGE2WEBMCP_TEST_WORKER_DATABASE_URL;
@@ -51,6 +57,8 @@ test("PostgreSQL route lifecycle is completed by a separately launched durable w
   let workerOutput = () => "";
   setControlPlaneRepositoryForTest(repository);
   setAuthServiceForTest(createFixtureAuthService());
+  setReleaseArtifactStoreForTest(hermeticReleaseArtifactStore);
+  setReleaseVerificationPortForTest(hermeticReleaseVerificationPort);
 
   try {
     const loginResponse = await login(jsonRequest("/api/auth/login", {
@@ -151,14 +159,21 @@ test("PostgreSQL route lifecycle is completed by a separately launched durable w
         sri: string;
         status: string;
         url: string;
+        artifactUrl: string;
+        downloadUrl: string;
+        localOnly: boolean;
       };
     };
     assert.equal(published.release.analysisRunId, accepted.runId);
     assert.equal(published.release.status, "published");
     assert.equal(published.release.allowedOrigin, "https://widgets.example");
+    assert.equal(published.release.url, published.release.artifactUrl);
+    assert.equal(published.release.localOnly, false);
+    assert.equal(published.release.downloadUrl,
+      `${published.release.artifactUrl}?download=page2webmcp-${published.release.contentHash}.js`);
 
     const artifactResponse = await getArtifact(
-      new Request(`${controlOrigin}${published.release.url}`),
+      new Request(`${controlOrigin}/api/releases/${published.release.contentHash}.js`),
       { params: Promise.resolve({ artifact: `${published.release.contentHash}.js` }) }
     );
     await assertResponseStatus(artifactResponse, 200);
@@ -174,6 +189,8 @@ test("PostgreSQL route lifecycle is completed by a separately launched durable w
     if (worker) await terminateWorker(worker);
     setControlPlaneRepositoryForTest(undefined);
     setAuthServiceForTest(undefined);
+    setReleaseArtifactStoreForTest(undefined);
+    setReleaseVerificationPortForTest(undefined);
     await repository.close();
     await admin.end();
   }

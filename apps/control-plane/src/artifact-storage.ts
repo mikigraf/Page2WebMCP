@@ -52,6 +52,17 @@ export interface ReleaseArtifactStore {
   }>, signal: AbortSignal): Promise<ReleaseArtifactPublication>;
 }
 
+let testStore: ReleaseArtifactStore | undefined;
+
+export function setReleaseArtifactStoreForTest(store: ReleaseArtifactStore | undefined): void {
+  if (process.env.NODE_ENV === "production") throw new Error("TEST_ADAPTER_FORBIDDEN");
+  testStore = store;
+}
+
+export function releaseArtifactStore(): ReleaseArtifactStore {
+  return testStore ?? createConfiguredReleaseArtifactStore(process.env);
+}
+
 export type ReleaseArtifactStoreDependencies = Readonly<{
   createClient?: ReleaseArtifactClientFactory;
   fetch?: typeof fetch;

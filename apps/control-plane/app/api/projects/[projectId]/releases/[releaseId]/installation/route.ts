@@ -8,10 +8,7 @@ import {
   requireMutationActor,
   successResponse,
 } from "../../../../../../../src/api.ts";
-import {
-  configuredPublicOrigin,
-  verifyInstalledRelease,
-} from "../../../../../../../src/releases.ts";
+import { verifyInstalledRelease } from "../../../../../../../src/releases.ts";
 import { recordLifecycle, recordLifecycleFailure } from "../../../../../../../src/telemetry.ts";
 
 const ParamsSchema = z.object({ projectId: z.string().uuid(), releaseId: z.string().uuid() }).strict();
@@ -43,7 +40,6 @@ export async function POST(
       input.pageUrl,
       input.selfHostedUrl,
       idempotencyKey,
-      configuredPublicOrigin(request),
       request.signal,
     );
     await recordLifecycle({

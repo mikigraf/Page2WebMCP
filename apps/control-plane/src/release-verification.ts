@@ -38,6 +38,8 @@ export type CandidateVerificationReport = Readonly<{
 export type InstalledVerificationInput = Readonly<{
   pageUrl: string;
   artifactUrl: string;
+  downloadUrl: string;
+  localOnly: boolean;
   contentHash: string;
   integrity: string;
   manifest: unknown;
@@ -47,8 +49,13 @@ export type InstalledVerificationInput = Readonly<{
 }>;
 
 export type InstalledVerificationReport = Readonly<{
+  observedArtifactUrl: string;
+  observedDownloadUrl: string;
+  observedLocalOnly: boolean;
+  observedIntegrity: string;
+  executedArtifactUrl: string | null;
   servedContentHash: string;
-  executedContentHash: string;
+  executedContentHash: string | null;
   observedTargetOrigin: string;
   registeredTools: readonly string[];
   webMcpImplementation: "native" | "compatibility_shim";
@@ -56,7 +63,7 @@ export type InstalledVerificationReport = Readonly<{
   routeInterception: boolean;
   injectedRegistration: boolean;
   syntheticHarness: boolean;
-  duplicateLoadHarmless: boolean;
+  duplicateLoadHarmless: boolean | null;
   csp: Readonly<{ hosted: "allowed" | "blocked"; directive?: string }>;
 }>;
 
@@ -65,6 +72,7 @@ export type InstalledAttestation = Readonly<{
   delivery: "hosted" | "self_hosted";
   csp: InstalledVerificationReport["csp"];
   webMcpImplementation: InstalledVerificationReport["webMcpImplementation"];
+  report: InstalledVerificationReport;
 }>;
 
 export interface ReleaseVerificationPort {
@@ -140,31 +148,48 @@ export async function attestReleaseInstallation(
   port: ReleaseVerificationPort,
   signal: AbortSignal,
 ): Promise<InstalledAttestation> {
-  assertInstalledInput(input);
+  assertInstalledInput(input, port.mode);
   const report = await withDeadline((deadlineSignal) => port.verifyInstalled(input, deadlineSignal), signal);
   if (!report || typeof report !== "object"
+    || report.observedArtifactUrl !== input.artifactUrl
+    || report.observedDownloadUrl !== input.downloadUrl
+    || report.observedLocalOnly !== input.localOnly
+    || report.observedIntegrity !== input.integrity
     || report.servedContentHash !== input.contentHash
-    || report.executedContentHash !== input.contentHash
     || report.observedTargetOrigin !== input.targetOrigin
-    || !equalStrings(report.registeredTools, input.expectedTools)
     || report.normalPageLoad !== true
     || report.routeInterception !== false
     || report.injectedRegistration !== false
     || report.syntheticHarness !== false
-    || report.duplicateLoadHarmless !== true
+    || !["native", "compatibility_shim"].includes(report.webMcpImplementation)
     || !report.csp || !["allowed", "blocked"].includes(report.csp.hosted)
     || report.csp.directive !== undefined && !safeDirective(report.csp.directive)) {
+    throw new Error("INSTALLED_VERIFICATION_INVALID");
+  }
+  const pendingSelfHost = !input.selfHostedUrl && report.csp.hosted === "blocked";
+  if (pendingSelfHost) {
+    if (report.executedArtifactUrl !== null || report.executedContentHash !== null
+      || !Array.isArray(report.registeredTools) || report.registeredTools.length !== 0
+      || report.duplicateLoadHarmless !== null) {
+      throw new Error("INSTALLED_VERIFICATION_INVALID");
+    }
+  } else if (report.executedArtifactUrl !== (input.selfHostedUrl ?? input.artifactUrl)
+    || report.executedContentHash !== input.contentHash
+    || !equalStrings(report.registeredTools, input.expectedTools)
+    || report.duplicateLoadHarmless !== true) {
     throw new Error("INSTALLED_VERIFICATION_INVALID");
   }
   if (port.mode === "live" && report.webMcpImplementation !== "native") {
     throw new Error("WEBMCP_NATIVE_REQUIRED");
   }
-  if (!input.selfHostedUrl && report.csp.hosted === "blocked") {
+  const normalizedReport = normalizeInstalledReport(report);
+  if (pendingSelfHost) {
     return {
       status: "pending_self_host",
       delivery: "hosted",
       csp: normalizedCsp(report.csp),
       webMcpImplementation: report.webMcpImplementation,
+      report: normalizedReport,
     };
   }
   return {
@@ -172,6 +197,7 @@ export async function attestReleaseInstallation(
     delivery: input.selfHostedUrl ? "self_hosted" : "hosted",
     csp: normalizedCsp(report.csp),
     webMcpImplementation: report.webMcpImplementation,
+    report: normalizedReport,
   };
 }
 
@@ -217,18 +243,22 @@ function assertCandidateInput(input: CandidateVerificationInput): void {
     || !validTools(input.expectedTools)) throw new Error("CANDIDATE_VERIFICATION_INVALID");
 }
 
-function assertInstalledInput(input: InstalledVerificationInput): void {
+function assertInstalledInput(input: InstalledVerificationInput, mode: ReleaseVerificationPort["mode"]): void {
   const targetOrigin = exactHttpsOrigin(input.targetOrigin);
   let page: URL;
-  let artifact: URL;
   try {
     page = new URL(input.pageUrl);
-    artifact = new URL(input.artifactUrl);
   } catch {
     throw new Error("INSTALLED_VERIFICATION_INVALID");
   }
+  const prefix = input.localOnly
+    ? "http://127.0.0.1:54321/storage/v1/object/public/page2webmcp-releases"
+    : "https://bimqgiedckdurqiywctl.supabase.co/storage/v1/object/public/page2webmcp-releases";
+  const artifactUrl = `${prefix}/${input.contentHash}.js`;
+  const downloadUrl = `${artifactUrl}?download=page2webmcp-${input.contentHash}.js`;
   if (!targetOrigin || page.origin !== targetOrigin || page.username || page.password || page.search || page.hash
-    || artifact.protocol !== "https:" || artifact.username || artifact.password || artifact.search || artifact.hash
+    || typeof input.localOnly !== "boolean" || mode === "live" && input.localOnly
+    || input.artifactUrl !== artifactUrl || input.downloadUrl !== downloadUrl
     || !HASH.test(input.contentHash) || !SRI.test(input.integrity) || !validTools(input.expectedTools)) {
     throw new Error("INSTALLED_VERIFICATION_INVALID");
   }
@@ -243,6 +273,27 @@ function assertInstalledInput(input: InstalledVerificationInput): void {
       throw new Error("INSTALLED_VERIFICATION_INVALID");
     }
   }
+}
+
+function normalizeInstalledReport(report: InstalledVerificationReport): InstalledVerificationReport {
+  return {
+    observedArtifactUrl: report.observedArtifactUrl,
+    observedDownloadUrl: report.observedDownloadUrl,
+    observedLocalOnly: report.observedLocalOnly,
+    observedIntegrity: report.observedIntegrity,
+    executedArtifactUrl: report.executedArtifactUrl,
+    servedContentHash: report.servedContentHash,
+    executedContentHash: report.executedContentHash,
+    observedTargetOrigin: report.observedTargetOrigin,
+    registeredTools: [...report.registeredTools].sort(compareStrings),
+    webMcpImplementation: report.webMcpImplementation,
+    normalPageLoad: report.normalPageLoad,
+    routeInterception: report.routeInterception,
+    injectedRegistration: report.injectedRegistration,
+    syntheticHarness: report.syntheticHarness,
+    duplicateLoadHarmless: report.duplicateLoadHarmless,
+    csp: normalizedCsp(report.csp),
+  };
 }
 
 function normalizedCsp(csp: InstalledVerificationReport["csp"]): InstalledVerificationReport["csp"] {

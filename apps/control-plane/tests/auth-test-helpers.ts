@@ -2,6 +2,10 @@ import type { RepositoryActor } from "../../../packages/database/src/control-pla
 import { InMemoryControlPlaneRepository } from "../../../packages/database/src/control-plane.ts";
 import { setControlPlaneRepositoryForTest } from "../../../packages/database/src/factory.ts";
 import { issueCsrfChallenge } from "../src/api.ts";
+import {
+  setReleaseArtifactStoreForTest,
+  type ReleaseArtifactStore,
+} from "../src/artifact-storage.ts";
 import { setAuthServiceForTest } from "../src/auth.ts";
 import {
   REQUIRED_CANDIDATE_CHECKS,
@@ -37,6 +41,11 @@ export const hermeticReleaseVerificationPort: ReleaseVerificationPort = {
     csp: { hosted: "allowed" as const },
   }),
   verifyInstalled: async (input) => ({
+    observedArtifactUrl: input.artifactUrl,
+    observedDownloadUrl: input.downloadUrl,
+    observedLocalOnly: input.localOnly,
+    observedIntegrity: input.integrity,
+    executedArtifactUrl: input.selfHostedUrl ?? input.artifactUrl,
     servedContentHash: input.contentHash,
     executedContentHash: input.contentHash,
     observedTargetOrigin: input.targetOrigin,
@@ -51,6 +60,20 @@ export const hermeticReleaseVerificationPort: ReleaseVerificationPort = {
   }),
 };
 
+export const hermeticReleaseArtifactStore: ReleaseArtifactStore = {
+  publish: async (input) => {
+    const artifactUrl =
+      `https://bimqgiedckdurqiywctl.supabase.co/storage/v1/object/public/page2webmcp-releases/${input.contentHash}.js`;
+    return {
+      artifactUrl,
+      downloadUrl: `${artifactUrl}?download=page2webmcp-${input.contentHash}.js`,
+      contentHash: input.contentHash,
+      integrity: input.integrity,
+      localOnly: false,
+    };
+  },
+};
+
 setAuthServiceForTest(createFixtureAuthService());
 
 export function installTestRepository(repository = new InMemoryControlPlaneRepository()): InMemoryControlPlaneRepository {
@@ -60,6 +83,7 @@ export function installTestRepository(repository = new InMemoryControlPlaneRepos
   setControlPlaneRepositoryForTest(repository);
   setAuthServiceForTest(createFixtureAuthService());
   setReleaseVerificationPortForTest(hermeticReleaseVerificationPort);
+  setReleaseArtifactStoreForTest(hermeticReleaseArtifactStore);
   return repository;
 }
 

@@ -46,6 +46,15 @@ function releaseCandidate(code: string, selectedPlans = plans("find_order"), all
   };
 }
 
+function hostedArtifactIdentity(contentHash: string) {
+  const artifactUrl = `https://bimqgiedckdurqiywctl.supabase.co/storage/v1/object/public/page2webmcp-releases/${contentHash}.js`;
+  return {
+    artifactUrl,
+    downloadUrl: `${artifactUrl}?download=page2webmcp-${contentHash}.js`,
+    localOnly: false,
+  } as const;
+}
+
 test("Postgres personal organization provisioning converges and revoked sessions fail closed", {
   skip: !connectionString || !adminConnectionString
 }, async () => {
@@ -351,15 +360,70 @@ test("Postgres repository persists and recovers the fixture lifecycle", { skip: 
       verificationMode: "hermetic" as const
     };
     const verification = await repository.saveVerification(actor, project.id, verificationInput);
-    const release = await repository.publishRelease(actor, {
+    const publishInput = {
       projectId: project.id,
       analysisRunId: run.id,
       capabilityStateDigest: capabilityDigest,
       candidateContentHash: verification.candidateContentHash,
+      ...hostedArtifactIdentity(verification.candidateContentHash),
       idempotencyKey: "postgres-publish",
       inputHash: "publish-input"
-    });
+    } as const;
+    const [release, concurrentRelease] = await Promise.all([
+      repository.publishRelease(actor, publishInput),
+      repository.publishRelease(actor, {
+        ...publishInput,
+        idempotencyKey: "postgres-publish-concurrent",
+      }),
+    ]);
+    assert.equal(concurrentRelease.id, release.id);
     assert.equal(release.capabilityStateDigest, capabilityDigest);
+    assert.deepEqual({
+      artifactUrl: release.artifactUrl,
+      downloadUrl: release.downloadUrl,
+      localOnly: release.localOnly,
+    }, hostedArtifactIdentity(release.contentHash));
+    const storedReleaseIdentity = await repository.getRelease(actor, project.id, release.id);
+    assert.deepEqual({
+      artifactUrl: storedReleaseIdentity.artifactUrl,
+      downloadUrl: storedReleaseIdentity.downloadUrl,
+      localOnly: storedReleaseIdentity.localOnly,
+    }, {
+      artifactUrl: release.artifactUrl,
+      downloadUrl: release.downloadUrl,
+      localOnly: false,
+    });
+    assert.ok(release.artifactUrl);
+    const installationInput = {
+      releaseId: release.id,
+      pageUrl: "https://acme.example/account",
+      artifactUrl: release.artifactUrl,
+      targetOrigin: release.allowedOrigin,
+      artifactContentHash: release.contentHash,
+      integrity: release.sri,
+      expectedTools: ["find_order"],
+      status: "verified" as const,
+      delivery: "hosted" as const,
+      csp: { hosted: "allowed" as const },
+      webMcpImplementation: "native" as const,
+      attestation: { servedContentHash: release.contentHash, executedContentHash: release.contentHash },
+      idempotencyKey: "postgres-installation",
+      inputHash: "c".repeat(64),
+    };
+    const installation = await repository.saveReleaseInstallation(actor, project.id, installationInput);
+    assert.equal(installation.artifactUrl, release.artifactUrl);
+    await assert.rejects(repository.saveReleaseInstallation(actor, project.id, {
+      ...installationInput,
+      artifactUrl: `https://unrelated.example/${release.contentHash}.js`,
+      idempotencyKey: "postgres-installation-unrelated",
+      inputHash: "d".repeat(64),
+    }), (error: unknown) => error instanceof RepositoryError && error.code === "INVALID_STATE");
+    await assert.rejects(repository.saveReleaseInstallation(actor, project.id, {
+      ...installationInput,
+      csp: { hosted: "blocked" },
+      idempotencyKey: "postgres-installation-contradictory-csp",
+      inputHash: "e".repeat(64),
+    }), (error: unknown) => error instanceof RepositoryError && error.code === "INVALID_STATE");
     assert.equal((await repository.saveVerification(actor, project.id, verificationInput)).id, verification.id);
     await assert.rejects(repository.saveVerification(actor, project.id, {
       ...verificationInput,
@@ -402,6 +466,7 @@ test("Postgres repository persists and recovers the fixture lifecycle", { skip: 
       analysisRunId: secondRun.id,
       capabilityStateDigest: secondDigest,
       candidateContentHash: secondVerification.candidateContentHash,
+      ...hostedArtifactIdentity(secondVerification.candidateContentHash),
       idempotencyKey: "postgres-publish-two",
       inputHash: "publish-input-two"
     });
@@ -882,6 +947,7 @@ test("Postgres queue exhaustion and stale release gates match the in-memory cont
       analysisRunId: publishRun.id,
       capabilityStateDigest: staleDigest,
       candidateContentHash: verification.candidateContentHash,
+      ...hostedArtifactIdentity(verification.candidateContentHash),
       idempotencyKey: "stale-publish",
       inputHash: "stale-publish"
     }), (error: unknown) => error instanceof RepositoryError
@@ -944,6 +1010,7 @@ test("Postgres queue exhaustion and stale release gates match the in-memory cont
       analysisRunId: publishRun.id,
       capabilityStateDigest: reviewedDigest,
       candidateContentHash: latestCandidate.candidateContentHash,
+      ...hostedArtifactIdentity(latestCandidate.candidateContentHash),
       idempotencyKey: "publish-expired-evidence",
       inputHash: "publish-expired-evidence"
     }), (error: unknown) => error instanceof RepositoryError
@@ -959,6 +1026,7 @@ test("Postgres queue exhaustion and stale release gates match the in-memory cont
       analysisRunId: publishRun.id,
       capabilityStateDigest: reviewedDigest,
       candidateContentHash: firstCandidate.candidateContentHash,
+      ...hostedArtifactIdentity(firstCandidate.candidateContentHash),
       idempotencyKey: "publish-old-subset",
       inputHash: "publish-old-subset"
     }), (error: unknown) => error instanceof RepositoryError
@@ -969,6 +1037,7 @@ test("Postgres queue exhaustion and stale release gates match the in-memory cont
       analysisRunId: publishRun.id,
       capabilityStateDigest: reviewedDigest,
       candidateContentHash: latestCandidate.candidateContentHash,
+      ...hostedArtifactIdentity(latestCandidate.candidateContentHash),
       idempotencyKey: "publish-latest-subset",
       inputHash: "publish-latest-subset"
     });
@@ -1047,6 +1116,7 @@ test("Postgres preserves the worker candidate across capability changes and publ
       analysisRunId: run.id,
       capabilityStateDigest: blockedDigest,
       candidateContentHash: subsetVerification.candidateContentHash,
+      ...hostedArtifactIdentity(subsetVerification.candidateContentHash),
       idempotencyKey: "immutable-source-publish",
       inputHash: "immutable-source-publish-stale"
     }), (error: unknown) => error instanceof RepositoryError
@@ -1073,6 +1143,7 @@ test("Postgres preserves the worker candidate across capability changes and publ
       analysisRunId: run.id,
       capabilityStateDigest: approvedDigest,
       candidateContentHash: fullVerification.candidateContentHash,
+      ...hostedArtifactIdentity(fullVerification.candidateContentHash),
       idempotencyKey: "immutable-source-publish",
       inputHash: "immutable-source-publish-fresh"
     });
@@ -1168,6 +1239,7 @@ test("publication evidence locking serializes with retention cleanup", {
       analysisRunId: run.id,
       capabilityStateDigest: digest,
       candidateContentHash: verification.candidateContentHash,
+      ...hostedArtifactIdentity(verification.candidateContentHash),
       idempotencyKey: "retention-race-publish",
       inputHash: "retention-race-publish"
     });

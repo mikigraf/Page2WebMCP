@@ -8,7 +8,8 @@ import {
   requireMutationActor,
   successResponse
 } from "../../../../../src/api.ts";
-import { configuredPublicOrigin, publishPersistedRelease } from "../../../../../src/releases.ts";
+import { releaseArtifactStore } from "../../../../../src/artifact-storage.ts";
+import { publishPersistedRelease } from "../../../../../src/releases.ts";
 import { recordLifecycle, recordLifecycleFailure } from "../../../../../src/telemetry.ts";
 
 const PublishInputSchema = z.object({ analysisRunId: z.string().uuid() }).strict();
@@ -37,7 +38,7 @@ export async function POST(
       input.analysisRunId,
       idempotencyKey,
       request.signal,
-      configuredPublicOrigin(request),
+      releaseArtifactStore(),
     );
     await recordLifecycle({
       event: "release_published",

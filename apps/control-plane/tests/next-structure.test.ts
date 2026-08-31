@@ -31,6 +31,9 @@ test("auth/project UI exposes actionable SSR states without trusting browser rol
   assert.match(entry, /Verify exact candidate/);
   assert.match(entry, /Copy trusted-loader script/);
   assert.match(entry, /Check installed target/);
+  assert.match(entry, /release\.installation\.verificationPageUrl/);
+  assert.doesNotMatch(entry, /const pageUrl = new URL\(url\)\.origin/);
+  assert.match(entry, /Local-only artifact/);
   assert.match(entry, /Self-hosted artifact URL/);
   assert.match(entry, /nothing was merged or installed/i);
   assert.match(entry, /\/api\/workflow-runs\//);

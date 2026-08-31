@@ -58,6 +58,15 @@ function releaseCandidate(code: string, selectedPlans = plans("find_order"), all
   };
 }
 
+function hostedArtifactIdentity(contentHash: string) {
+  const artifactUrl = `https://bimqgiedckdurqiywctl.supabase.co/storage/v1/object/public/page2webmcp-releases/${contentHash}.js`;
+  return {
+    artifactUrl,
+    downloadUrl: `${artifactUrl}?download=page2webmcp-${contentHash}.js`,
+    localOnly: false,
+  } as const;
+}
+
 test("capability-state digests use locale-independent canonical ordering", () => {
   const capabilities = [
     {
@@ -376,6 +385,7 @@ test("eligible publication is content addressed and idempotent", async () => {
     analysisRunId: run.id,
     capabilityStateDigest: capabilityState,
     candidateContentHash: verification.candidateContentHash,
+    ...hostedArtifactIdentity(verification.candidateContentHash),
     idempotencyKey: "publish-one",
     inputHash: "publish-input"
   };
@@ -387,11 +397,17 @@ test("eligible publication is content addressed and idempotent", async () => {
   assert.equal(release.capabilityStateDigest, capabilityState);
   assert.match(release.contentHash, /^[0-9a-f]{64}$/);
   assert.match(release.sri, /^sha384-/);
+  assert.deepEqual({
+    artifactUrl: release.artifactUrl,
+    downloadUrl: release.downloadUrl,
+    localOnly: release.localOnly,
+  }, hostedArtifactIdentity(release.contentHash));
+  assert.ok(release.artifactUrl);
   assert.equal((await repository.getReleaseArtifact(release.contentHash)).code, "export const fixture = true;");
   const installationInput = {
     releaseId: release.id,
     pageUrl: "https://acme.example/account",
-    artifactUrl: `https://control.example/api/releases/${release.contentHash}.js`,
+    artifactUrl: release.artifactUrl,
     targetOrigin: release.allowedOrigin,
     artifactContentHash: release.contentHash,
     integrity: release.sri,
@@ -411,6 +427,34 @@ test("eligible publication is content addressed and idempotent", async () => {
     ...installationInput,
     idempotencyKey: "install-editor",
   }), (error: unknown) => error instanceof RepositoryError && error.code === "FORBIDDEN");
+  await assert.rejects(repository.saveReleaseInstallation(owner, project.id, {
+    ...installationInput,
+    artifactUrl: `https://unrelated.example/${release.contentHash}.js`,
+    idempotencyKey: "install-unrelated-artifact",
+    inputHash: "b".repeat(64),
+  }), (error: unknown) => error instanceof RepositoryError && error.code === "INVALID_STATE");
+  await assert.rejects(repository.saveReleaseInstallation(owner, project.id, {
+    ...installationInput,
+    csp: { hosted: "blocked" },
+    idempotencyKey: "install-contradictory-csp",
+    inputHash: "e".repeat(64),
+  }), (error: unknown) => error instanceof RepositoryError && error.code === "INVALID_STATE");
+  await assert.rejects(repository.publishRelease(owner, {
+    ...request,
+    artifactUrl: `https://unrelated.example/${release.contentHash}.js`,
+    downloadUrl: `https://unrelated.example/${release.contentHash}.js?download=page2webmcp-${release.contentHash}.js`,
+  }), (error: unknown) => error instanceof RepositoryError && error.code === "INVALID_STATE");
+  await assert.rejects(repository.publishRelease(owner, {
+    ...request,
+    capabilityStateDigest: "0".repeat(64),
+  }), (error: unknown) => error instanceof RepositoryError && error.code === "INVALID_STATE");
+  await assert.rejects(repository.publishRelease(owner, {
+    ...request,
+    ...hostedArtifactIdentity(release.contentHash),
+    artifactUrl: `https://unrelated.example/${release.contentHash}.js`,
+    downloadUrl: `https://unrelated.example/${release.contentHash}.js?download=page2webmcp-${release.contentHash}.js`,
+    idempotencyKey: "publish-other-artifact",
+  }), (error: unknown) => error instanceof RepositoryError && error.code === "INVALID_STATE");
   await assert.rejects(repository.saveVerification(owner, project.id, {
     ...verificationInput,
     candidate: releaseCandidate("export const changedAfterPublish = true;")
@@ -642,6 +686,7 @@ test("publication atomically rejects a stale capability-state verification", asy
       analysisRunId: run.id,
       capabilityStateDigest: staleDigest,
       candidateContentHash: verification.candidateContentHash,
+      ...hostedArtifactIdentity(verification.candidateContentHash),
       idempotencyKey: "stale-release",
       inputHash: "stale-release"
     }),
@@ -702,6 +747,7 @@ test("a blocked capability publishes reviewed bytes without mutating the worker 
     analysisRunId: run.id,
     capabilityStateDigest: digest,
     candidateContentHash: verification.candidateContentHash,
+    ...hostedArtifactIdentity(verification.candidateContentHash),
     idempotencyKey: "publish-reviewed-subset",
     inputHash: "publish-reviewed-subset"
   });
@@ -783,6 +829,7 @@ test("candidate hashes are validated and a later verification cannot be overwrit
     analysisRunId: run.id,
     capabilityStateDigest: digest,
     candidateContentHash: first.candidateContentHash,
+    ...hostedArtifactIdentity(first.candidateContentHash),
     idempotencyKey: "publish-old-candidate",
     inputHash: "publish-old-candidate"
   }), (error: unknown) => error instanceof RepositoryError
@@ -794,6 +841,7 @@ test("candidate hashes are validated and a later verification cannot be overwrit
     analysisRunId: run.id,
     capabilityStateDigest: digest,
     candidateContentHash: second.candidateContentHash,
+    ...hostedArtifactIdentity(second.candidateContentHash),
     idempotencyKey: "publish-new-candidate",
     inputHash: "publish-new-candidate"
   });
@@ -843,6 +891,7 @@ test("identical code remains attributable to each exact analysis run", async () 
       analysisRunId: run.id,
       capabilityStateDigest: digest,
       candidateContentHash: verification.candidateContentHash,
+      ...hostedArtifactIdentity(verification.candidateContentHash),
       idempotencyKey: `release-${index}`,
       inputHash: `release-${index}`
     }));

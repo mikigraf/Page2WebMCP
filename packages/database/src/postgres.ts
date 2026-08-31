@@ -11,7 +11,9 @@ import {
   normalizeAnalysisSourceTypes,
   parsePersistedSourceConfiguration,
   normalizeSourceConfiguration,
+  normalizeReleaseArtifactIdentity,
   normalizeReleaseInstallation,
+  persistedReleaseArtifactIdentity,
   releaseFailures,
   RepositoryError,
   type AnalysisResult,
@@ -1690,7 +1692,8 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
       }
       const published = await client.query(
         "select r.id, r.organization_id, r.project_id, r.analysis_run_id, r.capability_state_digest, " +
-        "r.content_hash, r.sri, r.code, r.allowed_origin, r.manifest, r.status, r.created_at " +
+        "r.content_hash, r.sri, r.code, r.allowed_origin, r.manifest, r.artifact_url, r.download_url, r.local_only, " +
+        "r.status, r.created_at " +
         "from public.releases r " +
         "where r.project_id = $1 and r.analysis_run_id = $2 limit 1",
         [projectId, run.id]
@@ -1738,6 +1741,7 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
 
   async publishRelease(actor: RepositoryActor, input: PublishRequest): Promise<ReleaseRecord> {
     if (actor.role !== "owner") throw new RepositoryError("FORBIDDEN");
+    const artifactIdentity = normalizeReleaseArtifactIdentity(input, input.candidateContentHash);
     return this.#transaction({ kind: "app", actor }, async (client) => {
       await this.#project(client, actor, input.projectId);
       const proposedId = randomUUID();
@@ -1796,19 +1800,19 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
       }
       const existing = await client.query(
         "select id, organization_id, project_id, analysis_run_id, capability_state_digest, content_hash, sri, code, allowed_origin, " +
-        "manifest, status, created_at from public.releases where project_id = $1 and analysis_run_id = $2 limit 1",
+        "manifest, artifact_url, download_url, local_only, status, created_at " +
+        "from public.releases where project_id = $1 and analysis_run_id = $2 limit 1",
         [input.projectId, input.analysisRunId]
       );
       if (existing.rows[0]) {
-        if (String(existing.rows[0].content_hash) !== input.candidateContentHash) {
-          throw new RepositoryError("RELEASE_GATE_FAILED", ["CANDIDATE_CHANGED"]);
-        }
+        const existingRelease = mapRelease(existing.rows[0]);
+        if (!releaseMatchesPublication(existingRelease, input)) throw new RepositoryError("INVALID_STATE");
         await client.query(
           "update private.idempotency_keys set result_id = $5 where organization_id = $1 and actor_id = $2 " +
           "and operation = 'release' and idempotency_key = $3 and input_hash = $4",
           [actor.organizationId, actor.id, input.idempotencyKey, input.inputHash, existing.rows[0].id]
         );
-        return mapRelease(existing.rows[0]);
+        return existingRelease;
       }
       const code = verifiedCandidate.code;
       const bytes = Buffer.from(code);
@@ -1820,12 +1824,15 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
       const sri = "sha384-" + createHash("sha384").update(bytes).digest("base64");
       const release = await client.query(
         "insert into public.releases " +
-        "(id, organization_id, project_id, analysis_run_id, capability_state_digest, content_hash, sri, code, allowed_origin, manifest, status) " +
-        "values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,'published') returning id, organization_id, project_id, " +
-        "analysis_run_id, capability_state_digest, content_hash, sri, code, allowed_origin, manifest, status, created_at",
+        "(id, organization_id, project_id, analysis_run_id, capability_state_digest, content_hash, sri, code, allowed_origin, " +
+        "manifest, artifact_url, download_url, local_only, status) " +
+        "values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11,$12,$13,'published') returning id, organization_id, project_id, " +
+        "analysis_run_id, capability_state_digest, content_hash, sri, code, allowed_origin, manifest, artifact_url, " +
+        "download_url, local_only, status, created_at",
         [proposedId, actor.organizationId, input.projectId, input.analysisRunId, input.capabilityStateDigest,
           contentHash, sri, code, verifiedCandidate.allowedOrigin,
-          JSON.stringify(verifiedCandidate.manifest ?? {})]
+          JSON.stringify(verifiedCandidate.manifest ?? {}), artifactIdentity.artifactUrl, artifactIdentity.downloadUrl,
+          artifactIdentity.localOnly]
       );
       await this.#audit(client, actor, "release.published", proposedId);
       return mapRelease(release.rows[0]);
@@ -1835,21 +1842,23 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
   async #releaseById(db: Db, actor: RepositoryActor, input: PublishRequest, id: string): Promise<ReleaseRecord> {
     const result = await db.query(
       "select id, organization_id, project_id, analysis_run_id, capability_state_digest, content_hash, sri, code, allowed_origin, " +
-      "manifest, status, created_at from public.releases where id = $1 and organization_id = $2 " +
+      "manifest, artifact_url, download_url, local_only, status, created_at " +
+      "from public.releases where id = $1 and organization_id = $2 " +
       "and project_id = $3 and analysis_run_id = $4 limit 1",
       [id, actor.organizationId, input.projectId, input.analysisRunId]
     );
-    if (!result.rows[0] || String(result.rows[0].content_hash) !== input.candidateContentHash) {
-      throw new RepositoryError("INVALID_STATE");
-    }
-    return mapRelease(result.rows[0]);
+    if (!result.rows[0]) throw new RepositoryError("INVALID_STATE");
+    const release = mapRelease(result.rows[0]);
+    if (!releaseMatchesPublication(release, input)) throw new RepositoryError("INVALID_STATE");
+    return release;
   }
 
   async getReleaseArtifact(contentHash: string): Promise<ReleaseRecord> {
     return this.#transaction({ kind: "artifact" }, async (client) => {
       const result = await client.query(
         "select id, organization_id, project_id, analysis_run_id, capability_state_digest, content_hash, sri, code, allowed_origin, " +
-        "manifest, status, created_at from public.releases where content_hash = $1 and status = 'published' " +
+        "manifest, artifact_url, download_url, local_only, status, created_at " +
+        "from public.releases where content_hash = $1 and status = 'published' " +
         "order by created_at, id limit 1",
         [contentHash]
       );
@@ -1863,7 +1872,7 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
       await this.#project(client, actor, projectId);
       const result = await client.query(
         "select id, organization_id, project_id, analysis_run_id, capability_state_digest, content_hash, sri, code, " +
-        "allowed_origin, manifest, status, created_at from public.releases " +
+        "allowed_origin, manifest, artifact_url, download_url, local_only, status, created_at from public.releases " +
         "where id = $1 and project_id = $2 and organization_id = $3 limit 1",
         [releaseId, projectId, actor.organizationId]
       );
@@ -1886,7 +1895,8 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
       if (!current.rows[0]) throw new RepositoryError("NOT_FOUND");
       const result = await client.query(
         "select id, organization_id, project_id, analysis_run_id, capability_state_digest, content_hash, sri, code, " +
-        "allowed_origin, manifest, status, created_at from public.releases where project_id = $1 and organization_id = $2 " +
+        "allowed_origin, manifest, artifact_url, download_url, local_only, status, created_at " +
+        "from public.releases where project_id = $1 and organization_id = $2 " +
         "and (created_at, id) < ($3::timestamptz, $4::uuid) order by created_at desc, id desc limit 1",
         [projectId, actor.organizationId, current.rows[0].created_at, releaseId]
       );
@@ -1904,7 +1914,7 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
       await this.#project(client, actor, projectId);
       const releaseResult = await client.query(
         "select id, organization_id, project_id, analysis_run_id, capability_state_digest, content_hash, sri, code, " +
-        "allowed_origin, manifest, status, created_at from public.releases " +
+        "allowed_origin, manifest, artifact_url, download_url, local_only, status, created_at from public.releases " +
         "where id = $1 and project_id = $2 and organization_id = $3 limit 1 for share",
         [input.releaseId, projectId, actor.organizationId]
       );
@@ -1931,7 +1941,7 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
         "webmcp_implementation, attestation, idempotency_key, input_hash, verified_at) " +
         "values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12,$13,$14,$15,$16,$17::jsonb,$18,$19," +
         "case when $12 = 'verified' then now() else null end) " +
-        "on conflict (organization_id, project_id, release_id) do nothing " +
+        "on conflict (organization_id, actor_id, idempotency_key) do nothing " +
         "returning id, organization_id, project_id, release_id, actor_id, page_url, artifact_url, self_hosted_url, " +
         "target_origin, artifact_content_hash, integrity, expected_tools, status, delivery, csp_status, csp_directive, " +
         "webmcp_implementation, attestation, idempotency_key, input_hash, created_at, verified_at",
@@ -1946,11 +1956,12 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
         "select id, organization_id, project_id, release_id, actor_id, page_url, artifact_url, self_hosted_url, " +
         "target_origin, artifact_content_hash, integrity, expected_tools, status, delivery, csp_status, csp_directive, " +
         "webmcp_implementation, attestation, idempotency_key, input_hash, created_at, verified_at " +
-        "from public.release_installations where organization_id = $1 and project_id = $2 and release_id = $3 limit 1",
-        [actor.organizationId, projectId, input.releaseId]
+        "from public.release_installations where organization_id = $1 and actor_id = $2 and idempotency_key = $3 limit 1",
+        [actor.organizationId, actor.id, input.idempotencyKey]
       );
       const record = existing.rows[0] ? mapReleaseInstallation(existing.rows[0]) : undefined;
-      if (!record || record.inputHash !== input.inputHash || record.idempotencyKey !== input.idempotencyKey) {
+      if (!record || record.projectId !== projectId || record.releaseId !== input.releaseId
+        || record.inputHash !== input.inputHash) {
         throw new RepositoryError("IDEMPOTENCY_CONFLICT");
       }
       return record;
@@ -2209,11 +2220,41 @@ function mapVerificationCandidate(row: QueryResultRow): CandidateRelease {
 }
 
 function mapRelease(row: QueryResultRow): ReleaseRecord {
-  return { id: String(row.id), organizationId: String(row.organization_id), projectId: String(row.project_id),
+  const release = { id: String(row.id), organizationId: String(row.organization_id), projectId: String(row.project_id),
     analysisRunId: String(row.analysis_run_id), capabilityStateDigest: String(row.capability_state_digest),
     contentHash: String(row.content_hash), sri: String(row.sri),
     code: String(row.code), allowedOrigin: String(row.allowed_origin), manifest: row.manifest,
-    status: "published", createdAt: iso(row.created_at) };
+    status: "published" as const, createdAt: iso(row.created_at) };
+  const values = [row.artifact_url, row.download_url, row.local_only];
+  if (values.every((value) => value === null || value === undefined)) return release;
+  if (values.some((value) => value === null || value === undefined) || typeof row.local_only !== "boolean") {
+    throw new RepositoryError("INVALID_STATE");
+  }
+  return {
+    ...release,
+    ...normalizeReleaseArtifactIdentity({
+      artifactUrl: String(row.artifact_url),
+      downloadUrl: String(row.download_url),
+      localOnly: row.local_only,
+    }, release.contentHash),
+  };
+}
+
+function releaseMatchesPublication(release: ReleaseRecord, input: PublishRequest): boolean {
+  let artifactIdentity: ReturnType<typeof persistedReleaseArtifactIdentity>;
+  try {
+    artifactIdentity = persistedReleaseArtifactIdentity(release);
+  } catch {
+    return false;
+  }
+  return release.projectId === input.projectId
+    && release.analysisRunId === input.analysisRunId
+    && release.capabilityStateDigest === input.capabilityStateDigest
+    && release.contentHash === input.candidateContentHash
+    && artifactIdentity !== undefined
+    && artifactIdentity.artifactUrl === input.artifactUrl
+    && artifactIdentity.downloadUrl === input.downloadUrl
+    && artifactIdentity.localOnly === input.localOnly;
 }
 
 function candidateMatches(candidate: CandidateRelease, stored: CandidateRelease): boolean {

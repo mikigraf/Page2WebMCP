@@ -14,6 +14,23 @@ import {
 const release = compileWebMcpRelease(acmeCapabilityPlans("https://acme.example")
   .filter((plan) => plan.tool.name !== "get_order_status"));
 const expectedTools = ["create_support_ticket", "find_order"];
+const artifactUrl = `https://bimqgiedckdurqiywctl.supabase.co/storage/v1/object/public/page2webmcp-releases/${release.contentHash}.js`;
+const downloadUrl = `${artifactUrl}?download=page2webmcp-${release.contentHash}.js`;
+
+function installedInput(overrides: Record<string, unknown> = {}) {
+  return {
+    pageUrl: "https://acme.example/account",
+    artifactUrl,
+    downloadUrl,
+    localOnly: false,
+    contentHash: release.contentHash,
+    integrity: release.integrity,
+    manifest: release.manifest,
+    targetOrigin: release.allowedOrigin,
+    expectedTools,
+    ...overrides,
+  };
+}
 
 function report(overrides: Partial<CandidateVerificationReport> = {}): CandidateVerificationReport {
   return {
@@ -117,6 +134,11 @@ test("installed verification proves a normal unintercepted native WebMCP page lo
     mode: "hermetic",
     verifyCandidate: async () => { throw new Error("UNUSED"); },
     verifyInstalled: async (input) => ({
+      observedArtifactUrl: input.artifactUrl,
+      observedDownloadUrl: input.downloadUrl,
+      observedLocalOnly: input.localOnly,
+      observedIntegrity: input.integrity,
+      executedArtifactUrl: input.artifactUrl,
       servedContentHash: input.contentHash,
       executedContentHash: input.contentHash,
       observedTargetOrigin: input.targetOrigin,
@@ -130,25 +152,40 @@ test("installed verification proves a normal unintercepted native WebMCP page lo
       csp: { hosted: "allowed" },
     }),
   };
-  const attestation = await attestReleaseInstallation({
-    pageUrl: "https://acme.example/account",
-    artifactUrl: `https://control.example/api/releases/${release.contentHash}.js`,
-    contentHash: release.contentHash,
-    integrity: release.integrity,
-    manifest: release.manifest,
-    targetOrigin: release.allowedOrigin,
-    expectedTools,
-  }, port, new AbortController().signal);
+  const attestation = await attestReleaseInstallation(installedInput(), port, new AbortController().signal);
   assert.deepEqual(attestation, {
     status: "verified",
     delivery: "hosted",
     csp: { hosted: "allowed" },
     webMcpImplementation: "native",
+    report: {
+      observedArtifactUrl: artifactUrl,
+      observedDownloadUrl: downloadUrl,
+      observedLocalOnly: false,
+      observedIntegrity: release.integrity,
+      executedArtifactUrl: artifactUrl,
+      servedContentHash: release.contentHash,
+      executedContentHash: release.contentHash,
+      observedTargetOrigin: release.allowedOrigin,
+      registeredTools: expectedTools,
+      webMcpImplementation: "native",
+      normalPageLoad: true,
+      routeInterception: false,
+      injectedRegistration: false,
+      syntheticHarness: false,
+      duplicateLoadHarmless: true,
+      csp: { hosted: "allowed" },
+    },
   });
 });
 
 test("installed verification rejects interception, injection, synthetic/shim success, wrong hashes, and harmful duplicates", async (context) => {
   const base = {
+    observedArtifactUrl: artifactUrl,
+    observedDownloadUrl: downloadUrl,
+    observedLocalOnly: false,
+    observedIntegrity: release.integrity,
+    executedArtifactUrl: artifactUrl,
     servedContentHash: release.contentHash,
     executedContentHash: release.contentHash,
     observedTargetOrigin: release.allowedOrigin,
@@ -164,6 +201,11 @@ test("installed verification rejects interception, injection, synthetic/shim suc
   const cases = [
     ["wrong served hash", { servedContentHash: "0".repeat(64) }],
     ["wrong executed hash", { executedContentHash: "0".repeat(64) }],
+    ["wrong artifact URL", { observedArtifactUrl: `https://unrelated.example/${release.contentHash}.js` }],
+    ["wrong download URL", { observedDownloadUrl: `${artifactUrl}?download=wrong.js` }],
+    ["wrong locality", { observedLocalOnly: true }],
+    ["wrong integrity", { observedIntegrity: "sha384-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" }],
+    ["wrong executed URL", { executedArtifactUrl: `https://unrelated.example/${release.contentHash}.js` }],
     ["route interception", { routeInterception: true }],
     ["registration injection", { injectedRegistration: true }],
     ["synthetic harness", { syntheticHarness: true }],
@@ -177,15 +219,8 @@ test("installed verification rejects interception, injection, synthetic/shim suc
         verifyCandidate: async () => { throw new Error("UNUSED"); },
         verifyInstalled: async () => ({ ...base, ...overrides }),
       };
-      await assert.rejects(attestReleaseInstallation({
-        pageUrl: "https://acme.example/account",
-        artifactUrl: `https://control.example/api/releases/${release.contentHash}.js`,
-        contentHash: release.contentHash,
-        integrity: release.integrity,
-        manifest: release.manifest,
-        targetOrigin: release.allowedOrigin,
-        expectedTools,
-      }, port, new AbortController().signal), /INSTALLED_VERIFICATION_INVALID|WEBMCP_NATIVE_REQUIRED/);
+      await assert.rejects(attestReleaseInstallation(installedInput(), port, new AbortController().signal),
+        /INSTALLED_VERIFICATION_INVALID|WEBMCP_NATIVE_REQUIRED/);
     });
   }
 });
@@ -195,32 +230,137 @@ test("CSP blocked hosted delivery remains uninstalled and requires exact-hash se
     mode: "hermetic",
     verifyCandidate: async () => { throw new Error("UNUSED"); },
     verifyInstalled: async (input) => ({
+      observedArtifactUrl: input.artifactUrl,
+      observedDownloadUrl: input.downloadUrl,
+      observedLocalOnly: input.localOnly,
+      observedIntegrity: input.integrity,
+      executedArtifactUrl: null,
       servedContentHash: input.contentHash,
-      executedContentHash: input.contentHash,
+      executedContentHash: null,
       observedTargetOrigin: input.targetOrigin,
-      registeredTools: [...input.expectedTools],
+      registeredTools: [],
       webMcpImplementation: "native",
       normalPageLoad: true,
       routeInterception: false,
       injectedRegistration: false,
       syntheticHarness: false,
-      duplicateLoadHarmless: true,
+      duplicateLoadHarmless: null,
       csp: { hosted: "blocked", directive: "script-src 'self'" },
     }),
   };
-  const attestation = await attestReleaseInstallation({
-    pageUrl: "https://acme.example/account",
-    artifactUrl: `https://control.example/api/releases/${release.contentHash}.js`,
-    contentHash: release.contentHash,
-    integrity: release.integrity,
-    manifest: release.manifest,
-    targetOrigin: release.allowedOrigin,
-    expectedTools,
-  }, port, new AbortController().signal);
+  const attestation = await attestReleaseInstallation(installedInput(), port, new AbortController().signal);
   assert.deepEqual(attestation, {
     status: "pending_self_host",
     delivery: "hosted",
     csp: { hosted: "blocked", directive: "script-src 'self'" },
     webMcpImplementation: "native",
+    report: {
+      observedArtifactUrl: artifactUrl,
+      observedDownloadUrl: downloadUrl,
+      observedLocalOnly: false,
+      observedIntegrity: release.integrity,
+      executedArtifactUrl: null,
+      servedContentHash: release.contentHash,
+      executedContentHash: null,
+      observedTargetOrigin: release.allowedOrigin,
+      registeredTools: [],
+      webMcpImplementation: "native",
+      normalPageLoad: true,
+      routeInterception: false,
+      injectedRegistration: false,
+      syntheticHarness: false,
+      duplicateLoadHarmless: null,
+      csp: { hosted: "blocked", directive: "script-src 'self'" },
+    },
   });
+
+  const impossibleExecution: ReleaseVerificationPort = {
+    ...port,
+    verifyInstalled: async (input) => ({
+      ...await port.verifyInstalled(input, new AbortController().signal),
+      executedArtifactUrl: input.artifactUrl,
+      executedContentHash: input.contentHash,
+      registeredTools: [...input.expectedTools],
+    }),
+  };
+  await assert.rejects(attestReleaseInstallation(installedInput(), impossibleExecution,
+    new AbortController().signal), /INSTALLED_VERIFICATION_INVALID/);
+});
+
+test("local artifact verification is hermetic-only and bound to the canonical Docker identity", async () => {
+  const localArtifactUrl = `http://127.0.0.1:54321/storage/v1/object/public/page2webmcp-releases/${release.contentHash}.js`;
+  const localDownloadUrl = `${localArtifactUrl}?download=page2webmcp-${release.contentHash}.js`;
+  const report = {
+    observedArtifactUrl: localArtifactUrl,
+    observedDownloadUrl: localDownloadUrl,
+    observedLocalOnly: true,
+    observedIntegrity: release.integrity,
+    executedArtifactUrl: localArtifactUrl,
+    servedContentHash: release.contentHash,
+    executedContentHash: release.contentHash,
+    observedTargetOrigin: release.allowedOrigin,
+    registeredTools: expectedTools,
+    webMcpImplementation: "native" as const,
+    normalPageLoad: true,
+    routeInterception: false,
+    injectedRegistration: false,
+    syntheticHarness: false,
+    duplicateLoadHarmless: true,
+    csp: { hosted: "allowed" as const },
+  };
+  const hermetic: ReleaseVerificationPort = {
+    mode: "hermetic",
+    verifyCandidate: async () => { throw new Error("UNUSED"); },
+    verifyInstalled: async () => report,
+  };
+  const localInput = installedInput({ artifactUrl: localArtifactUrl, downloadUrl: localDownloadUrl, localOnly: true });
+  assert.equal((await attestReleaseInstallation(localInput, hermetic, new AbortController().signal)).status, "verified");
+
+  const live: ReleaseVerificationPort = { ...hermetic, mode: "live" };
+  await assert.rejects(attestReleaseInstallation(localInput, live, new AbortController().signal),
+    /INSTALLED_VERIFICATION_INVALID/);
+});
+
+test("self-host verification preserves canonical Storage identity and separately proves the executed URL", async (context) => {
+  const selfHostedUrl = `https://acme.example/assets/${release.contentHash}.js`;
+  const baseReport = {
+    observedArtifactUrl: artifactUrl,
+    observedDownloadUrl: downloadUrl,
+    observedLocalOnly: false,
+    observedIntegrity: release.integrity,
+    executedArtifactUrl: selfHostedUrl,
+    servedContentHash: release.contentHash,
+    executedContentHash: release.contentHash,
+    observedTargetOrigin: release.allowedOrigin,
+    registeredTools: expectedTools,
+    webMcpImplementation: "native" as const,
+    normalPageLoad: true,
+    routeInterception: false,
+    injectedRegistration: false,
+    syntheticHarness: false,
+    duplicateLoadHarmless: true,
+    csp: { hosted: "blocked" as const, directive: "script-src 'self'" },
+  };
+  const input = installedInput({ selfHostedUrl });
+  const port = (report: typeof baseReport): ReleaseVerificationPort => ({
+    mode: "hermetic",
+    verifyCandidate: async () => { throw new Error("UNUSED"); },
+    verifyInstalled: async () => report,
+  });
+  const attestation = await attestReleaseInstallation(input, port(baseReport), new AbortController().signal);
+  assert.equal(attestation.delivery, "self_hosted");
+  assert.equal(attestation.report.observedArtifactUrl, artifactUrl);
+  assert.equal(attestation.report.executedArtifactUrl, selfHostedUrl);
+
+  const cases = [
+    ["canonical replaced by self-host", { observedArtifactUrl: selfHostedUrl }],
+    ["canonical executed instead", { executedArtifactUrl: artifactUrl }],
+    ["unrelated URL executed", { executedArtifactUrl: `https://acme.example/assets/${"0".repeat(64)}.js` }],
+  ] as const;
+  for (const [name, override] of cases) {
+    await context.test(name, async () => {
+      await assert.rejects(attestReleaseInstallation(input, port({ ...baseReport, ...override }),
+        new AbortController().signal), /INSTALLED_VERIFICATION_INVALID/);
+    });
+  }
 });

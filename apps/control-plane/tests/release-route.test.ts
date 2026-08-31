@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import test from "node:test";
 import { POST as verify } from "../app/api/capabilities/verify/route.ts";
 import { GET as getArtifact } from "../app/api/releases/[artifact]/route.ts";
+import { POST as publishCompatibility } from "../app/api/releases/publish/route.ts";
 import { POST as publish } from "../app/api/projects/[projectId]/releases/route.ts";
 import { POST as verifyInstallation } from "../app/api/projects/[projectId]/releases/[releaseId]/installation/route.ts";
 import { compileWebMcpRelease } from "../../../packages/compiler/src/compiler.ts";
@@ -10,17 +11,70 @@ import { acmeCapabilityEvidence, acmeCapabilityPlans } from "../../acme-support/
 import {
   InMemoryControlPlaneRepository,
   type AnalysisResult,
+  type PublishRequest,
+  type ReleaseRecord,
   type RepositoryActor,
   type VerificationRecord,
   type VerificationRequest
 } from "../../../packages/database/src/control-plane.ts";
+import {
+  setReleaseArtifactStoreForTest,
+  type ReleaseArtifactPublication,
+  type ReleaseArtifactStore,
+} from "../src/artifact-storage.ts";
 import { deriveVerification } from "../src/releases.ts";
 import {
   REQUIRED_CANDIDATE_CHECKS,
   setReleaseVerificationPortForTest,
+  type InstalledVerificationInput,
+  type InstalledVerificationReport,
   type ReleaseVerificationPort,
 } from "../src/release-verification.ts";
 import { authenticatedHeaders, editor, installTestRepository, owner } from "./auth-test-helpers.ts";
+
+const HOSTED_ARTIFACT_PREFIX =
+  "https://bimqgiedckdurqiywctl.supabase.co/storage/v1/object/public/page2webmcp-releases";
+const LOCAL_ARTIFACT_PREFIX =
+  "http://127.0.0.1:54321/storage/v1/object/public/page2webmcp-releases";
+
+function artifactPublication(
+  input: Readonly<{ contentHash: string; integrity: string }>,
+  localOnly = false,
+): ReleaseArtifactPublication {
+  const artifactUrl = `${localOnly ? LOCAL_ARTIFACT_PREFIX : HOSTED_ARTIFACT_PREFIX}/${input.contentHash}.js`;
+  return {
+    artifactUrl,
+    downloadUrl: `${artifactUrl}?download=page2webmcp-${input.contentHash}.js`,
+    contentHash: input.contentHash,
+    integrity: input.integrity,
+    localOnly,
+  };
+}
+
+function exactInstalledReport(
+  input: InstalledVerificationInput,
+  overrides: Partial<InstalledVerificationReport> = {},
+): InstalledVerificationReport {
+  return {
+    observedArtifactUrl: input.artifactUrl,
+    observedDownloadUrl: input.downloadUrl,
+    observedLocalOnly: input.localOnly,
+    observedIntegrity: input.integrity,
+    executedArtifactUrl: input.selfHostedUrl ?? input.artifactUrl,
+    servedContentHash: input.contentHash,
+    executedContentHash: input.contentHash,
+    observedTargetOrigin: input.targetOrigin,
+    registeredTools: [...input.expectedTools],
+    webMcpImplementation: "native",
+    normalPageLoad: true,
+    routeInterception: false,
+    injectedRegistration: false,
+    syntheticHarness: false,
+    duplicateLoadHarmless: true,
+    csp: { hosted: "allowed" },
+    ...overrides,
+  };
+}
 
 async function fixture(
   repository: InMemoryControlPlaneRepository,
@@ -32,7 +86,7 @@ async function fixture(
   const project = await repository.createProject(owner, {
     name: "Acme",
     sourceType: "website",
-    url: "https://acme.example/",
+    url: "https://acme.example",
     idempotencyKey: "release-project",
     inputHash: "release-project"
   });
@@ -56,6 +110,79 @@ async function fixture(
     }
   });
   return { project, run, candidate };
+}
+
+async function openApiFixture(repository: InMemoryControlPlaneRepository) {
+  const targetOrigin = "https://support.example";
+  const plans = acmeCapabilityPlans(targetOrigin)
+    .filter((plan) => plan.tool.name !== "get_order_status");
+  const candidate = compileWebMcpRelease(plans);
+  const project = await repository.createProject(owner, {
+    name: "Independent support API",
+    sourceType: "openapi",
+    url: "https://specs.example/openapi.yaml",
+    sourceConfiguration: {
+      kind: "openapi",
+      targetOrigin,
+      testPageUrl: `${targetOrigin}/webmcp-test`,
+      environment: "test",
+    },
+    idempotencyKey: "openapi-release-project",
+    inputHash: "openapi-release-project",
+  });
+  const run = await repository.enqueueAnalysis(owner, {
+    projectId: project.id,
+    idempotencyKey: "openapi-release-analysis",
+    inputHash: "openapi-release-analysis",
+  });
+  await repository.claimAnalysis("worker", 60_000);
+  await repository.completeAnalysis("worker", run.id, {
+    capabilities: plans.map((plan) => ({ plan, status: "proposed" as const })),
+    diagnostics: [],
+    evidence: acmeCapabilityEvidence()
+      .filter(({ reference }) => reference !== acmeCapabilityPlans(targetOrigin)[1]!.evidence[0]!.reference),
+    release: {
+      code: candidate.code,
+      contentHash: candidate.contentHash,
+      allowedOrigin: targetOrigin,
+      manifest: candidate.manifest,
+    },
+  });
+  await approveTicket(repository, project.id);
+  return { project, run, candidate, targetOrigin };
+}
+
+async function nextWebsiteAnalysis(
+  repository: InMemoryControlPlaneRepository,
+  projectId: string,
+  suffix: string,
+) {
+  const plans = acmeCapabilityPlans("https://acme.example")
+    .filter((plan) => plan.tool.name !== "get_order_status");
+  const candidate = compileWebMcpRelease(plans);
+  const run = await repository.enqueueAnalysis(owner, {
+    projectId,
+    idempotencyKey: `release-analysis-${suffix}`,
+    inputHash: `release-analysis-${suffix}`,
+  });
+  await repository.claimAnalysis("worker", 60_000);
+  await repository.completeAnalysis("worker", run.id, {
+    capabilities: plans.map((plan) => ({ plan, status: "proposed" as const })),
+    diagnostics: [],
+    evidence: acmeCapabilityEvidence()
+      .filter(({ reference }) => reference !== acmeCapabilityPlans("https://acme.example")[1]!.evidence[0]!.reference),
+    release: {
+      code: candidate.code,
+      contentHash: candidate.contentHash,
+      allowedOrigin: "https://acme.example",
+      manifest: candidate.manifest,
+    },
+  });
+  const ticket = (await repository.listAnalysisCapabilities(owner, run.id))
+    .find((item) => item.stableName === "create_support_ticket");
+  assert.ok(ticket);
+  await repository.reviewCapability(owner, ticket.id, { action: "approve", expectedVersion: ticket.version });
+  return { run, candidate };
 }
 
 test("verification binds the reviewed complete plan, not a same-name shallow capability", () => {
@@ -184,6 +311,48 @@ class CapabilityChangeAfterVerificationRepository extends InMemoryControlPlaneRe
   }
 }
 
+class OrderedPublicationRepository extends InMemoryControlPlaneRepository {
+  readonly events: string[] = [];
+
+  override async saveVerification(
+    actor: RepositoryActor,
+    projectId: string,
+    input: VerificationRequest,
+  ): Promise<VerificationRecord> {
+    const verification = await super.saveVerification(actor, projectId, input);
+    this.events.push("verification");
+    return verification;
+  }
+
+  override async publishRelease(actor: RepositoryActor, input: PublishRequest): Promise<ReleaseRecord> {
+    this.events.push("database");
+    return super.publishRelease(actor, input);
+  }
+}
+
+class FailFirstPublicationRepository extends InMemoryControlPlaneRepository {
+  attempts = 0;
+
+  override async publishRelease(actor: RepositoryActor, input: PublishRequest): Promise<ReleaseRecord> {
+    this.attempts += 1;
+    if (this.attempts === 1) throw new Error("SIMULATED_DATABASE_FAILURE");
+    return super.publishRelease(actor, input);
+  }
+}
+
+class CorruptPublicationReturnRepository extends InMemoryControlPlaneRepository {
+  override async publishRelease(actor: RepositoryActor, input: PublishRequest): Promise<ReleaseRecord> {
+    const release = await super.publishRelease(actor, input);
+    return {
+      ...release,
+      capabilityStateDigest: "0".repeat(64),
+      code: `${release.code}\n// corrupt return`,
+      sri: "sha384-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      manifest: { ...(release.manifest as Record<string, unknown>), releaseId: "0".repeat(64) },
+    };
+  }
+}
+
 function request(projectId: string, runId: string, key: string, actor = owner, extra: Record<string, unknown> = {}): Request {
   return new Request(`https://control.example/api/projects/${projectId}/releases`, {
     method: "POST",
@@ -204,6 +373,18 @@ function verificationRequest(projectId: string, runId: string): Request {
       "content-type": "application/json"
     },
     body: JSON.stringify({ projectId, analysisRunId: runId })
+  });
+}
+
+function compatibilityRequest(projectId: string, runId: string, key: string): Request {
+  return new Request("https://control.example/api/releases/publish", {
+    method: "POST",
+    headers: {
+      ...authenticatedHeaders(owner),
+      "content-type": "application/json",
+      "idempotency-key": key,
+    },
+    body: JSON.stringify({ projectId, analysisRunId: runId }),
   });
 }
 
@@ -365,16 +546,18 @@ test("publication derives verification from persisted state and requires R1 revi
   assert.equal(published.status, 201);
   const body = await published.json();
   assert.equal(body.release.status, "published");
-  assert.match(body.release.url, /^\/api\/releases\/[0-9a-f]{64}\.js$/);
+  assert.equal(body.release.url, `${HOSTED_ARTIFACT_PREFIX}/${body.release.contentHash}.js`);
   assert.match(body.release.sri, /^sha384-/);
   assert.deepEqual(body.release.installation, {
-    artifactUrl: `https://control.example${body.release.url}`,
-    downloadUrl: `https://control.example${body.release.url}?download=1`,
-    moduleScriptTag: `<script type="module" src="https://control.example${body.release.url}" integrity="${body.release.sri}" crossorigin="anonymous"></script>`,
+    artifactUrl: body.release.url,
+    downloadUrl: `${body.release.url}?download=page2webmcp-${body.release.contentHash}.js`,
+    moduleScriptTag: `<script type="module" src="${body.release.url}" integrity="${body.release.sri}" crossorigin="anonymous"></script>`,
     manifest: body.release.manifest,
     integrity: body.release.sri,
     contentHash: body.release.contentHash,
     targetOrigin: "https://acme.example",
+    verificationPageUrl: "https://acme.example/",
+    localOnly: false,
     compatibility: { moduleScripts: true, webMcp: "native-current-required" },
     csp: { hosted: "allowed" },
     selfHost: {
@@ -390,6 +573,251 @@ test("publication derives verification from persisted state and requires R1 revi
     { params: Promise.resolve({ projectId: project.id }) }
   );
   assert.equal((await duplicate.json()).release.id, body.release.id);
+});
+
+test("publication persists verification before uploading the exact candidate and then records Storage identity", async () => {
+  const repository = new OrderedPublicationRepository();
+  installTestRepository(repository);
+  const { project, run, candidate } = await fixture(repository);
+  await approveTicket(repository, project.id);
+  let uploaded: Parameters<ReleaseArtifactStore["publish"]>[0] | undefined;
+  setReleaseArtifactStoreForTest({
+    publish: async (input) => {
+      repository.events.push("storage");
+      uploaded = input;
+      return artifactPublication(input);
+    },
+  });
+
+  const response = await publish(
+    request(project.id, run.id, "publish-storage-order"),
+    { params: Promise.resolve({ projectId: project.id }) },
+  );
+  assert.equal(response.status, 201, JSON.stringify(await response.clone().json()));
+  const release = (await response.json()).release;
+  assert.deepEqual(repository.events, ["verification", "storage", "database"]);
+  assert.equal(uploaded?.code, candidate.code);
+  assert.equal(uploaded?.contentHash, candidate.contentHash);
+  assert.equal(uploaded?.targetOrigin, "https://acme.example");
+  const expectedPublication = artifactPublication(candidate);
+  assert.deepEqual({
+    artifactUrl: release.artifactUrl,
+    downloadUrl: release.downloadUrl,
+    localOnly: release.localOnly,
+  }, {
+    artifactUrl: expectedPublication.artifactUrl,
+    downloadUrl: expectedPublication.downloadUrl,
+    localOnly: expectedPublication.localOnly,
+  });
+});
+
+test("publication never uploads an ineligible candidate", async () => {
+  const repository = new InMemoryControlPlaneRepository();
+  installTestRepository(repository);
+  const { project, run } = await fixture(repository);
+  await approveTicket(repository, project.id);
+  let uploads = 0;
+  setReleaseArtifactStoreForTest({
+    publish: async () => {
+      uploads += 1;
+      throw new Error("INELIGIBLE_UPLOAD");
+    },
+  });
+  setReleaseVerificationPortForTest({
+    mode: "hermetic",
+    verifyCandidate: async (input) => ({
+      observedContentHash: input.contentHash,
+      observedIntegrity: input.integrity,
+      observedReleaseId: input.manifest.releaseId,
+      observedTargetOrigin: input.targetOrigin,
+      registeredTools: [...input.expectedTools],
+      trustedLoader: { enforcedBeforeEvaluation: true, evaluatedContentHash: input.contentHash },
+      controlPlaneRequestsDuringExecution: 0,
+      modelRequestsDuringExecution: 0,
+      checks: REQUIRED_CANDIDATE_CHECKS.map((name) => name === "final_state"
+        ? { name, status: "failed" as const, code: "WRONG_STATE" as const }
+        : { name, status: "passed" as const }),
+      csp: { hosted: "allowed" },
+    }),
+    verifyInstalled: async () => { throw new Error("UNUSED"); },
+  });
+
+  const response = await publish(
+    request(project.id, run.id, "publish-ineligible-storage"),
+    { params: Promise.resolve({ projectId: project.id }) },
+  );
+  assert.equal(response.status, 409);
+  assert.equal(uploads, 0);
+});
+
+test("Storage failure or returned identity mismatch creates no release", async (context) => {
+  for (const [name, store] of [
+    ["upload failure", {
+      publish: async () => { throw new Error("RELEASE_ARTIFACT_UPLOAD_FAILED"); },
+    }],
+    ["identity mismatch", {
+      publish: async (input: Parameters<ReleaseArtifactStore["publish"]>[0]) => ({
+        ...artifactPublication(input),
+        integrity: "sha384-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      }),
+    }],
+  ] satisfies Array<[string, ReleaseArtifactStore]>) {
+    await context.test(name, async () => {
+      const repository = new InMemoryControlPlaneRepository();
+      installTestRepository(repository);
+      const { project, run, candidate } = await fixture(repository);
+      await approveTicket(repository, project.id);
+      setReleaseArtifactStoreForTest(store);
+      const response = await publish(
+        request(project.id, run.id, `publish-storage-${name.replace(" ", "-")}`),
+        { params: Promise.resolve({ projectId: project.id }) },
+      );
+      assert.equal(response.status, 500);
+      await assert.rejects(repository.getReleaseArtifact(candidate.contentHash), { code: "NOT_FOUND" });
+    });
+  }
+});
+
+test("an immutable Storage orphan is reconciled on DB retry and concurrent same-run publishes converge", async () => {
+  const repository = new FailFirstPublicationRepository();
+  installTestRepository(repository);
+  const { project, run, candidate } = await fixture(repository);
+  await approveTicket(repository, project.id);
+  let uploads = 0;
+  setReleaseArtifactStoreForTest({
+    publish: async (input) => {
+      uploads += 1;
+      return artifactPublication(input);
+    },
+  });
+
+  const failed = await publish(
+    request(project.id, run.id, "publish-orphan-retry"),
+    { params: Promise.resolve({ projectId: project.id }) },
+  );
+  assert.equal(failed.status, 500);
+  await assert.rejects(repository.getReleaseArtifact(candidate.contentHash), { code: "NOT_FOUND" });
+  const recovered = await publish(
+    request(project.id, run.id, "publish-orphan-retry"),
+    { params: Promise.resolve({ projectId: project.id }) },
+  );
+  assert.equal(recovered.status, 201, JSON.stringify(await recovered.clone().json()));
+  assert.equal(uploads, 2);
+
+  const [first, second] = await Promise.all([
+    publish(request(project.id, run.id, "publish-concurrent-first"),
+      { params: Promise.resolve({ projectId: project.id }) }),
+    publish(request(project.id, run.id, "publish-concurrent-second"),
+      { params: Promise.resolve({ projectId: project.id }) }),
+  ]);
+  assert.equal(first.status, 201);
+  assert.equal(second.status, 201);
+  assert.equal((await first.json()).release.id, (await second.json()).release.id);
+});
+
+test("publication rejects a repository return that diverges from the exact verified candidate", async () => {
+  const repository = new CorruptPublicationReturnRepository();
+  installTestRepository(repository);
+  const { project, run } = await fixture(repository);
+  await approveTicket(repository, project.id);
+  const response = await publish(
+    request(project.id, run.id, "publish-corrupt-repository-return"),
+    { params: Promise.resolve({ projectId: project.id }) },
+  );
+  assert.equal(response.status, 409);
+  assert.equal((await response.json()).error.code, "INVALID_STATE");
+});
+
+test("both publication routes use Storage and OpenAPI binds its immutable snapshot target", async () => {
+  const repository = new InMemoryControlPlaneRepository();
+  installTestRepository(repository);
+  const { project, run, targetOrigin } = await openApiFixture(repository);
+  const observedTargets: string[] = [];
+  setReleaseArtifactStoreForTest({
+    publish: async (input) => {
+      observedTargets.push(input.targetOrigin);
+      return artifactPublication(input);
+    },
+  });
+  const port: ReleaseVerificationPort = {
+    mode: "hermetic",
+    verifyCandidate: async (input) => {
+      observedTargets.push(input.targetOrigin);
+      return {
+        observedContentHash: input.contentHash,
+        observedIntegrity: input.integrity,
+        observedReleaseId: input.manifest.releaseId,
+        observedTargetOrigin: input.targetOrigin,
+        registeredTools: [...input.expectedTools],
+        trustedLoader: { enforcedBeforeEvaluation: true, evaluatedContentHash: input.contentHash },
+        controlPlaneRequestsDuringExecution: 0,
+        modelRequestsDuringExecution: 0,
+        checks: REQUIRED_CANDIDATE_CHECKS.map((name) => ({ name, status: "passed" as const })),
+        csp: { hosted: "allowed" },
+      };
+    },
+    verifyInstalled: async () => { throw new Error("UNUSED"); },
+  };
+  setReleaseVerificationPortForTest(port);
+
+  const response = await publishCompatibility(compatibilityRequest(
+    project.id,
+    run.id,
+    "publish-openapi-compatibility",
+  ));
+  assert.equal(response.status, 201, JSON.stringify(await response.clone().json()));
+  const release = (await response.clone().json()).release;
+  assert.deepEqual(observedTargets, [targetOrigin, targetOrigin]);
+  assert.equal(release.installation.verificationPageUrl, `${targetOrigin}/webmcp-test`);
+  assert.notEqual(targetOrigin, new URL(project.url).origin);
+});
+
+test("release guides preserve local-only and the previous persisted Storage URL", async () => {
+  let instant = Date.parse("2026-08-31T10:00:00.000Z");
+  const repository = new InMemoryControlPlaneRepository(() => new Date(instant++));
+  installTestRepository(repository);
+  const { project, run } = await fixture(repository);
+  await approveTicket(repository, project.id);
+  const firstResponse = await publish(
+    request(project.id, run.id, "publish-guide-first"),
+    { params: Promise.resolve({ projectId: project.id }) },
+  );
+  assert.equal(firstResponse.status, 201, JSON.stringify(await firstResponse.clone().json()));
+  const first = (await firstResponse.json()).release;
+
+  const secondAnalysis = await nextWebsiteAnalysis(repository, project.id, "second");
+  const secondResponse = await publish(
+    request(project.id, secondAnalysis.run.id, "publish-guide-second"),
+    { params: Promise.resolve({ projectId: project.id }) },
+  );
+  assert.equal(secondResponse.status, 201, JSON.stringify(await secondResponse.clone().json()));
+  const second = (await secondResponse.json()).release;
+  assert.deepEqual(second.installation.previousRelease, {
+    id: first.id,
+    contentHash: first.contentHash,
+    integrity: first.sri,
+    artifactUrl: first.artifactUrl,
+  });
+
+  const localRepository = new InMemoryControlPlaneRepository();
+  installTestRepository(localRepository);
+  const localFixture = await fixture(localRepository);
+  await approveTicket(localRepository, localFixture.project.id);
+  setReleaseArtifactStoreForTest({
+    publish: async (input) => artifactPublication(input, true),
+  });
+  const localResponse = await publish(
+    request(localFixture.project.id, localFixture.run.id, "publish-local-guide"),
+    { params: Promise.resolve({ projectId: localFixture.project.id }) },
+  );
+  assert.equal(localResponse.status, 201, JSON.stringify(await localResponse.clone().json()));
+  const local = (await localResponse.json()).release;
+  assert.equal(local.localOnly, true);
+  assert.equal(local.url, `${LOCAL_ARTIFACT_PREFIX}/${local.contentHash}.js`);
+  assert.equal(local.installation.localOnly, true);
+  assert.equal(local.installation.selfHost.required, true);
+  assert.match(local.installation.selfHost.guidance, /Loopback delivery validates bytes only/);
+  assert.match(local.installation.moduleScriptTag, /^<script type="module" src="http:\/\/127\.0\.0\.1:54321\//);
 });
 
 test("publication rejects caller reports, non-owners, and serves immutable exact bytes", async () => {
@@ -418,7 +846,7 @@ test("publication rejects caller reports, non-owners, and serves immutable exact
   );
   const release = (await response.json()).release;
   const artifact = await getArtifact(
-    new Request(`https://control.example${release.url}`),
+    new Request(`https://control.example/api/releases/${release.contentHash}.js`),
     { params: Promise.resolve({ artifact: `${release.contentHash}.js` }) }
   );
   assert.equal(artifact.status, 200);
@@ -432,14 +860,14 @@ test("publication rejects caller reports, non-owners, and serves immutable exact
   assert.equal(await artifact.text(), candidate.code);
 
   const download = await getArtifact(
-    new Request(`https://control.example${release.url}?download=1`),
+    new Request(`https://control.example/api/releases/${release.contentHash}.js?download=1`),
     { params: Promise.resolve({ artifact: `${release.contentHash}.js` }) }
   );
   assert.equal(download.headers.get("content-disposition"), `attachment; filename="page2webmcp-${release.contentHash}.js"`);
   assert.equal(await download.text(), candidate.code);
 
   const notModified = await getArtifact(
-    new Request(`https://control.example${release.url}`, {
+    new Request(`https://control.example/api/releases/${release.contentHash}.js`, {
       headers: { "if-none-match": `"${release.contentHash}"` }
     }),
     { params: Promise.resolve({ artifact: `${release.contentHash}.js` }) }
@@ -473,7 +901,7 @@ test("blocking a proposed capability publishes the deterministic reviewed subset
   assert.equal(release.contentHash, expected.contentHash);
 
   const artifact = await getArtifact(
-    new Request(`https://control.example${release.url}`),
+    new Request(`https://control.example/api/releases/${release.contentHash}.js`),
     { params: Promise.resolve({ artifact: `${release.contentHash}.js` }) }
   );
   const code = await artifact.text();
@@ -514,11 +942,100 @@ test("installed-target route records only an exact normal native WebMCP observat
   assert.equal(installation.artifactContentHash, release.contentHash);
   assert.equal(installation.integrity, release.sri);
   assert.equal(installation.webMcpImplementation, "native");
+  assert.equal(installation.artifactUrl, release.artifactUrl);
+  assert.deepEqual(installation.attestation, {
+    observedArtifactUrl: release.artifactUrl,
+    observedDownloadUrl: release.downloadUrl,
+    observedLocalOnly: false,
+    observedIntegrity: release.sri,
+    executedArtifactUrl: release.artifactUrl,
+    servedContentHash: release.contentHash,
+    executedContentHash: release.contentHash,
+    observedTargetOrigin: "https://acme.example",
+    registeredTools: ["create_support_ticket", "find_order"],
+    webMcpImplementation: "native",
+    normalPageLoad: true,
+    routeInterception: false,
+    injectedRegistration: false,
+    syntheticHarness: false,
+    duplicateLoadHarmless: true,
+    csp: { hosted: "allowed" },
+  });
 
   const duplicate = await verifyInstallation(installRequest(), {
     params: Promise.resolve({ projectId: project.id, releaseId: release.id }),
   });
   assert.equal((await duplicate.json()).installation.id, installation.id);
+});
+
+test("an exact self-host verification can supersede pending hosted CSP evidence without overwriting unrelated evidence", async () => {
+  const repository = new InMemoryControlPlaneRepository();
+  installTestRepository(repository);
+  const { project, run } = await fixture(repository);
+  await approveTicket(repository, project.id);
+  const published = await publish(
+    request(project.id, run.id, "publish-for-self-host"),
+    { params: Promise.resolve({ projectId: project.id }) },
+  );
+  const release = (await published.json()).release;
+  setReleaseVerificationPortForTest({
+    mode: "hermetic",
+    verifyCandidate: async () => { throw new Error("UNUSED"); },
+    verifyInstalled: async (input) => exactInstalledReport(input, input.selfHostedUrl ? {
+      csp: { hosted: "blocked", directive: "script-src 'self'" },
+    } : {
+      executedArtifactUrl: null,
+      executedContentHash: null,
+      registeredTools: [],
+      duplicateLoadHarmless: null,
+      csp: { hosted: "blocked", directive: "script-src 'self'" },
+    }),
+  });
+  const install = (key: string, selfHostedUrl?: string) => verifyInstallation(new Request(
+    `https://control.example/api/projects/${project.id}/releases/${release.id}/installation`,
+    {
+      method: "POST",
+      headers: {
+        ...authenticatedHeaders(owner),
+        "content-type": "application/json",
+        "idempotency-key": key,
+      },
+      body: JSON.stringify({ pageUrl: "https://acme.example/account", ...(selfHostedUrl ? { selfHostedUrl } : {}) }),
+    },
+  ), { params: Promise.resolve({ projectId: project.id, releaseId: release.id }) });
+
+  const pendingResponse = await install("verify-self-host-pending");
+  assert.equal(pendingResponse.status, 200, JSON.stringify(await pendingResponse.clone().json()));
+  const pending = (await pendingResponse.json()).installation;
+  assert.equal(pending.status, "pending_self_host");
+
+  const selfHostedUrl = `https://acme.example/assets/${release.contentHash}.js`;
+  const verifiedResponse = await install("verify-self-host-complete", selfHostedUrl);
+  assert.equal(verifiedResponse.status, 200, JSON.stringify(await verifiedResponse.clone().json()));
+  const verified = (await verifiedResponse.json()).installation;
+  assert.notEqual(verified.id, pending.id);
+  assert.equal(verified.status, "verified");
+  assert.equal(verified.delivery, "self_hosted");
+  assert.equal(verified.selfHostedUrl, selfHostedUrl);
+  assert.equal(verified.attestation.executedArtifactUrl, selfHostedUrl);
+
+  setReleaseVerificationPortForTest({
+    mode: "hermetic",
+    verifyCandidate: async () => { throw new Error("UNUSED"); },
+    verifyInstalled: async (input) => exactInstalledReport(input, {
+      executedArtifactUrl: null,
+      executedContentHash: null,
+      registeredTools: [],
+      duplicateLoadHarmless: null,
+      csp: { hosted: "blocked", directive: "script-src 'none'" },
+    }),
+  });
+  const pendingReplay = await install("verify-self-host-pending");
+  assert.equal(pendingReplay.status, 200);
+  const replayedPending = (await pendingReplay.json()).installation;
+  assert.equal(replayedPending.id, pending.id);
+  assert.equal(replayedPending.status, "pending_self_host");
+  assert.deepEqual(replayedPending.attestation, pending.attestation);
 });
 
 test("a capability change after subset verification rejects stale publication and a retry restores the tool", async () => {
@@ -554,7 +1071,7 @@ test("a capability change after subset verification rejects stale publication an
   assert.equal(release.contentHash, candidate.contentHash);
 
   const artifact = await getArtifact(
-    new Request(`https://control.example${release.url}`),
+    new Request(`https://control.example/api/releases/${release.contentHash}.js`),
     { params: Promise.resolve({ artifact: `${release.contentHash}.js` }) }
   );
   const code = await artifact.text();

@@ -53,6 +53,9 @@ type ReleaseResult = {
     artifactUrl: string;
     downloadUrl: string;
     moduleScriptTag: string;
+    targetOrigin: string;
+    verificationPageUrl: string;
+    localOnly: boolean;
     selfHost: { required: boolean; guidance: string };
   };
 };
@@ -143,6 +146,8 @@ export function ProjectEntry({ authState }: Readonly<{ authState?: "verified" | 
         });
     });
     return () => controller.abort();
+    // Recovery intentionally consumes only the immutable snapshot loaded once at mount.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
@@ -552,7 +557,7 @@ export function ProjectEntry({ authState }: Readonly<{ authState?: "verified" | 
     if (!projectId || !release) return;
     setBusy(true);
     try {
-      const pageUrl = new URL(url).origin;
+      const pageUrl = release.installation.verificationPageUrl;
       const { response, body } = await postIdempotent<{ installation?: { status: string } } & ApiFailure>(
         `/api/projects/${encodeURIComponent(projectId)}/releases/${encodeURIComponent(release.id)}/installation`,
         { pageUrl, ...(selfHostedUrl ? { selfHostedUrl } : {}) },
@@ -677,6 +682,7 @@ export function ProjectEntry({ authState }: Readonly<{ authState?: "verified" | 
     {release && <section aria-label="Installation">
       <button type="button" disabled={busy} onClick={copyTrustedLoaderScript}>Copy trusted-loader script</button>{" "}
       <a href={release.installation.downloadUrl}>Download exact artifact bytes</a>
+      {release.installation.localOnly && <p>Local-only artifact: self-host these exact bytes before production installation.</p>}
       <p>{release.installation.selfHost.guidance}</p>
       <label>Self-hosted artifact URL <input type="url" value={selfHostedUrl}
         onChange={(event) => setSelfHostedUrl(event.target.value)} /></label>

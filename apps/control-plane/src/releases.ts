@@ -5,6 +5,8 @@ import { CapabilityPlanSchema, type CapabilityPlan } from "../../../packages/cap
 import {
   capabilityPlanDigest,
   capabilityStateDigest,
+  normalizeReleaseArtifactIdentity,
+  persistedReleaseArtifactIdentity,
   type AnalysisResult,
   type CandidateRelease,
   type CapabilityRecord,
@@ -16,6 +18,10 @@ import {
   type VerificationRequest
 } from "../../../packages/database/src/control-plane.ts";
 import { ApiError } from "./api.ts";
+import {
+  releaseArtifactStore,
+  type ReleaseArtifactStore,
+} from "./artifact-storage.ts";
 import {
   attestReleaseCandidate,
   attestReleaseInstallation,
@@ -43,7 +49,7 @@ export async function publishPersistedRelease(
   analysisRunId: string,
   idempotencyKey: string,
   signal: AbortSignal = new AbortController().signal,
-  publicOrigin = configuredPublicOrigin(),
+  artifactStore: ReleaseArtifactStore = releaseArtifactStore(),
 ): Promise<ReleaseRecord & { url: string; installation: ReleaseInstallationGuide }> {
   if (actor.role !== "owner") throw new ApiError("FORBIDDEN", 403);
   const project = await repository.getProject(actor, projectId);
@@ -52,6 +58,8 @@ export async function publishPersistedRelease(
   const result = await repository.getAnalysisResult(actor, run.id);
   if (!result) throw new ApiError("INVALID_STATE", 409);
   assertCurrentEvidence(result, actor.organizationId, project.id, run.id);
+  const sourceCandidate = result.release;
+  if (!sourceCandidate) throw new ApiError("INVALID_STATE", 409);
   const capabilities = await repository.listAnalysisCapabilities(actor, run.id);
 
   const pendingReview = capabilities.some((capability) =>
@@ -59,16 +67,47 @@ export async function publishPersistedRelease(
       && capability.status === "proposed"
   );
   if (pendingReview) throw new ApiError("REVIEW_REQUIRED", 409);
+  const target = await resolveReleaseTarget(
+    repository,
+    actor,
+    project.id,
+    run.id,
+    sourceCandidate,
+  );
   const verificationRequest = await deriveTrustedVerification(
-    analysisRunId, project.url, result, capabilities, signal
+    analysisRunId, target.targetOrigin, result, capabilities, signal
   );
   const verification = await repository.saveVerification(actor, project.id, verificationRequest);
+  if (!verification.eligible) {
+    throw new ApiError("RELEASE_GATE_FAILED", 409, false,
+      verification.failures.length > 0 ? verification.failures : ["VERIFICATION_INELIGIBLE"]);
+  }
+  const candidate = verificationRequest.candidate;
+  const integrity = `sha384-${createHash("sha384").update(candidate.code).digest("base64")}`;
+  const publication = await artifactStore.publish({
+    code: candidate.code,
+    contentHash: candidate.contentHash,
+    integrity,
+    targetOrigin: target.targetOrigin,
+  }, signal);
+  if (publication.contentHash !== candidate.contentHash || publication.integrity !== integrity) {
+    throw new Error("RELEASE_ARTIFACT_IDENTITY_MISMATCH");
+  }
+  let artifactIdentity: ReturnType<typeof normalizeReleaseArtifactIdentity>;
+  try {
+    artifactIdentity = normalizeReleaseArtifactIdentity(publication, candidate.contentHash);
+  } catch {
+    throw new Error("RELEASE_ARTIFACT_IDENTITY_MISMATCH");
+  }
   const inputHash = createHash("sha256")
     .update(JSON.stringify({
       analysisRunId,
       projectId,
       capabilityStateDigest: verification.capabilityStateDigest,
-      candidateContentHash: verification.candidateContentHash
+      candidateContentHash: verification.candidateContentHash,
+      artifactUrl: artifactIdentity.artifactUrl,
+      downloadUrl: artifactIdentity.downloadUrl,
+      localOnly: artifactIdentity.localOnly,
     }))
     .digest("hex");
   const release = await repository.publishRelease(actor, {
@@ -76,16 +115,61 @@ export async function publishPersistedRelease(
     analysisRunId,
     capabilityStateDigest: verification.capabilityStateDigest,
     candidateContentHash: verification.candidateContentHash,
+    ...artifactIdentity,
     idempotencyKey,
     inputHash
   });
+  const persistedIdentity = assertPublishedReleaseConvergence({
+    release,
+    candidate,
+    artifactIdentity,
+    integrity,
+    targetOrigin: target.targetOrigin,
+    organizationId: actor.organizationId,
+    projectId,
+    analysisRunId,
+    capabilityStateDigest: verification.capabilityStateDigest,
+  });
   const previous = await repository.getPreviousRelease(actor, project.id, release.id);
-  const url = `/api/releases/${release.contentHash}.js`;
   return {
     ...release,
-    url,
-    installation: buildReleaseInstallationGuide(release, verification, previous, `${publicOrigin}${url}`),
+    url: persistedIdentity.artifactUrl,
+    installation: buildReleaseInstallationGuide(release, verification, previous, target.verificationPageUrl),
   };
+}
+
+function assertPublishedReleaseConvergence(input: Readonly<{
+  release: ReleaseRecord;
+  candidate: CandidateRelease;
+  artifactIdentity: ReturnType<typeof normalizeReleaseArtifactIdentity>;
+  integrity: string;
+  targetOrigin: string;
+  organizationId: string;
+  projectId: string;
+  analysisRunId: string;
+  capabilityStateDigest: string;
+}>): ReturnType<typeof normalizeReleaseArtifactIdentity> {
+  const { release, candidate } = input;
+  const persistedIdentity = persistedReleaseArtifactIdentity(release);
+  const candidateManifest = ManifestSchema.safeParse(candidate.manifest);
+  const releaseManifest = ManifestSchema.safeParse(release.manifest);
+  const codeHash = createHash("sha256").update(release.code).digest("hex");
+  const codeIntegrity = `sha384-${createHash("sha384").update(release.code).digest("base64")}`;
+  if (!persistedIdentity || !candidateManifest.success || !releaseManifest.success
+    || release.organizationId !== input.organizationId || release.projectId !== input.projectId
+    || release.analysisRunId !== input.analysisRunId
+    || release.capabilityStateDigest !== input.capabilityStateDigest
+    || release.code !== candidate.code || release.contentHash !== candidate.contentHash
+    || codeHash !== candidate.contentHash || release.sri !== input.integrity || codeIntegrity !== input.integrity
+    || release.allowedOrigin !== input.targetOrigin || candidate.allowedOrigin !== input.targetOrigin
+    || releaseManifest.data.releaseId !== candidateManifest.data.releaseId
+    || JSON.stringify(releaseManifest.data) !== JSON.stringify(candidateManifest.data)
+    || persistedIdentity.artifactUrl !== input.artifactIdentity.artifactUrl
+    || persistedIdentity.downloadUrl !== input.artifactIdentity.downloadUrl
+    || persistedIdentity.localOnly !== input.artifactIdentity.localOnly) {
+    throw new ApiError("INVALID_STATE", 409);
+  }
+  return persistedIdentity;
 }
 
 export type ReleaseInstallationGuide = Readonly<{
@@ -96,6 +180,8 @@ export type ReleaseInstallationGuide = Readonly<{
   integrity: string;
   contentHash: string;
   targetOrigin: string;
+  verificationPageUrl: string;
+  localOnly: boolean;
   compatibility: { moduleScripts: true; webMcp: "native-current-required" };
   csp: VerificationRecord["csp"];
   selfHost: { required: boolean; guidance: string };
@@ -107,48 +193,47 @@ export function buildReleaseInstallationGuide(
   release: ReleaseRecord,
   verification: VerificationRecord,
   previous: ReleaseRecord | undefined,
-  artifactUrl: string,
+  verificationPageUrl: string,
 ): ReleaseInstallationGuide {
-  const url = new URL(artifactUrl);
-  if (url.protocol !== "https:" || url.username || url.password || url.hash
-    || !url.pathname.endsWith(`/${release.contentHash}.js`)) throw new ApiError("INVALID_STATE", 409);
-  const previousArtifactUrl = previous
-    ? new URL(`/api/releases/${previous.contentHash}.js`, url.origin).toString()
-    : undefined;
+  const identity = persistedReleaseArtifactIdentity(release);
+  if (!identity) throw new ApiError("INVALID_STATE", 409);
+  let verifiedPage: URL;
+  try {
+    verifiedPage = new URL(verificationPageUrl);
+  } catch {
+    throw new ApiError("INVALID_STATE", 409);
+  }
+  if (verifiedPage.protocol !== "https:" || verifiedPage.origin !== release.allowedOrigin
+    || verifiedPage.username || verifiedPage.password || verifiedPage.search || verifiedPage.hash) {
+    throw new ApiError("INVALID_STATE", 409);
+  }
+  const previousIdentity = previous ? persistedReleaseArtifactIdentity(previous) : undefined;
   return {
-    artifactUrl: url.toString(),
-    downloadUrl: `${url.toString()}?download=1`,
-    moduleScriptTag: `<script type="module" src="${url.toString()}" integrity="${release.sri}" crossorigin="anonymous"></script>`,
+    artifactUrl: identity.artifactUrl,
+    downloadUrl: identity.downloadUrl,
+    moduleScriptTag: `<script type="module" src="${identity.artifactUrl}" integrity="${release.sri}" crossorigin="anonymous"></script>`,
     manifest: release.manifest,
     integrity: release.sri,
     contentHash: release.contentHash,
     targetOrigin: release.allowedOrigin,
+    verificationPageUrl: verifiedPage.toString(),
+    localOnly: identity.localOnly,
     compatibility: { moduleScripts: true, webMcp: "native-current-required" },
     csp: verification.csp,
     selfHost: {
-      required: verification.csp.hosted === "blocked",
-      guidance: "Host the downloaded bytes unchanged on the target origin, then verify that exact SHA-256 before installation.",
+      required: identity.localOnly || verification.csp.hosted === "blocked",
+      guidance: identity.localOnly
+        ? "Loopback delivery validates bytes only. Host the downloaded bytes unchanged on the target HTTPS origin, or publish from hosted Storage, then verify that exact SHA-256."
+        : "Host the downloaded bytes unchanged on the target origin, then verify that exact SHA-256 before installation.",
     },
-    previousRelease: previous && previousArtifactUrl ? {
+    previousRelease: previous && previousIdentity ? {
       id: previous.id,
       contentHash: previous.contentHash,
       integrity: previous.sri,
-      artifactUrl: previousArtifactUrl,
+      artifactUrl: previousIdentity.artifactUrl,
     } : null,
     installed: false,
   };
-}
-
-export function configuredPublicOrigin(request?: Request): string {
-  const value = process.env.PAGE2WEBMCP_PUBLIC_ORIGIN ?? (process.env.NODE_ENV === "production" ? undefined : request?.url);
-  if (!value) throw new Error("PUBLIC_ORIGIN_CONFIGURATION_REQUIRED");
-  try {
-    const url = new URL(value);
-    if (url.protocol !== "https:" || url.username || url.password) throw new Error("PUBLIC_ORIGIN_CONFIGURATION_REQUIRED");
-    return url.origin;
-  } catch {
-    throw new Error("PUBLIC_ORIGIN_CONFIGURATION_REQUIRED");
-  }
 }
 
 export async function verifyPersistedRelease(
@@ -165,9 +250,18 @@ export async function verifyPersistedRelease(
   const result = await repository.getAnalysisResult(actor, run.id);
   if (!result) throw new ApiError("INVALID_STATE", 409);
   assertCurrentEvidence(result, actor.organizationId, project.id, run.id);
+  const sourceCandidate = result.release;
+  if (!sourceCandidate) throw new ApiError("INVALID_STATE", 409);
   const capabilities = await repository.listAnalysisCapabilities(actor, run.id);
+  const target = await resolveReleaseTarget(
+    repository,
+    actor,
+    project.id,
+    run.id,
+    sourceCandidate,
+  );
   return repository.saveVerification(actor, project.id,
-    await deriveTrustedVerification(run.id, project.url, result, capabilities, signal));
+    await deriveTrustedVerification(run.id, target.targetOrigin, result, capabilities, signal));
 }
 
 export async function verifyInstalledRelease(
@@ -178,7 +272,6 @@ export async function verifyInstalledRelease(
   pageUrl: string,
   selfHostedUrl: string | undefined,
   idempotencyKey: string,
-  publicOrigin: string,
   signal: AbortSignal,
 ): Promise<ReleaseInstallationRecord> {
   if (actor.role !== "owner") throw new ApiError("FORBIDDEN", 403);
@@ -187,11 +280,12 @@ export async function verifyInstalledRelease(
   if (!manifest.success || manifest.data.targetOrigin !== release.allowedOrigin) {
     throw new ApiError("INVALID_STATE", 409);
   }
+  const artifactIdentity = persistedReleaseArtifactIdentity(release);
+  if (!artifactIdentity) throw new ApiError("INVALID_STATE", 409);
   const expectedTools = manifest.data.plans.map(({ tool }) => tool.name).sort(compareStrings);
-  const artifactUrl = `${publicOrigin}/api/releases/${release.contentHash}.js`;
   const attestation = await attestReleaseInstallation({
     pageUrl,
-    artifactUrl,
+    ...artifactIdentity,
     contentHash: release.contentHash,
     integrity: release.sri,
     manifest: manifest.data,
@@ -203,14 +297,16 @@ export async function verifyInstalledRelease(
     releaseId,
     pageUrl,
     selfHostedUrl: selfHostedUrl ?? null,
-    artifactUrl,
+    artifactUrl: artifactIdentity.artifactUrl,
+    downloadUrl: artifactIdentity.downloadUrl,
+    localOnly: artifactIdentity.localOnly,
     contentHash: release.contentHash,
     integrity: release.sri,
   })).digest("hex");
   return repository.saveReleaseInstallation(actor, projectId, {
     releaseId,
     pageUrl,
-    artifactUrl,
+    artifactUrl: artifactIdentity.artifactUrl,
     ...(selfHostedUrl ? { selfHostedUrl } : {}),
     targetOrigin: release.allowedOrigin,
     artifactContentHash: release.contentHash,
@@ -220,32 +316,68 @@ export async function verifyInstalledRelease(
     delivery: attestation.delivery,
     csp: attestation.csp,
     webMcpImplementation: attestation.webMcpImplementation,
-    attestation: {
-      servedContentHash: release.contentHash,
-      executedContentHash: release.contentHash,
-      registeredTools: expectedTools,
-      normalPageLoad: true,
-      routeInterception: false,
-      injectedRegistration: false,
-      syntheticHarness: false,
-      duplicateLoadHarmless: true,
-    },
+    attestation: attestation.report,
     idempotencyKey,
     inputHash,
   });
 }
 
+async function resolveReleaseTarget(
+  repository: ControlPlaneRepository,
+  actor: RepositoryActor,
+  projectId: string,
+  analysisRunId: string,
+  candidate: CandidateRelease,
+): Promise<Readonly<{ targetOrigin: string; verificationPageUrl: string }>> {
+  const workflow = await repository.getWorkflowRun(actor, analysisRunId);
+  const snapshots = await repository.listSourceSnapshots(actor, projectId);
+  const snapshot = snapshots.find(({ id }) => id === workflow.sourceSnapshotId);
+  const sources = await repository.listProjectSources(actor, projectId);
+  const source = snapshot
+    ? sources.find(({ id }) => id === snapshot.projectSourceId)
+    : undefined;
+  if (!snapshot || !source || workflow.projectId !== projectId
+    || workflow.analysisRunId !== analysisRunId
+    || snapshot.projectId !== projectId || source.projectId !== projectId
+    || snapshot.organizationId !== actor.organizationId || source.organizationId !== actor.organizationId
+    || source.sourceType !== source.sourceConfiguration.kind) {
+    throw new ApiError("INVALID_STATE", 409);
+  }
+  if (source.sourceType === "openapi") {
+    if (source.sourceConfiguration.kind !== "openapi") throw new ApiError("INVALID_STATE", 409);
+    return {
+      targetOrigin: source.sourceConfiguration.targetOrigin,
+      verificationPageUrl: source.sourceConfiguration.testPageUrl,
+    };
+  }
+  if (source.sourceType === "website") {
+    try {
+      const url = new URL(source.sourceUrl);
+      if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash) {
+        throw new Error("INVALID_SOURCE_URL");
+      }
+      return { targetOrigin: url.origin, verificationPageUrl: url.toString() };
+    } catch {
+      throw new ApiError("INVALID_STATE", 409);
+    }
+  }
+  const manifest = ManifestSchema.safeParse(candidate.manifest);
+  const origin = safeOrigin(candidate.allowedOrigin);
+  if (!manifest.success || !origin || origin !== candidate.allowedOrigin
+    || manifest.data.targetOrigin !== origin) throw new ApiError("INVALID_STATE", 409);
+  return { targetOrigin: origin, verificationPageUrl: `${origin}/` };
+}
+
 async function deriveTrustedVerification(
   analysisRunId: string,
-  projectUrl: string,
+  targetOrigin: string,
   result: AnalysisResult,
   capabilities: CapabilityRecord[],
   signal: AbortSignal,
 ): Promise<VerificationRequest> {
-  const prepared = deriveVerification(analysisRunId, projectUrl, result, capabilities);
+  const prepared = deriveVerification(analysisRunId, targetOrigin, result, capabilities);
   const manifest = ManifestSchema.safeParse(prepared.candidate.manifest);
-  const targetOrigin = safeOrigin(projectUrl);
-  if (!manifest.success || !targetOrigin) return prepared;
+  if (!manifest.success || safeOrigin(targetOrigin) !== targetOrigin) return prepared;
   const integrity = `sha384-${createHash("sha384").update(prepared.candidate.code).digest("base64")}`;
   const expectedTools = capabilities.filter(({ status }) => status !== "blocked")
     .map(({ stableName }) => stableName).sort(compareStrings);
@@ -336,7 +468,6 @@ export function deriveVerification(
     && parsedManifest.data.targetOrigin === targetOrigin;
 
   let replayPasses = 0;
-  let canonical = false;
   if (parsedManifest.success && authenticated) {
     try {
       for (let attempt = 0; attempt < 3; attempt += 1) {
@@ -344,7 +475,6 @@ export function deriveVerification(
         if (replay.code !== candidate.code || replay.contentHash !== digest) break;
         replayPasses += 1;
       }
-      canonical = replayPasses === 3;
     } catch {
       replayPasses = 0;
     }
@@ -352,11 +482,6 @@ export function deriveVerification(
 
   const inspectedState = `${candidate.code}\n${JSON.stringify(result.evidence)}\n${JSON.stringify(result.draftPullRequest ?? {})}`;
   const noSecretLeakage = !/(?:fixture-password|paymentDetails|\bBearer\s+[A-Za-z0-9._~-]+|\b(?:sk|phc)_[A-Za-z0-9_-]+|process\.env)/i.test(inspectedState);
-  // Exact canonical replay proves this candidate is byte-for-byte output from the
-  // compiler whose runtime contract is exercised independently. Avoid treating
-  // incidental source spelling as a security boundary.
-  const browserExecution = canonical;
-
   return {
     analysisRunId,
     capabilityStateDigest: capabilityStateDigest(capabilities),

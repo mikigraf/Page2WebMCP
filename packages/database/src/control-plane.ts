@@ -186,6 +186,10 @@ export type ReleaseVerificationCheckRecord = {
   code?: ReleaseVerificationFailureCode;
 };
 
+export type ReleaseArtifactIdentity =
+  | Readonly<{ artifactUrl: string; downloadUrl: string; localOnly: boolean }>
+  | Readonly<{ artifactUrl?: undefined; downloadUrl?: undefined; localOnly?: undefined }>;
+
 export type ReleaseRecord = {
   id: string;
   organizationId: string;
@@ -199,7 +203,7 @@ export type ReleaseRecord = {
   manifest?: unknown;
   status: "published";
   createdAt: string;
-};
+} & ReleaseArtifactIdentity;
 
 export type ReleaseInstallationRecord = {
   id: string;
@@ -256,7 +260,7 @@ export type PublishRequest = IdempotentRequest & {
   analysisRunId: string;
   capabilityStateDigest: string;
   candidateContentHash: string;
-};
+} & Extract<ReleaseArtifactIdentity, { artifactUrl: string }>;
 
 export type RepositoryErrorCode =
   | "FORBIDDEN"
@@ -558,7 +562,6 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
   readonly #releaseByHash = new Map<string, string[]>();
   readonly #releaseByRun = new Map<string, string>();
   readonly #releaseInstallations = new Map<string, ReleaseInstallationRecord>();
-  readonly #releaseInstallationByRelease = new Map<string, string>();
   readonly #idempotency = new Map<string, IdempotencyRecord>();
   readonly #analysisAvailableAt = new Map<string, string>();
   readonly #analysisSources = new Map<string, Readonly<{
@@ -1831,13 +1834,14 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
   async publishRelease(actor: RepositoryActor, input: PublishRequest): Promise<ReleaseRecord> {
     if (actor.role !== "owner") throw new RepositoryError("FORBIDDEN");
     this.#assertProject(actor, input.projectId);
+    const artifactIdentity = normalizeReleaseArtifactIdentity(input, input.candidateContentHash);
     const idempotencyId = this.#idempotencyId("release", actor, input.idempotencyKey);
     const previous = this.#idempotentReplay(idempotencyId, input.inputHash);
     if (previous) {
       const release = this.#releases.get(previous.resultId);
       if (!release || release.organizationId !== actor.organizationId || release.projectId !== input.projectId
         || release.analysisRunId !== input.analysisRunId
-        || release.contentHash !== input.candidateContentHash) throw new RepositoryError("INVALID_STATE");
+        || !releaseMatchesPublication(release, input)) throw new RepositoryError("INVALID_STATE");
       return copy(release);
     }
     const run = this.#runs.get(input.analysisRunId);
@@ -1891,7 +1895,7 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
     const existingRunReleaseId = this.#releaseByRun.get(input.analysisRunId);
     if (existingRunReleaseId) {
       const existing = this.#releases.get(existingRunReleaseId);
-      if (!existing) throw new RepositoryError("INVALID_STATE");
+      if (!existing || !releaseMatchesPublication(existing, input)) throw new RepositoryError("INVALID_STATE");
       this.#reserveIdempotency(idempotencyId, input.inputHash, existing.id);
       return copy(existing);
     }
@@ -1906,6 +1910,7 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
       code: candidate.code,
       allowedOrigin: candidate.allowedOrigin,
       manifest: candidate.manifest,
+      ...artifactIdentity,
       status: "published",
       createdAt: this.#now()
     };
@@ -1964,13 +1969,6 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
       }
       return copy(record);
     }
-    const exactId = this.#releaseInstallationByRelease.get(input.releaseId);
-    if (exactId) {
-      const existing = this.#releaseInstallations.get(exactId);
-      if (!existing || existing.inputHash !== input.inputHash) throw new RepositoryError("IDEMPOTENCY_CONFLICT");
-      this.#reserveIdempotency(idempotencyId, input.inputHash, existing.id);
-      return copy(existing);
-    }
     const record: ReleaseInstallationRecord = {
       id: randomUUID(),
       organizationId: actor.organizationId,
@@ -1981,7 +1979,6 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
       ...(normalized.status === "verified" ? { verifiedAt: this.#now() } : {}),
     };
     this.#releaseInstallations.set(record.id, record);
-    this.#releaseInstallationByRelease.set(record.releaseId, record.id);
     this.#reserveIdempotency(idempotencyId, input.inputHash, record.id);
     this.#auditEvent(actor, `release.installation.${record.status}`, record.id);
     return copy(record);
@@ -2007,7 +2004,6 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
     this.#releaseByHash.clear();
     this.#releaseByRun.clear();
     this.#releaseInstallations.clear();
-    this.#releaseInstallationByRelease.clear();
     this.#idempotency.clear();
     this.#analysisAvailableAt.clear();
     this.#analysisSources.clear();
@@ -2031,6 +2027,7 @@ export function normalizeReleaseInstallation(
   release: ReleaseRecord,
 ): ReleaseInstallationRequest {
   const expectedTools = plansFromManifest(release.manifest)?.map(({ tool }) => tool.name).sort(compareCodePoints);
+  const releaseArtifactIdentity = persistedReleaseArtifactIdentity(release);
   let page: URL;
   let artifact: URL;
   try {
@@ -2042,14 +2039,16 @@ export function normalizeReleaseInstallation(
   const selfHosted = input.selfHostedUrl ? safeUrl(input.selfHostedUrl) : undefined;
   const canonicalAttestation = canonicalJson(input.attestation);
   if (!expectedTools || expectedTools.length === 0
+    || !releaseArtifactIdentity
     || page.origin !== release.allowedOrigin || page.protocol !== "https:" || page.username || page.password
     || page.search || page.hash
-    || artifact.protocol !== "https:" || artifact.username || artifact.password || artifact.search || artifact.hash
+    || artifact.toString() !== releaseArtifactIdentity.artifactUrl || input.artifactUrl !== releaseArtifactIdentity.artifactUrl
     || input.targetOrigin !== release.allowedOrigin || input.artifactContentHash !== release.contentHash
     || input.integrity !== release.sri || !equalStringArrays(input.expectedTools, expectedTools)
     || input.delivery === "self_hosted" && (!selfHosted || selfHosted.origin !== release.allowedOrigin)
     || input.delivery === "hosted" && input.selfHostedUrl !== undefined
     || input.status === "verified" && input.webMcpImplementation !== "native"
+    || input.status === "verified" && input.delivery === "hosted" && input.csp.hosted !== "allowed"
     || input.status === "pending_self_host" && (input.delivery !== "hosted" || input.csp.hosted !== "blocked")
     || input.csp.directive !== undefined && (input.csp.directive.length > 512 || /[\r\n]/.test(input.csp.directive))
     || canonicalAttestation === "__INVALID_JSON__" || Buffer.byteLength(canonicalAttestation) > 16_384
@@ -2060,6 +2059,61 @@ export function normalizeReleaseInstallation(
     expectedTools,
     attestation: JSON.parse(canonicalAttestation),
   };
+}
+
+const HOSTED_RELEASE_ARTIFACT_PREFIX =
+  "https://bimqgiedckdurqiywctl.supabase.co/storage/v1/object/public/page2webmcp-releases";
+const LOCAL_RELEASE_ARTIFACT_PREFIX =
+  "http://127.0.0.1:54321/storage/v1/object/public/page2webmcp-releases";
+
+export function normalizeReleaseArtifactIdentity(
+  input: Readonly<{ artifactUrl: string; downloadUrl: string; localOnly: boolean }>,
+  contentHash: string,
+): Extract<ReleaseArtifactIdentity, { artifactUrl: string }> {
+  if (!input || typeof input.artifactUrl !== "string" || typeof input.downloadUrl !== "string"
+    || typeof input.localOnly !== "boolean" || !/^[0-9a-f]{64}$/.test(contentHash)
+    || input.artifactUrl.length > 2_048 || input.downloadUrl.length > 2_048) {
+    throw new RepositoryError("INVALID_STATE");
+  }
+  const prefix = input.localOnly ? LOCAL_RELEASE_ARTIFACT_PREFIX : HOSTED_RELEASE_ARTIFACT_PREFIX;
+  const artifactUrl = `${prefix}/${contentHash}.js`;
+  const downloadUrl = `${artifactUrl}?download=page2webmcp-${contentHash}.js`;
+  if (input.artifactUrl !== artifactUrl || input.downloadUrl !== downloadUrl) {
+    throw new RepositoryError("INVALID_STATE");
+  }
+  return { artifactUrl, downloadUrl, localOnly: input.localOnly };
+}
+
+export function persistedReleaseArtifactIdentity(
+  release: Pick<ReleaseRecord, "contentHash" | "artifactUrl" | "downloadUrl" | "localOnly">,
+): Extract<ReleaseArtifactIdentity, { artifactUrl: string }> | undefined {
+  const present = release.artifactUrl !== undefined || release.downloadUrl !== undefined || release.localOnly !== undefined;
+  if (!present) return undefined;
+  if (release.artifactUrl === undefined || release.downloadUrl === undefined || release.localOnly === undefined) {
+    throw new RepositoryError("INVALID_STATE");
+  }
+  return normalizeReleaseArtifactIdentity({
+    artifactUrl: release.artifactUrl,
+    downloadUrl: release.downloadUrl,
+    localOnly: release.localOnly,
+  }, release.contentHash);
+}
+
+function releaseMatchesPublication(release: ReleaseRecord, input: PublishRequest): boolean {
+  let artifactIdentity: Extract<ReleaseArtifactIdentity, { artifactUrl: string }> | undefined;
+  try {
+    artifactIdentity = persistedReleaseArtifactIdentity(release);
+  } catch {
+    return false;
+  }
+  return release.projectId === input.projectId
+    && release.analysisRunId === input.analysisRunId
+    && release.capabilityStateDigest === input.capabilityStateDigest
+    && release.contentHash === input.candidateContentHash
+    && artifactIdentity !== undefined
+    && artifactIdentity.artifactUrl === input.artifactUrl
+    && artifactIdentity.downloadUrl === input.downloadUrl
+    && artifactIdentity.localOnly === input.localOnly;
 }
 
 function safeUrl(value: string): URL | undefined {
