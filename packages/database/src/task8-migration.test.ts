@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
 import test from "node:test";
 
 const migrationUrl = new URL(
@@ -47,6 +47,13 @@ test("Task 8 migration stores bounded provider, verifier, candidate, and install
   assert.doesNotMatch(sql, /https?:\/\/[^'\s]*acme/i);
 });
 
+test("pending self-host observations permit exactly empty tools while every executable observation stays bounded", async () => {
+  const sql = (await readFile(migrationUrl, "utf8")).replace(/\s+/g, " ");
+  assert.match(sql, /status = 'pending_self_host' and registered_tools = '\[\]'::jsonb/);
+  assert.match(sql, /status <> 'pending_self_host' and private\.valid_registered_tools\(registered_tools\)/);
+  assert.match(sql, /verification_runs_native_observation_check[\s\S]*private\.valid_registered_tools\(registered_tools\)/);
+});
+
 test("selected-hash live proof is maintenance-only, deterministic, bounded, and contains no tenant URLs or code", async () => {
   const sql = await readFile(migrationUrl, "utf8");
   assert.match(sql, /create (?:or replace )?function private\.selected_native_installation_proof\(selected_hash text\)/i);
@@ -90,7 +97,7 @@ test("selected-hash live proof is maintenance-only, deterministic, bounded, and 
 test("active topology is a maintenance-only selected-hash projection over ledger, RLS, and real providers", async () => {
   const sql = await readFile(migrationUrl, "utf8");
   assert.match(sql, /create function private\.selected_release_readiness_topology\(selected_hash text\)/i);
-  assert.match(sql, /supabase_migrations\.schema_migrations[\s\S]*version = '20260831120000'/i);
+  assert.match(sql, /from supabase_migrations\.schema_migrations/i);
   assert.match(sql, /relation\.relrowsecurity[\s\S]*relation\.relforcerowsecurity/i);
   for (const table of ["analysis_runs", "project_sources", "source_snapshots", "verification_runs", "releases",
     "release_installations", "workflow_runs", "workflow_tasks"]) {
@@ -102,4 +109,19 @@ test("active topology is a maintenance-only selected-hash projection over ledger
   assert.match(sql, /local_openapi_release boolean[\s\S]*hosted_github_release boolean/i);
   assert.match(sql, /revoke all on function private\.selected_release_readiness_topology\(text\) from public/i);
   assert.match(sql, /grant execute on function private\.selected_release_readiness_topology\(text\) to page2webmcp_maintenance/i);
+});
+
+test("active topology compares the exact complete committed migration version set", async () => {
+  const sql = await readFile(migrationUrl, "utf8");
+  const committed = (await readdir(new URL("../../../supabase/migrations/", import.meta.url)))
+    .filter((name) => /^\d{14}_[a-z0-9_]+\.sql$/.test(name))
+    .map((name) => name.slice(0, 14))
+    .sort();
+  const requiredBlock = /required_migrations\s*\(version\)\s+as\s*\(\s*values([\s\S]*?)\),\s*applied_migrations/i
+    .exec(sql)?.[1];
+  assert.ok(requiredBlock, "topology must declare its complete expected migration ledger");
+  const expected = [...requiredBlock.matchAll(/\('(\d{14})'\)/g)].map((match) => match[1]).sort();
+  assert.deepEqual(expected, committed);
+  assert.match(sql, /count\(\*\)\s*=\s*count\(distinct version\)/i);
+  assert.match(sql, /array_agg\(version order by version\)[\s\S]*array_agg\(version order by version\)/i);
 });

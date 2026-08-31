@@ -10,7 +10,9 @@ import {
   inspectProductionProviderConfiguration,
 } from "../apps/worker/src/production-runtime.ts";
 import {
+  createApplicationReadinessRepository,
   createMaintenanceReadinessRepository,
+  type ApplicationReadinessRepository,
   type MaintenanceReadinessRepository,
 } from "../packages/database/src/readiness.ts";
 import {
@@ -45,6 +47,10 @@ export type ReadinessCliDependencies = Readonly<{
     connectionString: string;
     mode: "local-live" | "live";
   }>) => MaintenanceReadinessRepository;
+  createApplicationRepository?: (input: Readonly<{
+    connectionString: string;
+    mode: "local-live" | "live";
+  }>) => ApplicationReadinessRepository;
 }>;
 
 export function parseReadinessMode(args: readonly string[]): ReadinessMode {
@@ -121,11 +127,32 @@ export async function runReadinessCli(
     return result("failed", "RELEASE_VERIFIER_READINESS_FAILED", 1);
   }
 
+  const createApplicationRepository = dependencies.createApplicationRepository
+    ?? ((input) => createApplicationReadinessRepository(input));
+  let applicationRepository: ApplicationReadinessRepository | undefined;
+  let applicationIdentity: Readonly<{ sessionIdentityDigest: string }>;
+  try {
+    applicationRepository = createApplicationRepository({
+      connectionString: environment.DATABASE_URL!,
+      mode: mode === "live" ? "live" : "local-live",
+    });
+    applicationIdentity = await applicationRepository.inspectApplicationRole();
+  } catch {
+    return result("failed", "APPLICATION_DATABASE_READINESS_FAILED", 1);
+  } finally {
+    try { await applicationRepository?.close(); } catch { /* diagnostic export must stay redacted */ }
+  }
+
   const createRepository = dependencies.createMaintenanceRepository
     ?? ((input) => createMaintenanceReadinessRepository(input));
   let repository: MaintenanceReadinessRepository | undefined;
   let proof: NativeInstallationProof | undefined;
-  let topology: Readonly<{ migrationsCurrent: boolean; rlsVerified: boolean; selectedReleasePersisted: boolean }>;
+  let topology: Readonly<{
+    migrationsCurrent: boolean;
+    rlsVerified: boolean;
+    selectedReleasePersisted: boolean;
+    sessionIdentityDigest: string;
+  }>;
   try {
     repository = createRepository({
       connectionString: environment.PAGE2WEBMCP_MAINTENANCE_DATABASE_URL!,
@@ -136,11 +163,16 @@ export async function runReadinessCli(
       provider.provenance,
       mode === "local-live",
     );
-    if (mode === "live") proof = await repository.findSelectedNativeInstallationProof(selectedHash);
+    if (topology.sessionIdentityDigest !== applicationIdentity.sessionIdentityDigest && mode === "live") {
+      proof = await repository.findSelectedNativeInstallationProof(selectedHash);
+    }
   } catch {
     return result("failed", "MAINTENANCE_DATABASE_READINESS_FAILED", 1);
   } finally {
     try { await repository?.close(); } catch { /* diagnostic export must stay redacted */ }
+  }
+  if (topology.sessionIdentityDigest === applicationIdentity.sessionIdentityDigest) {
+    return result("failed", "DATABASE_ROLE_SEPARATION_FAILED", 1);
   }
 
   const output = evaluateDeploymentReadiness({

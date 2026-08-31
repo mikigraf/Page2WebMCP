@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  createApplicationReadinessRepository,
   createMaintenanceReadinessRepository,
   type MaintenanceReadinessPool,
 } from "./readiness.ts";
@@ -66,7 +67,11 @@ function topologyRow() {
   };
 }
 
-function fakePool(roleOverrides: Record<string, unknown> = {}, rows = [proofRow()]) {
+function fakePool(
+  roleOverrides: Record<string, unknown> = {},
+  rows = [proofRow()],
+  expectedRole: "page2webmcp_app" | "page2webmcp_maintenance" = "page2webmcp_maintenance",
+) {
   const queries: Array<{ text: string; values?: readonly unknown[] }> = [];
   let released = 0;
   let ended = 0;
@@ -74,15 +79,34 @@ function fakePool(roleOverrides: Record<string, unknown> = {}, rows = [proofRow(
     connect: async () => ({
       query: async (text, values) => {
         queries.push({ text, values });
-        if (text.includes("session_relevant_roles")) return { rows: [{
-          current_role: "page2webmcp_maintenance",
-          session_role: "page2webmcp_readiness_login",
-          session_superuser: false,
-          session_bypass_rls: false,
-          session_can_login: true,
-          session_relevant_roles: ["page2webmcp_maintenance"],
-          ...roleOverrides,
-        }] };
+        if (text.includes("session_role")) {
+          for (const field of ["session_createdb", "session_createrole", "session_replication",
+            "session_assumable_roles", "session_owns_current_database", "session_owns_scoped_schema",
+            "session_owns_scoped_relation", "session_owns_scoped_routine"]) {
+            assert.match(text, new RegExp(`\\b${field}\\b`));
+          }
+          assert.match(text, /array\(select role\.rolname::text/);
+          assert.match(text, /role\.oid <> login\.oid/);
+          assert.match(text, /database\.datdba in \(login\.oid, current_user::regrole::oid\)/);
+          assert.doesNotMatch(text, /role\.rolname in \('page2webmcp_app'/i);
+          return { rows: [{
+            current_role: expectedRole,
+            session_role: expectedRole === "page2webmcp_app"
+              ? "page2webmcp_app_login" : "page2webmcp_readiness_login",
+            session_superuser: false,
+            session_bypass_rls: false,
+            session_can_login: true,
+            session_createdb: false,
+            session_createrole: false,
+            session_replication: false,
+            session_assumable_roles: [expectedRole],
+            session_owns_current_database: false,
+            session_owns_scoped_schema: false,
+            session_owns_scoped_relation: false,
+            session_owns_scoped_routine: false,
+            ...roleOverrides,
+          }] };
+        }
         if (text.includes("private.selected_release_readiness_topology")) return { rows: [topologyRow()] };
         if (text.includes("private.selected_native_installation_proof")) return { rows };
         return { rows: [] };
@@ -93,6 +117,45 @@ function fakePool(roleOverrides: Record<string, unknown> = {}, rows = [proofRow(
   };
   return { pool, queries, released: () => released, ended: () => ended };
 }
+
+test("application readiness actively proves its distinct non-owner app login", async () => {
+  const fake = fakePool({}, [], "page2webmcp_app");
+  const repository = createApplicationReadinessRepository({
+    connectionString: "postgresql://redacted.invalid/db",
+    mode: "live",
+    pool: fake.pool,
+  });
+  assert.deepEqual(await repository.inspectApplicationRole(), {
+    sessionIdentityDigest: "bdda2dd07b6d83336e3cf190c1aac07a8f37fc54a22f48e2c61db4095769a951",
+  });
+  assert.ok(fake.queries.some(({ text }) => text === "set local role page2webmcp_app"));
+  assert.ok(fake.queries.some(({ text }) => text === "set transaction read only"));
+  assert.equal(fake.queries.some(({ text }) => /private\.selected_|public\.releases/i.test(text)), false);
+  assert.equal(fake.released(), 1);
+  await repository.close();
+  assert.equal(fake.ended(), 1);
+});
+
+test("application readiness rejects privileged, owning, or broadly assumable logins", async () => {
+  for (const override of [
+    { session_superuser: true },
+    { session_bypass_rls: true },
+    { session_createdb: true },
+    { session_createrole: true },
+    { session_replication: true },
+    { session_assumable_roles: ["page2webmcp_app", "pg_read_all_data"] },
+    { session_owns_current_database: true },
+    { session_owns_scoped_schema: true },
+    { session_owns_scoped_relation: true },
+    { session_owns_scoped_routine: true },
+  ]) {
+    const fake = fakePool(override, [], "page2webmcp_app");
+    const repository = createApplicationReadinessRepository({
+      connectionString: "postgresql://redacted.invalid/db", mode: "live", pool: fake.pool,
+    });
+    await assert.rejects(repository.inspectApplicationRole(), /^Error: APPLICATION_DATABASE_ROLE_REQUIRED$/);
+  }
+});
 
 test("maintenance readiness actively checks the selected provider, migration ledger, and forced RLS", async () => {
   const fake = fakePool();
@@ -107,11 +170,12 @@ test("maintenance readiness actively checks the selected provider, migration led
     migrationsCurrent: true,
     rlsVerified: true,
     selectedReleasePersisted: true,
+    sessionIdentityDigest: "b3aa06a51f209ab981a749d3dbb2aaf3922315a0eaa0a7e694f042caa3537bf1",
   });
   assert.deepEqual(fake.queries.filter(({ text }) => text.includes("selected_release_readiness_topology")), [{
     text: "select * from private.selected_release_readiness_topology($1)", values: [selectedHash],
   }]);
-  assert.equal(fake.queries.some(({ text }) => /public\.releases|supabase_migrations|pg_class/i.test(text)), false);
+  assert.equal(fake.queries.some(({ text }) => /public\.releases|supabase_migrations/i.test(text)), false);
 });
 
 test("maintenance readiness reads only the exact selected hash through the bounded function", async () => {
@@ -169,19 +233,27 @@ test("maintenance readiness reads only the exact selected hash through the bound
   }]);
   assert.equal(fake.queries.some(({ text }) => /\blatest\b|public\.releases|private\.analysis_jobs/i.test(text)), false);
   assert.ok(fake.queries.some(({ text }) => text === "set local role page2webmcp_maintenance"));
+  assert.ok(fake.queries.some(({ text }) => text === "set transaction read only"));
   assert.ok(fake.queries.some(({ text }) => text.includes("statement_timeout")));
   assert.equal(fake.released(), 1);
   await repository.close();
   assert.equal(fake.ended(), 1);
 });
 
-test("maintenance readiness rejects superuser, bypass, wrong role, or additional service memberships", async () => {
+test("maintenance readiness rejects every privilege, ownership, and assumable-role escape", async () => {
   for (const override of [
     { current_role: "page2webmcp_app" },
     { session_superuser: true },
     { session_bypass_rls: true },
     { session_can_login: false },
-    { session_relevant_roles: ["page2webmcp_app", "page2webmcp_maintenance"] },
+    { session_createdb: true },
+    { session_createrole: true },
+    { session_replication: true },
+    { session_assumable_roles: ["page2webmcp_maintenance", "pg_read_all_data"] },
+    { session_owns_current_database: true },
+    { session_owns_scoped_schema: true },
+    { session_owns_scoped_relation: true },
+    { session_owns_scoped_routine: true },
   ]) {
     const fake = fakePool(override);
     const repository = createMaintenanceReadinessRepository({

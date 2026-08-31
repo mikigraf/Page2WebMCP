@@ -601,6 +601,18 @@ test("eligible publication is content addressed and idempotent", async () => {
   assert.equal((await repository.saveReleaseInstallation(
     owner, project.id, pendingInstallationInput,
   )).id, pendingInstallation.id);
+  await assert.rejects(repository.saveReleaseInstallation(owner, project.id, {
+    ...pendingInstallationInput,
+    attestation: { ...pendingInstallationInput.attestation, registeredTools: ["find_order"] },
+    idempotencyKey: "install-pending-with-tools",
+    inputHash: "9".repeat(64),
+  }), (error: unknown) => error instanceof RepositoryError && error.code === "INVALID_STATE");
+  await assert.rejects(repository.saveReleaseInstallation(owner, project.id, {
+    ...installationInput,
+    attestation: { ...installationInput.attestation, registeredTools: [] },
+    idempotencyKey: "install-verified-without-tools",
+    inputHash: "8".repeat(64),
+  }), (error: unknown) => error instanceof RepositoryError && error.code === "INVALID_STATE");
   const installation = await repository.saveReleaseInstallation(owner, project.id, installationInput);
   assert.equal(installation.status, "verified");
   assert.notEqual(installation.id, pendingInstallation.id);

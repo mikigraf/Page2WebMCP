@@ -78,6 +78,16 @@ function dependencies(order: string[], expectedLocalOnly = false): ReadinessCliD
       order.push("verifier");
       return { protocolVersion: 1, mode, webMcpImplementation: "native", verifierOriginDigest: "b".repeat(64) };
     },
+    createApplicationRepository: () => {
+      order.push("application-database-construction");
+      return {
+        inspectApplicationRole: async () => {
+          order.push("application-database-audit");
+          return { sessionIdentityDigest: "a".repeat(64) };
+        },
+        close: async () => { order.push("application-database-close"); },
+      };
+    },
     createMaintenanceRepository: () => {
       order.push("database-construction");
       return {
@@ -86,7 +96,12 @@ function dependencies(order: string[], expectedLocalOnly = false): ReadinessCliD
           assert.equal(hash, selectedHash);
           assert.equal(provider.mode, "openapi");
           assert.equal(localOnly, expectedLocalOnly);
-          return { migrationsCurrent: true, rlsVerified: true, selectedReleasePersisted: true };
+          return {
+            migrationsCurrent: true,
+            rlsVerified: true,
+            selectedReleasePersisted: true,
+            sessionIdentityDigest: "d".repeat(64),
+          };
         },
         findSelectedNativeInstallationProof: async (hash) => {
           order.push("database-query");
@@ -179,9 +194,40 @@ test("live constructs the provider before active artifact, verifier, and exact-h
     exitCode: 2,
   });
   assert.deepEqual(order, [
-    "provider", "artifact", "verifier", "database-construction", "database-topology", "database-query",
-    "database-close",
+    "provider", "artifact", "verifier", "application-database-construction", "application-database-audit",
+    "application-database-close", "database-construction", "database-topology", "database-query", "database-close",
   ]);
+});
+
+test("an unreachable or overprivileged application database prevents readiness before maintenance proof", async () => {
+  const order: string[] = [];
+  const deps: ReadinessCliDependencies = {
+    ...dependencies(order),
+    createApplicationRepository: () => ({
+      inspectApplicationRole: async () => { throw new Error("connection detail must stay redacted"); },
+      close: async () => { order.push("application-database-close"); },
+    }),
+  };
+  assert.deepEqual(await runReadinessCli(["--live"], completeEnvironment(), deps), {
+    output: { status: "failed", code: "APPLICATION_DATABASE_READINESS_FAILED", liveSuccess: false },
+    exitCode: 1,
+  });
+  assert.equal(order.includes("database-construction"), false);
+});
+
+test("application and maintenance readiness connections must use distinct login identities", async () => {
+  const order: string[] = [];
+  const deps: ReadinessCliDependencies = {
+    ...dependencies(order),
+    createApplicationRepository: () => ({
+      inspectApplicationRole: async () => ({ sessionIdentityDigest: "d".repeat(64) }),
+      close: async () => undefined,
+    }),
+  };
+  assert.deepEqual(await runReadinessCli(["--live"], completeEnvironment(), deps), {
+    output: { status: "failed", code: "DATABASE_ROLE_SEPARATION_FAILED", liveSuccess: false },
+    exitCode: 1,
+  });
 });
 
 test("live never reads the local verifier environment key", async () => {

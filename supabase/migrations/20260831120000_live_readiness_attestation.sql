@@ -206,17 +206,18 @@ alter table public.release_installations
       and observed_local_only is not null
       and observed_integrity ~ '^sha384-[A-Za-z0-9+/]+={0,2}$'
       and octet_length(observed_target_origin) between 9 and 2048
-      and private.valid_registered_tools(registered_tools)
       and served_content_hash ~ '^[0-9a-f]{64}$'
       and normal_page_load is not null
       and route_interception is not null
       and injected_registration is not null
       and synthetic_harness is not null
       and (
-        (status = 'pending_self_host' and executed_artifact_url is null
+        (status = 'pending_self_host' and registered_tools = '[]'::jsonb
+          and executed_artifact_url is null
           and executed_content_hash is null and duplicate_load_harmless is null)
         or
-        (status <> 'pending_self_host' and octet_length(executed_artifact_url) between 9 and 4096
+        (status <> 'pending_self_host' and private.valid_registered_tools(registered_tools)
+          and octet_length(executed_artifact_url) between 9 and 4096
           and executed_content_hash ~ '^[0-9a-f]{64}$' and duplicate_load_harmless is not null)
       )
     )
@@ -277,7 +278,35 @@ begin
   end if;
 
   return query
-  with required_rls(schema_name, table_name) as (
+  with required_migrations(version) as (
+    values
+      ('20260826000000'),
+      ('20260829074144'),
+      ('20260829090000'),
+      ('20260829092023'),
+      ('20260829094207'),
+      ('20260829100000'),
+      ('20260830094622'),
+      ('20260830120000'),
+      ('20260830160000'),
+      ('20260830180000'),
+      ('20260830190000'),
+      ('20260831090000'),
+      ('20260831100000'),
+      ('20260831110000'),
+      ('20260831111000'),
+      ('20260831120000')
+  ), applied_migrations(version) as (
+    select migration.version::text
+    from supabase_migrations.schema_migrations migration
+  ), migration_state as (
+    select
+      (select count(*) = count(distinct version) from applied_migrations)
+      and coalesce(
+        (select array_agg(version order by version) from applied_migrations),
+        array[]::text[]
+      ) = (select array_agg(version order by version) from required_migrations) as current
+  ), required_rls(schema_name, table_name) as (
     values
       ('private', 'analysis_jobs'),
       ('private', 'app_sessions'),
@@ -366,10 +395,7 @@ begin
         || '?download=page2webmcp-' || release.content_hash || '.js'
   )
   select
-    exists (
-      select 1 from supabase_migrations.schema_migrations migration
-      where migration.version = '20260831120000'
-    ),
+    (select migration_state.current from migration_state),
     (select rls_state.verified from rls_state),
     exists (select 1 from selected_paths path where path.local_only and path.provider_mode = 'openapi'),
     exists (select 1 from selected_paths path where path.local_only and path.provider_mode = 'website'),

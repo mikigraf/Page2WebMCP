@@ -130,6 +130,9 @@ export type DeploymentReadiness = Readonly<{
 }>;
 
 export function evaluateDeploymentReadiness(input: DeploymentReadinessInput): DeploymentReadiness {
+  if (input.mode !== "hermetic" && input.mode !== "local-live" && input.mode !== "live") {
+    return { status: "failed", code: "INVALID_READINESS_MODE", liveSuccess: false };
+  }
   if (input.versionDrift.length > 0) return { status: "failed", code: "VERSION_DRIFT", liveSuccess: false };
   if (!input.migrationsCurrent) return { status: "failed", code: "MIGRATIONS_OUTDATED", liveSuccess: false };
   if (!input.rlsVerified) return { status: "failed", code: "RLS_NOT_VERIFIED", liveSuccess: false };

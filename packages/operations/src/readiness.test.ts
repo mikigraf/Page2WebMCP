@@ -146,6 +146,15 @@ function liveReadiness(overrides: Record<string, unknown> = {}) {
   };
 }
 
+test("runtime-invalid readiness modes fail closed before the live proof path", () => {
+  const input = { ...liveReadiness(), mode: "production" } as unknown as Parameters<
+    typeof evaluateDeploymentReadiness
+  >[0];
+  assert.deepEqual(evaluateDeploymentReadiness(input), {
+    status: "failed", code: "INVALID_READINESS_MODE", liveSuccess: false,
+  });
+});
+
 test("only one exact selected-hash native installation proof constructs liveSuccess", () => {
   assert.deepEqual(evaluateDeploymentReadiness(liveReadiness()), {
     status: "passed", code: "LIVE_READINESS_PASSED", liveSuccess: true,

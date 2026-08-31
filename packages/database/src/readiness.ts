@@ -1,4 +1,5 @@
 import pg from "pg";
+import { createHash } from "node:crypto";
 import type {
   NativeInstallationProof,
   ProductionProviderProvenance,
@@ -20,8 +21,18 @@ export type MaintenanceReadinessRepository = Readonly<{
     hash: string,
     provider: ProductionProviderProvenance,
     localOnly: boolean,
-  ): Promise<Readonly<{ migrationsCurrent: boolean; rlsVerified: boolean; selectedReleasePersisted: boolean }>>;
+  ): Promise<Readonly<{
+    migrationsCurrent: boolean;
+    rlsVerified: boolean;
+    selectedReleasePersisted: boolean;
+    sessionIdentityDigest: string;
+  }>>;
   findSelectedNativeInstallationProof(hash: string): Promise<NativeInstallationProof | undefined>;
+  close(): Promise<void>;
+}>;
+
+export type ApplicationReadinessRepository = Readonly<{
+  inspectApplicationRole(): Promise<Readonly<{ sessionIdentityDigest: string }>>;
   close(): Promise<void>;
 }>;
 
@@ -80,25 +91,37 @@ const PROOF_COLUMNS = Object.freeze({
   candidate_checks_passed: "candidateChecksPassed",
 } as const);
 
+export function createApplicationReadinessRepository(
+  options: MaintenanceReadinessOptions,
+): ApplicationReadinessRepository {
+  const { pool, timeout } = readinessPool(options);
+  return {
+    async inspectApplicationRole() {
+      const client = await pool.connect();
+      try {
+        await client.query("begin");
+        await client.query("set transaction read only");
+        await client.query("set local role page2webmcp_app");
+        await configureTransactionBounds(client, timeout);
+        const role = await client.query(ROLE_AUDIT_QUERY);
+        const sessionIdentityDigest = validatedRoleIdentity(role.rows[0], "page2webmcp_app");
+        await client.query("commit");
+        return { sessionIdentityDigest };
+      } catch (error) {
+        try { await client.query("rollback"); } catch { /* preserve the original bounded error */ }
+        throw error;
+      } finally {
+        client.release();
+      }
+    },
+    close: () => pool.end(),
+  };
+}
+
 export function createMaintenanceReadinessRepository(
   options: MaintenanceReadinessOptions,
 ): MaintenanceReadinessRepository {
-  if (!options?.connectionString || options.connectionString.length > 4_096
-    || !["local-live", "live"].includes(options.mode)) throw new Error("MAINTENANCE_DATABASE_CONFIGURATION_REQUIRED");
-  const timeout = Math.max(250, Math.min(options.statementTimeoutMs ?? 5_000, 15_000));
-  const pool: MaintenanceReadinessPool = options.pool ?? (options.poolFactory ?? ((configuration) => new pg.Pool(
-    configuration,
-  )))({
-    connectionString: options.connectionString,
-    max: 1,
-    connectionTimeoutMillis: 5_000,
-    // Bound every query on the client before BEGIN/SET ROLE can rely on server-local settings.
-    query_timeout: timeout,
-    statement_timeout: timeout,
-    idleTimeoutMillis: 5_000,
-    allowExitOnIdle: true,
-    ssl: options.mode === "live" ? { rejectUnauthorized: true } : false,
-  });
+  const { pool, timeout } = readinessPool(options);
   return {
     async inspectSelectedReleaseTopology(hash, provider, localOnly) {
       if (!HASH.test(hash)) throw new Error("READINESS_RELEASE_HASH_INVALID");
@@ -106,10 +129,11 @@ export function createMaintenanceReadinessRepository(
       const client = await pool.connect();
       try {
         await client.query("begin");
+        await client.query("set transaction read only");
         await client.query("set local role page2webmcp_maintenance");
         await configureTransactionBounds(client, timeout);
         const role = await client.query(ROLE_AUDIT_QUERY);
-        if (!validMaintenanceRole(role.rows[0])) throw new Error("MAINTENANCE_DATABASE_ROLE_REQUIRED");
+        const sessionIdentityDigest = validatedRoleIdentity(role.rows[0], "page2webmcp_maintenance");
         const result = await client.query(
           "select * from private.selected_release_readiness_topology($1)",
           [hash],
@@ -117,7 +141,7 @@ export function createMaintenanceReadinessRepository(
         if (result.rows.length !== 1) throw new Error("READINESS_TOPOLOGY_INVALID");
         const topology = mapTopology(result.rows[0]!, providerMode, localOnly);
         await client.query("commit");
-        return topology;
+        return { ...topology, sessionIdentityDigest };
       } catch (error) {
         try { await client.query("rollback"); } catch { /* preserve the original bounded error */ }
         throw error;
@@ -130,10 +154,11 @@ export function createMaintenanceReadinessRepository(
       const client = await pool.connect();
       try {
         await client.query("begin");
+        await client.query("set transaction read only");
         await client.query("set local role page2webmcp_maintenance");
         await configureTransactionBounds(client, timeout);
         const role = await client.query(ROLE_AUDIT_QUERY);
-        if (!validMaintenanceRole(role.rows[0])) throw new Error("MAINTENANCE_DATABASE_ROLE_REQUIRED");
+        validatedRoleIdentity(role.rows[0], "page2webmcp_maintenance");
         const result = await client.query(
           "select * from private.selected_native_installation_proof($1)",
           [hash],
@@ -151,6 +176,29 @@ export function createMaintenanceReadinessRepository(
     },
     close: () => pool.end(),
   };
+}
+
+function readinessPool(options: MaintenanceReadinessOptions): Readonly<{
+  pool: MaintenanceReadinessPool;
+  timeout: number;
+}> {
+  if (!options?.connectionString || options.connectionString.length > 4_096
+    || !["local-live", "live"].includes(options.mode)) throw new Error("DATABASE_READINESS_CONFIGURATION_REQUIRED");
+  const timeout = Math.max(250, Math.min(options.statementTimeoutMs ?? 5_000, 15_000));
+  const pool: MaintenanceReadinessPool = options.pool ?? (options.poolFactory ?? ((configuration) => new pg.Pool(
+    configuration,
+  )))({
+    connectionString: options.connectionString,
+    max: 1,
+    connectionTimeoutMillis: 5_000,
+    // Bound every query on the client before BEGIN/SET ROLE can rely on server-local settings.
+    query_timeout: timeout,
+    statement_timeout: timeout,
+    idleTimeoutMillis: 5_000,
+    allowExitOnIdle: true,
+    ssl: options.mode === "live" ? { rejectUnauthorized: true } : false,
+  });
+  return { pool, timeout };
 }
 
 async function configureTransactionBounds(client: MaintenanceReadinessClient, timeout: number): Promise<void> {
@@ -202,17 +250,43 @@ function mapTopology(
 const ROLE_AUDIT_QUERY =
   "select current_user as current_role, session_user as session_role, login.rolsuper as session_superuser, " +
   "login.rolbypassrls as session_bypass_rls, login.rolcanlogin as session_can_login, " +
-  "coalesce(array(select role.rolname from pg_catalog.pg_roles role " +
-  "where role.rolname in ('page2webmcp_app','page2webmcp_worker','page2webmcp_maintenance') " +
-  "and pg_catalog.pg_has_role(session_user, role.oid, 'member') order by role.rolname), array[]::name[]) " +
-  "as session_relevant_roles from pg_catalog.pg_roles login where login.rolname = session_user";
+  "login.rolcreatedb as session_createdb, login.rolcreaterole as session_createrole, " +
+  "login.rolreplication as session_replication, " +
+  "coalesce(array(select role.rolname::text from pg_catalog.pg_roles role " +
+  "where role.oid <> login.oid and pg_catalog.pg_has_role(session_user, role.oid, 'member') " +
+  "order by role.rolname), array[]::text[]) as session_assumable_roles, " +
+  "exists(select 1 from pg_catalog.pg_database database " +
+  "where database.datname = pg_catalog.current_database() " +
+  "and database.datdba in (login.oid, current_user::regrole::oid)) " +
+  "as session_owns_current_database, " +
+  "exists(select 1 from pg_catalog.pg_namespace namespace " +
+  "where namespace.nspname in ('private','public') and namespace.nspowner in (login.oid, current_user::regrole::oid)) " +
+  "as session_owns_scoped_schema, " +
+  "exists(select 1 from pg_catalog.pg_class relation join pg_catalog.pg_namespace namespace " +
+  "on namespace.oid = relation.relnamespace where namespace.nspname in ('private','public') " +
+  "and relation.relowner in (login.oid, current_user::regrole::oid)) as session_owns_scoped_relation, " +
+  "exists(select 1 from pg_catalog.pg_proc routine join pg_catalog.pg_namespace namespace " +
+  "on namespace.oid = routine.pronamespace where namespace.nspname in ('private','public') " +
+  "and routine.proowner in (login.oid, current_user::regrole::oid)) as session_owns_scoped_routine " +
+  "from pg_catalog.pg_roles login where login.rolname = session_user";
 
-function validMaintenanceRole(row: Record<string, unknown> | undefined): boolean {
-  return row?.current_role === "page2webmcp_maintenance"
-    && typeof row.session_role === "string" && row.session_role.length > 0 && row.session_role.length <= 128
-    && row.session_superuser === false && row.session_bypass_rls === false && row.session_can_login === true
-    && Array.isArray(row.session_relevant_roles) && row.session_relevant_roles.length === 1
-    && row.session_relevant_roles[0] === "page2webmcp_maintenance";
+function validatedRoleIdentity(
+  row: Record<string, unknown> | undefined,
+  expectedRole: "page2webmcp_app" | "page2webmcp_maintenance",
+): string {
+  const sessionRole = row?.session_role;
+  if (row?.current_role !== expectedRole
+    || typeof sessionRole !== "string" || sessionRole.length === 0 || sessionRole.length > 128
+    || row.session_superuser !== false || row.session_bypass_rls !== false || row.session_can_login !== true
+    || row.session_createdb !== false || row.session_createrole !== false || row.session_replication !== false
+    || !Array.isArray(row.session_assumable_roles) || row.session_assumable_roles.length !== 1
+    || row.session_assumable_roles[0] !== expectedRole
+    || row.session_owns_current_database !== false || row.session_owns_scoped_schema !== false
+    || row.session_owns_scoped_relation !== false || row.session_owns_scoped_routine !== false) {
+    throw new Error(expectedRole === "page2webmcp_app"
+      ? "APPLICATION_DATABASE_ROLE_REQUIRED" : "MAINTENANCE_DATABASE_ROLE_REQUIRED");
+  }
+  return createHash("sha256").update(sessionRole, "utf8").digest("hex");
 }
 
 function mapProof(row: Record<string, unknown>): NativeInstallationProof {
