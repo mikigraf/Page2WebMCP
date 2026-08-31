@@ -229,12 +229,8 @@ test("Supabase cookies are server-only and securely scoped", () => {
 });
 
 test("production cookies drop Secure only for requests to the configured local-stack control origin", async () => {
-  const service = createSupabaseAuthService({
-    environment: {
-      NODE_ENV: "production",
-      PAGE2WEBMCP_LOCAL_STACK: "true",
-      PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN: "http://127.0.0.1:3100"
-    },
+  const serviceFor = (environment: Record<string, string>) => createSupabaseAuthService({
+    environment,
     createClient(_request, setCookies) {
       setCookies([{ name: "sb-control-auth", value: "opaque", options: { sameSite: "lax" } }]);
       return client({
@@ -248,25 +244,42 @@ test("production cookies drop Secure only for requests to the configured local-s
       });
     }
   });
+  const signInCookie = async (environment: Record<string, string>, requestUrl: string) => {
+    const result = await serviceFor(environment).signIn(
+      new Request(requestUrl, { method: "POST" }),
+      "person@example.test",
+      "strong password"
+    );
+    assert.equal(result.cookies.length, 1);
+    return result.cookies[0]!;
+  };
+  const productionLocal = {
+    NODE_ENV: "production",
+    PAGE2WEBMCP_LOCAL_STACK: "true",
+    PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN: "http://127.0.0.1:3100"
+  };
 
-  const local = await service.signIn(
-    new Request("http://127.0.0.1:3100/api/auth/login", { method: "POST" }),
-    "person@example.test",
-    "strong password"
-  );
-  const wrongLoopbackPort = await service.signIn(
-    new Request("http://127.0.0.1:3101/api/auth/login", { method: "POST" }),
-    "person@example.test",
-    "strong password"
-  );
-  const remote = await service.signIn(
-    new Request("http://control.example/api/auth/login", { method: "POST" }),
-    "person@example.test",
-    "strong password"
-  );
+  const local = await signInCookie(productionLocal, "http://127.0.0.1:3100/api/auth/login");
+  const wrongLoopbackPort = await signInCookie(productionLocal, "http://127.0.0.1:3101/api/auth/login");
+  const remote = await signInCookie(productionLocal, "http://control.example/api/auth/login");
+  const developmentRemote = await signInCookie({
+    ...productionLocal,
+    NODE_ENV: "development"
+  }, "http://control.example/api/auth/login");
+  const developmentWithoutLocalStack = await signInCookie({
+    NODE_ENV: "development",
+    PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN: "http://127.0.0.1:3100"
+  }, "http://127.0.0.1:3100/api/auth/login");
+  const developmentArbitraryPort = await signInCookie({
+    NODE_ENV: "development",
+    PAGE2WEBMCP_LOCAL_STACK: "true",
+    PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN: "http://127.0.0.1:3101"
+  }, "http://127.0.0.1:3101/api/auth/login");
 
-  assert.equal(local.cookies.length, 1);
-  assert.doesNotMatch(local.cookies[0]!, /; Secure(?:;|$)/);
-  assert.match(wrongLoopbackPort.cookies[0]!, /; Secure(?:;|$)/);
-  assert.match(remote.cookies[0]!, /; Secure(?:;|$)/);
+  assert.doesNotMatch(local, /; Secure(?:;|$)/);
+  assert.match(wrongLoopbackPort, /; Secure(?:;|$)/);
+  assert.match(remote, /; Secure(?:;|$)/);
+  assert.match(developmentRemote, /; Secure(?:;|$)/);
+  assert.match(developmentWithoutLocalStack, /; Secure(?:;|$)/);
+  assert.match(developmentArbitraryPort, /; Secure(?:;|$)/);
 });

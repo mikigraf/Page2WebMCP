@@ -116,10 +116,14 @@ test("production permits HTTP Auth and control origins only for the explicit IP-
   for (const overrides of [
     { PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN: "http://localhost:3100" },
     { PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN: "http://127.0.0.2:3100" },
+    { PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN: "http://127.0.0.1:3101" },
+    { PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN: "http://[::1]:3101" },
     { PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN: "http://127.0.0.1:3100/path" },
     { PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN: "http://user@127.0.0.1:3100" },
     { NEXT_PUBLIC_SUPABASE_URL: "http://localhost:54321" },
     { NEXT_PUBLIC_SUPABASE_URL: "http://127.0.0.2:54321" },
+    { NEXT_PUBLIC_SUPABASE_URL: "http://127.0.0.1:54322" },
+    { NEXT_PUBLIC_SUPABASE_URL: "http://[::1]:54322" },
     { NEXT_PUBLIC_SUPABASE_URL: "http://127.0.0.1:54321/auth/v1" },
     { NEXT_PUBLIC_SUPABASE_URL: "http://127.0.0.1:54321?unsafe=true" }
   ]) assert.throws(

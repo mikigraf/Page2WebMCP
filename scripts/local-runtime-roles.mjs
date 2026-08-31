@@ -81,8 +81,11 @@ async function assertAppliedMigrationHistory(client, expectedMigrationVersions) 
   const result = await client.query(
     "select version from supabase_migrations.schema_migrations order by version"
   );
-  const applied = new Set(result.rows.map((row) => row.version).filter((version) => typeof version === "string"));
-  if (expectedMigrationVersions.some((version) => !applied.has(version))) {
+  const applied = result.rows.map((row) => row?.version);
+  if (applied.length !== expectedMigrationVersions.length
+    || applied.some((version) => typeof version !== "string" || !/^\d{14}$/.test(version))
+    || new Set(applied).size !== applied.length
+    || applied.some((version, index) => version !== expectedMigrationVersions[index])) {
     throw new Error("LOCAL_MIGRATION_HISTORY_INCOMPLETE");
   }
 }
@@ -178,18 +181,4 @@ async function writeLocalEnvironment(destination, credentials, ownerUrl, localSt
     await rm(temporary, { force: true }).catch(() => undefined);
     throw error;
   }
-}
-
-async function main() {
-  const [flag, ownerDatabaseUrl] = process.argv.slice(2);
-  if (flag !== "--owner-database-url" || !ownerDatabaseUrl || process.argv.length !== 4) throw new Error(LOCAL_OWNER_URL_ERROR);
-  await bootstrapLocalRuntimeRoles(ownerDatabaseUrl);
-  console.log("Local runtime roles refreshed.");
-}
-
-if (import.meta.url === `file://${process.argv[1]}`) {
-  main().catch((error) => {
-    process.stderr.write(`${error instanceof Error && /^[A-Z0-9_]{1,80}$/.test(error.message) ? error.message : "LOCAL_RUNTIME_ROLE_BOOTSTRAP_FAILED"}\n`);
-    process.exitCode = 2;
-  });
 }

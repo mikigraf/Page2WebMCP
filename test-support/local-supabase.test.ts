@@ -36,13 +36,14 @@ test("local Supabase lifecycle is pinned, uses the pnpm CLI boundary, and declar
   assert.equal(await exists(join(workspaceRoot, "scripts/local-supabase.mjs")), true);
 });
 
-test("runtime role bootstrap rejects a non-loopback owner URL without printing or persisting it", async () => {
+test("runtime role helper is import-only and local-supabase remains the executable lifecycle", async () => {
   const directory = await mkdtemp(join(tmpdir(), "page2webmcp-local-roles-"));
   const ownerUrl = "postgresql://postgres:owner-secret@database.example:5432/postgres";
   try {
     const result = await run("scripts/local-runtime-roles.mjs", ["--owner-database-url", ownerUrl], directory);
-    assert.equal(result.code, 2);
-    assert.match(result.stderr, /LOCAL_OWNER_DATABASE_URL_LOOPBACK_REQUIRED/);
+    assert.equal(result.code, 0);
+    assert.equal(result.stdout, "");
+    assert.equal(result.stderr, "");
     assert.doesNotMatch(`${result.stdout}\n${result.stderr}`, /owner-secret|database\.example/);
     assert.equal(await exists(join(directory, ".page2webmcp/local.env")), false);
   } finally {
@@ -205,6 +206,32 @@ test("runtime role bootstrap refuses to persist credentials until every committe
     ), /^Error: LOCAL_MIGRATION_HISTORY_INCOMPLETE$/);
     assert.equal(await exists(destination), false);
     assert.equal(client.ended, true);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("runtime role bootstrap requires the exact sorted committed migration history", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "page2webmcp-local-migration-identity-"));
+  const invalidHistories = [
+    [...migrationVersions, "20260831130000"],
+    [...migrationVersions, "malformed"],
+    [migrationVersions[0]!, migrationVersions[1]!, migrationVersions[1]!],
+    [...migrationVersions].reverse()
+  ];
+  try {
+    for (const [index, appliedMigrationVersions] of invalidHistories.entries()) {
+      const destination = join(directory, `.page2webmcp/local-${index}.env`);
+      const client = fakeBootstrapClient(appliedMigrationVersions);
+      await assert.rejects(bootstrapLocalRuntimeRoles(
+        "postgresql://postgres:owner-secret@127.0.0.1:54322/postgres",
+        destination,
+        { createClient: () => client },
+        { localStatus, expectedMigrationVersions: migrationVersions }
+      ), /^Error: LOCAL_MIGRATION_HISTORY_INCOMPLETE$/);
+      assert.equal(await exists(destination), false);
+      assert.equal(client.ended, true);
+    }
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

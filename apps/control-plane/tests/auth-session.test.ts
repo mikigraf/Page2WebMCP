@@ -48,6 +48,8 @@ test("production Auth permits HTTP only for the explicit canonical IP-literal lo
   for (const url of [
     "http://localhost:54321",
     "http://127.0.0.2:54321",
+    "http://127.0.0.1:54322",
+    "http://[::1]:54322",
     "http://127.0.0.1:54321/auth/v1",
     "http://127.0.0.1:54321?unsafe=true",
     "http://user@127.0.0.1:54321"

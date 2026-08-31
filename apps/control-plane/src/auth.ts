@@ -288,7 +288,7 @@ function configuredValues(environment: Record<string, string | undefined> = proc
     ?? "";
   let url: URL;
   try { url = new URL(rawUrl); } catch { throw new AuthError("SUPABASE_CONFIGURATION_REQUIRED"); }
-  if ((url.protocol !== "https:" && !localStackHttpOrigin(url, environment))
+  if ((url.protocol !== "https:" && !localStackHttpOrigin(url, environment, "54321"))
     || url.username || url.password || url.search || url.hash || url.pathname !== "/"
     || publishableKey.length < 20
     || unsafeSupabaseBrowserKey(publishableKey)) {
@@ -299,18 +299,19 @@ function configuredValues(environment: Record<string, string | undefined> = proc
 
 function localStackHttpOrigin(
   url: URL,
-  environment: Record<string, string | undefined>
+  environment: Record<string, string | undefined>,
+  expectedPort: string
 ): boolean {
   return environment.PAGE2WEBMCP_LOCAL_STACK === "true"
     && url.protocol === "http:"
     && ["127.0.0.1", "[::1]"].includes(url.hostname)
+    && url.port === expectedPort
     && !url.username && !url.password && !url.search && !url.hash && url.pathname === "/";
 }
 
 function secureCookie(request: Request, environment: Record<string, string | undefined>): boolean {
   const requestUrl = new URL(request.url);
   if (requestUrl.protocol === "https:") return true;
-  if (environment.NODE_ENV !== "production") return false;
   const configured = exactConfiguredControlOrigin(environment.PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN ?? "", environment);
   return !configured || requestUrl.username !== "" || requestUrl.password !== ""
     || requestUrl.protocol !== "http:" || requestUrl.origin !== configured;
@@ -322,7 +323,7 @@ function exactConfiguredControlOrigin(
 ): string | undefined {
   let url: URL;
   try { url = new URL(value); } catch { return undefined; }
-  return localStackHttpOrigin(url, environment) ? url.origin : undefined;
+  return localStackHttpOrigin(url, environment, "3100") ? url.origin : undefined;
 }
 
 export function createConfiguredSupabaseAuthService(

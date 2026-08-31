@@ -11,7 +11,7 @@ export function validateRuntimeConfiguration(environment: RuntimeEnvironment = p
   const publicOrigin = exactUrl(environment.PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN ?? "");
   if (!publicOrigin
     || !exactOrigin(publicOrigin)
-    || (publicOrigin.protocol !== "https:" && !localStackHttpOrigin(publicOrigin, environment))) {
+    || (publicOrigin.protocol !== "https:" && !localStackHttpOrigin(publicOrigin, environment, "3100"))) {
     throw new Error("INVALID_CONTROL_PLANE_PUBLIC_ORIGIN");
   }
   validateSharedRuntimeConfiguration(environment, true);
@@ -51,7 +51,7 @@ function validateSupabaseConfiguration(environment: RuntimeEnvironment): void {
     ?? environment.NEXT_PUBLIC_SUPABASE_ANON_KEY
     ?? "";
   if (!url || !exactOrigin(url)
-    || (url.protocol !== "https:" && !localStackHttpOrigin(url, environment))
+    || (url.protocol !== "https:" && !localStackHttpOrigin(url, environment, "54321"))
     || key.length < 20 || unsafeSupabaseBrowserKey(key)) {
     throw new Error("SUPABASE_CONFIGURATION_REQUIRED");
   }
@@ -68,10 +68,11 @@ function exactOrigin(url: URL): boolean {
   return !url.username && !url.password && !url.search && !url.hash && url.pathname === "/";
 }
 
-function localStackHttpOrigin(url: URL, environment: RuntimeEnvironment): boolean {
+function localStackHttpOrigin(url: URL, environment: RuntimeEnvironment, expectedPort: string): boolean {
   return environment.PAGE2WEBMCP_LOCAL_STACK === "true"
     && url.protocol === "http:"
     && ["127.0.0.1", "[::1]"].includes(url.hostname)
+    && url.port === expectedPort
     && exactOrigin(url);
 }
 
