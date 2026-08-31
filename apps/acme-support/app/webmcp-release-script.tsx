@@ -1,3 +1,5 @@
+import Script from "next/script";
+
 const CONTENT_HASH = /^[0-9a-f]{64}$/;
 const SHA384_SRI = /^sha384-[A-Za-z0-9+/]+={0,2}$/;
 
@@ -42,7 +44,7 @@ export function WebMcpReleaseScript() {
   } catch {
     return <meta name="page2webmcp-status" content="release-unconfigured" />;
   }
-  return <script
+  return <Script
     type="module"
     src={config.src}
     integrity={config.integrity}
