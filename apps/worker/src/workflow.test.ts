@@ -16,20 +16,25 @@ test("OpenAPI worker adapter binds exact source bytes to generic canonical plans
     } } } },
   } } } });
   const adapter = createOpenApiAnalysisAdapter({
-    targetOrigin: "https://widgets.example",
-    testPageUrl: "https://widgets.example/review/openapi",
-    environment: "test",
     provider: {
       resolver: { resolve: async () => ["93.184.216.34"] },
       transport: { request: async ({ url }) => ({
         status: 200,
         url,
+        connectedAddress: "93.184.216.34",
+        tls: { authorized: true, servername: "specs.widgets.example", protocol: "TLSv1.3" },
         headers: { "content-type": "application/json" },
         body: { async *[Symbol.asyncIterator]() { yield new TextEncoder().encode(source); } },
       }) },
     },
   });
-  const result = await adapter({ sourceType: "openapi", sourceUrl: "https://specs.widgets.example/openapi.json" }, new AbortController().signal);
+  const result = await adapter({
+    sourceType: "openapi", sourceUrl: "https://specs.widgets.example/openapi.json",
+    sourceConfiguration: {
+      kind: "openapi", targetOrigin: "https://widgets.example",
+      testPageUrl: "https://widgets.example/review/openapi", environment: "test",
+    },
+  }, new AbortController().signal);
   assert.equal(result.capabilities.length, 1);
   assert.equal(result.capabilities[0]!.plan.targetOrigin, "https://widgets.example");
   assert.ok(result.release);
@@ -53,22 +58,25 @@ test("OpenAPI worker adapter fails closed for other source types and returns exa
     responses: { "200": { description: "ok", content: { "application/json": { schema: { type: "boolean" } } } } },
   } } } });
   const adapter = createOpenApiAnalysisAdapter({
-    targetOrigin: "https://widgets.example",
-    testPageUrl: "https://widgets.example/review/openapi",
-    environment: "test",
     provider: {
       resolver: { resolve: async () => ["93.184.216.34"] },
       transport: { request: async ({ url }) => ({
         status: 200,
         url,
+        connectedAddress: "93.184.216.34",
+        tls: { authorized: true, servername: "specs.widgets.example", protocol: "TLSv1.3" },
         headers: { "content-type": "application/json" },
         body: { async *[Symbol.asyncIterator]() { yield new TextEncoder().encode(source); } },
       }) },
     },
   });
-  await assert.rejects(() => adapter({ sourceType: "website", sourceUrl: "https://widgets.example" }, new AbortController().signal), /SOURCE_TYPE_UNSUPPORTED/);
+  const configuration = {
+    kind: "openapi" as const, targetOrigin: "https://widgets.example",
+    testPageUrl: "https://widgets.example/review/openapi", environment: "test" as const,
+  };
+  await assert.rejects(() => adapter({ sourceType: "website", sourceUrl: "https://widgets.example", sourceConfiguration: { kind: "website" } }, new AbortController().signal), /SOURCE_TYPE_UNSUPPORTED/);
   const result = await adapter(
-    { sourceType: "openapi", sourceUrl: "https://specs.widgets.example/openapi.json" },
+    { sourceType: "openapi", sourceUrl: "https://specs.widgets.example/openapi.json", sourceConfiguration: configuration },
     new AbortController().signal,
   );
   assert.deepEqual(result.capabilities, []);
@@ -76,15 +84,72 @@ test("OpenAPI worker adapter fails closed for other source types and returns exa
   assert.equal(result.release, undefined);
   assert.equal(result.evidence.length, 1);
 
-  assert.throws(() => createOpenApiAnalysisAdapter({
-    targetOrigin: "http://widgets.example",
-    testPageUrl: "https://other.example/review/openapi",
-    environment: "test",
+});
+
+test("OpenAPI worker copies distinct per-run verification contexts and rejects legacy context before transport", async () => {
+  const source = JSON.stringify({
+    openapi: "3.1.0", info: { title: "Widgets", version: "1" },
+    paths: { "/widgets": { get: {
+      operationId: "listWidgets",
+      responses: { "200": { description: "ok", content: { "application/json": {
+        schema: { type: "array", items: { type: "string", maxLength: 32 } },
+      } } } },
+    } } },
+  });
+  let resolverCalls = 0;
+  let releaseFetch!: () => void;
+  const gate = new Promise<void>((resolve) => { releaseFetch = resolve; });
+  const adapter = createOpenApiAnalysisAdapter({
     provider: {
-      resolver: { resolve: async () => ["93.184.216.34"] },
-      transport: { request: async () => { throw new Error("must not fetch"); } },
+      resolver: { resolve: async () => { resolverCalls += 1; await gate; return ["93.184.216.34"]; } },
+      transport: { request: async ({ url }) => ({
+        status: 200, url, connectedAddress: "93.184.216.34",
+        tls: { authorized: true, servername: "specs.widgets.example", protocol: "TLSv1.3" },
+        headers: { "content-type": "application/json" },
+        body: { async *[Symbol.asyncIterator]() { yield new TextEncoder().encode(source); } },
+      }) },
     },
-  }), /OPENAPI_VERIFICATION_CONTEXT_REQUIRED/);
+  });
+  const firstConfiguration = {
+    kind: "openapi" as const, targetOrigin: "https://one.example",
+    testPageUrl: "https://one.example/review", environment: "staging" as const,
+  };
+  const first = adapter({
+    sourceType: "openapi", sourceUrl: "https://specs.widgets.example/openapi.json",
+    sourceConfiguration: firstConfiguration,
+  }, new AbortController().signal);
+  const second = adapter({
+    sourceType: "openapi", sourceUrl: "https://specs.widgets.example/openapi.json",
+    sourceConfiguration: {
+      kind: "openapi", targetOrigin: "https://two.example",
+      testPageUrl: "https://two.example/test", environment: "production",
+    },
+  }, new AbortController().signal);
+  (firstConfiguration as { targetOrigin: string }).targetOrigin = "https://mutated.example";
+  releaseFetch();
+  const [one, two] = await Promise.all([first, second]);
+  assert.deepEqual([one.release?.allowedOrigin, two.release?.allowedOrigin], ["https://one.example", "https://two.example"]);
+  assert.deepEqual([one, two].map((result) => {
+    const evidence = JSON.parse(result.evidence[0]!.content);
+    return [evidence.targetOrigin, evidence.testPageUrl, evidence.environment];
+  }), [
+    ["https://one.example", "https://one.example/review", "staging"],
+    ["https://two.example", "https://two.example/test", "production"],
+  ]);
+
+  for (const sourceConfiguration of [
+    undefined,
+    { kind: "legacy_unconfigured" },
+    { kind: "website" },
+    { kind: "openapi", targetOrigin: "http://one.example", testPageUrl: "https://one.example/review", environment: "test" },
+    { kind: "openapi", targetOrigin: "https://one.example", testPageUrl: "https://other.example/review", environment: "test" },
+  ]) {
+    await assert.rejects(adapter({
+      sourceType: "openapi", sourceUrl: "https://specs.widgets.example/openapi.json",
+      sourceConfiguration: sourceConfiguration as never,
+    }, new AbortController().signal), /^RepositoryError: OPENAPI_VERIFICATION_CONTEXT_REQUIRED$/);
+  }
+  assert.equal(resolverCalls, 2);
 });
 
 const websiteOrigin = "https://widgets.example";

@@ -113,14 +113,13 @@ test("mixed OpenAPI analysis preserves unsupported-operation diagnostics through
     },
   });
   const mixedAdapter = createOpenApiAnalysisAdapter({
-    targetOrigin: "https://widgets.example",
-    testPageUrl: "https://widgets.example/review/openapi",
-    environment: "test",
     provider: {
       resolver: { resolve: async () => ["93.184.216.34"] },
       transport: { request: async ({ url }) => ({
         status: 200,
         url,
+        connectedAddress: "93.184.216.34",
+        tls: { authorized: true, servername: "specs.widgets.example", protocol: "TLSv1.3" },
         headers: { "content-type": "application/json" },
         body: { async *[Symbol.asyncIterator]() { yield new TextEncoder().encode(source); } },
       }) },
@@ -168,14 +167,13 @@ test("all-unsupported OpenAPI analysis exposes exact diagnostics without an inve
     } } },
   });
   const unsupportedAdapter = createOpenApiAnalysisAdapter({
-    targetOrigin: "https://widgets.example",
-    testPageUrl: "https://widgets.example/review/openapi",
-    environment: "test",
     provider: {
       resolver: { resolve: async () => ["93.184.216.34"] },
       transport: { request: async ({ url }) => ({
         status: 200,
         url,
+        connectedAddress: "93.184.216.34",
+        tls: { authorized: true, servername: "specs.widgets.example", protocol: "TLSv1.3" },
         headers: { "content-type": "application/json" },
         body: { async *[Symbol.asyncIterator]() { yield new TextEncoder().encode(source); } },
       }) },

@@ -8,6 +8,12 @@ const DEFAULT_MAX_REDIRECTS = 3;
 export type OpenApiFetchResponse = Readonly<{
   status: number;
   url: string;
+  connectedAddress: string;
+  tls: Readonly<{
+    authorized: boolean;
+    servername: string;
+    protocol: string | null;
+  }>;
   headers: Readonly<Record<string, string>>;
   body: AsyncIterable<Uint8Array>;
 }>;
@@ -116,6 +122,36 @@ async function discardBody(body: AsyncIterable<Uint8Array>): Promise<void> {
   try { await body[Symbol.asyncIterator]().return?.(); } catch { /* best-effort transport cleanup */ }
 }
 
+function normalizedAddress(value: string): string {
+  const mappedIpv4 = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i.exec(value);
+  if (mappedIpv4) return mappedIpv4[1]!;
+  if (!value.includes(":")) return value;
+  try { return new URL(`https://[${value.replace(/^\[|\]$/g, "")}]`).hostname.replace(/^\[|\]$/g, ""); }
+  catch { return value; }
+}
+
+async function assertVerifiedConnection(
+  response: OpenApiFetchResponse,
+  hostname: string,
+  pinnedAddresses: readonly string[],
+): Promise<void> {
+  if (typeof response.connectedAddress !== "string") {
+    await discardBody(response.body);
+    throw new Error("OPENAPI_TRANSPORT_POLICY_VIOLATION");
+  }
+  if (!response.tls || response.tls.authorized !== true || response.tls.servername !== hostname
+    || response.tls.protocol !== "TLSv1.2" && response.tls.protocol !== "TLSv1.3") {
+    await discardBody(response.body);
+    throw new Error("OPENAPI_TLS_VERIFICATION_FAILED");
+  }
+  const connectedAddress = normalizedAddress(response.connectedAddress);
+  if (!validateResolvedAddress(connectedAddress).ok
+    || !pinnedAddresses.some((address) => normalizedAddress(address) === connectedAddress)) {
+    await discardBody(response.body);
+    throw new Error("OPENAPI_DNS_REBINDING_BLOCKED");
+  }
+}
+
 async function fetchWithinPolicy(urlValue: string, controls: OpenApiProviderControls, signal: AbortSignal): Promise<OpenApiSource> {
   const maximum = boundedInteger(controls.maxBytes, DEFAULT_MAX_BYTES, 1, DEFAULT_MAX_BYTES);
   const maximumRedirects = boundedInteger(controls.maxRedirects, DEFAULT_MAX_REDIRECTS, 0, 10);
@@ -127,6 +163,7 @@ async function fetchWithinPolicy(urlValue: string, controls: OpenApiProviderCont
   for (let redirects = 0; ; redirects += 1) {
     if (signal.aborted) throw signal.reason;
     const addressValues = await controls.resolver.resolve(current.hostname, signal);
+    if (signal.aborted) throw signal.reason;
     if (!Array.isArray(addressValues) || addressValues.length === 0 || addressValues.length > 16
       || addressValues.some((address) => typeof address !== "string" || !validateResolvedAddress(address).ok)) {
       throw new Error("OPENAPI_SSRF_BLOCKED");
@@ -141,7 +178,9 @@ async function fetchWithinPolicy(urlValue: string, controls: OpenApiProviderCont
       credentials: "omit",
       signal,
     });
-    if (!response || response.url !== current.href || !Number.isInteger(response.status)) {
+    if (!response) throw new Error("OPENAPI_TRANSPORT_POLICY_VIOLATION");
+    await assertVerifiedConnection(response, current.hostname, pinnedAddresses);
+    if (response.url !== current.href || !Number.isInteger(response.status)) {
       throw new Error("OPENAPI_TRANSPORT_POLICY_VIOLATION");
     }
     if (response.status >= 300 && response.status <= 399) {

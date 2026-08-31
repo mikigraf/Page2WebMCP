@@ -16,8 +16,17 @@ function body(...chunks: string[]): AsyncIterable<Uint8Array> {
   };
 }
 
-function response(status: number, url: string, headers: Record<string, string>, ...chunks: string[]): OpenApiFetchResponse {
-  return { status, url, headers, body: body(...chunks) };
+function response(
+  status: number,
+  url: string,
+  headers: Record<string, string>,
+  chunks: string[] = [],
+  connection: Pick<OpenApiFetchResponse, "connectedAddress" | "tls"> = {
+    connectedAddress: "93.184.216.34",
+    tls: { authorized: true, servername: "specs.widgets.example", protocol: "TLSv1.3" },
+  },
+): OpenApiFetchResponse {
+  return { status, url, headers, body: body(...chunks), ...connection };
 }
 
 test("fetches bounded OpenAPI bytes through pinned public DNS and same-origin manual redirects", async () => {
@@ -32,7 +41,7 @@ test("fetches bounded OpenAPI bytes through pinned public DNS and same-origin ma
       requests.push(request);
       return requests.length === 1
         ? response(302, request.url, { location: "/canonical/openapi.json" })
-        : response(200, request.url, { "content-type": "application/json; charset=utf-8" }, source.slice(0, 10), source.slice(10));
+        : response(200, request.url, { "content-type": "application/json; charset=utf-8" }, [source.slice(0, 10), source.slice(10)]);
     } },
     timeoutMs: 1_000,
     maxBytes: 1_000,
@@ -79,8 +88,112 @@ test("blocks private DNS, cross-origin and hidden redirects before consuming a d
 
   await assert.rejects(() => fetchOpenApiSource("https://specs.widgets.example/openapi.json", {
     resolver: { resolve: async () => ["93.184.216.34"] },
-    transport: { request: async () => response(200, "https://attacker.example/hidden", { "content-type": "application/json" }, "{}") },
+    transport: { request: async () => response(200, "https://attacker.example/hidden", { "content-type": "application/json" }, ["{}"]) },
   }), /^Error: OPENAPI_TRANSPORT_POLICY_VIOLATION$/);
+});
+
+test("rejects empty, malformed, excessive, mixed, private, reserved, and metadata DNS answers", async () => {
+  const blockedAnswers: readonly (readonly string[])[] = [
+    [],
+    ["not-an-address"],
+    Array.from({ length: 17 }, () => "8.8.8.8"),
+    ["8.8.8.8", "10.0.0.1"],
+    ["0.0.0.1"], ["10.0.0.1"], ["100.64.0.1"], ["127.0.0.1"], ["169.254.169.254"],
+    ["172.16.0.1"], ["192.168.0.1"], ["192.0.2.1"], ["192.88.99.1"], ["198.18.0.1"],
+    ["198.51.100.1"], ["203.0.113.1"], ["224.0.0.1"], ["240.0.0.1"],
+    ["::"], ["::1"], ["fc00::1"], ["fe80::1"], ["ff02::1"], ["2001:db8::1"],
+    ["2002::1"], ["2001::1"], ["2001:10::1"], ["::ffff:7f00:1"],
+  ];
+  for (const addresses of blockedAnswers) {
+    let transportCalls = 0;
+    await assert.rejects(fetchOpenApiSource("https://specs.widgets.example/openapi.json", {
+      resolver: { resolve: async () => addresses },
+      transport: { request: async () => { transportCalls += 1; throw new Error("must not run"); } },
+    }), /^Error: OPENAPI_SSRF_BLOCKED$/);
+    assert.equal(transportCalls, 0);
+  }
+});
+
+test("rejects actual-peer rebinding and invalid TLS attestation before consuming a response", async () => {
+  const base = { resolver: { resolve: async () => ["93.184.216.34"] } };
+  const variants: Array<readonly [Pick<OpenApiFetchResponse, "connectedAddress" | "tls">, RegExp]> = [
+    [{ connectedAddress: "8.8.8.8", tls: { authorized: true, servername: "specs.widgets.example", protocol: "TLSv1.3" } }, /^Error: OPENAPI_DNS_REBINDING_BLOCKED$/],
+    [{ connectedAddress: "127.0.0.1", tls: { authorized: true, servername: "specs.widgets.example", protocol: "TLSv1.3" } }, /^Error: OPENAPI_DNS_REBINDING_BLOCKED$/],
+    [{ connectedAddress: "93.184.216.34", tls: { authorized: false, servername: "specs.widgets.example", protocol: "TLSv1.3" } }, /^Error: OPENAPI_TLS_VERIFICATION_FAILED$/],
+    [{ connectedAddress: "93.184.216.34", tls: { authorized: true, servername: "attacker.example", protocol: "TLSv1.3" } }, /^Error: OPENAPI_TLS_VERIFICATION_FAILED$/],
+    [{ connectedAddress: "93.184.216.34", tls: { authorized: true, servername: "specs.widgets.example", protocol: "TLSv1.1" } }, /^Error: OPENAPI_TLS_VERIFICATION_FAILED$/],
+  ];
+  for (const [connection, expected] of variants) {
+    let bodyStarted = false;
+    await assert.rejects(() => fetchOpenApiSource("https://specs.widgets.example/openapi.json", {
+      ...base,
+      transport: { request: async (request) => ({
+        ...response(200, request.url, { "content-type": "application/json" }, [], connection),
+        body: { async *[Symbol.asyncIterator]() { bodyStarted = true; yield new TextEncoder().encode("{}"); } },
+      }) },
+    }), expected);
+    assert.equal(bodyStarted, false);
+  }
+});
+
+test("maps malformed connection metadata to stable policy errors without raw type failures", async () => {
+  await assert.rejects(fetchOpenApiSource("https://specs.widgets.example/openapi.json", {
+    resolver: { resolve: async () => ["93.184.216.34"] },
+    transport: { request: async (request) => ({
+      ...response(200, request.url, { "content-type": "application/json" }, ["{}"]),
+      connectedAddress: undefined,
+    } as unknown as OpenApiFetchResponse) },
+  }), /^Error: OPENAPI_TRANSPORT_POLICY_VIOLATION$/);
+});
+
+test("accepts a socket peer that is the canonical equivalent of a pinned public IPv6 address", async () => {
+  const fetched = await fetchOpenApiSource("https://specs.widgets.example/openapi.json", {
+    resolver: { resolve: async () => ["2606:2800:0220:0001:0248:1893:25c8:1946"] },
+    transport: { request: async (request) => response(
+      200,
+      request.url,
+      { "content-type": "application/json" },
+      ["{}"],
+      {
+        connectedAddress: "2606:2800:220:1:248:1893:25c8:1946",
+        tls: { authorized: true, servername: "specs.widgets.example", protocol: "TLSv1.3" },
+      },
+    ) },
+  });
+  assert.equal(fetched.source, "{}");
+});
+
+test("accepts IPv4-mapped socket notation only when its public IPv4 is pinned", async () => {
+  const fetched = await fetchOpenApiSource("https://specs.widgets.example/openapi.json", {
+    resolver: { resolve: async () => ["93.184.216.34"] },
+    transport: { request: async (request) => response(
+      200,
+      request.url,
+      { "content-type": "application/json" },
+      ["{}"],
+      {
+        connectedAddress: "::ffff:93.184.216.34",
+        tls: { authorized: true, servername: "specs.widgets.example", protocol: "TLSv1.3" },
+      },
+    ) },
+  });
+  assert.equal(fetched.source, "{}");
+});
+
+test("does not start HTTPS when cancellation lands after an uncooperative DNS lookup", async () => {
+  let release!: (addresses: readonly string[]) => void;
+  let transportCalls = 0;
+  const controller = new AbortController();
+  const pending = fetchOpenApiSource("https://specs.widgets.example/openapi.json", {
+    signal: controller.signal,
+    resolver: { resolve: async () => new Promise((resolve) => { release = resolve; }) },
+    transport: { request: async () => { transportCalls += 1; throw new Error("must not run"); } },
+  });
+  controller.abort();
+  release(["93.184.216.34"]);
+  await assert.rejects(pending, /^Error: OPENAPI_FETCH_ABORTED$/);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(transportCalls, 0);
 });
 
 test("enforces content type, streaming byte cap, redirect cap, and total deadline", async () => {
@@ -89,12 +202,12 @@ test("enforces content type, streaming byte cap, redirect cap, and total deadlin
   };
   await assert.rejects(() => fetchOpenApiSource("https://specs.widgets.example/openapi.json", {
     ...base,
-    transport: { request: async (request) => response(200, request.url, { "content-type": "text/html" }, "<html></html>") },
+    transport: { request: async (request) => response(200, request.url, { "content-type": "text/html" }, ["<html></html>"]) },
   }), /^Error: OPENAPI_CONTENT_TYPE_BLOCKED$/);
   await assert.rejects(() => fetchOpenApiSource("https://specs.widgets.example/openapi.json", {
     ...base,
     maxBytes: 4,
-    transport: { request: async (request) => response(200, request.url, { "content-type": "application/yaml" }, "123", "45") },
+    transport: { request: async (request) => response(200, request.url, { "content-type": "application/yaml" }, ["123", "45"]) },
   }), /^Error: OPENAPI_RESPONSE_TOO_LARGE$/);
   await assert.rejects(() => fetchOpenApiSource("https://specs.widgets.example/openapi.json", {
     ...base,

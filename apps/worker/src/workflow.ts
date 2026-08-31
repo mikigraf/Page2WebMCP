@@ -1,5 +1,9 @@
 import { createHash } from "node:crypto";
-import type { AnalysisResult, ClaimedAnalysisRunRecord } from "../../../packages/database/src/control-plane.ts";
+import {
+  parsePersistedSourceConfiguration,
+  type AnalysisResult,
+  type ClaimedAnalysisRunRecord,
+} from "../../../packages/database/src/control-plane.ts";
 import { compileWebMcpRelease } from "../../../packages/compiler/src/compiler.ts";
 import {
   compileOpenApiWithGrouping,
@@ -40,15 +44,12 @@ import {
 } from "../../../packages/source-analyzer/src/analyze.ts";
 
 export type OpenApiAnalysisConfiguration = Readonly<{
-  targetOrigin: string;
-  testPageUrl: string;
-  environment: "test" | "staging" | "production";
   provider: Omit<OpenApiProviderControls, "signal">;
   groupingPort?: OpenApiGroupingPort;
 }>;
 
 type AnalysisSource = Pick<ClaimedAnalysisRunRecord, "sourceType" | "sourceUrl">
-  & Partial<Pick<ClaimedAnalysisRunRecord, "id" | "organizationId" | "projectId">>;
+  & Partial<Pick<ClaimedAnalysisRunRecord, "id" | "organizationId" | "projectId" | "sourceConfiguration">>;
 export type AnalysisAdapter = (source: AnalysisSource, signal: AbortSignal) => Promise<AnalysisResult>;
 
 export type GitHubAnalysisConfiguration = Readonly<{
@@ -100,27 +101,16 @@ export type WebsiteAnalysisConfiguration = Readonly<{
   evidenceStore: WebsiteEvidenceStore;
 }>;
 
-function assertVerificationContext(configuration: OpenApiAnalysisConfiguration): void {
-  if (!configuration) throw new Error("OPENAPI_VERIFICATION_CONTEXT_REQUIRED");
-  let origin: URL;
-  let page: URL;
-  try {
-    origin = new URL(configuration.targetOrigin);
-    page = new URL(configuration.testPageUrl);
-  } catch {
-    throw new Error("OPENAPI_VERIFICATION_CONTEXT_REQUIRED");
-  }
-  if (origin.protocol !== "https:" || origin.origin !== configuration.targetOrigin || origin.username || origin.password
-    || page.protocol !== "https:" || page.origin !== origin.origin || page.username || page.password
-    || !["test", "staging", "production"].includes(configuration.environment)) {
-    throw new Error("OPENAPI_VERIFICATION_CONTEXT_REQUIRED");
-  }
+type OpenApiVerificationConfiguration = Extract<ClaimedAnalysisRunRecord["sourceConfiguration"], { kind: "openapi" }>;
+
+function verificationContext(source: AnalysisSource): OpenApiVerificationConfiguration {
+  return parsePersistedSourceConfiguration("openapi", source.sourceConfiguration) as OpenApiVerificationConfiguration;
 }
 
 function evidenceContent(
   sourceDigest: string,
   openApiVersion: string,
-  configuration: Pick<OpenApiAnalysisConfiguration, "targetOrigin" | "testPageUrl" | "environment">,
+  configuration: OpenApiVerificationConfiguration,
 ): string {
   return JSON.stringify({
     adapter: "bounded-openapi",
@@ -133,25 +123,22 @@ function evidenceContent(
   });
 }
 
-/**
- * Creates the production OpenAPI adapter only when every network and verification
- * control is supplied explicitly. There is intentionally no implicit live fetcher.
- */
+/** Creates an OpenAPI adapter from bounded transport controls; verification context is claimed per run. */
 export function createOpenApiAnalysisAdapter(configuration: OpenApiAnalysisConfiguration): AnalysisAdapter {
-  assertVerificationContext(configuration);
   if (!configuration?.provider?.resolver || !configuration.provider.transport) {
     throw new Error("OPENAPI_PROVIDER_CONTROLS_REQUIRED");
   }
   return async (source, signal) => {
     if (source.sourceType !== "openapi") throw new Error("SOURCE_TYPE_UNSUPPORTED");
+    const context = verificationContext(source);
     const fetched = await fetchOpenApiSource(source.sourceUrl, { ...configuration.provider, signal });
     const document = await validateOpenApiSource(fetched.source, fetched.format);
-    const content = evidenceContent(fetched.evidenceReference, document.openapi, configuration);
+    const content = evidenceContent(fetched.evidenceReference, document.openapi, context);
     const reference = `urn:sha256:${createHash("sha256").update(content, "utf8").digest("hex")}`;
     const compiled = await compileOpenApiWithGrouping(document, {
-      targetOrigin: configuration.targetOrigin,
-      testPageUrl: configuration.testPageUrl,
-      environment: configuration.environment,
+      targetOrigin: context.targetOrigin,
+      testPageUrl: context.testPageUrl,
+      environment: context.environment,
       evidenceReference: reference,
     }, configuration.groupingPort);
     if (compiled.plans.length === 0) {
