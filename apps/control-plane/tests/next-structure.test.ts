@@ -53,6 +53,4 @@ test("project entry offers all source paths and describes OpenAPI verification c
   assert.match(entry, /Environment/);
   assert.match(entry, /sourceConfiguration/);
   assert.match(entry, /body\.source\.sourceConfiguration/);
-  assert.match(entry, /PROVIDER_UNAVAILABLE/);
-  assert.doesNotMatch(entry, /Analysis complete for \$\{sourceType\}.*PROVIDER_UNAVAILABLE/);
 });

@@ -9,6 +9,7 @@ import {
   completeOperation,
   loadWorkflow,
   operationKey,
+  reconcileProjectWorkflow,
   saveWorkflow,
   type PersistedWorkflow,
   type SourceConfiguration,
@@ -361,17 +362,23 @@ export function ProjectEntry({ authState }: Readonly<{ authState?: "verified" | 
       capabilities?: Capability[];
     } & ApiFailure>(`/api/projects/${encodeURIComponent(id)}`, { cache: "no-store", ...(signal ? { signal } : {}) });
     if (!response.ok || !body.project || !body.source) throw new Error(body.code ?? "PROJECT_LOAD_FAILED");
-    applySource(body.source);
-    setProjectId(body.project.id);
-    setAnalysisRunId(body.latestAnalysis?.id);
-    setCapabilities(body.capabilities ?? []);
-    persistWorkflow({
+    const storage = browserStorage();
+    const recovered = reconcileProjectWorkflow(storage ? loadWorkflow(storage) : undefined, {
       sourceType: body.source.sourceType,
       url: body.source.sourceUrl,
       sourceConfiguration: body.source.sourceConfiguration,
       projectId: body.project.id,
       analysisRunId: body.latestAnalysis?.id
     });
+    applySource(body.source);
+    setProjectId(body.project.id);
+    setAnalysisRunId(body.latestAnalysis?.id);
+    setCapabilities(body.capabilities ?? []);
+    setWorkflowRunId(recovered.workflowRunId);
+    setReleaseUrl(recovered.releaseUrl);
+    if (!recovered.workflowRunId) setGitHubOutcome(undefined);
+    if (!recovered.releaseUrl) setRelease(undefined);
+    persistWorkflow(recovered);
     return { ...body, project: body.project, source: body.source };
   }
 

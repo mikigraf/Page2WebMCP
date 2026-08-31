@@ -20,6 +20,11 @@ export type PersistedWorkflow = {
   releaseUrl?: string;
 };
 
+export type AuthoritativeProjectWorkflow = Pick<PersistedWorkflow,
+  "sourceType" | "url" | "sourceConfiguration" | "projectId" | "analysisRunId"> & {
+  projectId: string;
+};
+
 const WORKFLOW_KEY = "page2webmcp.workflow.v1";
 const OPERATION_PREFIX = "page2webmcp.operation.v1.";
 
@@ -100,6 +105,23 @@ export function clearClientWorkflow(storage: Storage): void {
   }
 }
 
+export function reconcileProjectWorkflow(
+  recovered: PersistedWorkflow | undefined,
+  authoritative: AuthoritativeProjectWorkflow
+): PersistedWorkflow {
+  const compatible = recovered?.projectId === authoritative.projectId
+    && recovered.analysisRunId === authoritative.analysisRunId
+    && recovered.sourceType === authoritative.sourceType
+    && recovered.url === authoritative.url
+    && sourceConfigurationMatches(recovered.sourceConfiguration, authoritative.sourceConfiguration);
+  if (!compatible) return authoritative;
+  return {
+    ...authoritative,
+    ...(recovered.workflowRunId ? { workflowRunId: recovered.workflowRunId } : {}),
+    ...(recovered.releaseUrl ? { releaseUrl: recovered.releaseUrl } : {})
+  };
+}
+
 function isSourceType(value: unknown): value is SourceType {
   return value === "website" || value === "openapi" || value === "github";
 }
@@ -116,6 +138,15 @@ function isSourceConfiguration(sourceType: SourceType, value: unknown): value is
   } catch {
     return false;
   }
+}
+
+function sourceConfigurationMatches(left: SourceConfiguration | undefined, right: SourceConfiguration | undefined): boolean {
+  if (!left || !right || left.kind !== right.kind) return left === right;
+  return left.kind !== "openapi" || right.kind !== "openapi" || (
+    left.targetOrigin === right.targetOrigin
+    && left.testPageUrl === right.testPageUrl
+    && left.environment === right.environment
+  );
 }
 
 function isBoundedUrl(value: unknown): value is string {

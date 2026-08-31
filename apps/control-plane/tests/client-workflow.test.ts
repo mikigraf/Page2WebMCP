@@ -5,6 +5,7 @@ import {
   completeOperation,
   loadWorkflow,
   operationKey,
+  reconcileProjectWorkflow,
   saveWorkflow
 } from "../src/client-workflow.ts";
 
@@ -75,6 +76,47 @@ test("OpenAPI recovery state keeps bounded verification context and fails closed
   }));
   assert.equal(loadWorkflow(storage), undefined);
   assert.equal(storage.getItem("page2webmcp.workflow.v1"), null);
+});
+
+test("authoritative refresh preserves compatible workflow and release recovery only for the same source and analysis", () => {
+  const current = {
+    sourceType: "openapi" as const,
+    url: "https://api.acme.example/openapi.json",
+    sourceConfiguration: {
+      kind: "openapi" as const,
+      targetOrigin: "https://app.acme.example",
+      testPageUrl: "https://app.acme.example/checkout",
+      environment: "staging" as const
+    },
+    projectId: "project-1",
+    analysisRunId: "analysis-1",
+    workflowRunId: "workflow-1",
+    releaseUrl: "https://releases.acme.example/project-1"
+  };
+  const authoritative = {
+    sourceType: current.sourceType,
+    url: current.url,
+    sourceConfiguration: current.sourceConfiguration,
+    projectId: current.projectId,
+    analysisRunId: current.analysisRunId
+  };
+  assert.deepEqual(reconcileProjectWorkflow(current, authoritative), current);
+
+  assert.deepEqual(reconcileProjectWorkflow(current, { ...authoritative, projectId: "project-2" }), {
+    ...authoritative,
+    projectId: "project-2"
+  });
+  assert.deepEqual(reconcileProjectWorkflow(current, { ...authoritative, analysisRunId: "analysis-2" }), {
+    ...authoritative,
+    analysisRunId: "analysis-2"
+  });
+  assert.deepEqual(reconcileProjectWorkflow(current, {
+    ...authoritative,
+    sourceConfiguration: { ...authoritative.sourceConfiguration, environment: "production" }
+  }), {
+    ...authoritative,
+    sourceConfiguration: { ...authoritative.sourceConfiguration, environment: "production" }
+  });
 });
 
 test("clearing a workflow removes persisted workflow and pending operation keys only", () => {

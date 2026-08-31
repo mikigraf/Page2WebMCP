@@ -25,10 +25,40 @@ test("all source paths stay selectable and OpenAPI context survives reopening th
   await page.getByRole("button", { name: "Create project" }).click();
   await expect(page.getByRole("status")).toContainText("created");
 
+  await page.evaluate(({ apiHost, appHost }) => sessionStorage.setItem("page2webmcp.workflow.v1", JSON.stringify({
+    sourceType: "openapi",
+    url: `https://stale-${apiHost}/openapi.json`,
+    sourceConfiguration: {
+      kind: "openapi",
+      targetOrigin: `https://stale-${appHost}`,
+      testPageUrl: `https://stale-${appHost}/checkout`,
+      environment: "production"
+    },
+    projectId: [...document.querySelectorAll("[role=status]")].find((element) => element.textContent?.includes("created"))?.textContent?.match(/[0-9a-f-]{36}/)?.[0]
+  })), { apiHost, appHost });
   await page.reload();
-  await page.getByRole("listitem").filter({ hasText: `${apiHost} API` }).getByRole("button", { name: "Open and resume" }).click();
   await expect(page.getByLabel("OpenAPI source URL")).toHaveValue(`https://${apiHost}/openapi.json`);
   await expect(page.getByLabel("Target origin")).toHaveValue(`https://${appHost}`);
   await expect(page.getByLabel("Same-origin test page URL")).toHaveValue(`https://${appHost}/checkout`);
   await expect(page.getByLabel("Environment")).toHaveValue("staging");
+});
+
+test("provider unavailability is a failed analysis, never a successful result", async ({ page }) => {
+  const suffix = Date.now();
+  await page.goto(CONTROL_PLANE_URL);
+  await page.getByLabel("Email").fill("owner@example.test");
+  await page.getByLabel("Password").fill(CONTROL_PLANE_OWNER_PASSWORD);
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await page.getByLabel("Source type").selectOption("website");
+  await page.getByLabel("Website URL").fill(`https://provider-${suffix}.acme.example/`);
+  await page.getByRole("button", { name: "Create project" }).click();
+  await expect(page.getByRole("status")).toContainText("created");
+
+  await page.route("**/api/projects/analyze", (route) => route.fulfill({ json: { runId: "provider-run" } }));
+  await page.route("**/api/analysis-runs/provider-run", (route) => route.fulfill({ json: {
+    run: { status: "failed", errorCode: "PROVIDER_UNAVAILABLE" }, capabilities: []
+  } }));
+  await page.getByRole("button", { name: "Analyze website" }).click();
+  await expect(page.getByRole("status")).toHaveText("Source provider unavailable: PROVIDER_UNAVAILABLE");
+  await expect(page.getByRole("status")).not.toContainText("Analysis complete");
 });
