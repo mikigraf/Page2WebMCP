@@ -119,6 +119,91 @@ git commit -m "fix: make trusted installation migration replayable"
 git rev-parse HEAD
 ```
 
+## Fix round 3: schema-qualified pgcrypto calls
+
+### Root cause and minimal fix
+
+The PostgreSQL 17 replay installs `pgcrypto` in the Supabase `extensions`
+schema. The migration-session search path is not guaranteed to include that
+schema, but the workflow and source-configuration migrations invoked bare
+`digest()`. The configuration used for API `extra_search_path` is not a safe
+migration dependency.
+
+The migration-wide RED scan found five actual bare call sites: four in
+`20260830120000_phased_workflow_substrate.sql` and one in
+`20260831090000_source_configuration.sql`. Each now uses
+`extensions.digest(...)`; hash inputs and algorithms are unchanged.
+
+### TDD evidence
+
+Added `pgcrypto calls in replayed migrations are schema-qualified (catches
+relying on the migration session search path)`. It scans every SQL migration
+and fails if a `digest(` call is not schema-qualified.
+
+RED command:
+
+```sh
+scratch_dir=$(mktemp -d /tmp/page2webmcp-trusted-migration-test.XXXXXX)
+mkdir -p "$scratch_dir/packages/database/src"
+ln -s "$PWD/supabase" "$scratch_dir/supabase"
+PATH=/usr/local/bin:/usr/bin:/bin /usr/local/bin/node node_modules/typescript/bin/tsc \
+  --module NodeNext --moduleResolution NodeNext --target ES2022 --esModuleInterop --skipLibCheck \
+  --rootDir packages/database/src --outDir "$scratch_dir/packages/database/src" \
+  packages/database/src/trusted-release-installations-migration.test.ts
+PATH=/usr/local/bin:/usr/bin:/bin /usr/local/bin/node --test "$scratch_dir/packages/database/src/trusted-release-installations-migration.test.js"
+```
+
+Result: `3/4` passed; the new test failed with the four workflow migration
+filenames and one source-configuration migration filename as unqualified
+`digest()` call sites.
+
+GREEN: the same command passed, `4/4` tests, and the following direct scan
+returned no results:
+
+```sh
+rg -nP "(?<![[:alnum:]_.])digest\\s*\\(" supabase/migrations
+```
+
+### PostgreSQL 17 lexical replay
+
+This fresh no-host-port container had the same minimal Supabase prerequisites
+as the previous replay rounds and was removed by the `--rm` cleanup trap:
+
+```sh
+docker run --rm -d --name page2webmcp-migration-replay-round3-48475 \
+  -e POSTGRES_HOST_AUTH_METHOD=trust postgres:17
+for migration in $(rg --files supabase/migrations | sort); do
+  docker exec -i page2webmcp-migration-replay-round3-48475 \
+    psql -q -v ON_ERROR_STOP=1 -U postgres -d postgres < "$migration"
+done
+```
+
+Result: PostgreSQL `17.11 (Debian 17.11-1.pgdg13+2)` replayed all `16/16`
+migrations successfully, including both repaired migration files.
+
+### Round-3 verification
+
+The full migration-contract compilation/test command from round 2 passed
+`20/20` tests. The following commands all exited 0:
+
+```sh
+PATH=/usr/local/bin:/usr/bin:/bin /usr/local/bin/node \
+  node_modules/typescript/bin/tsc --project tsconfig.base.json --noEmit
+PATH=/usr/local/bin:/usr/bin:/bin /usr/local/bin/node scripts/check-source.mjs
+git diff --check
+```
+
+Round-3 commit command:
+
+```sh
+git add supabase/migrations/20260830120000_phased_workflow_substrate.sql \
+  supabase/migrations/20260831090000_source_configuration.sql \
+  packages/database/src/trusted-release-installations-migration.test.ts
+git add -f .superpowers/sdd/2026-08-31-local-live-user-journey/task-10-migration-fix-report.md
+git commit -m "fix: qualify migration pgcrypto calls"
+git rev-parse HEAD
+```
+
 Result: recorded in the task handoff after the commit command completes.
 
 ## Fix round 2: release tenant-key ordering

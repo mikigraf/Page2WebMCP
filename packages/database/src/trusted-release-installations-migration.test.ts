@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
 import test from "node:test";
 
 const migrationUrl = new URL(
@@ -10,6 +10,7 @@ const workflowMigrationUrl = new URL(
   "../../../supabase/migrations/20260830120000_phased_workflow_substrate.sql",
   import.meta.url,
 );
+const migrationsUrl = new URL("../../../supabase/migrations/", import.meta.url);
 
 test("trusted installation migration drops the legacy eligibility constraint before its legacy reverify update (catches moving the drop below the update)", async () => {
   const sql = await readFile(migrationUrl, "utf8");
@@ -60,4 +61,14 @@ test("trusted installation migration creates the release tenant key before its c
     releaseTenantKey,
     "the later workflow migration must not add the same release tenant key twice",
   );
+});
+
+test("pgcrypto calls in replayed migrations are schema-qualified (catches relying on the migration session search path)", async () => {
+  const migrationFiles = (await readdir(migrationsUrl)).filter((file) => file.endsWith(".sql"));
+  const bareDigestCalls = (await Promise.all(migrationFiles.map(async (file) => {
+    const sql = await readFile(new URL(file, migrationsUrl), "utf8");
+    return [...sql.matchAll(/(?<![\w.])digest\s*\(/gi)].map(() => file);
+  }))).flat();
+
+  assert.deepEqual(bareDigestCalls, []);
 });

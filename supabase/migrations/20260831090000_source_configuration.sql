@@ -160,7 +160,7 @@ alter table private.analysis_jobs
 
 -- Source snapshots bind the canonical JSON representation as well as type/URL.
 update public.source_snapshots snapshot
-set source_identity_hash = encode(digest(
+set source_identity_hash = encode(extensions.digest(
   octet_length(source.source_type)::text || ':' || source.source_type || ':' ||
   octet_length(source.source_url)::text || ':' || source.source_url || ':' ||
   octet_length(source.source_configuration::text)::text || ':' || source.source_configuration::text,

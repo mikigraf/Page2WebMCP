@@ -54,7 +54,7 @@ insert into public.source_snapshots (
   organization_id, project_id, project_source_id, source_identity_hash, created_at
 )
 select source.organization_id, source.project_id, source.id,
-  encode(digest(
+  encode(extensions.digest(
     octet_length(source.source_type)::text || ':' || source.source_type || ':' ||
     octet_length(source.source_url)::text || ':' || source.source_url,
     'sha256'
@@ -523,7 +523,7 @@ insert into public.workflow_runs (
   cancelled_at, error_code, created_at, updated_at
 )
 select analysis.id, analysis.organization_id, analysis.project_id, snapshot.id, analysis.id,
-  analysis.status, 'analysis', encode(digest('legacy-analysis:' || analysis.id::text, 'sha256'), 'hex'),
+  analysis.status, 'analysis', encode(extensions.digest('legacy-analysis:' || analysis.id::text, 'sha256'), 'hex'),
   0, 1,
   case when analysis.status = 'cancelled' then analysis.updated_at else null end,
   case when analysis.status = 'cancelled' then analysis.updated_at else null end,
@@ -543,12 +543,12 @@ insert into private.workflow_tasks (
   lease_expires_at, attempts, retry_classification, error_code, available_at, created_at, updated_at
 )
 select analysis.organization_id, analysis.project_id, analysis.id, 'analysis', job.status,
-  'wft_' || encode(digest(
+  'wft_' || encode(extensions.digest(
     length(analysis.id::text)::text || ':' || analysis.id::text || ':' ||
     length('analysis')::text || ':analysis:' || workflow.input_hash,
     'sha256'
   ), 'hex'),
-  workflow.input_hash, case when job.status = 'succeeded' then encode(digest(
+  workflow.input_hash, case when job.status = 'succeeded' then encode(extensions.digest(
     'legacy-analysis-result:' || analysis.id::text || ':' || coalesce(analysis.release_hash, 'diagnostic-only'),
     'sha256'
   ), 'hex') else null end,
