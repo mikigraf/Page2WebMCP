@@ -1,10 +1,12 @@
 import { unsafeSupabaseBrowserKey } from "./supabase-config.ts";
+import { validateReleaseArtifactStorageConfiguration } from "./artifact-storage.ts";
 
 type RuntimeEnvironment = Record<string, string | undefined>;
 
 export function validateRuntimeConfiguration(environment: RuntimeEnvironment = process.env): void {
   if (environment.NODE_ENV !== "production") return;
   if ((environment.PAGE2WEBMCP_SESSION_SECRET?.length ?? 0) < 32) throw new Error("SESSION_SECRET_REQUIRED");
+  validateReleaseArtifactStorageConfiguration(environment);
   validateSupabaseConfiguration(environment);
   const publicOrigin = exactUrl(environment.PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN ?? "");
   const permitsHttp = environment.PAGE2WEBMCP_TEST_MODE === "true";

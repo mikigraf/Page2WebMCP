@@ -8,6 +8,9 @@ const production = {
   NEXT_PUBLIC_SUPABASE_URL: "https://auth.example",
   NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: "sb_publishable_safe-public-key-value",
   PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN: "https://control.example",
+  PAGE2WEBMCP_SUPABASE_URL: "https://bimqgiedckdurqiywctl.supabase.co",
+  PAGE2WEBMCP_SUPABASE_SECRET_KEY: "sb_secret_test-only-artifact-storage-key",
+  PAGE2WEBMCP_PUBLIC_ORIGIN: "https://bimqgiedckdurqiywctl.supabase.co/storage/v1/object/public/page2webmcp-releases",
   PAGE2WEBMCP_STORAGE_MODE: "postgres",
   DATABASE_URL: "postgresql://database.example/page2webmcp"
 };
@@ -94,6 +97,38 @@ test("production requires an exact HTTPS public origin for CSRF validation", () 
     PAGE2WEBMCP_TEST_MODE: "true",
     PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN: "http://127.0.0.1:3100"
   }));
+});
+
+test("production requires this app's exact hosted Supabase Storage artifact topology", () => {
+  for (const overrides of [
+    { PAGE2WEBMCP_SUPABASE_URL: "" },
+    { PAGE2WEBMCP_SUPABASE_SECRET_KEY: "" },
+    { PAGE2WEBMCP_PUBLIC_ORIGIN: "" },
+    { PAGE2WEBMCP_SUPABASE_URL: "https://different-project.supabase.co" },
+    { PAGE2WEBMCP_SUPABASE_URL: "https://bimqgiedckdurqiywctl.supabase.co/" },
+    { PAGE2WEBMCP_PUBLIC_ORIGIN: "https://bimqgiedckdurqiywctl.supabase.co/storage/v1/object/public/other" },
+    { PAGE2WEBMCP_PUBLIC_ORIGIN: "https://bimqgiedckdurqiywctl.supabase.co/storage/v1/object/public/page2webmcp-releases/" },
+  ]) {
+    assert.throws(
+      () => validateRuntimeConfiguration({ ...production, ...overrides }),
+      /^Error: RELEASE_ARTIFACT_CONFIGURATION_REQUIRED$/,
+    );
+  }
+});
+
+test("production rejects artifact Storage secret aliases without rejecting browser Auth configuration", () => {
+  for (const overrides of [
+    { NEXT_PUBLIC_PAGE2WEBMCP_SUPABASE_URL: production.PAGE2WEBMCP_SUPABASE_URL },
+    { NEXT_PUBLIC_SUPABASE_SERVICE_ROLE_KEY: production.PAGE2WEBMCP_SUPABASE_SECRET_KEY },
+    { PAGE2WEBMCP_SUPABASE_SERVICE_ROLE_KEY: production.PAGE2WEBMCP_SUPABASE_SECRET_KEY },
+    { SUPABASE_SECRET_KEY: production.PAGE2WEBMCP_SUPABASE_SECRET_KEY },
+  ]) {
+    assert.throws(
+      () => validateRuntimeConfiguration({ ...production, ...overrides }),
+      /^Error: RELEASE_ARTIFACT_SECRET_EXPOSURE_BLOCKED$/,
+    );
+  }
+  assert.doesNotThrow(() => validateRuntimeConfiguration(production));
 });
 
 test("shared configuration recognizes only exact untrimmed provider mode spellings", () => {
