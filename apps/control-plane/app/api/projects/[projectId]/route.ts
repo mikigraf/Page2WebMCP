@@ -16,8 +16,7 @@ export async function GET(
     const parsed = ProjectIdSchema.safeParse(rawProjectId);
     if (!parsed.success) throw new ApiError("NOT_FOUND", 404);
     const project = await repository.getProject(actor, parsed.data);
-    const source = (await repository.listProjectSources(actor, project.id)).find((candidate) => candidate.active);
-    if (!source) throw new ApiError("NOT_FOUND", 404);
+    const source = await repository.getActiveProjectSource(actor, project.id);
     const latestAnalysis = await repository.getLatestAnalysis(actor, project.id);
     const capabilities = latestAnalysis?.status === "succeeded"
       ? await repository.listAnalysisCapabilities(actor, latestAnalysis.id)

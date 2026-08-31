@@ -100,6 +100,9 @@ test("project list/detail APIs resume durable state across reloads with opaque c
   assert.equal(second.status, 200);
   assert.equal((await second.json()).projects.length, 2);
 
+  repository.listProjectSources = async () => {
+    throw new Error("DETAIL_MUST_NOT_PAGE_PROJECT_SOURCES");
+  };
   const detail = await projectDetail(
     new Request(`https://control.example/api/projects/${resumableProjectId}`, { headers }),
     { params: Promise.resolve({ projectId: resumableProjectId }) }

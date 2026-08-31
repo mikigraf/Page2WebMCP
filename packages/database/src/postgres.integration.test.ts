@@ -107,6 +107,7 @@ test("Postgres copies canonical OpenAPI verification context into an immutable a
       inputHash: "postgres-source-configuration-project",
     });
     assert.deepEqual((await repository.listProjectSources(actor, project.id))[0]?.sourceConfiguration, configuration);
+    assert.deepEqual((await repository.getActiveProjectSource(actor, project.id)).sourceConfiguration, configuration);
     const run = await repository.enqueueAnalysis(actor, {
       projectId: project.id,
       idempotencyKey: "postgres-source-configuration-analysis",

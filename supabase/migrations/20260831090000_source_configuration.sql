@@ -1,32 +1,87 @@
 -- Persist the bounded verification context with the source and copy it to each
 -- analysis job. Existing sources are deliberately marked legacy rather than
 -- inferred, because they did not supply the required OpenAPI verification data.
-create function private.valid_source_configuration(value jsonb)
+create function private.canonical_https_origin(origin text)
+returns boolean
+language plpgsql
+immutable
+security invoker
+set search_path = pg_catalog
+as $$
+declare
+  authority text;
+  host text;
+  port_text text;
+  port integer;
+  label text;
+begin
+  if origin is null or left(origin, 8) <> 'https://' then return false; end if;
+  authority := substring(origin from 9);
+  if authority = '' or position('/' in authority) > 0 or position('?' in authority) > 0
+    or position('#' in authority) > 0 or position('@' in authority) > 0 then return false; end if;
+  if position(':' in authority) > 0 then
+    if position(':' in substring(authority from position(':' in authority) + 1)) > 0 then return false; end if;
+    host := split_part(authority, ':', 1);
+    port_text := split_part(authority, ':', 2);
+    if port_text = '' or char_length(port_text) > 5
+      or translate(port_text, '0123456789', '') <> '' then return false; end if;
+    port := port_text::integer;
+    if port < 1 or port > 65535 or port = 443 or port_text <> port::text then return false; end if;
+  else
+    host := authority;
+  end if;
+  if host = '' or char_length(host) > 253 or host <> lower(host)
+    or translate(host, 'abcdefghijklmnopqrstuvwxyz0123456789.-', '') <> ''
+    or left(host, 1) in ('.', '-') or right(host, 1) in ('.', '-') then return false; end if;
+  foreach label in array string_to_array(host, '.') loop
+    if label = '' or char_length(label) > 63 or left(label, 1) = '-' or right(label, 1) = '-' then return false; end if;
+  end loop;
+  return true;
+end
+$$;
+
+create function private.canonical_https_test_page(origin text, page_url text)
 returns boolean
 language sql
 immutable
 security invoker
 set search_path = pg_catalog
 as $$
-  select jsonb_typeof(value) = 'object' and (
-    value = '{"kind":"website"}'::jsonb
-    or value = '{"kind":"github"}'::jsonb
-    or value = '{"kind":"legacy_unconfigured"}'::jsonb
-    or (
-      value ?& array['kind', 'targetOrigin', 'testPageUrl', 'environment']
+  select private.canonical_https_origin(origin)
+    and page_url is not null
+    and position('#' in page_url) = 0
+    and position(' ' in page_url) = 0
+    and left(page_url, char_length(origin) + 1) = origin || '/';
+$$;
+
+create function private.valid_source_configuration(source_type text, value jsonb)
+returns boolean
+language sql
+immutable
+security invoker
+set search_path = pg_catalog, private
+as $$
+  select case source_type
+    when 'website' then value in ('{"kind":"website"}'::jsonb, '{"kind":"legacy_unconfigured"}'::jsonb)
+    when 'github' then value in ('{"kind":"github"}'::jsonb, '{"kind":"legacy_unconfigured"}'::jsonb)
+    when 'openapi' then value = '{"kind":"legacy_unconfigured"}'::jsonb or (
+      jsonb_typeof(value) = 'object'
+      and value ?& array['kind', 'targetOrigin', 'testPageUrl', 'environment']
       and value - array['kind', 'targetOrigin', 'testPageUrl', 'environment'] = '{}'::jsonb
       and value->>'kind' = 'openapi'
       and value->>'environment' in ('test', 'staging', 'production')
-      and value->>'targetOrigin' ~ '^https://[^/?#@]+(?::[0-9]{1,5})?$'
-      and value->>'testPageUrl' ~ '^https://[^?#@]+(?:\\?[^#]*)?$'
-      and left(value->>'testPageUrl', octet_length(value->>'targetOrigin')) = value->>'targetOrigin'
-      and substring(value->>'testPageUrl' from octet_length(value->>'targetOrigin') + 1 for 1) = '/'
+      and private.canonical_https_origin(value->>'targetOrigin')
+      and private.canonical_https_test_page(value->>'targetOrigin', value->>'testPageUrl')
     )
-  );
+    else false
+  end;
 $$;
 
-revoke all on function private.valid_source_configuration(jsonb) from public;
-grant execute on function private.valid_source_configuration(jsonb) to page2webmcp_app, page2webmcp_worker;
+revoke all on function private.canonical_https_origin(text) from public;
+revoke all on function private.canonical_https_test_page(text, text) from public;
+revoke all on function private.valid_source_configuration(text, jsonb) from public;
+grant execute on function private.canonical_https_origin(text), private.canonical_https_test_page(text, text),
+  private.valid_source_configuration(text, jsonb) to page2webmcp_app, page2webmcp_worker;
 
 alter table public.project_sources
   add column source_configuration jsonb;
@@ -38,7 +93,7 @@ where source_configuration is null;
 alter table public.project_sources
   alter column source_configuration set not null,
   add constraint project_sources_source_configuration_check
-    check (private.valid_source_configuration(source_configuration));
+    check (private.valid_source_configuration(source_type, source_configuration));
 
 alter table private.analysis_jobs
   add column source_configuration jsonb;
@@ -65,7 +120,7 @@ $$;
 alter table private.analysis_jobs
   alter column source_configuration set not null,
   add constraint analysis_jobs_source_configuration_check
-    check (private.valid_source_configuration(source_configuration));
+    check (private.valid_source_configuration(source_type, source_configuration));
 
 -- Source snapshots bind the canonical JSON representation as well as type/URL.
 update public.source_snapshots snapshot

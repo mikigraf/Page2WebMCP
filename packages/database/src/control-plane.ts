@@ -289,6 +289,7 @@ export interface ControlPlaneRepository extends WorkflowRepository {
   listProjects(actor: RepositoryActor): Promise<ProjectRecord[]>;
   listProjectsPage(actor: RepositoryActor, input?: ProjectPageRequest): Promise<ProjectPage>;
   getProject(actor: RepositoryActor, id: string): Promise<ProjectRecord>;
+  getActiveProjectSource(actor: RepositoryActor, projectId: string): Promise<ProjectSourceRecord>;
   getLatestAnalysis(actor: RepositoryActor, projectId: string): Promise<AnalysisRunRecord | undefined>;
   enqueueAnalysis(actor: RepositoryActor, input: IdempotentRequest): Promise<AnalysisRunRecord>;
   getAnalysis(actor: RepositoryActor, id: string): Promise<AnalysisRunRecord>;
@@ -398,7 +399,11 @@ function parseSourceConfiguration(value: unknown, sourceType: SourceType): Sourc
     if (sourceType === "openapi") throw new RepositoryError("OPENAPI_VERIFICATION_CONTEXT_REQUIRED");
     throw error;
   }
-  if (parsed.kind === "legacy_unconfigured" || parsed.kind !== sourceType) {
+  if (parsed.kind === "legacy_unconfigured") {
+    if (sourceType === "website" || sourceType === "github") return { kind: sourceType };
+    throw new RepositoryError("OPENAPI_VERIFICATION_CONTEXT_REQUIRED");
+  }
+  if (parsed.kind !== sourceType) {
     if (sourceType === "openapi") throw new RepositoryError("OPENAPI_VERIFICATION_CONTEXT_REQUIRED");
     throw new RepositoryError("INVALID_STATE");
   }
@@ -867,6 +872,14 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
 
   async getProject(actor: RepositoryActor, id: string): Promise<ProjectRecord> {
     return copy(this.#assertProject(actor, id));
+  }
+
+  async getActiveProjectSource(actor: RepositoryActor, projectId: string): Promise<ProjectSourceRecord> {
+    this.#assertProject(actor, projectId);
+    const source = [...this.#projectSources.values()].find((candidate) =>
+      candidate.projectId === projectId && candidate.organizationId === actor.organizationId && candidate.active);
+    if (!source) throw new RepositoryError("NOT_FOUND");
+    return copy(source);
   }
 
   async getLatestAnalysis(actor: RepositoryActor, projectId: string): Promise<AnalysisRunRecord | undefined> {

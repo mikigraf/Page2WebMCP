@@ -297,6 +297,20 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
     return this.#transaction({ kind: "app", actor }, (client) => this.#project(client, actor, id));
   }
 
+  async getActiveProjectSource(actor: RepositoryActor, projectId: string): Promise<ProjectSourceRecord> {
+    return this.#transaction({ kind: "app", actor }, async (client) => {
+      await this.#project(client, actor, projectId);
+      const result = await client.query(
+        "select id, organization_id, project_id, source_type, source_url, source_configuration, version, active, created_at " +
+        "from public.project_sources where project_id = $1 and organization_id = $2 and active " +
+        "limit 1",
+        [projectId, actor.organizationId],
+      );
+      if (!result.rows[0]) throw new RepositoryError("NOT_FOUND");
+      return mapProjectSource(result.rows[0]);
+    });
+  }
+
   async getLatestAnalysis(actor: RepositoryActor, projectId: string): Promise<AnalysisRunRecord | undefined> {
     return this.#transaction({ kind: "app", actor }, async (client) => {
       await this.#project(client, actor, projectId);

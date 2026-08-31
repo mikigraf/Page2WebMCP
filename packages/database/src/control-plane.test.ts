@@ -268,6 +268,28 @@ test("persisted source configuration rejects missing and unknown JSON fields at 
   );
 });
 
+test("legacy persisted website and GitHub sources remain runnable while legacy OpenAPI is rejected", async () => {
+  assert.deepEqual(parsePersistedSourceConfiguration("website", { kind: "legacy_unconfigured" }), { kind: "website" });
+  assert.deepEqual(parsePersistedSourceConfiguration("github", { kind: "legacy_unconfigured" }), { kind: "github" });
+  assert.throws(
+    () => parsePersistedSourceConfiguration("openapi", { kind: "legacy_unconfigured" }),
+    (error: unknown) => error instanceof RepositoryError && error.code === "OPENAPI_VERIFICATION_CONTEXT_REQUIRED",
+  );
+
+  const repository = new InMemoryControlPlaneRepository();
+  const project = await repository.createProject(owner, {
+    name: "Active source lookup",
+    sourceType: "website",
+    url: "https://widgets.example/",
+    sourceConfiguration: { kind: "website" },
+    idempotencyKey: "project-active-source-lookup",
+    inputHash: "project-active-source-lookup",
+  });
+  const source = await repository.getActiveProjectSource(owner, project.id);
+  assert.equal(source.active, true);
+  assert.equal(source.projectId, project.id);
+});
+
 test("analysis completion persists capability ownership and optimistic reviews", async () => {
   const repository = new InMemoryControlPlaneRepository();
   const project = await repository.createProject(owner, {
