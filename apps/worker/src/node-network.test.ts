@@ -457,6 +457,48 @@ test("pinned JSON transport writes credentials only after pinned TLS peer verifi
   assert.deepEqual(JSON.parse(new TextDecoder().decode(response.body)), { ok: true });
 });
 
+test("pinned JSON transport performs read-only readiness GETs without a body or content length", async () => {
+  let sentBody: string | undefined = "not-ended";
+  let capturedOptions: RequestOptions | undefined;
+  const request: NodeHttpsRequest = (_url, options, onResponse) => {
+    capturedOptions = options;
+    const client = new EventEmitter() as EventEmitter & { end(body?: string): void; destroy(error?: Error): void };
+    const socket = new EventEmitter() as EventEmitter & {
+      remoteAddress: string; authorized: boolean; servername: string;
+      getProtocol(): string; destroy(error?: Error): void;
+    };
+    Object.assign(socket, {
+      remoteAddress: "93.184.216.34", authorized: true, servername: "control.widgets.example",
+      getProtocol: () => "TLSv1.3", destroy: () => undefined,
+    });
+    client.end = (body?: string) => {
+      sentBody = body;
+      const response = Readable.from([Buffer.from('{"status":"ready"}')]) as Readable & {
+        statusCode?: number; headers: Record<string, string>; socket: unknown;
+      };
+      response.statusCode = 200;
+      response.headers = { "content-type": "application/json" };
+      response.socket = socket;
+      onResponse(response as never);
+    };
+    client.destroy = (error?: Error) => { if (error) client.emit("error", error); };
+    queueMicrotask(() => { client.emit("socket", socket); socket.emit("secureConnect"); });
+    return client as never;
+  };
+  const response = await createNodePinnedJsonTransport({
+    resolver: { resolve: async () => ["93.184.216.34"] }, request,
+  }).request({
+    url: "https://control.widgets.example/v1/readiness",
+    method: "GET",
+    headers: { authorization: "Bearer secret-control-token", accept: "application/json" },
+    signal: new AbortController().signal,
+  });
+  assert.equal(sentBody, undefined);
+  assert.equal(capturedOptions?.method, "GET");
+  assert.equal((capturedOptions?.headers as Record<string, string> | undefined)?.["content-length"], undefined);
+  assert.deepEqual(JSON.parse(new TextDecoder().decode(response.body)), { status: "ready" });
+});
+
 test("pinned JSON transport does not write credentials to an unpinned actual peer", async () => {
   let endCalls = 0;
   const request: NodeHttpsRequest = () => {

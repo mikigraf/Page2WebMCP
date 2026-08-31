@@ -6,8 +6,10 @@ import type { WebsiteProviderControls } from "../../../packages/providers/src/we
 import type { NodePinnedJsonTransport } from "./node-network.ts";
 import {
   createConfiguredWebsiteAnalysisAdapter,
+  probeConfiguredWebsiteControls,
   WEBSITE_LIVE_CONTROL_PATHS,
   WEBSITE_LIVE_GATEWAY_PROTOCOL_VERSION,
+  WEBSITE_LIVE_READINESS_PATH,
   websiteMissingControls,
 } from "./website-live.ts";
 
@@ -34,7 +36,7 @@ function environment(): Record<string, string> {
     PAGE2WEBMCP_EVIDENCE_STORE_TOKEN: "evidence_store_control_token_abcdefghijklmnopqrstuvwxyz",
     PAGE2WEBMCP_OWNERSHIP_STORE_ORIGIN: "https://ownership-store.example",
     PAGE2WEBMCP_OWNERSHIP_STORE_TOKEN: "ownership_store_control_token_abcdefghijklmnopqrstuvwxyz",
-    PAGE2WEBMCP_PUBLIC_ORIGIN: "https://storage.example/storage/v1/object/public/page2webmcp-releases",
+    PAGE2WEBMCP_PUBLIC_ORIGIN: "https://bimqgiedckdurqiywctl.supabase.co/storage/v1/object/public/page2webmcp-releases",
     PAGE2WEBMCP_SECRET_STORE_KMS_KEY_ID: "kms://page2webmcp/browser-session-secrets",
     PAGE2WEBMCP_SECRET_STORE_ORIGIN: "https://secret-store.example",
     PAGE2WEBMCP_SECRET_STORE_TOKEN: "secret_store_control_token_abcdefghijklmnopqrstuvwxyz",
@@ -91,6 +93,7 @@ function controlHarness(input: Readonly<{
   badSecretDigest?: boolean;
   issueStatus?: number;
   ambiguousBrowserStartOnce?: boolean;
+  rejectedReadinessControl?: string;
 }> = {}) {
   const calls: ControlCall[] = [];
   let currentExpiry = new Date(now.getTime() + 9 * 60_000).toISOString();
@@ -108,6 +111,26 @@ function controlHarness(input: Readonly<{
     calls.push({ url, method, headers, body });
     assert.equal(init?.redirect, "error");
     assert.ok(init?.signal instanceof AbortSignal);
+    if (url.endsWith(WEBSITE_LIVE_READINESS_PATH)) {
+      assert.equal(method, "GET");
+      assert.equal(init?.body, undefined);
+      const control = headers.get("x-page2webmcp-control");
+      if (control === input.rejectedReadinessControl) return jsonResponse(url, { rejected: true }, 401);
+      return jsonResponse(url, {
+        gatewayProtocolVersion: WEBSITE_LIVE_GATEWAY_PROTOCOL_VERSION,
+        status: "ready",
+        readOnly: true,
+        control,
+        selectedReleaseHash: headers.get("x-page2webmcp-release-hash"),
+        nonce: headers.get("x-page2webmcp-readiness-nonce"),
+        ...(control === "ttl-secret-store"
+          ? { kmsKeyIdDigest: headers.get("x-page2webmcp-kms-key-id-digest") }
+          : {}),
+        ...(control === "browser-use-v4"
+          ? { apiVersion: "v4", model: "browser-use-2.0" }
+          : {}),
+      });
+    }
     assert.equal(method, "POST");
     if (url.endsWith("/v1/website-egress-policies/issue")) {
       if (input.issueStatus !== undefined) return jsonResponse(url, { rejected: true }, input.issueStatus);
@@ -310,6 +333,55 @@ test("website control inventory is exact, sorted, validates values, and never re
     ...environment(),
     PAGE2WEBMCP_PUBLIC_ORIGIN: "https://127.0.0.1/storage/v1/object/public/page2webmcp-releases",
   }), ["PAGE2WEBMCP_PUBLIC_ORIGIN"]);
+  assert.deepEqual(websiteMissingControls({
+    ...environment(),
+    PAGE2WEBMCP_PUBLIC_ORIGIN: "https://another-project.supabase.co/storage/v1/object/public/page2webmcp-releases",
+  }), ["PAGE2WEBMCP_PUBLIC_ORIGIN"]);
+  assert.deepEqual(websiteMissingControls({
+    ...environment(),
+    PAGE2WEBMCP_LOCAL_STACK: "true",
+    PAGE2WEBMCP_PUBLIC_ORIGIN: "http://127.0.0.1:54321/storage/v1/object/public/page2webmcp-releases",
+  }), []);
+  assert.deepEqual(websiteMissingControls({
+    ...environment(),
+    PAGE2WEBMCP_PUBLIC_ORIGIN: "http://127.0.0.1:54321/storage/v1/object/public/page2webmcp-releases",
+  }), ["PAGE2WEBMCP_PUBLIC_ORIGIN"]);
+});
+
+test("website readiness freshly checks every authenticated control without creating a browser session or policy", async () => {
+  const harness = controlHarness();
+  await probeConfiguredWebsiteControls(environment(), { controlTransport: harness.transport }, {
+    selectedReleaseHash: "a".repeat(64),
+    publicOrigin: environment().PAGE2WEBMCP_PUBLIC_ORIGIN,
+    signal: new AbortController().signal,
+  });
+  const probes = harness.calls.filter(({ url }) => url.endsWith(WEBSITE_LIVE_READINESS_PATH));
+  assert.deepEqual(probes.map(({ headers }) => headers.get("x-page2webmcp-control")).sort(), [
+    "authentication-handoff",
+    "browser-lease-store",
+    "browser-use-v4",
+    "cdp-observer",
+    "egress-policy-store",
+    "egress-proxy",
+    "evidence-store",
+    "ownership-store",
+    "ttl-secret-store",
+  ]);
+  assert.equal(probes.length, 9);
+  assert.ok(probes.every(({ method, body }) => method === "GET" && Object.keys(body).length === 0));
+  assert.ok(probes.every(({ headers }) => headers.get("x-page2webmcp-release-hash") === "a".repeat(64)));
+  assert.ok(probes.every(({ headers }) => /^[a-f0-9]{64}$/.test(headers.get("x-page2webmcp-readiness-nonce") ?? "")));
+  assert.equal(harness.calls.some(({ url }) => url.endsWith(WEBSITE_LIVE_CONTROL_PATHS.policyIssue)), false);
+  assert.equal(harness.calls.some(({ url }) => url.endsWith(WEBSITE_LIVE_CONTROL_PATHS.browserStart)), false);
+});
+
+test("website readiness rejects one revoked control with a stable non-secret error", async () => {
+  const harness = controlHarness({ rejectedReadinessControl: "evidence-store" });
+  await assert.rejects(probeConfiguredWebsiteControls(environment(), { controlTransport: harness.transport }, {
+    selectedReleaseHash: "a".repeat(64),
+    publicOrigin: environment().PAGE2WEBMCP_PUBLIC_ORIGIN,
+    signal: new AbortController().signal,
+  }), /^Error: WEBSITE_PROVIDER_PROBE_FAILED$/);
 });
 
 test("website adapter rejects noncanonical source configuration before issuing a policy", async () => {

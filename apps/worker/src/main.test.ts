@@ -46,6 +46,7 @@ test("actual provider construction precedes repository creation and the exact in
       fixture: false as const,
     },
     analyze: async () => ({ capabilities: [], diagnostics: [], evidence: [] }),
+    probe: async () => undefined,
   };
   await runProductionWorker({ PAGE2WEBMCP_PROVIDER_MODE: "openapi" }, {
     signal: AbortSignal.abort(),

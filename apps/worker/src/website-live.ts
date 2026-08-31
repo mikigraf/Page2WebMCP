@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { Resolver } from "node:dns/promises";
 import type { WebsiteEvidence, WebsiteObservationInput } from "../../../packages/providers/src/website-evidence.ts";
 import type { WebsiteOwnershipChallenge, WebsiteProviderControls } from "../../../packages/providers/src/website.ts";
@@ -17,10 +17,15 @@ type RuntimeEnvironment = Readonly<Record<string, string | undefined>>;
 const MAX_CONTROL_BYTES = 64 * 1_024;
 const CONTROL_TIMEOUT_MS = 10_000;
 const SESSION_TTL_MS = 9 * 60_000;
+const HOSTED_PUBLIC_ORIGIN =
+  "https://bimqgiedckdurqiywctl.supabase.co/storage/v1/object/public/page2webmcp-releases";
+const LOCAL_PUBLIC_ORIGIN =
+  "http://127.0.0.1:54321/storage/v1/object/public/page2webmcp-releases";
 const referencePattern = /^secretref:[A-Za-z0-9._:-]{1,200}$/;
 const identifierPattern = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 
 export const WEBSITE_LIVE_GATEWAY_PROTOCOL_VERSION = 1 as const;
+export const WEBSITE_LIVE_READINESS_PATH = "/v1/readiness" as const;
 export const WEBSITE_LIVE_CONTROL_PATHS = Object.freeze({
   authClose: "/v1/auth-handoffs/close",
   authOpen: "/v1/auth-handoffs/open",
@@ -76,14 +81,8 @@ function exactHttpsOrigin(value: string | undefined): value is string {
   } catch { return false; }
 }
 
-function storagePublicPrefix(value: string | undefined): value is string {
-  if (!value || value.length > 2_048) return false;
-  try {
-    const url = new URL(value);
-    return validateTargetUrl(value).ok && url.protocol === "https:" && !url.username && !url.password && !url.search && !url.hash
-      && url.pathname === "/storage/v1/object/public/page2webmcp-releases"
-      && url.href.replace(/\/$/, "") === value;
-  } catch { return false; }
+function storagePublicPrefix(value: string | undefined, localStack: string | undefined): value is string {
+  return value === HOSTED_PUBLIC_ORIGIN || localStack === "true" && value === LOCAL_PUBLIC_ORIGIN;
 }
 
 function boundedToken(value: string | undefined): value is string {
@@ -108,7 +107,7 @@ export function websiteMissingControls(environment: RuntimeEnvironment): Website
     if (key.endsWith("_ORIGIN") && key !== "PAGE2WEBMCP_PUBLIC_ORIGIN") {
       if (!exactHttpsOrigin(value)) invalid.add(key);
     } else if (key === "PAGE2WEBMCP_PUBLIC_ORIGIN") {
-      if (!storagePublicPrefix(value)) invalid.add(key);
+      if (!storagePublicPrefix(value, environment.PAGE2WEBMCP_LOCAL_STACK)) invalid.add(key);
     } else if (key === "PAGE2WEBMCP_BROWSER_USE_API_KEY") {
       if (!browserUseKey(value)) invalid.add(key);
     } else if (key === "PAGE2WEBMCP_SECRET_STORE_KMS_KEY_ID") {
@@ -331,6 +330,83 @@ export type WebsiteLiveDependencies = Readonly<{
   transport?: WebsiteProviderControls["transport"];
   controlTransport?: NodePinnedJsonTransport;
 }>;
+
+type WebsiteProbeInput = Readonly<{
+  selectedReleaseHash: string;
+  publicOrigin: string;
+  signal: AbortSignal;
+}>;
+
+export async function probeConfiguredWebsiteControls(
+  environmentValue: RuntimeEnvironment,
+  dependencies: Pick<WebsiteLiveDependencies, "controlTransport">,
+  input: WebsiteProbeInput,
+): Promise<void> {
+  const environment = configuredEnvironment(environmentValue);
+  if (!/^[0-9a-f]{64}$/.test(input?.selectedReleaseHash ?? "")
+    || input.publicOrigin !== environment.PAGE2WEBMCP_PUBLIC_ORIGIN
+    || !(input.signal instanceof AbortSignal)) throw new Error("WEBSITE_PROVIDER_PROBE_FAILED");
+  const transport = dependencies?.controlTransport ?? createNodePinnedJsonTransport();
+  const nonce = randomBytes(32).toString("hex");
+  const commonHeaders = {
+    accept: "application/json",
+    "x-page2webmcp-gateway-version": String(WEBSITE_LIVE_GATEWAY_PROTOCOL_VERSION),
+    "x-page2webmcp-readiness-nonce": nonce,
+    "x-page2webmcp-release-hash": input.selectedReleaseHash,
+  } as const;
+  const bearer = (token: string) => ({ authorization: `Bearer ${token}` });
+  const kmsKeyIdDigest = createHash("sha256")
+    .update(environment.PAGE2WEBMCP_SECRET_STORE_KMS_KEY_ID, "utf8").digest("hex");
+  const probes = [
+    ["authentication-handoff", environment.PAGE2WEBMCP_AUTH_HANDOFF_ORIGIN,
+      bearer(environment.PAGE2WEBMCP_AUTH_HANDOFF_TOKEN), {}],
+    ["browser-lease-store", environment.PAGE2WEBMCP_BROWSER_LEASE_STORE_ORIGIN,
+      bearer(environment.PAGE2WEBMCP_BROWSER_LEASE_STORE_TOKEN), {}],
+    ["browser-use-v4", environment.PAGE2WEBMCP_BROWSER_USE_API_ORIGIN,
+      { "x-browser-use-api-key": environment.PAGE2WEBMCP_BROWSER_USE_API_KEY },
+      { apiVersion: "v4", model: "browser-use-2.0" }],
+    ["cdp-observer", environment.PAGE2WEBMCP_CDP_OBSERVER_ORIGIN,
+      bearer(environment.PAGE2WEBMCP_CDP_OBSERVER_TOKEN), {}],
+    ["egress-policy-store", environment.PAGE2WEBMCP_EGRESS_POLICY_ORIGIN,
+      bearer(environment.PAGE2WEBMCP_EGRESS_POLICY_TOKEN), {}],
+    ["egress-proxy", environment.PAGE2WEBMCP_EGRESS_PROXY_ORIGIN,
+      bearer(environment.PAGE2WEBMCP_EGRESS_PROXY_TOKEN), {}],
+    ["evidence-store", environment.PAGE2WEBMCP_EVIDENCE_STORE_ORIGIN,
+      bearer(environment.PAGE2WEBMCP_EVIDENCE_STORE_TOKEN), {}],
+    ["ownership-store", environment.PAGE2WEBMCP_OWNERSHIP_STORE_ORIGIN,
+      bearer(environment.PAGE2WEBMCP_OWNERSHIP_STORE_TOKEN), {}],
+    ["ttl-secret-store", environment.PAGE2WEBMCP_SECRET_STORE_ORIGIN,
+      { ...bearer(environment.PAGE2WEBMCP_SECRET_STORE_TOKEN), "x-page2webmcp-kms-key-id-digest": kmsKeyIdDigest },
+      { kmsKeyIdDigest }],
+  ] as const;
+  try {
+    await Promise.all(probes.map(async ([control, origin, authorization, expectedExtra]) => {
+      const url = `${origin}${WEBSITE_LIVE_READINESS_PATH}`;
+      const lifecycle = linkedSignal(input.signal);
+      try {
+        const response = await transport.request({
+          url,
+          method: "GET",
+          headers: { ...commonHeaders, ...authorization, "x-page2webmcp-control": control },
+          signal: lifecycle.signal,
+        });
+        if (response.url !== url || response.status !== 200
+          || response.headers["content-type"]?.split(";", 1)[0]?.trim().toLowerCase() !== "application/json"
+          || !same(asRecord(boundedJson(response)), {
+            gatewayProtocolVersion: WEBSITE_LIVE_GATEWAY_PROTOCOL_VERSION,
+            status: "ready",
+            readOnly: true,
+            control,
+            selectedReleaseHash: input.selectedReleaseHash,
+            nonce,
+            ...expectedExtra,
+          })) throw new Error("WEBSITE_PROVIDER_PROBE_FAILED");
+      } finally { lifecycle.close(); }
+    }));
+  } catch {
+    throw new Error("WEBSITE_PROVIDER_PROBE_FAILED");
+  }
+}
 
 export function createConfiguredWebsiteAnalysisAdapter(
   environmentValue: RuntimeEnvironment,

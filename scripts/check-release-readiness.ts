@@ -29,6 +29,7 @@ const LOCAL_PUBLIC_ORIGIN =
 const HASH = /^[0-9a-f]{64}$/;
 const MAX_ARTIFACT_BYTES = 65_536;
 const ARTIFACT_TIMEOUT_MS = 10_000;
+const PROVIDER_PROBE_TIMEOUT_MS = 10_000;
 
 type Environment = Readonly<Record<string, string | undefined>>;
 type Output = Readonly<{
@@ -101,6 +102,13 @@ export async function runReadinessCli(
   const selectedHash = environment.PAGE2WEBMCP_READINESS_RELEASE_HASH;
   if (!selectedHash || !HASH.test(selectedHash)) {
     return result("skipped", "LIVE_INSTALLATION_EVIDENCE_REQUIRED", 2);
+  }
+  if (mode === "live") {
+    try {
+      await probeSelectedProvider(provider, selectedHash, controls.publicOrigin);
+    } catch {
+      return result("skipped", "LIVE_CONTROLS_REQUIRED", 2);
+    }
   }
 
   let artifact: Readonly<{ contentHash: string; integrity: string; localOnly: boolean; publicOrigin: string }>;
@@ -190,6 +198,30 @@ export async function runReadinessCli(
   });
   const exitCode = output.status === "passed" ? 0 : output.status === "skipped" ? 2 : 1;
   return { output, exitCode };
+}
+
+async function probeSelectedProvider(
+  provider: ReturnType<typeof createProductionProvider>,
+  selectedReleaseHash: string,
+  publicOrigin: string,
+): Promise<void> {
+  const controller = new AbortController();
+  let rejectTimeout!: (error: Error) => void;
+  const timeout = new Promise<never>((_resolve, reject) => { rejectTimeout = reject; });
+  const timer = setTimeout(() => {
+    const error = new Error("PROVIDER_PROBE_TIMEOUT");
+    controller.abort(error);
+    rejectTimeout(error);
+  }, PROVIDER_PROBE_TIMEOUT_MS);
+  timer.unref?.();
+  try {
+    await Promise.race([
+      provider.probe({ selectedReleaseHash, publicOrigin, signal: controller.signal }),
+      timeout,
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function defaultHandshake(

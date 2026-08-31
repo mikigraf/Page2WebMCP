@@ -75,7 +75,7 @@ function configuredWebsiteEnvironment(): Record<string, string> {
     PAGE2WEBMCP_EVIDENCE_STORE_TOKEN: "evidence_store_control_token_abcdefghijklmnopqrstuvwxyz",
     PAGE2WEBMCP_OWNERSHIP_STORE_ORIGIN: "https://ownership-store.example",
     PAGE2WEBMCP_OWNERSHIP_STORE_TOKEN: "ownership_store_control_token_abcdefghijklmnopqrstuvwxyz",
-    PAGE2WEBMCP_PUBLIC_ORIGIN: "https://storage.example/storage/v1/object/public/page2webmcp-releases",
+    PAGE2WEBMCP_PUBLIC_ORIGIN: "https://bimqgiedckdurqiywctl.supabase.co/storage/v1/object/public/page2webmcp-releases",
     PAGE2WEBMCP_SECRET_STORE_KMS_KEY_ID: "kms://page2webmcp/browser-session-secrets",
     PAGE2WEBMCP_SECRET_STORE_ORIGIN: "https://secret-store.example",
     PAGE2WEBMCP_SECRET_STORE_TOKEN: "secret_store_control_token_abcdefghijklmnopqrstuvwxyz",
@@ -174,6 +174,20 @@ test("missing selected website controls fail before every repository claim path"
   assert.deepEqual({ analysisClaims, workflowReconciles, workflowClaims }, {
     analysisClaims: 0, workflowReconciles: 0, workflowClaims: 0,
   });
+});
+
+test("an arbitrary website artifact host fails before every repository claim path", () => {
+  const repository = new InMemoryControlPlaneRepository();
+  let analysisClaims = 0;
+  repository.claimAnalysis = async () => { analysisClaims += 1; return undefined; };
+  assert.throws(
+    () => createProductionWorkerRuntime(repository, {
+      ...configuredWebsiteEnvironment(),
+      PAGE2WEBMCP_PUBLIC_ORIGIN: "https://attacker.example/storage/v1/object/public/page2webmcp-releases",
+    }, { fetch }),
+    /^Error: WEBSITE_LIVE_CONFIGURATION_REQUIRED$/,
+  );
+  assert.equal(analysisClaims, 0);
 });
 
 test("OpenAPI and website runtimes expose one source and never enter GitHub workflow claims", async () => {

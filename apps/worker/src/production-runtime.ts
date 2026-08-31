@@ -7,8 +7,12 @@ import type {
 import { createHash } from "node:crypto";
 import { WorkflowController } from "../../../packages/database/src/workflow.ts";
 import { createConfiguredGitHubWorkflow, githubConfigurationInvalidKeys } from "./github-live.ts";
-import { createConfiguredOpenApiAnalysisAdapter } from "./openapi-live.ts";
-import { createConfiguredWebsiteAnalysisAdapter, websiteMissingControls } from "./website-live.ts";
+import { createConfiguredOpenApiProductionAdapter } from "./openapi-live.ts";
+import {
+  createConfiguredWebsiteAnalysisAdapter,
+  probeConfiguredWebsiteControls,
+  websiteMissingControls,
+} from "./website-live.ts";
 import {
   createGitHubProductionWorkflowSideEffect,
   createGitHubWorkflowPhaseHandlers,
@@ -30,6 +34,11 @@ export type ProductionProvider = Readonly<{
   analyze: AnalysisAdapter;
   analysisSourceTypes: readonly [SourceType];
   provenance: Exclude<ProviderProvenance, { mode: "local" }>;
+  probe(input: Readonly<{
+    selectedReleaseHash: string;
+    publicOrigin: string;
+    signal: AbortSignal;
+  }>): Promise<void>;
   github?: ReturnType<typeof createConfiguredGitHubWorkflow>;
 }>;
 
@@ -122,10 +131,12 @@ export function createProductionProvider(
     const provenance = {
       mode: "openapi", adapter: "bounded-openapi", adapterVersion: 1, fixture: false,
     } as const;
+    const openapi = createConfiguredOpenApiProductionAdapter(environment, {});
     return {
-      analyze: stampProviderProvenance(createConfiguredOpenApiAnalysisAdapter(environment, {}), provenance),
+      analyze: stampProviderProvenance(openapi.analyze, provenance),
       analysisSourceTypes: ["openapi"],
       provenance,
+      probe: openapi.probe,
     };
   }
   if (environment.PAGE2WEBMCP_PROVIDER_MODE === "website") {
@@ -136,6 +147,7 @@ export function createProductionProvider(
       analyze: stampProviderProvenance(createConfiguredWebsiteAnalysisAdapter(environment, dependencies), provenance),
       analysisSourceTypes: ["website"],
       provenance,
+      probe: (input) => probeConfiguredWebsiteControls(environment, {}, input),
     };
   }
   const github = createConfiguredGitHubWorkflow(environment, dependencies);
@@ -146,6 +158,7 @@ export function createProductionProvider(
     analyze: stampProviderProvenance(github.analyze, provenance),
     analysisSourceTypes: ["github"],
     provenance,
+    probe: github.probe,
     github,
   };
 }

@@ -70,6 +70,95 @@ test("configured GitHub workflow requires a bounded isolated sandbox adapter", (
   assert.equal(typeof workflow.draftPullRequest.createDraftPullRequest, "function");
 });
 
+test("GitHub readiness verifies the App, selected repository binding, and sandbox without side effects", async () => {
+  const calls: Array<{ url: string; method: string; headers: Headers; body: unknown }> = [];
+  const fakeFetch: typeof fetch = async (input, init) => {
+    const url = String(input);
+    const method = init?.method ?? "GET";
+    const headers = new Headers(init?.headers);
+    const body = init?.body;
+    calls.push({ url, method, headers, body });
+    if (url === "https://api.github.com/app") {
+      return response(url, 200, { id: 12345, slug: "page2webmcp" });
+    }
+    if (url === "https://api.github.com/repos/bright-tools/widget-console/installation") {
+      return response(url, 200, { id: 41, app_id: 12345 });
+    }
+    if (url === "https://sandbox.example/v1/readiness") {
+      return response(url, 200, {
+        protocolVersion: 1,
+        status: "ready",
+        readOnly: true,
+        provider: "github",
+        selectedReleaseHash: headers.get("x-page2webmcp-release-hash"),
+        nonce: headers.get("x-page2webmcp-readiness-nonce"),
+        isolation: "ephemeral",
+        network: "deny-by-default",
+      });
+    }
+    throw new Error(`UNEXPECTED_GITHUB_PROBE:${method}:${url}`);
+  };
+  const workflow = createConfiguredGitHubWorkflow({
+    ...environment(),
+    PAGE2WEBMCP_GITHUB_SANDBOX_ORIGIN: "https://sandbox.example",
+    PAGE2WEBMCP_GITHUB_SANDBOX_TOKEN: "sandbox_ephemeral_control_token_abcdefghijklmnopqrstuvwxyz",
+  }, { fetch: fakeFetch, clock: () => now });
+  await workflow.probe({
+    selectedReleaseHash: "a".repeat(64),
+    publicOrigin: "https://bimqgiedckdurqiywctl.supabase.co/storage/v1/object/public/page2webmcp-releases",
+    signal: new AbortController().signal,
+  });
+  assert.equal(calls.length, 3);
+  assert.ok(calls.every(({ method, body }) => method === "GET" && body === undefined));
+  assert.ok(calls.filter(({ url }) => url.startsWith("https://api.github.com/"))
+    .every(({ headers }) => /^Bearer [A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(headers.get("authorization") ?? "")));
+  assert.equal(calls.some(({ url }) => /access_tokens|\/pulls|\/git\/refs|\/v1\/github\/verify/.test(url)), false);
+});
+
+test("GitHub readiness rejects a revoked App with a stable non-secret error", async () => {
+  const workflow = createConfiguredGitHubWorkflow({
+    ...environment(),
+    PAGE2WEBMCP_GITHUB_SANDBOX_ORIGIN: "https://sandbox.example",
+    PAGE2WEBMCP_GITHUB_SANDBOX_TOKEN: "sandbox_ephemeral_control_token_abcdefghijklmnopqrstuvwxyz",
+  }, {
+    fetch: async (input) => response(String(input), 401, { message: "private provider detail" }),
+    clock: () => now,
+  });
+  await assert.rejects(workflow.probe({
+    selectedReleaseHash: "a".repeat(64),
+    publicOrigin: "https://bimqgiedckdurqiywctl.supabase.co/storage/v1/object/public/page2webmcp-releases",
+    signal: new AbortController().signal,
+  }), /^Error: GITHUB_PROVIDER_PROBE_FAILED$/);
+});
+
+test("GitHub readiness cancels an undeclared oversized sandbox response at its byte bound", async () => {
+  let cancelled = false;
+  const workflow = createConfiguredGitHubWorkflow({
+    ...environment(),
+    PAGE2WEBMCP_GITHUB_SANDBOX_ORIGIN: "https://sandbox.example",
+    PAGE2WEBMCP_GITHUB_SANDBOX_TOKEN: "sandbox_ephemeral_control_token_abcdefghijklmnopqrstuvwxyz",
+  }, {
+    fetch: async (input) => {
+      const url = String(input);
+      if (url.endsWith("/app")) return response(url, 200, { id: 12345, slug: "page2webmcp" });
+      if (url.endsWith("/installation")) return response(url, 200, { id: 41, app_id: 12345 });
+      const result = new Response(new ReadableStream<Uint8Array>({
+        start(controller) { controller.enqueue(new Uint8Array(65_537)); },
+        cancel() { cancelled = true; },
+      }), { status: 200, headers: { "content-type": "application/json" } });
+      Object.defineProperty(result, "url", { value: url });
+      return result;
+    },
+    clock: () => now,
+  });
+  await assert.rejects(workflow.probe({
+    selectedReleaseHash: "a".repeat(64),
+    publicOrigin: "https://bimqgiedckdurqiywctl.supabase.co/storage/v1/object/public/page2webmcp-releases",
+    signal: new AbortController().signal,
+  }), /^Error: GITHUB_PROVIDER_PROBE_FAILED$/);
+  assert.equal(cancelled, true);
+});
+
 test("configured production adapter uses pinned repository-scoped GitHub REST ports and returns canonical analysis without a PR claim", async () => {
   const calls: Array<{ url: string; method: string; authorization: string; body?: unknown }> = [];
   const fakeFetch: typeof fetch = async (input, init) => {

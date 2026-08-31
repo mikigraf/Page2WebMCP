@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import test from "node:test";
-import { createConfiguredOpenApiAnalysisAdapter } from "./openapi-live.ts";
+import {
+  createConfiguredOpenApiAnalysisAdapter,
+  createConfiguredOpenApiProductionAdapter,
+} from "./openapi-live.ts";
 import type { OpenApiProviderControls } from "../../../packages/providers/src/openapi.ts";
 
 function sourceResponse(url: string, source: string) {
@@ -76,4 +79,65 @@ test("configured OpenAPI factory consumes per-run context and ignores deployment
   });
   assert.equal("cookie" in requests[0]!.headers, false);
   assert.equal("authorization" in requests[0]!.headers, false);
+});
+
+test("OpenAPI readiness freshly exercises bounded DNS and HTTPS against the selected immutable artifact", async () => {
+  const requests: Parameters<OpenApiProviderControls["transport"]["request"]>[0][] = [];
+  let bodyDiscarded = false;
+  const provider = createConfiguredOpenApiProductionAdapter(
+    { PAGE2WEBMCP_PROVIDER_MODE: "openapi" },
+    {
+      resolver: { resolve: async (hostname) => {
+        assert.equal(hostname, "bimqgiedckdurqiywctl.supabase.co");
+        return ["93.184.216.34"];
+      } },
+      transport: { request: async (request) => {
+        requests.push(request);
+        return {
+          status: 200,
+          url: request.url,
+          connectedAddress: "93.184.216.34",
+          tls: { authorized: true, servername: "bimqgiedckdurqiywctl.supabase.co", protocol: "TLSv1.3" },
+          headers: { "content-type": "application/javascript" },
+          body: { [Symbol.asyncIterator]() {
+            return {
+              next: async () => ({ done: false, value: new TextEncoder().encode("must-not-be-read") }),
+              return: async () => { bodyDiscarded = true; return { done: true, value: undefined }; },
+            };
+          } },
+        };
+      } },
+    },
+  );
+  await provider.probe({
+    selectedReleaseHash: "a".repeat(64),
+    publicOrigin: "https://bimqgiedckdurqiywctl.supabase.co/storage/v1/object/public/page2webmcp-releases",
+    signal: new AbortController().signal,
+  });
+  assert.equal(requests.length, 1);
+  assert.deepEqual(requests[0], {
+    url: `https://bimqgiedckdurqiywctl.supabase.co/storage/v1/object/public/page2webmcp-releases/${"a".repeat(64)}.js`,
+    method: "GET",
+    headers: { accept: "application/json, application/openapi+json, application/yaml, application/x-yaml, text/yaml" },
+    pinnedAddresses: ["93.184.216.34"],
+    redirect: "manual",
+    credentials: "omit",
+    signal: requests[0]!.signal,
+  });
+  assert.equal(bodyDiscarded, true);
+});
+
+test("OpenAPI readiness redacts an unreachable or rejected artifact transport", async () => {
+  const provider = createConfiguredOpenApiProductionAdapter(
+    { PAGE2WEBMCP_PROVIDER_MODE: "openapi" },
+    {
+      resolver: { resolve: async () => ["93.184.216.34"] },
+      transport: { request: async () => { throw new Error("upstream credential and host detail"); } },
+    },
+  );
+  await assert.rejects(provider.probe({
+    selectedReleaseHash: "a".repeat(64),
+    publicOrigin: "https://bimqgiedckdurqiywctl.supabase.co/storage/v1/object/public/page2webmcp-releases",
+    signal: new AbortController().signal,
+  }), /^Error: OPENAPI_PROVIDER_PROBE_FAILED$/);
 });

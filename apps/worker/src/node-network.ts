@@ -29,14 +29,16 @@ export type NodeHttpsRequest = (
 ) => ClientRequest;
 type NodeLookupFunction = NonNullable<RequestOptions["lookup"]>;
 
-export type NodePinnedJsonRequest = Readonly<{
+type NodePinnedJsonRequestBase = Readonly<{
   url: string;
-  method: "POST";
   headers: Readonly<Record<string, string>>;
-  body: string;
-  maxBodyBytes?: number;
   signal: AbortSignal;
 }>;
+
+export type NodePinnedJsonRequest = NodePinnedJsonRequestBase & (
+  | Readonly<{ method: "GET"; body?: never; maxBodyBytes?: never }>
+  | Readonly<{ method: "POST"; body: string; maxBodyBytes?: number }>
+);
 
 export type NodePinnedJsonResponse = Readonly<{
   status: number;
@@ -161,10 +163,13 @@ function websiteAbortReason(signal: AbortSignal): Error {
 
 function validPinnedJsonRequest(input: NodePinnedJsonRequest): URL | undefined {
   const maxBodyBytes = input?.maxBodyBytes ?? DEFAULT_MAX_JSON_REQUEST_BYTES;
-  if (!input || input.method !== "POST" || typeof input.body !== "string"
+  const validBody = input?.method === "GET"
+    ? input.body === undefined && input.maxBodyBytes === undefined
+    : input?.method === "POST" && typeof input.body === "string"
+      && Buffer.byteLength(input.body, "utf8") <= maxBodyBytes;
+  if (!input || !validBody
     || !Number.isInteger(maxBodyBytes) || maxBodyBytes < 1 || maxBodyBytes > MAX_JSON_REQUEST_BYTES
-    || Buffer.byteLength(input.body, "utf8") > maxBodyBytes || !input.headers
-    || !validPinnedJsonHeaders(input.headers)) return undefined;
+    || !input.headers || !validPinnedJsonHeaders(input.headers)) return undefined;
   try {
     const url = new URL(input.url);
     if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash) return undefined;
@@ -254,10 +259,12 @@ export function createNodePinnedJsonTransport(
         };
         try {
           request = dependencies.request(url, {
-            method: "POST",
+            method: input.method,
             headers: {
               ...input.headers,
-              "content-length": String(Buffer.byteLength(input.body, "utf8")),
+              ...(input.method === "POST"
+                ? { "content-length": String(Buffer.byteLength(input.body, "utf8")) }
+                : {}),
             },
             agent: false,
             rejectUnauthorized: true,
@@ -328,7 +335,7 @@ export function createNodePinnedJsonTransport(
               return;
             }
             bodySent = true;
-            request.end(input.body);
+            request.end(input.method === "POST" ? input.body : undefined);
           });
         });
         request.once("error", (error) => {

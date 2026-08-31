@@ -64,6 +64,12 @@ function dependencies(order: string[], expectedLocalOnly = false): ReadinessCliD
         provenance: { mode: "openapi", adapter: "bounded-openapi", adapterVersion: 1, fixture: false },
         analysisSourceTypes: ["openapi"],
         analyze: async () => { throw new Error("UNUSED"); },
+        probe: async ({ selectedReleaseHash, publicOrigin, signal }) => {
+          order.push("provider-probe");
+          assert.equal(selectedReleaseHash, selectedHash);
+          assert.equal(publicOrigin, hosted);
+          assert.equal(signal.aborted, false);
+        },
       };
     },
     fetch: async (input, init) => {
@@ -218,9 +224,32 @@ test("live constructs the provider before active artifact, verifier, and exact-h
     exitCode: 2,
   });
   assert.deepEqual(order, [
-    "provider", "artifact", "verifier", "application-database-construction", "application-database-audit",
+    "provider", "provider-probe", "artifact", "verifier", "application-database-construction", "application-database-audit",
     "application-database-close", "database-construction", "database-topology", "database-query", "database-close",
   ]);
+});
+
+test("a syntactically valid but unreachable or revoked provider fails closed before artifact and databases", async () => {
+  const order: string[] = [];
+  const base = dependencies(order);
+  const outcome = await runReadinessCli(["--live"], completeEnvironment(), {
+    ...base,
+    constructProvider: () => ({
+      provenance: { mode: "openapi", adapter: "bounded-openapi", adapterVersion: 1, fixture: false },
+      analysisSourceTypes: ["openapi"],
+      analyze: async () => { throw new Error("UNUSED"); },
+      probe: async () => {
+        order.push("provider-probe");
+        throw new Error("revoked credential must stay redacted");
+      },
+    }),
+  });
+  assert.deepEqual(outcome, {
+    output: { status: "skipped", code: "LIVE_CONTROLS_REQUIRED", liveSuccess: false },
+    exitCode: 2,
+  });
+  assert.deepEqual(order, ["provider-probe"]);
+  assert.doesNotMatch(JSON.stringify(outcome), /revoked credential/);
 });
 
 test("an unreachable or overprivileged application database prevents readiness before maintenance proof", async () => {
@@ -276,7 +305,7 @@ test("artifact bytes are actively hashed and a mismatch stops before verifier or
   assert.deepEqual(outcome, {
     output: { status: "failed", code: "ARTIFACT_INTEGRITY_FAILED", liveSuccess: false }, exitCode: 1,
   });
-  assert.deepEqual(order, ["provider", "artifact"]);
+  assert.deepEqual(order, ["provider", "provider-probe", "artifact"]);
 });
 
 test("local-live runs its selected-provider topology diagnostics but can never claim live success", async () => {
