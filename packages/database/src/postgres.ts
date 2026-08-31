@@ -1998,7 +1998,7 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
       const releaseResult = await client.query(
         "select id, organization_id, project_id, analysis_run_id, capability_state_digest, content_hash, sri, code, " +
         "allowed_origin, manifest, artifact_url, download_url, local_only, status, created_at from public.releases " +
-        "where id = $1 and project_id = $2 and organization_id = $3 limit 1 for share",
+        "where id = $1 and project_id = $2 and organization_id = $3 limit 1",
         [input.releaseId, projectId, actor.organizationId]
       );
       if (!releaseResult.rows[0]) throw new RepositoryError("NOT_FOUND");
