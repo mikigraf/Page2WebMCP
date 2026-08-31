@@ -676,3 +676,61 @@ git diff --check
 Result: shell syntax, typecheck, source security policy, and diff checks all
 exited `0`. The standalone harness is not reported as fully passing because of
 the independently diagnosed stale post-replay assertion above.
+
+## Harness assertion alignment follow-up
+
+The unchanged standalone harness reproduced the stale assertion as RED after
+all 16 migrations replayed: immutable release bytes were present, but the test
+still required the legacy verification to remain eligible. The assertion now
+requires the intended fail-closed state instead:
+
+- `candidate_code = 'legacy published candidate'`;
+- `eligible = false`;
+- native verifier protocol, origin digest, and implementation provenance all
+  remain null rather than being invented;
+- `MIGRATION_NATIVE_REVERIFY_REQUIRED` is present in `failures`.
+
+That change allowed the harness to reach the standalone tenant-isolation
+fixture. Its direct `private.analysis_jobs` insert predated the required
+immutable `source_configuration` column, so the fixture now supplies the only
+canonical website value accepted by the migration,
+`{"kind":"website"}`. No application or migration behavior changed.
+
+With both harness-only fixes, migration replay, legacy-state assertions, Auth
+identity SQL, tenant-isolation SQL, and retention SQL all completed. The first
+TypeScript PostgreSQL integration failure is a separate production boundary:
+
+```text
+Postgres repository persists and recovers the fixture lifecycle
+packages/database/src/postgres.integration.test.ts:516
+PostgreSQL 42501: permission denied for table releases
+RepositoryError: FORBIDDEN
+```
+
+It occurs while `saveReleaseInstallation` inserts the valid
+`pending_self_host` observation. Temporary database-error diagnostics used to
+identify the exact PostgreSQL message were removed before the final diff. The
+later three `claimAnalysis` assertions returned `undefined` after this first
+failure; they are recorded as suspected shared-state/cascade failures, not
+independent root causes. The full harness therefore remains truthfully failed
+at production installation persistence and is not reported as passing.
+
+Fresh verification after the harness-only changes:
+
+```sh
+docker run --rm -v "$PWD:/workspace" \
+  -v page2webmcp-task8-node-modules:/workspace/node_modules \
+  -w /workspace node:24-bookworm \
+  sh -lc 'corepack pnpm exec tsx --test packages/database/src/*migration.test.ts'
+docker run --rm -v "$PWD:/workspace" \
+  -v page2webmcp-task8-node-modules:/workspace/node_modules \
+  -w /workspace node:24-bookworm sh -lc 'corepack pnpm typecheck'
+docker run --rm -v "$PWD:/workspace" \
+  -v page2webmcp-task8-node-modules:/workspace/node_modules \
+  -w /workspace node:24-bookworm sh -lc 'corepack pnpm security:policy'
+bash -n scripts/test-rls-local.sh
+git diff --check
+```
+
+The migration contracts passed `24/24`; Node 24 typecheck, the source security
+policy, shell syntax, and diff checks exited `0`.

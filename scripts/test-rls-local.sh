@@ -135,10 +135,14 @@ done
        select 1
        from public.verification_runs
        where id = 'aaaaaaaa-0000-0000-0000-0000000000f8'
-         and eligible
+         and not eligible
          and candidate_code = 'legacy published candidate'
+         and verifier_protocol_version is null
+         and verifier_origin_digest is null
+         and verifier_webmcp_implementation is null
+         and 'MIGRATION_NATIVE_REVERIFY_REQUIRED' = any(failures)
      ) then
-       raise exception 'legacy published verification was not reconstructed from immutable release bytes';
+       raise exception 'legacy published verification was not reconstructed and invalidated for native reverification';
      end if;
      if not exists (
        select 1

@@ -258,8 +258,12 @@ begin
     when unique_violation then null;
   end;
 
-  insert into private.analysis_jobs (analysis_run_id, organization_id, source_type, source_url) values
-    (active_run_id, 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'website', 'https://acme.example');
+  insert into private.analysis_jobs (
+    analysis_run_id, organization_id, source_type, source_url, source_configuration
+  ) values (
+    active_run_id, 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'website',
+    'https://acme.example', '{"kind":"website"}'::jsonb
+  );
   if (select status from public.projects where id = 'aaaaaaaa-0000-0000-0000-000000000001') <> 'analyzing' then
     raise exception 'queue/public lifecycle state did not synchronize';
   end if;
