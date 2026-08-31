@@ -578,3 +578,101 @@ git diff --cached --check
 git commit -m "fix: preserve migration upgrade compatibility"
 git rev-parse HEAD
 ```
+
+## Fix round 5: standalone Supabase Storage prerequisite
+
+### Root cause and minimal fix
+
+The standalone RLS harness replayed application migrations against minimal
+Supabase-owned Auth and extension prerequisites, but it did not create the
+Storage service's pre-existing `storage.buckets` table. The release-artifact
+migration inserts five bucket metadata fields and uses `on conflict (id)`, so
+the fixture now creates only:
+
+- the `storage` schema;
+- `storage.buckets.id` as a `text` primary key;
+- `name text not null`;
+- `public boolean default false`;
+- nullable `file_size_limit bigint default null` and
+  `allowed_mime_types text[] default null`.
+
+Those types and defaults match the corresponding Supabase Storage fields. No
+`storage.objects`, Storage policies, Storage service roles, or application
+behavior were added. The upstream name-uniqueness index and every unrelated
+Storage-owned field were also intentionally omitted because no committed
+migration depends on them.
+
+### Behavioral RED and Storage GREEN evidence
+
+The pre-fix standalone command was:
+
+```sh
+PAGE2WEBMCP_NATIVE_TYPESCRIPT_TESTS=true \
+PAGE2WEBMCP_NODE_BINARY=/usr/local/bin/node \
+  bash scripts/test-rls-local.sh
+```
+
+It exited `3` at the expected missing prerequisite:
+
+```text
+psql:supabase/migrations/20260831100000_release_artifact_storage.sql:11:
+ERROR: relation "storage.buckets" does not exist
+```
+
+After adding the five-column fixture, the same command successfully applied
+`20260831100000_release_artifact_storage.sql` and every remaining migration,
+including `20260831120000_live_readiness_attestation.sql`. This establishes the
+Storage prerequisite as GREEN. The overall harness then exited `1` at a
+separate post-replay assertion:
+
+```text
+ERROR: legacy published verification was not reconstructed from immutable release bytes
+CONTEXT: PL/pgSQL function inline_code_block line 30 at RAISE
+```
+
+Temporary diagnostic output (removed before the final diff) showed the exact
+candidate state at that assertion:
+
+```json
+{"eligible":false,"candidate_code":"legacy published candidate","failures":["MIGRATION_TRUSTED_REVERIFY_REQUIRED","MIGRATION_NATIVE_REVERIFY_REQUIRED"],"verifier_protocol_version":null}
+```
+
+The immutable code was therefore reconstructed correctly. The stale assertion
+fails only because the later readiness migration deliberately makes legacy
+proof with null native-verifier provenance ineligible and appends
+`MIGRATION_NATIVE_REVERIFY_REQUIRED`. The committed Task 8 migration contract
+also explicitly requires legacy proof to remain ineligible. Per the breaker
+round boundary, the protected Task 8/readiness files and this separate harness
+assertion were not changed.
+
+### Focused contracts and final checks
+
+The focused local-Supabase configuration contract passed `1/1`:
+
+```sh
+PATH=/usr/local/bin:/usr/bin:/bin /usr/local/bin/node \
+  --experimental-transform-types --test \
+  --test-name-pattern='local Supabase lifecycle is pinned' \
+  test-support/local-supabase.test.ts
+```
+
+The full migration-contract compile/run command from round 4 passed `24/24`,
+including the release-artifact Storage contract and Task 8's legacy-ineligible
+contract.
+
+An attempted full `test-support/local-supabase.test.ts` run passed its first
+two tests, then the platform left its fake `pnpm exec supabase --version` shell
+child sleeping without output. It was terminated after observation and no
+child process remained; this was a runner stall, not an assertion failure.
+
+```sh
+bash -n scripts/test-rls-local.sh
+PATH=/usr/local/bin:/usr/bin:/bin /usr/local/bin/node \
+  node_modules/typescript/bin/tsc --project tsconfig.base.json --noEmit
+PATH=/usr/local/bin:/usr/bin:/bin /usr/local/bin/node scripts/check-source.mjs
+git diff --check
+```
+
+Result: shell syntax, typecheck, source security policy, and diff checks all
+exited `0`. The standalone harness is not reported as fully passing because of
+the independently diagnosed stale post-replay assertion above.
