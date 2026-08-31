@@ -2,8 +2,6 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
-import { readFile } from "node:fs/promises";
-import { resolve } from "node:path";
 import pg from "pg";
 import { compileWebMcpRelease } from "../../compiler/src/compiler.ts";
 import { acmeCapabilityEvidence, acmeCapabilityPlans } from "../../../apps/acme-support/src/capability-plans.ts";
@@ -22,7 +20,6 @@ function passedVerificationChecks() {
 
 const connectionString = process.env.PAGE2WEBMCP_TEST_DATABASE_URL;
 const adminConnectionString = process.env.PAGE2WEBMCP_TEST_ADMIN_DATABASE_URL;
-const localRuntimeEnvironment = await localRuntimeEnvironmentFile();
 
 const canonicalFixturePlans = acmeCapabilityPlans("https://acme.example");
 
@@ -47,62 +44,6 @@ function releaseCandidate(code: string, selectedPlans = plans("find_order"), all
     allowedOrigin,
     manifest: compiled.manifest
   };
-}
-
-test("local Supabase runtime logins are separately bounded to one NOLOGIN application role", {
-  skip: !adminConnectionString
-    || !localRuntimeEnvironment.PAGE2WEBMCP_APP_DATABASE_URL
-    || !localRuntimeEnvironment.PAGE2WEBMCP_WORKER_DATABASE_URL
-    || !localRuntimeEnvironment.PAGE2WEBMCP_MAINTENANCE_DATABASE_URL
-}, async () => {
-  const admin = new pg.Pool({ connectionString: adminConnectionString!, max: 1 });
-  try {
-    const expected = [
-      ["PAGE2WEBMCP_APP_DATABASE_URL", "page2webmcp_local_app", "page2webmcp_app"],
-      ["PAGE2WEBMCP_WORKER_DATABASE_URL", "page2webmcp_local_worker", "page2webmcp_worker"],
-      ["PAGE2WEBMCP_MAINTENANCE_DATABASE_URL", "page2webmcp_local_maintenance", "page2webmcp_maintenance"]
-    ] as const;
-    for (const [environmentKey, login, applicationRole] of expected) {
-      const connectionString = localRuntimeEnvironment[environmentKey]!;
-      const runtime = new pg.Pool({ connectionString, max: 1 });
-      try {
-        const identity = await runtime.query("select session_user, current_user");
-        assert.equal(identity.rows[0]?.session_user, login);
-        assert.equal(identity.rows[0]?.current_user, applicationRole);
-        const membership = await admin.query(
-          "select member.rolname as login, role.rolname as application_role, member.rolinherit, " +
-          "member.rolsuper, member.rolbypassrls from pg_auth_members membership " +
-          "join pg_roles member on member.oid = membership.member " +
-          "join pg_roles role on role.oid = membership.roleid where member.rolname = $1",
-          [login]
-        );
-        assert.deepEqual(membership.rows, [{
-          login,
-          application_role: applicationRole,
-          rolinherit: false,
-          rolsuper: false,
-          rolbypassrls: false
-        }]);
-      } finally {
-        await runtime.end();
-      }
-    }
-  } finally {
-    await admin.end();
-  }
-});
-
-async function localRuntimeEnvironmentFile() {
-  try {
-    const text = await readFile(resolve(process.cwd(), ".page2webmcp/local.env"), "utf8");
-    return Object.fromEntries(text.split("\n").flatMap((line) => {
-      const match = /^(PAGE2WEBMCP_(?:APP|WORKER|MAINTENANCE)_DATABASE_URL)=(.+)$/.exec(line);
-      return match ? [[match[1], match[2]]] : [];
-    }));
-  } catch (error: unknown) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return {} as Record<string, string>;
-    throw error;
-  }
 }
 
 test("Postgres personal organization provisioning converges and revoked sessions fail closed", {

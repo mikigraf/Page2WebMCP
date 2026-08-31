@@ -11,19 +11,40 @@ const RUNTIME_ROLES = [
   { environmentKey: "PAGE2WEBMCP_MAINTENANCE_DATABASE_URL", login: "page2webmcp_local_maintenance", role: "page2webmcp_maintenance", limit: 2 }
 ];
 
-export async function bootstrapLocalRuntimeRoles(ownerDatabaseUrl, destination = resolve(process.cwd(), LOCAL_ENVIRONMENT_PATH)) {
+export async function bootstrapLocalRuntimeRoles(
+  ownerDatabaseUrl,
+  destination = resolve(process.cwd(), LOCAL_ENVIRONMENT_PATH),
+  dependencies = { createClient: (connectionString) => new pg.Client({ connectionString }) }
+) {
   const ownerUrl = validateOwnerDatabaseUrl(ownerDatabaseUrl);
-  const client = new pg.Client({ connectionString: ownerUrl.toString() });
+  const client = dependencies.createClient(ownerUrl.toString());
   const credentials = RUNTIME_ROLES.map((runtimeRole) => ({ ...runtimeRole, password: randomBytes(32).toString("base64url") }));
   try {
     await client.connect();
     await assertBoundedApplicationRoles(client);
     for (const credential of credentials) await configureLogin(client, credential);
+    await assertRuntimeLoginMemberships(client, credentials);
   } finally {
     await client.end().catch(() => undefined);
   }
   await writeLocalEnvironment(destination, credentials, ownerUrl);
   return credentials.map(({ environmentKey, login, role }) => ({ environmentKey, login, role }));
+}
+
+async function assertRuntimeLoginMemberships(client, credentials) {
+  const expected = new Map(credentials.map(({ login, role }) => [login, role]));
+  const result = await client.query(
+    "select member.rolname as login, role.rolname as application_role, member.rolinherit, member.rolsuper, member.rolbypassrls " +
+    "from pg_auth_members membership join pg_roles member on member.oid = membership.member " +
+    "join pg_roles role on role.oid = membership.roleid where member.rolname = any($1::text[])",
+    [credentials.map(({ login }) => login)]
+  );
+  if (result.rows.length !== expected.size || result.rows.some((row) =>
+    expected.get(row.login) !== row.application_role
+    || row.rolinherit
+    || row.rolsuper
+    || row.rolbypassrls
+  )) throw new Error("LOCAL_RUNTIME_ROLE_MEMBERSHIP_REQUIRED");
 }
 
 export function validateOwnerDatabaseUrl(value) {
