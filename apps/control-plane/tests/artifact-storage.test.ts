@@ -26,13 +26,22 @@ type ClientCall = Readonly<{ server: string; secret: string; options: Parameters
 function exactResponse(
   url: string,
   body: BodyInit = CODE,
-  options: Readonly<{ status?: number; contentType?: string; disposition?: string; setCookie?: string }> = {},
+  options: Readonly<{
+    status?: number;
+    contentType?: string;
+    disposition?: string;
+    setCookie?: string;
+    contentLength?: string;
+    redirected?: boolean;
+  }> = {},
 ): Response {
   const headers = new Headers({ "content-type": options.contentType ?? "application/javascript" });
   if (options.disposition) headers.set("content-disposition", options.disposition);
   if (options.setCookie) headers.set("set-cookie", options.setCookie);
+  if (options.contentLength) headers.set("content-length", options.contentLength);
   const response = new Response(body, { status: options.status ?? 200, headers });
   Object.defineProperty(response, "url", { value: url });
+  if (options.redirected) Object.defineProperty(response, "redirected", { value: true });
   return response;
 }
 
@@ -227,27 +236,47 @@ test("rejects missing, aliased, browser-exposed, and mismatched Storage configur
   }));
 });
 
-test("reconciles only a typed object-exists conflict without a second upload", async () => {
-  const duplicate = new StorageApiError("sensitive duplicate response", 409, "Duplicate");
-  const fixture = harness({ uploadResult: { data: null, error: duplicate } });
-
-  const published = await fixture.store.publish(input(), new AbortController().signal);
-  assert.equal(published.contentHash, CONTENT_HASH);
-  assert.equal(fixture.uploadCalls.length, 1);
-  assert.equal(fixture.fetchCalls.length, 2);
+test("reconciles only pinned current and documented legacy typed object-exists errors", async () => {
+  const accepted = [
+    new StorageApiError("current", 409, "409", "storage", "ResourceAlreadyExists"),
+    new StorageApiError("current", 400, "KeyAlreadyExists"),
+    new StorageApiError("legacy", 400, "409"),
+  ];
+  for (const duplicate of accepted) {
+    const fixture = harness({ uploadResult: { data: null, error: duplicate } });
+    const published = await fixture.store.publish(input(), new AbortController().signal);
+    assert.equal(published.contentHash, CONTENT_HASH);
+    assert.equal(fixture.uploadCalls.length, 1);
+    assert.equal(fixture.fetchCalls.length, 2);
+  }
 });
 
-test("does not reconcile untyped conflicts or overwrite mismatched existing bytes", async () => {
-  const untyped = harness({ uploadResult: { data: null, error: { status: 409, message: SECRET } } });
-  await assert.rejects(
-    untyped.store.publish(input(), new AbortController().signal),
-    /^Error: RELEASE_ARTIFACT_UPLOAD_FAILED$/,
-  );
-  assert.equal(untyped.fetchCalls.length, 0);
-  assert.equal(untyped.uploadCalls.length, 1);
+test("rejects unrelated typed and untyped conflicts without message parsing or public reconciliation", async () => {
+  const rejected = [
+    new StorageApiError("ResourceAlreadyExists in a message", 409, "Duplicate"),
+    new StorageApiError("plain conflict", 409, "409"),
+    new StorageApiError("legacy code is not absent", 400, "409", "storage", "OtherConflict"),
+    new StorageApiError("wrong status", 422, "ResourceAlreadyExists"),
+    new StorageApiError("other 400", 400, "Duplicate"),
+    { status: 409, statusCode: "ResourceAlreadyExists", message: SECRET },
+  ];
+  for (const error of rejected) {
+    const fixture = harness({ uploadResult: { data: null, error } });
+    await assert.rejects(
+      fixture.store.publish(input(), new AbortController().signal),
+      /^Error: RELEASE_ARTIFACT_UPLOAD_FAILED$/,
+    );
+    assert.equal(fixture.fetchCalls.length, 0);
+    assert.equal(fixture.uploadCalls.length, 1);
+  }
+});
 
+test("never overwrites or accepts mismatched bytes during typed conflict reconciliation", async () => {
   const typed = harness({
-    uploadResult: { data: null, error: new StorageApiError("duplicate", 409, "Duplicate") },
+    uploadResult: {
+      data: null,
+      error: new StorageApiError("duplicate", 409, "409", "storage", "ResourceAlreadyExists"),
+    },
     responses: [exactResponse(ARTIFACT_URL, "export const wrong = true;\n")],
   });
   await assert.rejects(
@@ -256,6 +285,138 @@ test("does not reconcile untyped conflicts or overwrite mismatched existing byte
   );
   assert.equal(typed.uploadCalls.length, 1);
   assert.equal(typed.fetchCalls.length, 1);
+});
+
+test("binds SDK upload fetch to the exact POST endpoint without stripping legitimate auth headers", async () => {
+  const transportCalls: Array<{ url: string; init: RequestInit | undefined }> = [];
+  const uploadUrl = `${HOSTED_SERVER}/storage/v1/object/page2webmcp-releases/${CONTENT_HASH}.js`;
+  const clientFactory: ReleaseArtifactClientFactory = (server, secret, clientOptions) => ({
+    storage: {
+      from(bucket) {
+        return {
+          async upload(path, body, uploadOptions) {
+            const response = await clientOptions.global.fetch(`${server}/storage/v1/object/${bucket}/${path}`, {
+              method: "POST",
+              headers: { authorization: `Bearer ${secret}`, apikey: secret },
+              body: Uint8Array.from(body).buffer,
+            });
+            assert.equal(response.status, 200);
+            assert.deepEqual(uploadOptions, {
+              contentType: "application/javascript", cacheControl: "31536000", upsert: false,
+            });
+            return { data: { path }, error: null };
+          },
+        };
+      },
+    },
+  });
+  const responses = [
+    exactResponse(uploadUrl, "", { contentType: "application/json" }),
+    exactResponse(ARTIFACT_URL),
+    exactResponse(DOWNLOAD_URL, CODE, {
+      disposition: `attachment; filename="page2webmcp-${CONTENT_HASH}.js"`,
+    }),
+  ];
+  const store = createConfiguredReleaseArtifactStore(environment(), {
+    createClient: clientFactory,
+    fetch: async (resource, init) => {
+      const url = typeof resource === "string" ? resource : resource instanceof URL ? resource.toString() : resource.url;
+      transportCalls.push({ url, init });
+      return responses.shift()!;
+    },
+  });
+
+  await store.publish(input(), new AbortController().signal);
+  assert.equal(transportCalls[0]?.url, uploadUrl);
+  assert.equal(transportCalls[0]?.init?.method, "POST");
+  assert.equal(transportCalls[0]?.init?.redirect, "error");
+  assert.equal(transportCalls[0]?.init?.credentials, "omit");
+  const headers = new Headers(transportCalls[0]?.init?.headers);
+  assert.equal(headers.get("authorization"), `Bearer ${SECRET}`);
+  assert.equal(headers.get("apikey"), SECRET);
+  assert.equal(new Headers(transportCalls[1]?.init?.headers).has("authorization"), false);
+});
+
+test("rejects SDK upload method or URL drift before transmitting Storage credentials", async () => {
+  for (const attempted of [
+    { url: `https://attacker.example/${CONTENT_HASH}.js`, method: "POST" },
+    {
+      url: `${HOSTED_SERVER}/storage/v1/object/page2webmcp-releases/${CONTENT_HASH}.js`,
+      method: "PUT",
+    },
+  ]) {
+    let transportCalls = 0;
+    const clientFactory: ReleaseArtifactClientFactory = (_server, secret, clientOptions) => ({
+      storage: {
+        from() {
+          return {
+            async upload() {
+              await clientOptions.global.fetch(attempted.url, {
+                method: attempted.method,
+                headers: { authorization: `Bearer ${secret}`, apikey: secret },
+              });
+              return { data: { path: `${CONTENT_HASH}.js` }, error: null };
+            },
+          };
+        },
+      },
+    });
+    const store = createConfiguredReleaseArtifactStore(environment(), {
+      createClient: clientFactory,
+      fetch: async () => {
+        transportCalls += 1;
+        throw new Error("must not transmit");
+      },
+    });
+
+    await assert.rejects(
+      store.publish(input(), new AbortController().signal),
+      /^Error: RELEASE_ARTIFACT_UPLOAD_FAILED$/,
+    );
+    assert.equal(transportCalls, 0);
+  }
+});
+
+test("blocks upload redirects and cross-origin final responses without credential-bearing follow-up", async () => {
+  const uploadUrl = `${HOSTED_SERVER}/storage/v1/object/page2webmcp-releases/${CONTENT_HASH}.js`;
+  for (const response of [
+    exactResponse(uploadUrl, "redirect", { status: 307 }),
+    exactResponse(`https://attacker.example/${CONTENT_HASH}.js`, "redirected", { redirected: true }),
+  ]) {
+    const transportCalls: Array<{ url: string; init: RequestInit | undefined }> = [];
+    const clientFactory: ReleaseArtifactClientFactory = (server, secret, clientOptions) => ({
+      storage: {
+        from(bucket) {
+          return {
+            async upload(path) {
+              await clientOptions.global.fetch(`${server}/storage/v1/object/${bucket}/${path}`, {
+                method: "POST",
+                headers: { authorization: `Bearer ${secret}`, apikey: secret },
+              });
+              return { data: { path }, error: null };
+            },
+          };
+        },
+      },
+    });
+    const store = createConfiguredReleaseArtifactStore(environment(), {
+      createClient: clientFactory,
+      fetch: async (resource, init) => {
+        const url = typeof resource === "string" ? resource : resource instanceof URL ? resource.toString() : resource.url;
+        transportCalls.push({ url, init });
+        return response;
+      },
+    });
+
+    await assert.rejects(
+      store.publish(input(), new AbortController().signal),
+      /^Error: RELEASE_ARTIFACT_UPLOAD_FAILED$/,
+    );
+    assert.equal(transportCalls.length, 1);
+    assert.equal(transportCalls[0]?.url, uploadUrl);
+    assert.equal(transportCalls[0]?.init?.redirect, "error");
+    assert.equal(new Headers(transportCalls[0]?.init?.headers).get("apikey"), SECRET);
+  }
 });
 
 test("keeps upload and public-read failures redacted and never retries uncontrolled errors", async () => {
@@ -360,6 +521,100 @@ test("fails closed without retry on exact-serving, MIME, cookie, or download-dis
     );
     assert.equal(fixture.fetchCalls.length, responses.length);
   }
+});
+
+test("accepts only exact safe single or Supabase dual download filename disposition", async () => {
+  const expected = `page2webmcp-${CONTENT_HASH}.js`;
+  for (const disposition of [
+    `attachment; filename=${expected}`,
+    `attachment; filename="${expected}"`,
+    `attachment; filename=${expected}; filename*=UTF-8''${expected}`,
+  ]) {
+    const fixture = harness({ responses: [
+      exactResponse(ARTIFACT_URL),
+      exactResponse(DOWNLOAD_URL, CODE, { disposition }),
+    ] });
+    await fixture.store.publish(input(), new AbortController().signal);
+  }
+
+  for (const disposition of [
+    `attachment; filename=${expected}; filename*=UTF-8''wrong.js`,
+    `attachment; filename=wrong.js; filename*=UTF-8''${expected}`,
+    `attachment; filename=${expected}; filename=${expected}`,
+    `attachment; filename=${expected}; filename*=UTF-8''${expected}; size=29`,
+    `attachment; filename*=UTF-8''${expected}`,
+    `inline; filename=${expected}; filename*=UTF-8''${expected}`,
+  ]) {
+    const fixture = harness({ responses: [
+      exactResponse(ARTIFACT_URL),
+      exactResponse(DOWNLOAD_URL, CODE, { disposition }),
+    ] });
+    await assert.rejects(
+      fixture.store.publish(input(), new AbortController().signal),
+      /^Error: RELEASE_ARTIFACT_MISMATCH$/,
+    );
+  }
+});
+
+test("cancels response bodies on every rejected non-consumed public response path", async () => {
+  const cases: ReadonlyArray<Readonly<{
+    response: (body: ReadableStream<Uint8Array>) => readonly Response[];
+    code: "RELEASE_ARTIFACT_READ_FAILED" | "RELEASE_ARTIFACT_MISMATCH";
+  }>> = [
+    { response: (body) => [exactResponse(ARTIFACT_URL, body, { status: 400 })], code: "RELEASE_ARTIFACT_READ_FAILED" },
+    { response: (body) => [exactResponse(`${ARTIFACT_URL}/wrong`, body)], code: "RELEASE_ARTIFACT_MISMATCH" },
+    { response: (body) => [exactResponse(ARTIFACT_URL, body, { contentType: "text/javascript" })], code: "RELEASE_ARTIFACT_MISMATCH" },
+    { response: (body) => [exactResponse(ARTIFACT_URL, body, { setCookie: "forbidden=1" })], code: "RELEASE_ARTIFACT_MISMATCH" },
+    {
+      response: (body) => [
+        exactResponse(ARTIFACT_URL),
+        exactResponse(DOWNLOAD_URL, body, { disposition: "inline" }),
+      ],
+      code: "RELEASE_ARTIFACT_MISMATCH",
+    },
+    {
+      response: (body) => [exactResponse(ARTIFACT_URL, body, { contentLength: "65537" })],
+      code: "RELEASE_ARTIFACT_MISMATCH",
+    },
+    {
+      response: (body) => [exactResponse(ARTIFACT_URL, body, { contentLength: "not-a-number" })],
+      code: "RELEASE_ARTIFACT_MISMATCH",
+    },
+  ];
+
+  for (const item of cases) {
+    let cancellations = 0;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("unconsumed"));
+      },
+      cancel() {
+        cancellations += 1;
+      },
+    });
+    const fixture = harness({ responses: item.response(body) });
+    await assert.rejects(
+      fixture.store.publish(input(), new AbortController().signal),
+      new RegExp(`^Error: ${item.code}$`),
+    );
+    assert.equal(cancellations, 1);
+  }
+});
+
+test("cancels a pending response reader when the total lifecycle expires", async () => {
+  let cancellations = 0;
+  const body = new ReadableStream<Uint8Array>({
+    cancel() {
+      cancellations += 1;
+    },
+  });
+  const fixture = harness({ deadlineMs: 5, responses: [exactResponse(ARTIFACT_URL, body)] });
+
+  await assert.rejects(
+    fixture.store.publish(input(), new AbortController().signal),
+    /^Error: RELEASE_ARTIFACT_DEADLINE_EXCEEDED$/,
+  );
+  assert.equal(cancellations, 1);
 });
 
 test("bounds public response streaming before accepting bytes", async () => {

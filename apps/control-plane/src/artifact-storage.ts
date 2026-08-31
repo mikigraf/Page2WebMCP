@@ -128,7 +128,7 @@ export function createConfiguredReleaseArtifactStore(
         lifecycle.dispose();
         throw lifecycleError(lifecycle);
       }
-      const operationFetch: typeof fetch = async (resource, init) => {
+      const boundedFetch: typeof fetch = async (resource, init) => {
         try {
           return await raceWithLifecycle(
             transport(resource, { ...init, signal: lifecycle.signal }),
@@ -139,12 +139,14 @@ export function createConfiguredReleaseArtifactStore(
           throw error;
         }
       };
+      const uploadUrl = `${topology.server}/storage/v1/object/${RELEASE_BUCKET}/${candidate.contentHash}.js`;
+      const uploadFetch = createUploadFetch(boundedFetch, uploadUrl, lifecycle);
       try {
         let client: ReleaseArtifactStorageClient;
         try {
           client = clientFactory(topology.server, topology.secret, {
             auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false },
-            global: { fetch: operationFetch },
+            global: { fetch: uploadFetch },
           });
         } catch {
           throw stableError("RELEASE_ARTIFACT_UPLOAD_FAILED");
@@ -172,8 +174,8 @@ export function createConfiguredReleaseArtifactStore(
         const artifactUrl = `${topology.publicOrigin}/${candidate.contentHash}.js`;
         const downloadUrl = `${artifactUrl}?download=page2webmcp-${candidate.contentHash}.js`;
         const budget = { remaining: PUBLIC_READ_BUDGET };
-        await verifyPublicIdentity(operationFetch, artifactUrl, candidate, false, budget, lifecycle);
-        await verifyPublicIdentity(operationFetch, downloadUrl, candidate, true, budget, lifecycle);
+        await verifyPublicIdentity(boundedFetch, artifactUrl, candidate, false, budget, lifecycle);
+        await verifyPublicIdentity(boundedFetch, downloadUrl, candidate, true, budget, lifecycle);
         return {
           artifactUrl,
           downloadUrl,
@@ -189,6 +191,33 @@ export function createConfiguredReleaseArtifactStore(
         lifecycle.dispose();
       }
     },
+  };
+}
+
+function createUploadFetch(
+  transport: typeof fetch,
+  expectedUrl: string,
+  lifecycle: PublicationLifecycle,
+): typeof fetch {
+  return async (resource, init) => {
+    const requestedUrl = requestUrl(resource);
+    const requestedMethod = init?.method ?? (resource instanceof Request ? resource.method : "GET");
+    if (requestedUrl !== expectedUrl || requestedMethod !== "POST") {
+      throw stableError("RELEASE_ARTIFACT_UPLOAD_FAILED");
+    }
+    const response = await transport(resource, {
+      ...init,
+      method: "POST",
+      redirect: "error",
+      credentials: "omit",
+      signal: lifecycle.signal,
+    });
+    if (response.url !== expectedUrl || response.redirected
+      || response.status >= 300 && response.status <= 399) {
+      await cancelResponseBody(response, lifecycle, "RELEASE_ARTIFACT_UPLOAD_FAILED");
+      throw stableError("RELEASE_ARTIFACT_UPLOAD_FAILED");
+    }
+    return response;
   };
 }
 
@@ -240,22 +269,22 @@ async function verifyPublicIdentity(
       if (lifecycle.signal.aborted) throw lifecycleError(lifecycle);
       throw stableError("RELEASE_ARTIFACT_READ_FAILED");
     }
+    if (response.url !== expectedUrl || response.redirected || response.headers.has("set-cookie")) {
+      await cancelResponseBody(response, lifecycle, "RELEASE_ARTIFACT_MISMATCH");
+      throw stableError("RELEASE_ARTIFACT_MISMATCH");
+    }
     if (transientReadStatus(response.status)) {
-      try {
-        await raceWithLifecycle(response.body?.cancel() ?? Promise.resolve(), lifecycle);
-      } catch (error) {
-        if (error instanceof ReleaseArtifactError) throw error;
-        if (lifecycle.signal.aborted) throw lifecycleError(lifecycle);
-        throw stableError("RELEASE_ARTIFACT_READ_FAILED");
-      }
+      await cancelResponseBody(response, lifecycle, "RELEASE_ARTIFACT_READ_FAILED");
       if (budget.remaining <= 0) throw stableError("RELEASE_ARTIFACT_READ_FAILED");
       continue;
     }
-    if (response.status !== 200) throw stableError("RELEASE_ARTIFACT_READ_FAILED");
-    if (response.url !== expectedUrl
-      || mediaType(response.headers.get("content-type")) !== "application/javascript"
-      || response.headers.has("set-cookie")
+    if (response.status !== 200) {
+      await cancelResponseBody(response, lifecycle, "RELEASE_ARTIFACT_READ_FAILED");
+      throw stableError("RELEASE_ARTIFACT_READ_FAILED");
+    }
+    if (mediaType(response.headers.get("content-type")) !== "application/javascript"
       || download && !validDownloadDisposition(response.headers.get("content-disposition"), candidate.contentHash)) {
+      await cancelResponseBody(response, lifecycle, "RELEASE_ARTIFACT_MISMATCH");
       throw stableError("RELEASE_ARTIFACT_MISMATCH");
     }
     let bytes: Buffer;
@@ -277,6 +306,7 @@ async function verifyPublicIdentity(
 async function readBoundedBody(response: Response, lifecycle: PublicationLifecycle): Promise<Buffer> {
   const declared = response.headers.get("content-length");
   if (declared !== null && (!/^\d+$/.test(declared) || Number(declared) > MAX_CANDIDATE_BYTES)) {
+    await cancelResponseBody(response, lifecycle, "RELEASE_ARTIFACT_MISMATCH");
     throw stableError("RELEASE_ARTIFACT_MISMATCH");
   }
   if (!response.body) return Buffer.alloc(0);
@@ -290,13 +320,16 @@ async function readBoundedBody(response: Response, lifecycle: PublicationLifecyc
       const bytes = Buffer.from(part.value);
       length += bytes.byteLength;
       if (length > MAX_CANDIDATE_BYTES) {
-        await reader.cancel().catch(() => undefined);
         throw stableError("RELEASE_ARTIFACT_MISMATCH");
       }
       chunks.push(bytes);
     }
+  } catch (error) {
+    await cancelReader(reader, lifecycle);
+    if (lifecycle.signal.aborted) throw lifecycleError(lifecycle);
+    throw error;
   } finally {
-    reader.releaseLock();
+    try { reader.releaseLock(); } catch { /* cancellation may settle a pending read asynchronously */ }
   }
   return Buffer.concat(chunks, length);
 }
@@ -323,7 +356,10 @@ function createPublicationLifecycle(callerSignal: AbortSignal, deadlineMs: numbe
 }
 
 async function raceWithLifecycle<T>(operation: Promise<T>, lifecycle: PublicationLifecycle): Promise<T> {
-  if (lifecycle.signal.aborted) throw lifecycleError(lifecycle);
+  if (lifecycle.signal.aborted) {
+    void operation.catch(() => undefined);
+    throw lifecycleError(lifecycle);
+  }
   let removeAbort: () => void = () => undefined;
   const aborted = new Promise<never>((_resolve, reject) => {
     const onAbort = () => reject(lifecycleError(lifecycle));
@@ -346,7 +382,10 @@ function lifecycleError(lifecycle: PublicationLifecycle): ReleaseArtifactError {
 }
 
 function isObjectExists(error: unknown): boolean {
-  return error instanceof StorageApiError && error.status === 409;
+  if (!(error instanceof StorageApiError) || error.status !== 400 && error.status !== 409) return false;
+  if (error.code === "ResourceAlreadyExists" || error.code === "KeyAlreadyExists"
+    || error.statusCode === "ResourceAlreadyExists" || error.statusCode === "KeyAlreadyExists") return true;
+  return error.status === 400 && error.code === undefined && error.statusCode === "409";
 }
 
 function transientReadStatus(status: number): boolean {
@@ -360,8 +399,58 @@ function mediaType(value: string | null): string | undefined {
 function validDownloadDisposition(value: string | null, contentHash: string): boolean {
   if (!value || /[\r\n]/.test(value)) return false;
   const expected = `page2webmcp-${contentHash}.js`;
-  const match = /^attachment\s*;\s*filename=(?:"([^"]+)"|([^;\s]+))\s*$/i.exec(value);
-  return (match?.[1] ?? match?.[2]) === expected;
+  const match = /^attachment\s*;\s*filename=(?:"([^"]+)"|([A-Za-z0-9.-]+))(?:\s*;\s*filename\*=UTF-8''([A-Za-z0-9.-]+))?\s*$/i.exec(value);
+  return (match?.[1] ?? match?.[2]) === expected
+    && (match?.[3] === undefined || match[3] === expected);
+}
+
+async function cancelResponseBody(
+  response: Response,
+  lifecycle: PublicationLifecycle,
+  failureCode: string,
+): Promise<void> {
+  if (!response.body) return;
+  let cancellation: Promise<void>;
+  try {
+    cancellation = response.body.cancel();
+  } catch {
+    throw stableError(failureCode);
+  }
+  try {
+    await raceWithLifecycle(cancellation, lifecycle);
+  } catch (error) {
+    if (lifecycle.signal.aborted) throw lifecycleError(lifecycle);
+    if (error instanceof ReleaseArtifactError) throw error;
+    throw stableError(failureCode);
+  }
+}
+
+async function cancelReader(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  lifecycle: PublicationLifecycle,
+): Promise<void> {
+  let cancellation: Promise<void>;
+  try {
+    cancellation = reader.cancel();
+  } catch {
+    return;
+  }
+  if (lifecycle.signal.aborted) {
+    void cancellation.catch(() => undefined);
+    return;
+  }
+  try {
+    await raceWithLifecycle(cancellation, lifecycle);
+  } catch {
+    void cancellation.catch(() => undefined);
+  }
+}
+
+function requestUrl(resource: RequestInfo | URL): string | undefined {
+  if (typeof resource === "string") return resource;
+  if (resource instanceof URL) return resource.toString();
+  if (resource instanceof Request) return resource.url;
+  return undefined;
 }
 
 function exactHttpsOrigin(value: string): string | undefined {
