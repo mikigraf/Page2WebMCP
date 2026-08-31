@@ -3,6 +3,7 @@ import {
   canonicalizeCapabilityPlans,
   type CapabilityPlan,
 } from "../../capability-ir/src/plan.ts";
+import { validateTargetUrl } from "../../security/src/security.ts";
 import {
   WORKFLOW_DEFAULT_ACTIVE_TASK_QUOTA,
   WORKFLOW_LEASE_MS,
@@ -16,6 +17,7 @@ import {
   type ProjectSourceRecord,
   type ResumeWorkflowTaskInput,
   type SourceSnapshotRecord,
+  type SourceConfiguration,
   type StartWorkflowInput,
   type WaitWorkflowTaskInput,
   type WorkflowCapabilityPlanLink,
@@ -63,6 +65,7 @@ export type AnalysisRunRecord = {
 export type ClaimedAnalysisRunRecord = Readonly<AnalysisRunRecord & {
   sourceType: SourceType;
   sourceUrl: string;
+  sourceConfiguration: SourceConfiguration;
   workflowTaskId: string;
   leaseGeneration: number;
 }>;
@@ -240,6 +243,7 @@ export type CreateProjectRequest = {
   name: string;
   sourceType: SourceType;
   url: string;
+  sourceConfiguration?: SourceConfiguration;
 } & IdempotencyInput;
 export type ProjectPageRequest = Readonly<{ limit?: number; cursor?: string }>;
 export type ProjectPage = Readonly<{ projects: ProjectRecord[]; nextCursor?: string }>;
@@ -268,7 +272,8 @@ export type RepositoryErrorCode =
   | "WAIT_EXPIRED"
   | "MEMBERSHIP_REQUIRED"
   | "INVALID_CURSOR"
-  | "SESSION_REVOKED";
+  | "SESSION_REVOKED"
+  | "OPENAPI_VERIFICATION_CONTEXT_REQUIRED";
 
 export class RepositoryError extends Error {
   constructor(readonly code: RepositoryErrorCode, readonly details?: string[]) {
@@ -339,6 +344,98 @@ const MAX_RELEASE_BYTES = 64 * 1_024;
 const MAX_ANALYSIS_DIAGNOSTICS = 1_000;
 const MAX_ANALYSIS_DIAGNOSTIC_BYTES = 64 * 1_024;
 const ANALYSIS_SOURCE_TYPES: readonly SourceType[] = ["github", "openapi", "website"];
+
+type LegacyUnconfiguredSourceConfiguration = Readonly<{ kind: "legacy_unconfigured" }>;
+type StoredSourceConfiguration = SourceConfiguration | LegacyUnconfiguredSourceConfiguration;
+
+const SOURCE_CONFIGURATION_KEYS = new Map<string, readonly string[]>([
+  ["website", ["kind"]],
+  ["github", ["kind"]],
+  ["openapi", ["kind", "targetOrigin", "testPageUrl", "environment"]],
+  ["legacy_unconfigured", ["kind"]],
+]);
+
+export function normalizeSourceConfiguration(
+  sourceType: SourceType,
+  value: SourceConfiguration | undefined,
+): SourceConfiguration {
+  if (value === undefined) {
+    if (sourceType === "openapi") throw new RepositoryError("OPENAPI_VERIFICATION_CONTEXT_REQUIRED");
+    return { kind: sourceType };
+  }
+  return parseSourceConfiguration(value, sourceType);
+}
+
+export function parsePersistedSourceConfiguration(sourceType: SourceType, value: unknown): SourceConfiguration {
+  return parseSourceConfiguration(value, sourceType);
+}
+
+function parseStoredSourceConfiguration(value: unknown): StoredSourceConfiguration {
+  if (!isPlainRecord(value) || typeof value.kind !== "string") throw new RepositoryError("INVALID_STATE");
+  const expectedKeys = SOURCE_CONFIGURATION_KEYS.get(value.kind);
+  if (!expectedKeys || Object.keys(value).length !== expectedKeys.length
+    || Object.keys(value).some((key) => !expectedKeys.includes(key))) {
+    throw new RepositoryError("INVALID_STATE");
+  }
+  if (value.kind === "website" || value.kind === "github" || value.kind === "legacy_unconfigured") {
+    return { kind: value.kind };
+  }
+  if (typeof value.targetOrigin !== "string" || typeof value.testPageUrl !== "string"
+    || !["test", "staging", "production"].includes(String(value.environment))) {
+    throw new RepositoryError("INVALID_STATE");
+  }
+  const targetOrigin = canonicalHttpsOrigin(value.targetOrigin);
+  const testPageUrl = canonicalHttpsUrl(value.testPageUrl);
+  if (new URL(testPageUrl).origin !== targetOrigin) throw new RepositoryError("INVALID_STATE");
+  return { kind: "openapi", targetOrigin, testPageUrl, environment: value.environment as "test" | "staging" | "production" };
+}
+
+function parseSourceConfiguration(value: unknown, sourceType: SourceType): SourceConfiguration {
+  let parsed: StoredSourceConfiguration;
+  try {
+    parsed = parseStoredSourceConfiguration(value);
+  } catch (error) {
+    if (sourceType === "openapi") throw new RepositoryError("OPENAPI_VERIFICATION_CONTEXT_REQUIRED");
+    throw error;
+  }
+  if (parsed.kind === "legacy_unconfigured" || parsed.kind !== sourceType) {
+    if (sourceType === "openapi") throw new RepositoryError("OPENAPI_VERIFICATION_CONTEXT_REQUIRED");
+    throw new RepositoryError("INVALID_STATE");
+  }
+  return parsed;
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    && (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null);
+}
+
+function canonicalHttpsOrigin(value: string): string {
+  if (!validateTargetUrl(value).ok) throw new RepositoryError("INVALID_STATE");
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new RepositoryError("INVALID_STATE");
+  }
+  if (url.protocol !== "https:" || url.username || url.password || url.pathname !== "/"
+    || url.search || url.hash) throw new RepositoryError("INVALID_STATE");
+  return url.origin;
+}
+
+function canonicalHttpsUrl(value: string): string {
+  if (!validateTargetUrl(value).ok) throw new RepositoryError("INVALID_STATE");
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new RepositoryError("INVALID_STATE");
+  }
+  if (url.protocol !== "https:" || url.username || url.password || url.hash) {
+    throw new RepositoryError("INVALID_STATE");
+  }
+  return url.toString();
+}
 
 export function normalizeAnalysisSourceTypes(
   sourceTypes: readonly SourceType[] | undefined,
@@ -459,7 +556,11 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
   readonly #releaseInstallationByRelease = new Map<string, string>();
   readonly #idempotency = new Map<string, IdempotencyRecord>();
   readonly #analysisAvailableAt = new Map<string, string>();
-  readonly #analysisSources = new Map<string, Readonly<{ sourceType: SourceType; sourceUrl: string }>>();
+  readonly #analysisSources = new Map<string, Readonly<{
+    sourceType: SourceType;
+    sourceUrl: string;
+    sourceConfiguration: SourceConfiguration;
+  }>>();
   readonly #projectSources = new Map<string, ProjectSourceRecord>();
   readonly #sourceSnapshots = new Map<string, SourceSnapshotRecord>();
   readonly #workflowRuns = new Map<string, WorkflowRunRecord>();
@@ -701,6 +802,7 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
       if (!project || project.organizationId !== actor.organizationId) throw new RepositoryError("INVALID_STATE");
       return copy(project);
     }
+    const sourceConfiguration = normalizeSourceConfiguration(input.sourceType, input.sourceConfiguration);
     const project: ProjectRecord = {
       id: randomUUID(),
       organizationId: actor.organizationId,
@@ -718,6 +820,7 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
       projectId: project.id,
       sourceType: project.sourceType,
       sourceUrl: project.url,
+      sourceConfiguration,
       version: 1,
       active: true,
       createdAt: project.createdAt,
@@ -728,7 +831,7 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
       organizationId: project.organizationId,
       projectId: project.id,
       projectSourceId: projectSource.id,
-      sourceIdentityHash: stableHash(sourceIdentityMaterial(project.sourceType, project.url)),
+      sourceIdentityHash: stableHash(sourceIdentityMaterial(project.sourceType, project.url, sourceConfiguration)),
       createdAt: project.createdAt,
     };
     this.#sourceSnapshots.set(snapshot.id, snapshot);
@@ -802,7 +905,13 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
     };
     this.#runs.set(run.id, run);
     this.#analysisAvailableAt.set(run.id, now);
-    this.#analysisSources.set(run.id, { sourceType: project.sourceType, sourceUrl: project.url });
+    const source = [...this.#projectSources.values()].find((candidate) => candidate.projectId === project.id && candidate.active);
+    if (!source) throw new RepositoryError("INVALID_STATE");
+    this.#analysisSources.set(run.id, {
+      sourceType: source.sourceType,
+      sourceUrl: source.sourceUrl,
+      sourceConfiguration: copy(source.sourceConfiguration),
+    });
     this.#createWorkflowRun({
       id: run.id,
       project,
@@ -2135,8 +2244,10 @@ function workflowTaskIdempotencyKey(runId: string, phase: WorkflowTaskRecord["ph
   return `wft_${stableHash(`${runId.length}:${runId}:${phase.length}:${phase}:${normalizedHash}`)}`;
 }
 
-function sourceIdentityMaterial(sourceType: string, sourceUrl: string): string {
-  return `${Buffer.byteLength(sourceType)}:${sourceType}:${Buffer.byteLength(sourceUrl)}:${sourceUrl}`;
+function sourceIdentityMaterial(sourceType: string, sourceUrl: string, sourceConfiguration: SourceConfiguration): string {
+  const configuration = canonicalJson(sourceConfiguration);
+  return `${Buffer.byteLength(sourceType)}:${sourceType}:${Buffer.byteLength(sourceUrl)}:${sourceUrl}:`
+    + `${Buffer.byteLength(configuration)}:${configuration}`;
 }
 
 function assertIdempotencyKey(value: string): void {

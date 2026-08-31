@@ -36,6 +36,14 @@ async function createFixtureProject(repository: InMemoryControlPlaneRepository, 
       : sourceType === "openapi"
         ? "https://acme.example/openapi.json"
         : "https://acme.example/",
+    ...(sourceType === "openapi" ? {
+      sourceConfiguration: {
+        kind: "openapi" as const,
+        targetOrigin: "https://acme.example",
+        testPageUrl: "https://acme.example/",
+        environment: "test" as const,
+      },
+    } : {}),
     idempotencyKey: `project-${sourceType}-${crypto.randomUUID()}`,
     inputHash: `project-${sourceType}`
   });
@@ -126,6 +134,7 @@ test("mixed OpenAPI analysis preserves unsupported-operation diagnostics through
       name: "Mixed Widgets",
       sourceType: "openapi",
       url: "https://specs.widgets.example/openapi.json",
+      sourceConfiguration: { kind: "openapi", targetOrigin: "https://specs.widgets.example", testPageUrl: "https://specs.widgets.example/", environment: "test" },
       idempotencyKey: "project-mixed-openapi",
       inputHash: "project-mixed-openapi",
     });
@@ -180,6 +189,7 @@ test("all-unsupported OpenAPI analysis exposes exact diagnostics without an inve
       name: "Private Widgets",
       sourceType: "openapi",
       url: "https://specs.widgets.example/openapi.json",
+      sourceConfiguration: { kind: "openapi", targetOrigin: "https://specs.widgets.example", testPageUrl: "https://specs.widgets.example/", environment: "test" },
       idempotencyKey: "project-private-openapi",
       inputHash: "project-private-openapi",
     });

@@ -81,6 +81,50 @@ test("Postgres personal organization provisioning converges and revoked sessions
   }
 });
 
+test("Postgres copies canonical OpenAPI verification context into an immutable analysis job", {
+  skip: !connectionString || !adminConnectionString,
+}, async () => {
+  const repository = createPostgresRepository({ connectionString: connectionString!, maxConnections: 2 });
+  const admin = new pg.Pool({ connectionString: adminConnectionString!, max: 1 });
+  const actor: RepositoryActor = {
+    id: "11111111-1111-1111-1111-111111111111",
+    organizationId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+    role: "owner",
+  };
+  try {
+    const configuration = {
+      kind: "openapi" as const,
+      targetOrigin: "https://configuration.widgets.example",
+      testPageUrl: "https://configuration.widgets.example/checkout",
+      environment: "staging" as const,
+    };
+    const project = await repository.createProject(actor, {
+      name: "Postgres source configuration",
+      sourceType: "openapi",
+      url: "https://api.configuration.widgets.example/openapi.json",
+      sourceConfiguration: configuration,
+      idempotencyKey: "postgres-source-configuration-project",
+      inputHash: "postgres-source-configuration-project",
+    });
+    assert.deepEqual((await repository.listProjectSources(actor, project.id))[0]?.sourceConfiguration, configuration);
+    const run = await repository.enqueueAnalysis(actor, {
+      projectId: project.id,
+      idempotencyKey: "postgres-source-configuration-analysis",
+      inputHash: "postgres-source-configuration-analysis",
+    });
+    const stored = await admin.query(
+      "select source_configuration from private.analysis_jobs where analysis_run_id = $1",
+      [run.id],
+    );
+    assert.deepEqual(stored.rows[0]?.source_configuration, configuration);
+    const claimed = await repository.claimAnalysis("postgres-source-configuration-worker", 60_000);
+    assert.deepEqual(claimed?.sourceConfiguration, configuration);
+  } finally {
+    await repository.close();
+    await admin.end();
+  }
+});
+
 test("Postgres GitHub workflow exposes exact reviewed material only under its live worker lease", {
   skip: !connectionString,
 }, async () => {
@@ -442,6 +486,7 @@ test("Postgres phased workflow matches in-memory transitions, lease generations,
       name: "Postgres phased workflow",
       sourceType: "openapi",
       url: "https://workflow.widgets.example/openapi.json",
+      sourceConfiguration: { kind: "openapi", targetOrigin: "https://workflow.widgets.example", testPageUrl: "https://workflow.widgets.example/", environment: "test" },
       idempotencyKey: "postgres-workflow-project",
       inputHash: "postgres-workflow-project",
     });
@@ -501,6 +546,7 @@ test("Postgres phased workflow matches in-memory transitions, lease generations,
       name: "Postgres illegal initial state",
       sourceType: "openapi",
       url: "https://initial-state.widgets.example/openapi.json",
+      sourceConfiguration: { kind: "openapi", targetOrigin: "https://initial-state.widgets.example", testPageUrl: "https://initial-state.widgets.example/", environment: "test" },
       idempotencyKey: "postgres-initial-state-project",
       inputHash: "postgres-initial-state-project",
     });
@@ -537,6 +583,7 @@ test("Postgres phased workflow matches in-memory transitions, lease generations,
       name: "Postgres illegal legacy task state",
       sourceType: "openapi",
       url: "https://legacy-state.widgets.example/openapi.json",
+      sourceConfiguration: { kind: "openapi", targetOrigin: "https://legacy-state.widgets.example", testPageUrl: "https://legacy-state.widgets.example/", environment: "test" },
       idempotencyKey: "postgres-legacy-state-project",
       inputHash: "postgres-legacy-state-project",
     });
@@ -618,6 +665,7 @@ test("Postgres phased workflow matches in-memory transitions, lease generations,
       name: "Postgres cancellation race",
       sourceType: "openapi",
       url: "https://race.widgets.example/openapi.json",
+      sourceConfiguration: { kind: "openapi", targetOrigin: "https://race.widgets.example", testPageUrl: "https://race.widgets.example/", environment: "test" },
       idempotencyKey: "postgres-race-project",
       inputHash: "postgres-race-project",
     });
@@ -649,6 +697,7 @@ test("Postgres phased workflow matches in-memory transitions, lease generations,
       name: "Postgres completion cancellation race",
       sourceType: "openapi",
       url: "https://complete-race.widgets.example/openapi.json",
+      sourceConfiguration: { kind: "openapi", targetOrigin: "https://complete-race.widgets.example", testPageUrl: "https://complete-race.widgets.example/", environment: "test" },
       idempotencyKey: "postgres-complete-race-project",
       inputHash: "postgres-complete-race-project",
     });
@@ -683,6 +732,7 @@ test("Postgres phased workflow matches in-memory transitions, lease generations,
       name: "Postgres missing next repair",
       sourceType: "openapi",
       url: "https://repair.widgets.example/openapi.json",
+      sourceConfiguration: { kind: "openapi", targetOrigin: "https://repair.widgets.example", testPageUrl: "https://repair.widgets.example/", environment: "test" },
       idempotencyKey: "postgres-repair-project",
       inputHash: "postgres-repair-project",
     });

@@ -149,6 +149,7 @@ async function createProject(
     name: `Widgets ${suffix}`,
     sourceType: "openapi",
     url: `https://${suffix}.widgets.example/openapi.json`,
+    sourceConfiguration: { kind: "openapi", targetOrigin: `https://${suffix}.widgets.example`, testPageUrl: `https://${suffix}.widgets.example/`, environment: "test" },
     idempotencyKey: `project-${suffix}`,
     inputHash: `project-${suffix}`,
   });

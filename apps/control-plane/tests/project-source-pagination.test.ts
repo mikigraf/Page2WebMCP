@@ -14,15 +14,15 @@ const identity = {
 test("arbitrary supported website, OpenAPI, and GitHub sources normalize without fixture branches", () => {
   assert.deepEqual(normalizeProjectInput({ sourceType: "website", url: "https://Docs.Example:443/guide/" }), {
     ok: true,
-    value: { sourceType: "website", url: "https://docs.example/guide/", name: "docs.example" }
+    value: { sourceType: "website", url: "https://docs.example/guide/", sourceConfiguration: { kind: "website" }, name: "docs.example" }
   });
-  assert.deepEqual(normalizeProjectInput({ sourceType: "openapi", url: "https://api.example/spec/openapi.yaml" }), {
+  assert.deepEqual(normalizeProjectInput({ sourceType: "openapi", url: "https://api.example/spec/openapi.yaml", sourceConfiguration: { kind: "openapi", targetOrigin: "https://api.example", testPageUrl: "https://api.example/", environment: "test" } }), {
     ok: true,
-    value: { sourceType: "openapi", url: "https://api.example/spec/openapi.yaml", name: "api.example API" }
+    value: { sourceType: "openapi", url: "https://api.example/spec/openapi.yaml", sourceConfiguration: { kind: "openapi", targetOrigin: "https://api.example", testPageUrl: "https://api.example/", environment: "test" }, name: "api.example API" }
   });
   assert.deepEqual(normalizeProjectInput({ sourceType: "github", url: "https://github.com/Example/Widget.git" }), {
     ok: true,
-    value: { sourceType: "github", url: "https://github.com/Example/Widget", name: "Example/Widget" }
+    value: { sourceType: "github", url: "https://github.com/Example/Widget", sourceConfiguration: { kind: "github" }, name: "Example/Widget" }
   });
   assert.deepEqual(normalizeProjectInput({ sourceType: "website", url: "https://docs.example/callback?code=secret" }), {
     ok: false,
@@ -107,6 +107,7 @@ test("project list/detail APIs resume durable state across reloads with opaque c
   assert.equal(detail.status, 200);
   const body = await detail.json();
   assert.equal(body.project.id, resumableProjectId);
+  assert.deepEqual(body.source.sourceConfiguration, { kind: "website" });
   assert.equal(body.latestAnalysis.id, run.id);
   assert.equal(body.latestAnalysis.status, "queued");
 });

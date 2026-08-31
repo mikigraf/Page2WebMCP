@@ -46,7 +46,13 @@ test("project entry persists scoped fixture sources with opaque IDs", async () =
 
   assert.equal((await POST(request("POST", {
     sourceType: "openapi",
-    url: "https://acme.example/openapi.json"
+    url: "https://acme.example/openapi.json",
+    sourceConfiguration: {
+      kind: "openapi",
+      targetOrigin: "https://acme.example",
+      testPageUrl: "https://acme.example/checkout",
+      environment: "test"
+    }
   }, undefined, "openapi-project"))).status, 201);
   assert.equal((await POST(request("POST", {
     sourceType: "github",
@@ -55,6 +61,36 @@ test("project entry persists scoped fixture sources with opaque IDs", async () =
 
   const list = await GET(request("GET"));
   assert.equal((await list.json()).projects.length, 3);
+});
+
+test("OpenAPI project creation requires a same-origin HTTPS verification context", async () => {
+  installTestRepository(new InMemoryControlPlaneRepository());
+  const missing = await POST(request("POST", {
+    sourceType: "openapi",
+    url: "https://api.acme.example/openapi.json"
+  }, undefined, "openapi-context-missing"));
+  assert.equal(missing.status, 400);
+  assert.equal((await missing.json()).code, "OPENAPI_VERIFICATION_CONTEXT_REQUIRED");
+
+  const mismatched = await POST(request("POST", {
+    sourceType: "openapi",
+    url: "https://api.acme.example/openapi.json",
+    sourceConfiguration: {
+      kind: "openapi",
+      targetOrigin: "https://acme.example",
+      testPageUrl: "https://other.example/checkout",
+      environment: "preview"
+    }
+  }, undefined, "openapi-context-invalid"));
+  assert.equal(mismatched.status, 400);
+  assert.equal((await mismatched.json()).code, "OPENAPI_VERIFICATION_CONTEXT_REQUIRED");
+
+  const strictWebsite = await POST(request("POST", {
+    sourceType: "website",
+    url: "https://acme.example",
+    sourceConfiguration: { kind: "github" }
+  }, undefined, "website-context-invalid"));
+  assert.equal(strictWebsite.status, 400);
 });
 
 test("project entry fails closed for private and invalid source shapes while accepting arbitrary public sources", async () => {
@@ -86,7 +122,8 @@ test("project creation requires a valid idempotency key and replays only identic
 
   const conflict = await POST(request("POST", {
     sourceType: "openapi",
-    url: "https://acme.example/openapi.json"
+    url: "https://acme.example/openapi.json",
+    sourceConfiguration: { kind: "openapi", targetOrigin: "https://acme.example", testPageUrl: "https://acme.example/", environment: "test" }
   }, undefined, "same-project-key"));
   assert.equal(conflict.status, 409);
   assert.equal((await conflict.json()).code, "IDEMPOTENCY_CONFLICT");

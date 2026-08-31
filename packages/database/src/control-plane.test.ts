@@ -7,6 +7,7 @@ import { compileWebMcpRelease } from "../../compiler/src/compiler.ts";
 import {
   capabilityStateDigest,
   InMemoryControlPlaneRepository,
+  parsePersistedSourceConfiguration,
   RELEASE_VERIFICATION_CHECK_NAMES,
   RepositoryError,
   type RepositoryActor
@@ -135,6 +136,7 @@ test("analysis enqueue is idempotent and leased jobs recover after expiry", asyn
     name: "Acme Support",
     sourceType: "openapi",
     url: "https://acme.example/openapi.json",
+    sourceConfiguration: { kind: "openapi", targetOrigin: "https://acme.example", testPageUrl: "https://acme.example/", environment: "test" },
     idempotencyKey: "project-analysis-one",
     inputHash: "project-analysis-one"
   });
@@ -163,6 +165,107 @@ test("analysis enqueue is idempotent and leased jobs recover after expiry", asyn
   const recovered = await repository.claimAnalysis("worker-b", 60_000);
   assert.equal(recovered?.id, first.id);
   assert.equal(recovered?.attempts, 2);
+});
+
+test("OpenAPI verification context is canonical, changes source identity, and is copied immutably to claimed jobs", async () => {
+  const repository = new InMemoryControlPlaneRepository();
+  const configuration: {
+    kind: "openapi";
+    targetOrigin: string;
+    testPageUrl: string;
+    environment: "test" | "staging" | "production";
+  } = {
+    kind: "openapi" as const,
+    targetOrigin: "https://widgets.example",
+    testPageUrl: "https://widgets.example/checkout",
+    environment: "staging" as const,
+  };
+  const project = await repository.createProject(owner, {
+    name: "OpenAPI verification context",
+    sourceType: "openapi",
+    url: "https://api.widgets.example/openapi.json",
+    sourceConfiguration: configuration,
+    idempotencyKey: "project-openapi-verification-context",
+    inputHash: "project-openapi-verification-context",
+  });
+  const [source] = await repository.listProjectSources(owner, project.id);
+  const [snapshot] = await repository.listSourceSnapshots(owner, project.id);
+  assert.deepEqual(source?.sourceConfiguration, configuration);
+  assert.ok(snapshot);
+
+  const run = await repository.enqueueAnalysis(owner, {
+    projectId: project.id,
+    idempotencyKey: "analysis-openapi-verification-context",
+    inputHash: "analysis-openapi-verification-context",
+  });
+  configuration.environment = "production";
+  const claimed = await repository.claimAnalysis("openapi-verification-worker", 60_000);
+  assert.equal(claimed?.id, run.id);
+  assert.deepEqual(claimed?.sourceConfiguration, {
+    kind: "openapi",
+    targetOrigin: "https://widgets.example",
+    testPageUrl: "https://widgets.example/checkout",
+    environment: "staging",
+  });
+
+  const changedConfigurationProject = await repository.createProject(owner, {
+    name: "Changed OpenAPI verification context",
+    sourceType: "openapi",
+    url: "https://api.widgets.example/openapi.json",
+    sourceConfiguration: { ...claimed!.sourceConfiguration, environment: "production" },
+    idempotencyKey: "project-changed-openapi-verification-context",
+    inputHash: "project-changed-openapi-verification-context",
+  });
+  const [changedSnapshot] = await repository.listSourceSnapshots(owner, changedConfigurationProject.id);
+  assert.notEqual(changedSnapshot?.sourceIdentityHash, snapshot.sourceIdentityHash);
+});
+
+test("OpenAPI analysis rejects legacy-unconfigured sources while preserving tenant isolation", async () => {
+  const repository = new InMemoryControlPlaneRepository();
+  const otherOwner = { ...owner, id: "99999999-9999-4999-8999-999999999999", organizationId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" };
+  repository.seedMembershipForTest(otherOwner);
+  await assert.rejects(
+    repository.createProject(owner, {
+      name: "Legacy OpenAPI source",
+      sourceType: "openapi",
+      url: "https://api.widgets.example/openapi.json",
+      idempotencyKey: "project-legacy-openapi-source",
+      inputHash: "project-legacy-openapi-source",
+    }),
+    (error: unknown) => error instanceof RepositoryError && error.code === "OPENAPI_VERIFICATION_CONTEXT_REQUIRED",
+  );
+  await assert.rejects(
+    repository.createProject(owner, {
+      name: "Free-form website configuration",
+      sourceType: "website",
+      url: "https://widgets.example/",
+      sourceConfiguration: { kind: "website", unexpected: true } as unknown as { kind: "website" },
+      idempotencyKey: "project-free-form-website-configuration",
+      inputHash: "project-free-form-website-configuration",
+    }),
+    (error: unknown) => error instanceof RepositoryError && error.code === "INVALID_STATE",
+  );
+  const project = await repository.createProject(owner, {
+    name: "Tenant scoped website",
+    sourceType: "website",
+    url: "https://widgets.example/",
+    sourceConfiguration: { kind: "website" },
+    idempotencyKey: "project-tenant-scoped-website",
+    inputHash: "project-tenant-scoped-website",
+  });
+  await assert.rejects(repository.getProject(otherOwner, project.id), (error: unknown) =>
+    error instanceof RepositoryError && error.code === "NOT_FOUND");
+});
+
+test("persisted source configuration rejects missing and unknown JSON fields at the repository boundary", () => {
+  assert.throws(
+    () => parsePersistedSourceConfiguration("website", undefined),
+    (error: unknown) => error instanceof RepositoryError && error.code === "INVALID_STATE",
+  );
+  assert.throws(
+    () => parsePersistedSourceConfiguration("website", { kind: "website", unexpected: true }),
+    (error: unknown) => error instanceof RepositoryError && error.code === "INVALID_STATE",
+  );
 });
 
 test("analysis completion persists capability ownership and optimistic reviews", async () => {

@@ -9,6 +9,8 @@ import {
   capabilityStateDigest,
   normalizeAnalysisDiagnostics,
   normalizeAnalysisSourceTypes,
+  parsePersistedSourceConfiguration,
+  normalizeSourceConfiguration,
   normalizeReleaseInstallation,
   releaseFailures,
   RepositoryError,
@@ -58,6 +60,7 @@ import {
   type WorkflowTaskCompletion,
   type WorkflowTaskEventInput,
   type WorkflowTaskRecord,
+  type SourceConfiguration,
 } from "./workflow.ts";
 
 type PostgresOptions = {
@@ -227,6 +230,7 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
   async createProject(actor: RepositoryActor, input: CreateProjectRequest): Promise<ProjectRecord> {
     if (actor.role === "viewer") throw new RepositoryError("FORBIDDEN");
     return this.#transaction({ kind: "app", actor }, async (client) => {
+      const sourceConfiguration = normalizeSourceConfiguration(input.sourceType, input.sourceConfiguration);
       const id = randomUUID();
       const replayId = await this.#reserveIdempotency(client, actor, "project", input.idempotencyKey, input.inputHash, id);
       if (replayId) return this.#project(client, actor, replayId);
@@ -239,14 +243,15 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
       );
       const source = await client.query(
         "insert into public.project_sources " +
-        "(organization_id, project_id, source_type, source_url, version, active) " +
-        "values ($1, $2, $3, $4, 1, true) returning id",
-        [actor.organizationId, id, input.sourceType, input.url]
+        "(organization_id, project_id, source_type, source_url, source_configuration, version, active) " +
+        "values ($1, $2, $3, $4, $5::jsonb, 1, true) returning id",
+        [actor.organizationId, id, input.sourceType, input.url, JSON.stringify(sourceConfiguration)]
       );
       await client.query(
         "insert into public.source_snapshots " +
         "(organization_id, project_id, project_source_id, source_identity_hash) values ($1, $2, $3, $4)",
-        [actor.organizationId, id, source.rows[0].id, stableHash(sourceIdentityMaterial(input.sourceType, input.url))]
+        [actor.organizationId, id, source.rows[0].id,
+          stableHash(sourceIdentityMaterial(input.sourceType, input.url, sourceConfiguration))]
       );
       await this.#audit(client, actor, "project.created", id);
       return mapProject(result.rows[0]);
@@ -323,19 +328,24 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
         "returning id, organization_id, project_id, requested_by, status, attempts, error_code, created_at, updated_at",
         [runId, actor.organizationId, project.id, actor.id]
       );
-      await client.query(
-        "insert into private.analysis_jobs (analysis_run_id, organization_id, source_type, source_url) " +
-        "values ($1, $2, $3, $4)",
-        [runId, actor.organizationId, project.sourceType, project.url]
-      );
       const snapshot = await client.query(
-        "select snapshot.id from public.source_snapshots snapshot " +
+        "select snapshot.id, source.source_type, source.source_url, source.source_configuration from public.source_snapshots snapshot " +
         "join public.project_sources source on source.id = snapshot.project_source_id " +
         "where source.project_id = $1 and source.organization_id = $2 and source.active " +
         "order by snapshot.created_at desc, snapshot.id limit 1",
         [project.id, actor.organizationId]
       );
       if (!snapshot.rows[0]) throw new RepositoryError("INVALID_STATE");
+      const sourceConfiguration = parsePersistedSourceConfiguration(
+        snapshot.rows[0].source_type as SourceType,
+        snapshot.rows[0].source_configuration as SourceConfiguration,
+      );
+      await client.query(
+        "insert into private.analysis_jobs (analysis_run_id, organization_id, source_type, source_url, source_configuration) " +
+        "values ($1, $2, $3, $4, $5::jsonb)",
+        [runId, actor.organizationId, snapshot.rows[0].source_type, snapshot.rows[0].source_url,
+          JSON.stringify(sourceConfiguration)]
+      );
       const workflowInputHash = stableHash(input.inputHash);
       await client.query(
         "insert into public.workflow_runs " +
@@ -479,7 +489,7 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
     return this.#transaction({ kind: "app", actor }, async (client) => {
       await this.#project(client, actor, projectId);
       const result = await client.query(
-        "select id, organization_id, project_id, source_type, source_url, version, active, created_at " +
+        "select id, organization_id, project_id, source_type, source_url, source_configuration, version, active, created_at " +
         "from public.project_sources where project_id = $1 and organization_id = $2 order by version, id limit 100",
         [projectId, actor.organizationId]
       );
@@ -1241,7 +1251,7 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
       const job = await client.query(
         "update private.analysis_jobs set status = 'running', attempts = attempts + 1, lease_owner = $2, " +
         "lease_expires_at = now() + ($3::integer * interval '1 millisecond'), updated_at = now() " +
-        "where analysis_run_id = $1 returning attempts, lease_owner, lease_expires_at, source_type, source_url",
+        "where analysis_run_id = $1 returning attempts, lease_owner, lease_expires_at, source_type, source_url, source_configuration",
         [runId, workerId, boundedLease]
       );
       const workflowTaskResult = await client.query(
@@ -1262,11 +1272,14 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
       const result = await client.query(
         "select ar.id, ar.organization_id, ar.project_id, ar.requested_by, ar.status, ar.attempts, " +
         "ar.error_code, ar.created_at, ar.updated_at, $2::text as lease_owner, $3::timestamptz as lease_expires_at, " +
-        "$4::text as source_type, $5::text as source_url, $6::uuid as workflow_task_id, " +
-        "$7::bigint as lease_generation " +
+        "$4::text as source_type, $5::text as source_url, $6::jsonb as source_configuration, $7::uuid as workflow_task_id, " +
+        "$8::bigint as lease_generation " +
         "from public.analysis_runs ar where ar.id = $1 limit 1",
         [runId, job.rows[0].lease_owner, job.rows[0].lease_expires_at, job.rows[0].source_type,
-          job.rows[0].source_url, workflowTask.id, workflowTask.leaseGeneration]
+          job.rows[0].source_url, JSON.stringify(parsePersistedSourceConfiguration(
+            job.rows[0].source_type as SourceType,
+            job.rows[0].source_configuration as SourceConfiguration,
+          )), workflowTask.id, workflowTask.leaseGeneration]
       );
       if (!result.rows[0]) throw new RepositoryError("INVALID_STATE");
       return mapClaimedAnalysis(result.rows[0]);
@@ -2017,6 +2030,10 @@ function mapClaimedAnalysis(row: QueryResultRow): ClaimedAnalysisRunRecord {
     ...mapAnalysis(row),
     sourceType: row.source_type as SourceType,
     sourceUrl: String(row.source_url),
+    sourceConfiguration: parsePersistedSourceConfiguration(
+      row.source_type as SourceType,
+      row.source_configuration as SourceConfiguration,
+    ),
     workflowTaskId: String(row.workflow_task_id),
     leaseGeneration: Number(row.lease_generation),
   };
@@ -2026,6 +2043,10 @@ function mapProjectSource(row: QueryResultRow): ProjectSourceRecord {
   return {
     id: String(row.id), organizationId: String(row.organization_id), projectId: String(row.project_id),
     sourceType: row.source_type as ProjectSourceRecord["sourceType"], sourceUrl: String(row.source_url),
+    sourceConfiguration: parsePersistedSourceConfiguration(
+      row.source_type as SourceType,
+      row.source_configuration as SourceConfiguration,
+    ),
     version: Number(row.version), active: Boolean(row.active), createdAt: iso(row.created_at),
   };
 }
@@ -2324,8 +2345,10 @@ function workflowTaskIdempotencyKey(runId: string, phase: WorkflowTaskRecord["ph
   return `wft_${stableHash(`${runId.length}:${runId}:${phase.length}:${phase}:${normalizedHash}`)}`;
 }
 
-function sourceIdentityMaterial(sourceType: string, sourceUrl: string): string {
-  return `${Buffer.byteLength(sourceType)}:${sourceType}:${Buffer.byteLength(sourceUrl)}:${sourceUrl}`;
+function sourceIdentityMaterial(sourceType: string, sourceUrl: string, sourceConfiguration: SourceConfiguration): string {
+  const configuration = canonicalJson(sourceConfiguration);
+  return `${Buffer.byteLength(sourceType)}:${sourceType}:${Buffer.byteLength(sourceUrl)}:${sourceUrl}:`
+    + `${Buffer.byteLength(configuration)}:${configuration}`;
 }
 
 function assertWorkflowWorkerId(workerId: string): void {

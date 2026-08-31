@@ -16,11 +16,13 @@ export async function GET(
     const parsed = ProjectIdSchema.safeParse(rawProjectId);
     if (!parsed.success) throw new ApiError("NOT_FOUND", 404);
     const project = await repository.getProject(actor, parsed.data);
+    const source = (await repository.listProjectSources(actor, project.id)).find((candidate) => candidate.active);
+    if (!source) throw new ApiError("NOT_FOUND", 404);
     const latestAnalysis = await repository.getLatestAnalysis(actor, project.id);
     const capabilities = latestAnalysis?.status === "succeeded"
       ? await repository.listAnalysisCapabilities(actor, latestAnalysis.id)
       : [];
-    return successResponse({ project, latestAnalysis, capabilities }, requestId);
+    return successResponse({ project, source, latestAnalysis, capabilities }, requestId);
   } catch (error) {
     return errorResponse(error, requestId, request);
   }

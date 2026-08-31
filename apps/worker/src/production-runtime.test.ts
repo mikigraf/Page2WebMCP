@@ -99,6 +99,14 @@ test("dedicated GitHub runtime never claims or fails website and OpenAPI analysi
       name: `${sourceType} source stays on its worker`,
       sourceType,
       url,
+      ...(sourceType === "openapi" ? {
+        sourceConfiguration: {
+          kind: "openapi" as const,
+          targetOrigin: "https://widgets.example",
+          testPageUrl: "https://widgets.example/",
+          environment: "test" as const,
+        },
+      } : {}),
       idempotencyKey: `production-source-filter-project-${sourceType}`,
       inputHash: `production-source-filter-project-${sourceType}`,
     });

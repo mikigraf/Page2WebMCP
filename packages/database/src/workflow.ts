@@ -22,6 +22,16 @@ export type WorkflowPhase =
 
 export type ProductionWorkflowPhase = Exclude<WorkflowPhase, "analysis">;
 
+export type SourceConfiguration =
+  | Readonly<{
+    kind: "openapi";
+    targetOrigin: string;
+    testPageUrl: string;
+    environment: "test" | "staging" | "production";
+  }>
+  | Readonly<{ kind: "website" }>
+  | Readonly<{ kind: "github" }>;
+
 export const WORKFLOW_PHASE_REGISTRY: readonly Readonly<{
   phase: ProductionWorkflowPhase;
   execution: "worker" | "wait";
@@ -55,6 +65,7 @@ export type ProjectSourceRecord = Readonly<{
   projectId: string;
   sourceType: "website" | "openapi" | "github";
   sourceUrl: string;
+  sourceConfiguration: SourceConfiguration;
   version: number;
   active: boolean;
   createdAt: string;

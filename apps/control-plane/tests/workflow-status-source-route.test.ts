@@ -15,6 +15,14 @@ for (const sourceType of ["website", "openapi"] as const) test(`${sourceType} wo
     name: `Generic ${sourceType}`,
     sourceType,
     url: sourceType === "website" ? "https://widgets.example/" : "https://widgets.example/openapi.json",
+    ...(sourceType === "openapi" ? {
+      sourceConfiguration: {
+        kind: "openapi" as const,
+        targetOrigin: "https://widgets.example",
+        testPageUrl: "https://widgets.example/",
+        environment: "test" as const,
+      },
+    } : {}),
     idempotencyKey: `status-source-project-${sourceType}`,
     inputHash: `status-source-project-${sourceType}`,
   });
