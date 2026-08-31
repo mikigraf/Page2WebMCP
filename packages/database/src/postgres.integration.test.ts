@@ -1010,7 +1010,11 @@ test("Postgres queue exhaustion and stale release gates match the in-memory cont
     for (let attempt = 1; attempt <= 3; attempt += 1) {
       assert.equal((await repository.claimAnalysis(`recovery-${attempt}`, 1_000))?.id, run.id);
       await admin.query(
-        "update private.analysis_jobs set lease_expires_at = now() - interval '1 second' where analysis_run_id = $1",
+        "with expired_job as (" +
+        "update private.analysis_jobs set lease_expires_at = now() - interval '1 second' " +
+        "where analysis_run_id = $1 returning analysis_run_id, lease_expires_at) " +
+        "update private.workflow_tasks task set lease_expires_at = expired_job.lease_expires_at " +
+        "from expired_job where task.workflow_run_id = expired_job.analysis_run_id and task.phase = 'analysis'",
         [run.id]
       );
       await assert.rejects(repository.heartbeatAnalysis(`recovery-${attempt}`, run.id, 1_000), (error: unknown) =>
