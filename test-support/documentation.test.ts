@@ -135,3 +135,14 @@ test("documentation explains exclusive readiness modes and truthful exit semanti
   assert.match(operations, /normal[^\n]{0,120}unintercepted[^\n]{0,120}native WebMCP/i);
   assert.match(operations, /--live[^\n]{0,240}ignores[^\n]{0,120}PAGE2WEBMCP_LOCAL_RELEASE_VERIFIER_ORIGIN/i);
 });
+
+test("CI verifies the pinned CLI and surfaces conditional real-journey gates", async () => {
+  const workflow = await read(".github/workflows/ci.yml");
+  requireLiterals(workflow, [
+    "pnpm exec supabase --version",
+    "2.116.0",
+    "e2e/local-live-openapi.test.ts",
+    "e2e/live-installation.test.ts",
+  ], "CI workflow");
+  assert.doesNotMatch(workflow, /LIVE_SUCCESS\s*=\s*true|PAGE2WEBMCP_TEST_MODE[^\n]*--live/i);
+});
