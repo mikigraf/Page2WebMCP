@@ -117,10 +117,7 @@ export function createProductionProvider(
   dependencies: Readonly<{ fetch: typeof fetch; clock?: () => Date }> = { fetch },
 ): ProductionProvider {
   const inspection = inspectProductionProviderConfiguration(environment);
-  if (inspection.code === "WORKER_PROVIDER_MODE_REQUIRED" || inspection.code === "INVALID_PROVIDER_MODE"
-    || inspection.code === "WEBSITE_LIVE_CONFIGURATION_REQUIRED") {
-    throw new Error(inspection.code);
-  }
+  if (inspection.code !== "PRODUCTION_PROVIDER_CONFIGURATION_READY") throw new Error(inspection.code);
   if (environment.PAGE2WEBMCP_PROVIDER_MODE === "openapi") {
     const provenance = {
       mode: "openapi", adapter: "bounded-openapi", adapterVersion: 1, fixture: false,

@@ -131,6 +131,20 @@ test("provider-only construction returns an exact non-fixture provenance tuple w
   });
 });
 
+test("GitHub provider construction rejects controls that fail canonical inspection", () => {
+  const environment = configuredEnvironment();
+  environment.PAGE2WEBMCP_GITHUB_PRIVATE_KEY_BASE64 += "\n";
+
+  assert.deepEqual(inspectProductionProviderConfiguration(environment), {
+    code: "GITHUB_LIVE_CONFIGURATION_REQUIRED",
+    keys: ["PAGE2WEBMCP_GITHUB_PRIVATE_KEY_BASE64"],
+  });
+  assert.throws(
+    () => createProductionProvider(environment, { fetch }),
+    /^Error: GITHUB_LIVE_CONFIGURATION_REQUIRED$/,
+  );
+});
+
 test("a provider constructed before repository creation is reused without reconstruction", () => {
   const provider = createProductionProvider({ PAGE2WEBMCP_PROVIDER_MODE: "openapi" }, {
     fetch: async () => { throw new Error("NO_NETWORK_DURING_CONSTRUCTION"); },
@@ -251,7 +265,7 @@ test("production runtime requires the isolated sandbox before exposing workflow 
   const repository = new InMemoryControlPlaneRepository();
   const missingSandbox: Record<string, string | undefined> = { ...configuredEnvironment() };
   delete missingSandbox.PAGE2WEBMCP_GITHUB_SANDBOX_TOKEN;
-  assert.throws(() => createProductionWorkerRuntime(repository, missingSandbox, { fetch }), /GITHUB_SANDBOX_CONFIGURATION_REQUIRED/);
+  assert.throws(() => createProductionWorkerRuntime(repository, missingSandbox, { fetch }), /GITHUB_LIVE_CONFIGURATION_REQUIRED/);
 });
 
 test("dedicated GitHub runtime never claims or fails website and OpenAPI analysis jobs", async () => {
