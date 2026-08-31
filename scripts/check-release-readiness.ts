@@ -321,17 +321,18 @@ function inspectControls(environment: Environment, mode: Exclude<ReadinessMode, 
 async function localFacts() {
   const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
   const migrations = await readdir(new URL("../supabase/migrations/", import.meta.url));
-  const task8 = await readFile(new URL(
-    "../supabase/migrations/20260831120000_live_readiness_attestation.sql", import.meta.url,
+  const installedExecution = await readFile(new URL(
+    "../supabase/migrations/20260831211329_installed_execution_evidence.sql", import.meta.url,
   ), "utf8");
   const task6 = await readFile(new URL(
     "../supabase/migrations/20260830094622_trusted_release_installations.sql", import.meta.url,
   ), "utf8");
   return {
     versionDrift: checkPackageVersionDrift(packageJson),
-    migrationsCurrent: migrations.includes("20260831120000_live_readiness_attestation.sql"),
-    rlsVerified: /selected_native_installation_proof/i.test(task8)
-      && /grant execute[^;]+page2webmcp_maintenance/is.test(task8)
+    migrationsCurrent: migrations.includes("20260831211329_installed_execution_evidence.sql"),
+    rlsVerified: /selected_native_installation_proof/i.test(installedExecution)
+      && /confirmed_mutation_effect_count\s*=\s*1/i.test(installedExecution)
+      && /grant execute[^;]+page2webmcp_maintenance/is.test(installedExecution)
       && /force row level security/i.test(task6),
   };
 }

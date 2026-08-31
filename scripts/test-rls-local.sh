@@ -95,6 +95,36 @@ for migration in supabase/migrations/*.sql; do
           repeat('2', 64), repeat('a', 64), 'legacy published candidate',
           'https://acme.example', '{}', 'sha256-legacy', 'published');"
   fi
+  if [[ "$(basename "$migration")" == "20260831120000_live_readiness_attestation.sql" ]]; then
+    "$task_psql" -h "$task_tmp_dir" -p "$task_port" -d postgres -v ON_ERROR_STOP=1 -c \
+      "insert into public.release_installations
+         (id, organization_id, project_id, release_id, actor_id, page_url,
+          artifact_url, target_origin, artifact_content_hash, integrity, expected_tools,
+          status, delivery, csp_status, webmcp_implementation, attestation,
+          idempotency_key, input_hash, verified_at,
+          download_url, local_only, verification_mode, verifier_protocol_version,
+          verifier_origin_digest, verifier_webmcp_implementation,
+          observed_artifact_url, observed_download_url, observed_local_only,
+          observed_integrity, observed_target_origin, registered_tools,
+          executed_artifact_url, served_content_hash, executed_content_hash,
+          normal_page_load, route_interception, injected_registration,
+          synthetic_harness, duplicate_load_harmless)
+       values
+         ('aaaaaaaa-0000-0000-0000-0000000000e5', 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+          'aaaaaaaa-0000-0000-0000-0000000000fa', 'aaaaaaaa-0000-0000-0000-0000000000f7',
+          '11111111-1111-1111-1111-111111111111', 'https://acme.example/',
+          'https://bimqgiedckdurqiywctl.supabase.co/storage/v1/object/public/page2webmcp-releases/' || repeat('a', 64) || '.js',
+          'https://acme.example', repeat('a', 64), 'sha384-AAAA', '[\"read_widget\"]',
+          'verified', 'hosted', 'allowed', 'native', '{}',
+          'legacy-registration-only', repeat('e', 64), now(),
+          'https://bimqgiedckdurqiywctl.supabase.co/storage/v1/object/public/page2webmcp-releases/' || repeat('a', 64) || '.js?download=page2webmcp-' || repeat('a', 64) || '.js',
+          false, 'live', 1, repeat('d', 64), 'native',
+          'https://bimqgiedckdurqiywctl.supabase.co/storage/v1/object/public/page2webmcp-releases/' || repeat('a', 64) || '.js',
+          'https://bimqgiedckdurqiywctl.supabase.co/storage/v1/object/public/page2webmcp-releases/' || repeat('a', 64) || '.js?download=page2webmcp-' || repeat('a', 64) || '.js',
+          false, 'sha384-AAAA', 'https://acme.example', '[\"read_widget\"]',
+          'https://bimqgiedckdurqiywctl.supabase.co/storage/v1/object/public/page2webmcp-releases/' || repeat('a', 64) || '.js',
+          repeat('a', 64), repeat('a', 64), true, false, false, false, true);"
+  fi
 done
 "$task_psql" -h "$task_tmp_dir" -p "$task_port" -d postgres -v ON_ERROR_STOP=1 -c \
   "do \$\$
@@ -156,6 +186,37 @@ done
      end if;
    end
    \$\$;
+   do \$\$
+   declare registration_only_rejected boolean := false;
+   begin
+     if not exists (
+       select 1
+       from public.release_installations
+       where id = 'aaaaaaaa-0000-0000-0000-0000000000e5'
+         and status = 'failed'
+         and verified_at is null
+         and authenticated_read_tool_name is null
+         and confirmed_mutation_effect_count is null
+         and final_state_verified is null
+     ) then
+       raise exception 'legacy registration-only installation did not fail closed for native execution reverification';
+     end if;
+     begin
+       update public.release_installations
+       set status = 'verified', verified_at = now()
+       where id = 'aaaaaaaa-0000-0000-0000-0000000000e5';
+     exception when check_violation then
+       registration_only_rejected := true;
+     end;
+     if not registration_only_rejected then
+       raise exception 'verified registration-only installation bypassed execution evidence constraint';
+     end if;
+     if exists (select 1 from private.selected_native_installation_proof(repeat('a', 64))) then
+       raise exception 'registration-only installation remained eligible for live readiness';
+     end if;
+   end
+   \$\$;
+   delete from public.release_installations where id = 'aaaaaaaa-0000-0000-0000-0000000000e5';
    delete from public.releases where id = 'aaaaaaaa-0000-0000-0000-0000000000f7';
    delete from public.projects where id in (
      'aaaaaaaa-0000-0000-0000-0000000000ff',

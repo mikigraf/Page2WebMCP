@@ -73,6 +73,15 @@ function exactInstalledReport(
     injectedRegistration: false,
     syntheticHarness: false,
     duplicateLoadHarmless: true,
+    executionEvidence: {
+      authenticatedRead: { toolName: "find_order", authenticated: true, succeeded: true },
+      confirmedReversibleMutation: {
+        toolName: "create_support_ticket", confirmation: "explicit", reversible: true, succeeded: true, effectCount: 1,
+      },
+      authoritativeFinalState: {
+        mutationToolName: "create_support_ticket", source: "target", verified: true,
+      },
+    },
     csp: { hosted: "allowed" },
     ...overrides,
   };
@@ -1047,6 +1056,15 @@ test("installed-target route records only an exact normal native WebMCP observat
     injectedRegistration: false,
     syntheticHarness: false,
     duplicateLoadHarmless: true,
+    executionEvidence: {
+      authenticatedRead: { toolName: "find_order", authenticated: true, succeeded: true },
+      confirmedReversibleMutation: {
+        toolName: "create_support_ticket", confirmation: "explicit", reversible: true, succeeded: true, effectCount: 1,
+      },
+      authoritativeFinalState: {
+        mutationToolName: "create_support_ticket", source: "target", verified: true,
+      },
+    },
     csp: { hosted: "allowed" },
   });
 
@@ -1076,6 +1094,7 @@ test("an exact self-host verification can supersede pending hosted CSP evidence 
       executedContentHash: null,
       registeredTools: [],
       duplicateLoadHarmless: null,
+      executionEvidence: null,
       csp: { hosted: "blocked", directive: "script-src 'self'" },
     }),
   });
@@ -1115,6 +1134,7 @@ test("an exact self-host verification can supersede pending hosted CSP evidence 
       executedContentHash: null,
       registeredTools: [],
       duplicateLoadHarmless: null,
+      executionEvidence: null,
       csp: { hosted: "blocked", directive: "script-src 'none'" },
     }),
   });

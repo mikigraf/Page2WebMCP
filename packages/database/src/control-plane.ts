@@ -77,7 +77,28 @@ export type InstalledVerificationObservation = Readonly<{
   injectedRegistration: boolean;
   syntheticHarness: boolean;
   duplicateLoadHarmless: boolean | null;
+  executionEvidence: InstalledExecutionEvidence | null;
   csp: Readonly<{ hosted: "allowed" | "blocked"; directive?: string }>;
+}>;
+
+export type InstalledExecutionEvidence = Readonly<{
+  authenticatedRead: Readonly<{
+    toolName: string;
+    authenticated: true;
+    succeeded: true;
+  }>;
+  confirmedReversibleMutation: Readonly<{
+    toolName: string;
+    confirmation: "explicit";
+    reversible: true;
+    succeeded: true;
+    effectCount: 1;
+  }>;
+  authoritativeFinalState: Readonly<{
+    mutationToolName: string;
+    source: "target";
+    verified: true;
+  }>;
 }>;
 
 export type ProjectRecord = {
@@ -2174,7 +2195,8 @@ export function normalizeReleaseInstallation(
   input: ReleaseInstallationRequest,
   release: ReleaseRecord,
 ): ReleaseInstallationRequest {
-  const expectedTools = plansFromManifest(release.manifest)?.map(({ tool }) => tool.name).sort(compareCodePoints);
+  const plans = plansFromManifest(release.manifest);
+  const expectedTools = plans?.map(({ tool }) => tool.name).sort(compareCodePoints);
   const releaseArtifactIdentity = persistedReleaseArtifactIdentity(release);
   let page: URL;
   let artifact: URL;
@@ -2188,7 +2210,7 @@ export function normalizeReleaseInstallation(
   const canonicalAttestation = canonicalJson(input.attestation);
   const attestation = canonicalAttestation === "__INVALID_JSON__"
     ? undefined : JSON.parse(canonicalAttestation) as InstalledVerificationObservation;
-  if (!expectedTools || expectedTools.length === 0
+  if (!plans || !expectedTools || expectedTools.length === 0
     || !releaseArtifactIdentity
     || page.origin !== release.allowedOrigin || page.protocol !== "https:" || page.username || page.password
     || page.search || page.hash
@@ -2204,7 +2226,7 @@ export function normalizeReleaseInstallation(
     || input.csp.directive !== undefined && (input.csp.directive.length > 512 || /[\r\n]/.test(input.csp.directive))
     || canonicalAttestation === "__INVALID_JSON__" || Buffer.byteLength(canonicalAttestation) > 16_384
     || !validVerifierIdentity(input.verifierIdentity, input.verifierIdentity.mode)
-    || !attestation || !installedObservationMatches(input, releaseArtifactIdentity, expectedTools, attestation)
+    || !attestation || !installedObservationMatches(input, releaseArtifactIdentity, plans, attestation)
     || !/^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/.test(input.idempotencyKey)
     || !/^[0-9a-f]{64}$/.test(input.inputHash)) throw new RepositoryError("INVALID_STATE");
   return {
@@ -2231,9 +2253,10 @@ function validVerifierIdentity(
 function installedObservationMatches(
   input: ReleaseInstallationRequest,
   identity: Extract<ReleaseArtifactIdentity, { artifactUrl: string }>,
-  expectedTools: readonly string[],
+  plans: readonly CapabilityPlan[],
   report: InstalledVerificationObservation,
 ): boolean {
+  const expectedTools = plans.map(({ tool }) => tool.name).sort(compareCodePoints);
   if (!isPlainRecord(report) || report.observedArtifactUrl !== identity.artifactUrl
     || report.observedDownloadUrl !== identity.downloadUrl || report.observedLocalOnly !== identity.localOnly
     || report.observedIntegrity !== input.integrity || report.observedTargetOrigin !== input.targetOrigin
@@ -2245,12 +2268,45 @@ function installedObservationMatches(
   if (input.status === "pending_self_host") {
     return report.executedArtifactUrl === null && report.executedContentHash === null
       && report.duplicateLoadHarmless === null && Array.isArray(report.registeredTools)
-      && report.registeredTools.length === 0;
+      && report.registeredTools.length === 0 && report.executionEvidence === null;
   }
   return report.executedArtifactUrl === (input.selfHostedUrl ?? identity.artifactUrl)
     && report.executedContentHash === input.artifactContentHash
     && report.duplicateLoadHarmless === true
-    && equalStringArrays(report.registeredTools, expectedTools);
+    && equalStringArrays(report.registeredTools, expectedTools)
+    && installedExecutionEvidenceMatches(report.executionEvidence, plans);
+}
+
+function installedExecutionEvidenceMatches(value: unknown, plans: readonly CapabilityPlan[]): boolean {
+  if (!plainRecordWithKeys(value, ["authenticatedRead", "authoritativeFinalState", "confirmedReversibleMutation"])) {
+    return false;
+  }
+  const read = value.authenticatedRead;
+  const mutation = value.confirmedReversibleMutation;
+  const finalState = value.authoritativeFinalState;
+  if (!plainRecordWithKeys(read, ["authenticated", "succeeded", "toolName"])
+    || !plainRecordWithKeys(mutation, ["confirmation", "effectCount", "reversible", "succeeded", "toolName"])
+    || !plainRecordWithKeys(finalState, ["mutationToolName", "source", "verified"])
+    || typeof read.toolName !== "string" || typeof mutation.toolName !== "string"
+    || !/^[a-z][a-z0-9_]{0,63}$/.test(read.toolName) || !/^[a-z][a-z0-9_]{0,63}$/.test(mutation.toolName)
+    || read.toolName === mutation.toolName || finalState.mutationToolName !== mutation.toolName
+    || read.authenticated !== true || read.succeeded !== true
+    || mutation.confirmation !== "explicit" || mutation.reversible !== true || mutation.succeeded !== true
+    || mutation.effectCount !== 1
+    || finalState.source !== "target" || finalState.verified !== true) return false;
+  const readPlan = plans.find(({ tool }) => tool.name === read.toolName);
+  const mutationPlan = plans.find(({ tool }) => tool.name === mutation.toolName);
+  return readPlan?.effects.kind === "read" && readPlan.annotations.readOnly
+    && ["same_origin_cookie", "browser_oauth"].includes(readPlan.authentication.mode)
+    && mutationPlan?.effects.kind === "mutation" && !mutationPlan.annotations.readOnly
+    && mutationPlan.effects.reversible && mutationPlan.effects.confirmation === "always";
+}
+
+function plainRecordWithKeys(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
+  if (!isPlainRecord(value)) return false;
+  const actual = Object.keys(value).sort(compareCodePoints);
+  const expected = [...keys].sort(compareCodePoints);
+  return actual.length === expected.length && actual.every((key, index) => key === expected[index]);
 }
 
 const HOSTED_RELEASE_ARTIFACT_PREFIX =

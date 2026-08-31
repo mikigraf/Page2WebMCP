@@ -97,6 +97,11 @@ export type NativeInstallationProof = Readonly<{
   injectedRegistration: boolean;
   syntheticHarness: boolean;
   duplicateLoadHarmless: boolean;
+  authenticatedReadExecuted: boolean;
+  confirmedReversibleMutationExecuted: boolean;
+  confirmedMutationEffectCount: number;
+  authoritativeFinalStateVerified: boolean;
+  executionToolsMatchCapabilities: boolean;
   zeroControlPlaneCalls: boolean;
   zeroModelCalls: boolean;
   trustedLoaderEnforced: boolean;
@@ -217,6 +222,11 @@ function exactNativeInstallationProof(input: DeploymentReadinessInput): boolean 
     && proof.injectedRegistration === false
     && proof.syntheticHarness === false
     && proof.duplicateLoadHarmless === true
+    && proof.authenticatedReadExecuted === true
+    && proof.confirmedReversibleMutationExecuted === true
+    && proof.confirmedMutationEffectCount === 1
+    && proof.authoritativeFinalStateVerified === true
+    && proof.executionToolsMatchCapabilities === true
     && proof.zeroControlPlaneCalls === true
     && proof.zeroModelCalls === true
     && proof.trustedLoaderEnforced === true

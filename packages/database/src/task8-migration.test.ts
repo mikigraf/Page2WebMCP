@@ -111,10 +111,11 @@ test("active topology is a maintenance-only selected-hash projection over ledger
   assert.match(sql, /grant execute on function private\.selected_release_readiness_topology\(text\) to page2webmcp_maintenance/i);
 });
 
-test("active topology compares the exact complete committed migration version set", async () => {
+test("Task 8 topology compares the exact complete migration version set through Task 8", async () => {
   const sql = await readFile(migrationUrl, "utf8");
   const committed = (await readdir(new URL("../../../supabase/migrations/", import.meta.url)))
     .filter((name) => /^\d{14}_[a-z0-9_]+\.sql$/.test(name))
+    .filter((name) => name.slice(0, 14) <= "20260831120000")
     .map((name) => name.slice(0, 14))
     .sort();
   const requiredBlock = /required_migrations\s*\(version\)\s+as\s*\(\s*values([\s\S]*?)\),\s*applied_migrations/i

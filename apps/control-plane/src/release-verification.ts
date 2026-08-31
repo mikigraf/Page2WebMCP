@@ -1,5 +1,9 @@
 import { createHash } from "node:crypto";
 import {
+  canonicalizeCapabilityPlans,
+  type CapabilityPlan,
+} from "../../../packages/capability-ir/src/plan.ts";
+import {
   RELEASE_VERIFICATION_CHECK_NAMES,
   type ReleaseVerificationCheckName as CandidateVerificationCheckName,
   type ReleaseVerificationCheckRecord as ReleaseVerificationCheck,
@@ -102,7 +106,28 @@ export type InstalledVerificationReport = Readonly<{
   injectedRegistration: boolean;
   syntheticHarness: boolean;
   duplicateLoadHarmless: boolean | null;
+  executionEvidence: InstalledExecutionEvidence | null;
   csp: Readonly<{ hosted: "allowed" | "blocked"; directive?: string }>;
+}>;
+
+export type InstalledExecutionEvidence = Readonly<{
+  authenticatedRead: Readonly<{
+    toolName: string;
+    authenticated: true;
+    succeeded: true;
+  }>;
+  confirmedReversibleMutation: Readonly<{
+    toolName: string;
+    confirmation: "explicit";
+    reversible: true;
+    succeeded: true;
+    effectCount: 1;
+  }>;
+  authoritativeFinalState: Readonly<{
+    mutationToolName: string;
+    source: "target";
+    verified: true;
+  }>;
 }>;
 
 export type InstalledAttestation = Readonly<{
@@ -229,13 +254,14 @@ export async function attestReleaseInstallation(
   if (pendingSelfHost) {
     if (report.executedArtifactUrl !== null || report.executedContentHash !== null
       || !Array.isArray(report.registeredTools) || report.registeredTools.length !== 0
-      || report.duplicateLoadHarmless !== null) {
+      || report.duplicateLoadHarmless !== null || report.executionEvidence !== null) {
       throw new Error("INSTALLED_VERIFICATION_INVALID");
     }
   } else if (report.executedArtifactUrl !== (input.selfHostedUrl ?? input.artifactUrl)
     || report.executedContentHash !== input.contentHash
     || !equalStrings(report.registeredTools, input.expectedTools)
-    || report.duplicateLoadHarmless !== true) {
+    || report.duplicateLoadHarmless !== true
+    || !validInstalledExecutionEvidence(report.executionEvidence, input.manifest, input.expectedTools)) {
     throw new Error("INSTALLED_VERIFICATION_INVALID");
   }
   if (port.mode !== "hermetic" && report.webMcpImplementation !== "native") {
@@ -555,8 +581,67 @@ function normalizeInstalledReport(report: InstalledVerificationReport): Installe
     injectedRegistration: report.injectedRegistration,
     syntheticHarness: report.syntheticHarness,
     duplicateLoadHarmless: report.duplicateLoadHarmless,
+    executionEvidence: report.executionEvidence === null ? null : {
+      authenticatedRead: { ...report.executionEvidence.authenticatedRead },
+      confirmedReversibleMutation: { ...report.executionEvidence.confirmedReversibleMutation },
+      authoritativeFinalState: { ...report.executionEvidence.authoritativeFinalState },
+    },
     csp: normalizedCsp(report.csp),
   };
+}
+
+function validInstalledExecutionEvidence(
+  value: unknown,
+  manifest: unknown,
+  expectedTools: readonly string[],
+): value is InstalledExecutionEvidence {
+  if (!plainRecordWithKeys(value, ["authenticatedRead", "authoritativeFinalState", "confirmedReversibleMutation"])) {
+    return false;
+  }
+  const read = value.authenticatedRead;
+  const mutation = value.confirmedReversibleMutation;
+  const finalState = value.authoritativeFinalState;
+  if (!plainRecordWithKeys(read, ["authenticated", "succeeded", "toolName"])
+    || !plainRecordWithKeys(mutation, ["confirmation", "effectCount", "reversible", "succeeded", "toolName"])
+    || !plainRecordWithKeys(finalState, ["mutationToolName", "source", "verified"])
+    || !validToolName(read.toolName) || !validToolName(mutation.toolName)
+    || finalState.mutationToolName !== mutation.toolName
+    || read.authenticated !== true || read.succeeded !== true
+    || mutation.confirmation !== "explicit" || mutation.reversible !== true || mutation.succeeded !== true
+    || mutation.effectCount !== 1
+    || finalState.source !== "target" || finalState.verified !== true
+    || read.toolName === mutation.toolName
+    || !expectedTools.includes(read.toolName) || !expectedTools.includes(mutation.toolName)) return false;
+  const plans = installedPlans(manifest);
+  if (!plans) return false;
+  const readPlan = plans.find(({ tool }) => tool.name === read.toolName);
+  const mutationPlan = plans.find(({ tool }) => tool.name === mutation.toolName);
+  return readPlan?.effects.kind === "read" && readPlan.annotations.readOnly
+    && ["same_origin_cookie", "browser_oauth"].includes(readPlan.authentication.mode)
+    && mutationPlan?.effects.kind === "mutation" && !mutationPlan.annotations.readOnly
+    && mutationPlan.effects.reversible && mutationPlan.effects.confirmation === "always";
+}
+
+function installedPlans(manifest: unknown): readonly CapabilityPlan[] | undefined {
+  if (!manifest || typeof manifest !== "object" || !("plans" in manifest)
+    || !Array.isArray((manifest as { plans?: unknown }).plans)) return undefined;
+  try {
+    return canonicalizeCapabilityPlans((manifest as { plans: CapabilityPlan[] }).plans);
+  } catch {
+    return undefined;
+  }
+}
+
+function plainRecordWithKeys(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+    || Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null) return false;
+  const actual = Object.keys(value).sort(compareStrings);
+  const expected = [...keys].sort(compareStrings);
+  return actual.length === expected.length && actual.every((key, index) => key === expected[index]);
+}
+
+function validToolName(value: unknown): value is string {
+  return typeof value === "string" && /^[a-z][a-z0-9_]{0,63}$/.test(value);
 }
 
 function normalizedCsp(csp: InstalledVerificationReport["csp"]): InstalledVerificationReport["csp"] {

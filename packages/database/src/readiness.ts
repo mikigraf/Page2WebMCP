@@ -85,6 +85,11 @@ const PROOF_COLUMNS = Object.freeze({
   injected_registration: "injectedRegistration",
   synthetic_harness: "syntheticHarness",
   duplicate_load_harmless: "duplicateLoadHarmless",
+  authenticated_read_executed: "authenticatedReadExecuted",
+  confirmed_reversible_mutation_executed: "confirmedReversibleMutationExecuted",
+  confirmed_mutation_effect_count: "confirmedMutationEffectCount",
+  authoritative_final_state_verified: "authoritativeFinalStateVerified",
+  execution_tools_match_capabilities: "executionToolsMatchCapabilities",
   zero_control_plane_calls: "zeroControlPlaneCalls",
   zero_model_calls: "zeroModelCalls",
   trusted_loader_enforced: "trustedLoaderEnforced",
@@ -316,14 +321,16 @@ function mapProof(row: Record<string, unknown>): NativeInstallationProof {
     if (!HASH.test(String(mapped[key]))) throw new Error("LIVE_INSTALLATION_EVIDENCE_INVALID");
   }
   for (const key of ["candidateProtocolVersion", "installationProtocolVersion", "providerAdapterVersion",
-    "expectedToolCount", "registeredToolCount"] as const) {
+    "expectedToolCount", "registeredToolCount", "confirmedMutationEffectCount"] as const) {
     if (!Number.isSafeInteger(mapped[key]) || Number(mapped[key]) < 0 || Number(mapped[key]) > 100_000_000) {
       throw new Error("LIVE_INSTALLATION_EVIDENCE_INVALID");
     }
   }
   for (const key of ["providerFixture", "sourceFixture", "localOnly", "targetIdentityMatches",
     "artifactIdentityMatches", "capabilityDigestMatches", "normalPageLoad", "routeInterception",
-    "injectedRegistration", "syntheticHarness", "duplicateLoadHarmless", "zeroControlPlaneCalls",
+    "injectedRegistration", "syntheticHarness", "duplicateLoadHarmless", "authenticatedReadExecuted",
+    "confirmedReversibleMutationExecuted", "authoritativeFinalStateVerified", "executionToolsMatchCapabilities",
+    "zeroControlPlaneCalls",
     "zeroModelCalls", "trustedLoaderEnforced", "candidateChecksPassed"] as const) {
     if (typeof mapped[key] !== "boolean") throw new Error("LIVE_INSTALLATION_EVIDENCE_INVALID");
   }

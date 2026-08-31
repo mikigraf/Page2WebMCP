@@ -376,10 +376,10 @@ test("Postgres repository persists and recovers the fixture lifecycle", { skip: 
     assert.equal(claimed?.sourceUrl, "https://acme.example");
 
     const completed = await repository.completeAnalysis("postgres-worker", run.id, {
-      capabilities: capabilities("find_order"),
+      capabilities: capabilities("find_order", "create_support_ticket"),
       diagnostics: [{ code: "SERVER_ADAPTER_REQUIRED", operationKey: "GET /private", reason: "api_key_header" }],
-      evidence: evidenceFor(plans("find_order")),
-      release: releaseCandidate("export const persisted = true;"),
+      evidence: evidenceFor(plans("find_order", "create_support_ticket")),
+      release: releaseCandidate("export const persisted = true;", plans("find_order", "create_support_ticket")),
       providerProvenance: {
         mode: "local", adapter: "local-fixture", adapterVersion: 1, fixture: true,
       },
@@ -391,18 +391,24 @@ test("Postgres repository persists and recovers the fixture lifecycle", { skip: 
       mode: "local", adapter: "local-fixture", adapterVersion: 1, fixture: true,
     });
     assert.equal((await repository.getAnalysis(actor, run.id)).status, "succeeded");
-    assert.equal((await repository.listCapabilities(actor, project.id)).length, 1);
+    assert.equal((await repository.listCapabilities(actor, project.id)).length, 2);
     assert.deepEqual((await repository.getAnalysisResult(actor, run.id))?.diagnostics, [{
       code: "SERVER_ADAPTER_REQUIRED",
       operationKey: "GET /private",
       reason: "api_key_header"
     }]);
 
+    const mutation = (await repository.listAnalysisCapabilities(actor, run.id))
+      .find(({ stableName }) => stableName === "create_support_ticket")!;
+    await repository.reviewCapability(actor, mutation.id, {
+      action: "approve",
+      expectedVersion: mutation.version,
+    });
     const capabilityDigest = capabilityStateDigest(await repository.listAnalysisCapabilities(actor, run.id));
     const verificationInput = {
       analysisRunId: run.id,
       capabilityStateDigest: capabilityDigest,
-      candidate: releaseCandidate("export const persisted = true;"),
+      candidate: releaseCandidate("export const persisted = true;", plans("find_order", "create_support_ticket")),
       schema: true,
       authenticated: true,
       replayPasses: 3,
@@ -466,7 +472,7 @@ test("Postgres repository persists and recovers the fixture lifecycle", { skip: 
       targetOrigin: release.allowedOrigin,
       artifactContentHash: release.contentHash,
       integrity: release.sri,
-      expectedTools: ["find_order"],
+      expectedTools: ["create_support_ticket", "find_order"],
       status: "verified" as const,
       delivery: "hosted" as const,
       csp: { hosted: "allowed" as const },
@@ -486,13 +492,23 @@ test("Postgres repository persists and recovers the fixture lifecycle", { skip: 
         servedContentHash: release.contentHash,
         executedContentHash: release.contentHash,
         observedTargetOrigin: release.allowedOrigin,
-        registeredTools: ["find_order"],
+        registeredTools: ["create_support_ticket", "find_order"],
         webMcpImplementation: "native" as const,
         normalPageLoad: true,
         routeInterception: false,
         injectedRegistration: false,
         syntheticHarness: false,
         duplicateLoadHarmless: true,
+        executionEvidence: {
+          authenticatedRead: { toolName: "find_order", authenticated: true as const, succeeded: true as const },
+          confirmedReversibleMutation: {
+            toolName: "create_support_ticket", confirmation: "explicit" as const,
+            reversible: true as const, succeeded: true as const, effectCount: 1 as const,
+          },
+          authoritativeFinalState: {
+            mutationToolName: "create_support_ticket", source: "target" as const, verified: true as const,
+          },
+        },
         csp: { hosted: "allowed" as const },
       },
       idempotencyKey: "postgres-installation",
@@ -508,6 +524,7 @@ test("Postgres repository persists and recovers the fixture lifecycle", { skip: 
         executedContentHash: null,
         registeredTools: [],
         duplicateLoadHarmless: null,
+        executionEvidence: null,
         csp: { hosted: "blocked" as const },
       },
       idempotencyKey: "postgres-installation-pending",
@@ -537,7 +554,10 @@ test("Postgres repository persists and recovers the fixture lifecycle", { skip: 
     assert.equal((await saveVerification(repository, actor, project.id, verificationInput)).id, verification.id);
     await assert.rejects(saveVerification(repository, actor, project.id, {
       ...verificationInput,
-      candidate: releaseCandidate("export const changedAfterPublish = true;")
+      candidate: releaseCandidate(
+        "export const changedAfterPublish = true;",
+        plans("find_order", "create_support_ticket"),
+      )
     }), (error: unknown) => error instanceof RepositoryError
       && error.code === "RELEASE_GATE_FAILED"
       && error.details?.includes("CANDIDATE_CHANGED"));

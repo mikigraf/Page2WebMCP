@@ -95,7 +95,11 @@ const RELEASE_INSTALLATION_COLUMNS =
   "verifier_protocol_version, verifier_origin_digest, verifier_webmcp_implementation, observed_artifact_url, " +
   "observed_download_url, observed_local_only, observed_integrity, observed_target_origin, registered_tools, " +
   "executed_artifact_url, served_content_hash, executed_content_hash, normal_page_load, route_interception, " +
-  "injected_registration, synthetic_harness, duplicate_load_harmless, created_at, verified_at";
+  "injected_registration, synthetic_harness, duplicate_load_harmless, authenticated_read_tool_name, " +
+  "authenticated_read_authenticated, authenticated_read_succeeded, confirmed_mutation_tool_name, " +
+  "confirmed_mutation_confirmation, confirmed_mutation_reversible, confirmed_mutation_succeeded, " +
+  "confirmed_mutation_effect_count, final_state_mutation_tool_name, final_state_source, final_state_verified, " +
+  "created_at, verified_at";
 
 export class PostgresControlPlaneRepository implements ControlPlaneRepository {
   readonly #pool: pg.Pool;
@@ -2003,6 +2007,7 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
       );
       if (!releaseResult.rows[0]) throw new RepositoryError("NOT_FOUND");
       const normalized = normalizeReleaseInstallation(input, mapRelease(releaseResult.rows[0]));
+      const executionEvidence = normalized.attestation.executionEvidence;
       const keyed = await client.query(
         `select ${RELEASE_INSTALLATION_COLUMNS} ` +
         "from public.release_installations where organization_id = $1 and actor_id = $2 and idempotency_key = $3 limit 1",
@@ -2023,9 +2028,14 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
         "verifier_protocol_version, verifier_origin_digest, verifier_webmcp_implementation, observed_artifact_url, " +
         "observed_download_url, observed_local_only, observed_integrity, observed_target_origin, registered_tools, " +
         "executed_artifact_url, served_content_hash, executed_content_hash, normal_page_load, route_interception, " +
-        "injected_registration, synthetic_harness, duplicate_load_harmless, verified_at) " +
+        "injected_registration, synthetic_harness, duplicate_load_harmless, authenticated_read_tool_name, " +
+        "authenticated_read_authenticated, authenticated_read_succeeded, confirmed_mutation_tool_name, " +
+        "confirmed_mutation_confirmation, confirmed_mutation_reversible, confirmed_mutation_succeeded, " +
+        "confirmed_mutation_effect_count, final_state_mutation_tool_name, final_state_source, final_state_verified, " +
+        "verified_at) " +
         "values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12,$13,$14,$15,$16,$17::jsonb,$18,$19," +
         "$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31::jsonb,$32,$33,$34,$35,$36,$37,$38,$39," +
+        "$40,$41,$42,$43,$44,$45,$46,$47,$48,$49,$50," +
         "case when $12 = 'verified' then now() else null end) " +
         "on conflict (organization_id, actor_id, idempotency_key) do nothing " +
         `returning ${RELEASE_INSTALLATION_COLUMNS}`,
@@ -2042,7 +2052,18 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
           normalized.attestation.executedArtifactUrl, normalized.attestation.servedContentHash,
           normalized.attestation.executedContentHash, normalized.attestation.normalPageLoad,
           normalized.attestation.routeInterception, normalized.attestation.injectedRegistration,
-          normalized.attestation.syntheticHarness, normalized.attestation.duplicateLoadHarmless]
+          normalized.attestation.syntheticHarness, normalized.attestation.duplicateLoadHarmless,
+          executionEvidence?.authenticatedRead.toolName ?? null,
+          executionEvidence?.authenticatedRead.authenticated ?? null,
+          executionEvidence?.authenticatedRead.succeeded ?? null,
+          executionEvidence?.confirmedReversibleMutation.toolName ?? null,
+          executionEvidence?.confirmedReversibleMutation.confirmation ?? null,
+          executionEvidence?.confirmedReversibleMutation.reversible ?? null,
+          executionEvidence?.confirmedReversibleMutation.succeeded ?? null,
+          executionEvidence?.confirmedReversibleMutation.effectCount ?? null,
+          executionEvidence?.authoritativeFinalState.mutationToolName ?? null,
+          executionEvidence?.authoritativeFinalState.source ?? null,
+          executionEvidence?.authoritativeFinalState.verified ?? null]
       );
       if (result.rows[0]) return mapReleaseInstallation(result.rows[0]);
       const existing = await client.query(
@@ -2330,6 +2351,58 @@ function mapReleaseInstallation(row: QueryResultRow): ReleaseInstallationRecord 
     webMcpImplementation: row.verifier_webmcp_implementation as "native",
     verifierOriginDigest: String(row.verifier_origin_digest),
   };
+  const executionColumns = [
+    row.authenticated_read_tool_name,
+    row.authenticated_read_authenticated,
+    row.authenticated_read_succeeded,
+    row.confirmed_mutation_tool_name,
+    row.confirmed_mutation_confirmation,
+    row.confirmed_mutation_reversible,
+    row.confirmed_mutation_succeeded,
+    row.confirmed_mutation_effect_count,
+    row.final_state_mutation_tool_name,
+    row.final_state_source,
+    row.final_state_verified,
+  ];
+  const hasExecutionEvidence = executionColumns.every((value) => value !== null && value !== undefined);
+  if (!hasExecutionEvidence && executionColumns.some((value) => value !== null && value !== undefined)) {
+    throw new RepositoryError("INVALID_STATE");
+  }
+  if (hasExecutionEvidence && (
+    typeof row.authenticated_read_tool_name !== "string"
+    || !/^[a-z][a-z0-9_]{0,63}$/.test(row.authenticated_read_tool_name)
+    || row.authenticated_read_authenticated !== true
+    || row.authenticated_read_succeeded !== true
+    || typeof row.confirmed_mutation_tool_name !== "string"
+    || !/^[a-z][a-z0-9_]{0,63}$/.test(row.confirmed_mutation_tool_name)
+    || row.confirmed_mutation_tool_name === row.authenticated_read_tool_name
+    || row.confirmed_mutation_confirmation !== "explicit"
+    || row.confirmed_mutation_reversible !== true
+    || row.confirmed_mutation_succeeded !== true
+    || row.confirmed_mutation_effect_count !== 1
+    || row.final_state_mutation_tool_name !== row.confirmed_mutation_tool_name
+    || row.final_state_source !== "target"
+    || row.final_state_verified !== true
+  )) throw new RepositoryError("INVALID_STATE");
+  const executionEvidence = hasExecutionEvidence ? {
+    authenticatedRead: {
+      toolName: row.authenticated_read_tool_name as string,
+      authenticated: row.authenticated_read_authenticated as true,
+      succeeded: row.authenticated_read_succeeded as true,
+    },
+    confirmedReversibleMutation: {
+      toolName: row.confirmed_mutation_tool_name as string,
+      confirmation: row.confirmed_mutation_confirmation as "explicit",
+      reversible: row.confirmed_mutation_reversible as true,
+      succeeded: row.confirmed_mutation_succeeded as true,
+      effectCount: row.confirmed_mutation_effect_count as 1,
+    },
+    authoritativeFinalState: {
+      mutationToolName: row.final_state_mutation_tool_name as string,
+      source: row.final_state_source as "target",
+      verified: row.final_state_verified as true,
+    },
+  } : null;
   const attestation = {
     observedArtifactUrl: String(row.observed_artifact_url),
     observedDownloadUrl: String(row.observed_download_url),
@@ -2347,6 +2420,7 @@ function mapReleaseInstallation(row: QueryResultRow): ReleaseInstallationRecord 
     syntheticHarness: Boolean(row.synthetic_harness),
     duplicateLoadHarmless: row.duplicate_load_harmless === null
       ? null : Boolean(row.duplicate_load_harmless),
+    executionEvidence,
     csp: {
       hosted: row.csp_status as "allowed" | "blocked",
       ...(row.csp_directive ? { directive: String(row.csp_directive) } : {}),

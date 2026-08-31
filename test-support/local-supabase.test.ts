@@ -15,7 +15,7 @@ const localStatus = {
   publishableKey: "sb_publishable_local-browser-safe-key",
   serviceKey: "sb_secret_local-server-only-key-value"
 };
-const migrationVersions = ["20260830190000", "20260831120000"];
+const migrationVersions = ["20260830190000", "20260831120000", "20260831211329"];
 
 test("local Supabase lifecycle is pinned, uses the pnpm CLI boundary, and declares the public release bucket", async () => {
   const packageJson = JSON.parse(await readFile(join(workspaceRoot, "package.json"), "utf8")) as {

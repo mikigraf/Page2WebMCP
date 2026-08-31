@@ -483,16 +483,19 @@ test("eligible publication is content addressed and idempotent", async () => {
   });
   await repository.claimAnalysis("worker", 60_000);
   await repository.completeAnalysis("worker", run.id, {
-    capabilities: capabilities("find_order"),
+    capabilities: capabilities("find_order", "create_support_ticket"),
     diagnostics: [],
-    evidence: evidenceFor(plans("find_order")),
-    release: releaseCandidate("export const fixture = true;")
+    evidence: evidenceFor(plans("find_order", "create_support_ticket")),
+    release: releaseCandidate("export const fixture = true;", plans("find_order", "create_support_ticket"))
   });
+  const mutation = (await repository.listAnalysisCapabilities(owner, run.id))
+    .find(({ stableName }) => stableName === "create_support_ticket")!;
+  await repository.reviewCapability(owner, mutation.id, { action: "approve", expectedVersion: mutation.version });
   const capabilityState = capabilityStateDigest(await repository.listAnalysisCapabilities(owner, run.id));
   const verificationInput = {
     analysisRunId: run.id,
     capabilityStateDigest: capabilityState,
-    candidate: releaseCandidate("export const fixture = true;"),
+    candidate: releaseCandidate("export const fixture = true;", plans("find_order", "create_support_ticket")),
     schema: true,
     authenticated: true,
     replayPasses: 3,
@@ -547,7 +550,7 @@ test("eligible publication is content addressed and idempotent", async () => {
     targetOrigin: release.allowedOrigin,
     artifactContentHash: release.contentHash,
     integrity: release.sri,
-    expectedTools: ["find_order"],
+    expectedTools: ["create_support_ticket", "find_order"],
     status: "verified" as const,
     delivery: "hosted" as const,
     csp: { hosted: "allowed" as const },
@@ -567,13 +570,23 @@ test("eligible publication is content addressed and idempotent", async () => {
       servedContentHash: release.contentHash,
       executedContentHash: release.contentHash,
       observedTargetOrigin: release.allowedOrigin,
-      registeredTools: ["find_order"],
+      registeredTools: ["create_support_ticket", "find_order"],
       webMcpImplementation: "native" as const,
       normalPageLoad: true,
       routeInterception: false,
       injectedRegistration: false,
       syntheticHarness: false,
       duplicateLoadHarmless: true,
+      executionEvidence: {
+        authenticatedRead: { toolName: "find_order", authenticated: true as const, succeeded: true as const },
+        confirmedReversibleMutation: {
+          toolName: "create_support_ticket", confirmation: "explicit" as const,
+          reversible: true as const, succeeded: true as const, effectCount: 1 as const,
+        },
+        authoritativeFinalState: {
+          mutationToolName: "create_support_ticket", source: "target" as const, verified: true as const,
+        },
+      },
       csp: { hosted: "allowed" as const },
     },
     idempotencyKey: "install-one",
@@ -589,6 +602,7 @@ test("eligible publication is content addressed and idempotent", async () => {
       executedContentHash: null,
       registeredTools: [],
       duplicateLoadHarmless: null,
+      executionEvidence: null,
       csp: { hosted: "blocked" as const },
     },
     idempotencyKey: "install-pending",
@@ -606,6 +620,16 @@ test("eligible publication is content addressed and idempotent", async () => {
     attestation: { ...pendingInstallationInput.attestation, registeredTools: ["find_order"] },
     idempotencyKey: "install-pending-with-tools",
     inputHash: "9".repeat(64),
+  }), (error: unknown) => error instanceof RepositoryError && error.code === "INVALID_STATE");
+  const registrationOnlyAttestation: Partial<typeof installationInput.attestation> = {
+    ...installationInput.attestation,
+  };
+  delete registrationOnlyAttestation.executionEvidence;
+  await assert.rejects(repository.saveReleaseInstallation(owner, project.id, {
+    ...installationInput,
+    attestation: registrationOnlyAttestation as typeof installationInput.attestation,
+    idempotencyKey: "install-registration-only",
+    inputHash: "7".repeat(64),
   }), (error: unknown) => error instanceof RepositoryError && error.code === "INVALID_STATE");
   await assert.rejects(repository.saveReleaseInstallation(owner, project.id, {
     ...installationInput,
@@ -651,7 +675,10 @@ test("eligible publication is content addressed and idempotent", async () => {
   }), (error: unknown) => error instanceof RepositoryError && error.code === "INVALID_STATE");
   await assert.rejects(saveVerification(repository, owner, project.id, {
     ...verificationInput,
-    candidate: releaseCandidate("export const changedAfterPublish = true;")
+    candidate: releaseCandidate(
+      "export const changedAfterPublish = true;",
+      plans("find_order", "create_support_ticket"),
+    )
   }), (error: unknown) => error instanceof RepositoryError
     && error.code === "RELEASE_GATE_FAILED"
     && error.details?.includes("CANDIDATE_CHANGED"));

@@ -9,6 +9,7 @@ import {
   attestReleaseInstallation,
   configuredReleaseVerificationPort,
   type CandidateVerificationReport,
+  type InstalledVerificationReport,
   type ReleaseVerifierHttpRequest,
   type ReleaseVerifierHttpResponse,
   type ReleaseVerificationPort,
@@ -19,6 +20,28 @@ const release = compileWebMcpRelease(acmeCapabilityPlans("https://acme.example")
 const expectedTools = ["create_support_ticket", "find_order"];
 const artifactUrl = `https://bimqgiedckdurqiywctl.supabase.co/storage/v1/object/public/page2webmcp-releases/${release.contentHash}.js`;
 const downloadUrl = `${artifactUrl}?download=page2webmcp-${release.contentHash}.js`;
+
+function installedExecutionEvidence() {
+  return {
+    authenticatedRead: {
+      toolName: "find_order",
+      authenticated: true as const,
+      succeeded: true as const,
+    },
+    confirmedReversibleMutation: {
+      toolName: "create_support_ticket",
+      confirmation: "explicit" as const,
+      reversible: true as const,
+      succeeded: true as const,
+      effectCount: 1 as const,
+    },
+    authoritativeFinalState: {
+      mutationToolName: "create_support_ticket",
+      source: "target" as const,
+      verified: true as const,
+    },
+  };
+}
 
 function installedInput(overrides: Record<string, unknown> = {}) {
   return {
@@ -297,6 +320,7 @@ test("configured installation performs a fresh readiness handshake and returns i
             injectedRegistration: false,
             syntheticHarness: false,
             duplicateLoadHarmless: true,
+            executionEvidence: installedExecutionEvidence(),
             csp: { hosted: "allowed" },
           });
       },
@@ -516,6 +540,7 @@ test("installed verification proves a normal unintercepted native WebMCP page lo
       injectedRegistration: false,
       syntheticHarness: false,
       duplicateLoadHarmless: true,
+      executionEvidence: installedExecutionEvidence(),
       csp: { hosted: "allowed" },
     }),
   };
@@ -547,9 +572,40 @@ test("installed verification proves a normal unintercepted native WebMCP page lo
       injectedRegistration: false,
       syntheticHarness: false,
       duplicateLoadHarmless: true,
+      executionEvidence: installedExecutionEvidence(),
       csp: { hosted: "allowed" },
     },
   });
+});
+
+test("installed verification rejects registration-only evidence without native tool execution", async () => {
+  const port: ReleaseVerificationPort = {
+    mode: "hermetic",
+    verifyCandidate: async () => { throw new Error("UNUSED"); },
+    verifyInstalled: async (input) => ({
+      observedArtifactUrl: input.artifactUrl,
+      observedDownloadUrl: input.downloadUrl,
+      observedLocalOnly: input.localOnly,
+      observedIntegrity: input.integrity,
+      executedArtifactUrl: input.artifactUrl,
+      servedContentHash: input.contentHash,
+      executedContentHash: input.contentHash,
+      observedTargetOrigin: input.targetOrigin,
+      registeredTools: [...input.expectedTools],
+      webMcpImplementation: "native",
+      normalPageLoad: true,
+      routeInterception: false,
+      injectedRegistration: false,
+      syntheticHarness: false,
+      duplicateLoadHarmless: true,
+      csp: { hosted: "allowed" },
+    }) as unknown as InstalledVerificationReport,
+  };
+
+  await assert.rejects(
+    attestReleaseInstallation(installedInput(), port, new AbortController().signal),
+    /INSTALLED_VERIFICATION_INVALID/,
+  );
 });
 
 test("installed verification rejects interception, injection, synthetic/shim success, wrong hashes, and harmful duplicates", async (context) => {
@@ -569,6 +625,7 @@ test("installed verification rejects interception, injection, synthetic/shim suc
     injectedRegistration: false,
     syntheticHarness: false,
     duplicateLoadHarmless: true,
+    executionEvidence: installedExecutionEvidence(),
     csp: { hosted: "allowed" as const },
   };
   const cases = [
@@ -626,6 +683,7 @@ test("CSP blocked hosted delivery remains uninstalled and requires exact-hash se
       injectedRegistration: false,
       syntheticHarness: false,
       duplicateLoadHarmless: null,
+      executionEvidence: null,
       csp: { hosted: "blocked", directive: "script-src 'self'" },
     }),
   };
@@ -657,6 +715,7 @@ test("CSP blocked hosted delivery remains uninstalled and requires exact-hash se
       injectedRegistration: false,
       syntheticHarness: false,
       duplicateLoadHarmless: null,
+      executionEvidence: null,
       csp: { hosted: "blocked", directive: "script-src 'self'" },
     },
   });
@@ -693,6 +752,7 @@ test("local artifact verification is hermetic-only and bound to the canonical Do
     injectedRegistration: false,
     syntheticHarness: false,
     duplicateLoadHarmless: true,
+    executionEvidence: installedExecutionEvidence(),
     csp: { hosted: "allowed" as const },
   };
   const hermetic: ReleaseVerificationPort = {
@@ -726,6 +786,7 @@ test("self-host verification preserves canonical Storage identity and separately
     injectedRegistration: false,
     syntheticHarness: false,
     duplicateLoadHarmless: true,
+    executionEvidence: installedExecutionEvidence(),
     csp: { hosted: "blocked" as const, directive: "script-src 'self'" },
   };
   const input = installedInput({ selfHostedUrl });
