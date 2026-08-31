@@ -9,6 +9,7 @@ const run = promisify(execFile);
 const root = fileURLToPath(new URL("../", import.meta.url));
 const tsx = fileURLToPath(new URL("../node_modules/tsx/dist/cli.mjs", import.meta.url));
 const commonEnvironment = [
+  "DATABASE_URL",
   "PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN",
   "PAGE2WEBMCP_E2E_LIVE_INSTALLATION",
   "PAGE2WEBMCP_MAINTENANCE_DATABASE_URL",

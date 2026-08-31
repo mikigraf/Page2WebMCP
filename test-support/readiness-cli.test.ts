@@ -177,13 +177,37 @@ test("a provider constructor failure never emits the inspection success code", a
   });
 });
 
+test("provider construction failure wins before missing or malformed selected-hash evidence", async () => {
+  for (const releaseHash of [undefined, "A".repeat(64)]) {
+    const environment: Record<string, string | undefined> = {
+      ...completeEnvironment(),
+      PAGE2WEBMCP_READINESS_RELEASE_HASH: releaseHash,
+    };
+    const order: string[] = [];
+    const outcome = await runReadinessCli(["--live"], environment, {
+      ...dependencies(order),
+      constructProvider: () => {
+        order.push("provider");
+        throw new Error("provider internal detail");
+      },
+    });
+    assert.deepEqual(outcome, {
+      output: { status: "failed", code: "PROVIDER_CONSTRUCTION_FAILED", liveSuccess: false },
+      exitCode: 1,
+    });
+    assert.deepEqual(order, ["provider"]);
+  }
+});
+
 test("complete controls without an exact selected hash remain installation-evidence-required", async () => {
-  const environment = completeEnvironment();
+  const order: string[] = [];
+  const environment: Record<string, string | undefined> = completeEnvironment();
   environment.PAGE2WEBMCP_READINESS_RELEASE_HASH = "A".repeat(64);
-  assert.deepEqual(await runReadinessCli(["--live"], environment, dependencies([])), {
+  assert.deepEqual(await runReadinessCli(["--live"], environment, dependencies(order)), {
     output: { status: "skipped", code: "LIVE_INSTALLATION_EVIDENCE_REQUIRED", liveSuccess: false },
     exitCode: 2,
   });
+  assert.deepEqual(order, ["provider"]);
 });
 
 test("live constructs the provider before active artifact, verifier, and exact-hash database checks", async () => {

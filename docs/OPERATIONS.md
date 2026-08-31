@@ -156,7 +156,7 @@ pnpm exec tsx scripts/check-release-readiness.ts --live
 - Valid controls without matching selected native proof return `LIVE_INSTALLATION_EVIDENCE_REQUIRED` with `liveSuccess:false`.
 - Only exact proof returns `LIVE_READINESS_PASSED` with `liveSuccess:true`.
 
-`--live` ignores `PAGE2WEBMCP_LOCAL_RELEASE_VERIFIER_ORIGIN` and requires `PAGE2WEBMCP_RELEASE_VERIFIER_ORIGIN` to be an exact HTTPS origin plus a 32–4096 character `PAGE2WEBMCP_RELEASE_VERIFIER_TOKEN`. It also requires lowercase 64-hex `PAGE2WEBMCP_READINESS_RELEASE_HASH`, `PAGE2WEBMCP_STORAGE_MODE=postgres`, the hosted Storage prefix, the selected real provider controls, and `PAGE2WEBMCP_MAINTENANCE_DATABASE_URL`.
+`--live` ignores `PAGE2WEBMCP_LOCAL_RELEASE_VERIFIER_ORIGIN` and requires `PAGE2WEBMCP_RELEASE_VERIFIER_ORIGIN` to be an exact HTTPS origin plus a 32–4096 character `PAGE2WEBMCP_RELEASE_VERIFIER_TOKEN`. It also requires lowercase 64-hex `PAGE2WEBMCP_READINESS_RELEASE_HASH`, `PAGE2WEBMCP_STORAGE_MODE=postgres`, the hosted Storage prefix, the selected real provider controls, `DATABASE_URL`, and `PAGE2WEBMCP_MAINTENANCE_DATABASE_URL`.
 
 Local-live may use `PAGE2WEBMCP_LOCAL_RELEASE_VERIFIER_ORIGIN=http://127.0.0.1:<port>` only with `PAGE2WEBMCP_LOCAL_STACK=true`. That verifier must still perform a real native browser check; the exception changes transport labeling, not evidence quality.
 

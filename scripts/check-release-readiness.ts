@@ -83,11 +83,6 @@ export async function runReadinessCli(
       exitCode: 2,
     };
   }
-  const selectedHash = environment.PAGE2WEBMCP_READINESS_RELEASE_HASH;
-  if (!selectedHash || !HASH.test(selectedHash)) {
-    return result("skipped", "LIVE_INSTALLATION_EVIDENCE_REQUIRED", 2);
-  }
-
   const constructProvider = dependencies.constructProvider ?? createProductionProvider;
   let provider: ReturnType<typeof createProductionProvider>;
   try {
@@ -102,6 +97,10 @@ export async function runReadinessCli(
         ...(inspection.keys.length > 0 ? { missingKeys: [...new Set(inspection.keys)].sort() } : {}) },
       exitCode: inspection.code === "INVALID_PROVIDER_MODE" || inspection.code === "WORKER_PROVIDER_MODE_REQUIRED" ? 1 : 2,
     };
+  }
+  const selectedHash = environment.PAGE2WEBMCP_READINESS_RELEASE_HASH;
+  if (!selectedHash || !HASH.test(selectedHash)) {
+    return result("skipped", "LIVE_INSTALLATION_EVIDENCE_REQUIRED", 2);
   }
 
   let artifact: Readonly<{ contentHash: string; integrity: string; localOnly: boolean; publicOrigin: string }>;
