@@ -205,10 +205,15 @@ export async function recoverLatestPublishedRelease(
   if (!state) return undefined;
   const { release, verification } = state;
   const identity = persistedReleaseArtifactIdentity(release);
+  // Releases created before immutable Storage identity was introduced remain
+  // readable for audit purposes, but they cannot produce an installation guide.
+  // Omit that optional projection instead of making the whole project
+  // impossible to resume.
+  if (!identity) return undefined;
   if (!verification.eligible || release.organizationId !== actor.organizationId || release.projectId !== projectId
     || verification.projectId !== projectId || verification.analysisRunId !== release.analysisRunId
     || verification.capabilityStateDigest !== release.capabilityStateDigest
-    || verification.candidateContentHash !== release.contentHash || !identity) {
+    || verification.candidateContentHash !== release.contentHash) {
     throw new ApiError("INVALID_STATE", 409);
   }
   const target = await resolveReleaseTarget(repository, actor, projectId, release.analysisRunId, release);

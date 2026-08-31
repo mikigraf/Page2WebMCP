@@ -65,6 +65,12 @@ test("source-configuration migration rejects test-page spellings that the URL pa
 test("applied source-configuration databases are hardened against OpenAPI test-page queries", async () => {
   const hardeningUrl = new URL("../../../supabase/migrations/20260831111000_openapi_test_page_no_query.sql", import.meta.url);
   const sql = await readFile(hardeningUrl, "utf8");
+  assert.match(sql, /OPENAPI_TEST_PAGE_QUERY_REMEDIATION_REQUIRED/);
+  assert.match(sql, /from public\.project_sources/);
+  assert.match(sql, /from private\.analysis_jobs/);
+  assert.match(sql, /raise exception using\s+errcode = 'P0001'/);
+  assert.ok(sql.indexOf("OPENAPI_TEST_PAGE_QUERY_REMEDIATION_REQUIRED")
+    < sql.indexOf("create or replace function private.canonical_https_test_page"));
   assert.match(sql, /create or replace function private\.canonical_https_test_page\(origin text, page_url text\)/);
   assert.match(sql, /position\('\?' in page_url\) > 0/);
   assert.doesNotMatch(sql, /delete from|update public\.project_sources/i);

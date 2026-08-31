@@ -12,6 +12,7 @@ import { acmeCapabilityEvidence, acmeCapabilityPlans } from "../../acme-support/
 import {
   InMemoryControlPlaneRepository,
   type AnalysisResult,
+  type PublishedReleaseState,
   type PublishRequest,
   type ReleaseRecord,
   type RepositoryActor,
@@ -351,6 +352,31 @@ class CorruptPublicationReturnRepository extends InMemoryControlPlaneRepository 
       sri: "sha384-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
       manifest: { ...(release.manifest as Record<string, unknown>), releaseId: "0".repeat(64) },
     };
+  }
+}
+
+class LegacyLatestReleaseRepository extends InMemoryControlPlaneRepository {
+  override async getLatestPublishedRelease(
+    actor: RepositoryActor,
+    projectId: string,
+  ): Promise<PublishedReleaseState | undefined> {
+    const state = await super.getLatestPublishedRelease(actor, projectId);
+    if (!state) return undefined;
+    const legacy: ReleaseRecord = {
+      id: state.release.id,
+      organizationId: state.release.organizationId,
+      projectId: state.release.projectId,
+      analysisRunId: state.release.analysisRunId,
+      capabilityStateDigest: state.release.capabilityStateDigest,
+      contentHash: state.release.contentHash,
+      sri: state.release.sri,
+      code: state.release.code,
+      allowedOrigin: state.release.allowedOrigin,
+      manifest: state.release.manifest,
+      status: state.release.status,
+      createdAt: state.release.createdAt,
+    };
+    return { release: legacy, verification: state.verification };
   }
 }
 
@@ -789,6 +815,27 @@ test("both publication routes use Storage and OpenAPI binds its immutable snapsh
   assert.equal(recovered.url, release.artifactUrl);
   assert.equal(recovered.installation.verificationPageUrl, `${targetOrigin}/webmcp-test`);
   assert.equal("code" in recovered, false);
+});
+
+test("project recovery omits an intentionally preserved legacy release identity instead of failing the project", async () => {
+  const repository = new LegacyLatestReleaseRepository();
+  installTestRepository(repository);
+  const { project, run } = await fixture(repository);
+  await approveTicket(repository, project.id);
+  const response = await publish(
+    request(project.id, run.id, "publish-before-legacy-recovery"),
+    { params: Promise.resolve({ projectId: project.id }) },
+  );
+  assert.equal(response.status, 201, JSON.stringify(await response.clone().json()));
+
+  const detail = await projectDetail(
+    new Request(`https://control.example/api/projects/${project.id}`, { headers: authenticatedHeaders(owner) }),
+    { params: Promise.resolve({ projectId: project.id }) },
+  );
+  assert.equal(detail.status, 200, JSON.stringify(await detail.clone().json()));
+  const body = await detail.json();
+  assert.equal(body.project.id, project.id);
+  assert.equal(body.release, undefined);
 });
 
 test("release guides preserve local-only and the previous persisted Storage URL", async () => {

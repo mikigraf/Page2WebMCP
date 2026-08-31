@@ -1,10 +1,35 @@
 begin;
 
 -- Applied databases previously admitted query-bearing OpenAPI test pages even
--- though installation guides can only verify a stable query-free page. Replace
--- the shared predicate so both source and copied analysis-job CHECK constraints
--- reject every new query-bearing configuration. Existing rows remain readable
--- only through the application parser, which now fails those rows closed.
+-- though installation guides can only verify a stable query-free page. Never
+-- strip a query silently: it is part of the immutable source identity and may
+-- select different target behavior. Stop with one bounded diagnostic before
+-- changing the predicate if an operator must replace historical source state.
+do $$
+begin
+  if exists (
+    select 1
+    from public.project_sources
+    where source_type = 'openapi'
+      and source_configuration->>'kind' = 'openapi'
+      and position('?' in source_configuration->>'testPageUrl') > 0
+  ) or exists (
+    select 1
+    from private.analysis_jobs
+    where source_type = 'openapi'
+      and source_configuration->>'kind' = 'openapi'
+      and position('?' in source_configuration->>'testPageUrl') > 0
+  ) then
+    raise exception using
+      errcode = 'P0001',
+      message = 'OPENAPI_TEST_PAGE_QUERY_REMEDIATION_REQUIRED';
+  end if;
+end
+$$;
+
+-- With historical state proven compatible, replace the shared predicate so
+-- both source and copied analysis-job CHECK constraints reject every new
+-- query-bearing configuration.
 create or replace function private.canonical_https_test_page(origin text, page_url text)
 returns boolean
 language plpgsql
