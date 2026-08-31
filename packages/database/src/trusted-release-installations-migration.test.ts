@@ -29,6 +29,23 @@ test("trusted installation migration drops the legacy eligibility constraint bef
   );
 });
 
+test("trusted installation migration restores the eligibility constraint after its legacy reverify update (catches leaving the table unconstrained)", async () => {
+  const sql = await readFile(migrationUrl, "utf8");
+  const legacyReverifyUpdate = sql.search(
+    /update public\.verification_runs\s+set[\s\S]*?eligible\s*=\s*false/i,
+  );
+  const restoredConstraint = sql.search(
+    /alter table public\.verification_runs\s+add constraint verification_runs_eligibility_check\s+check/i,
+  );
+
+  assert.ok(legacyReverifyUpdate >= 0, "legacy rows are made ineligible for reverification");
+  assert.ok(restoredConstraint >= 0, "the eligibility constraint is restored");
+  assert.ok(
+    restoredConstraint > legacyReverifyUpdate,
+    "the strengthened eligibility constraint must be restored after the legacy backfill",
+  );
+});
+
 test("trusted installation migration gives the inline status enum check its own stable name (catches PostgreSQL auto-name collision)", async () => {
   const sql = await readFile(migrationUrl, "utf8");
 
@@ -39,11 +56,8 @@ test("trusted installation migration gives the inline status enum check its own 
   assert.match(sql, /constraint release_installations_status_check check\s*\(/i);
 });
 
-test("trusted installation migration creates the release tenant key before its composite foreign key (catches leaving the key in the later workflow migration)", async () => {
-  const [sql, workflowSql] = await Promise.all([
-    readFile(migrationUrl, "utf8"),
-    readFile(workflowMigrationUrl, "utf8"),
-  ]);
+test("trusted installation migration creates the release tenant key before its composite foreign key (catches removing fresh-replay support)", async () => {
+  const sql = await readFile(migrationUrl, "utf8");
   const releaseTenantKey = /alter table public\.releases\s+add constraint releases_id_project_org_key\s+unique \(id, project_id, organization_id\)/i;
   const keyPosition = sql.search(releaseTenantKey);
   const foreignKeyPosition = sql.search(
@@ -56,19 +70,38 @@ test("trusted installation migration creates the release tenant key before its c
     keyPosition < foreignKeyPosition,
     "PostgreSQL must see the referenced release key before creating the tenant foreign key",
   );
-  assert.doesNotMatch(
-    workflowSql,
-    releaseTenantKey,
-    "the later workflow migration must not add the same release tenant key twice",
+});
+
+test("workflow migration restores the release tenant key for databases that already recorded the trusted-installation migration", async () => {
+  const sql = await readFile(workflowMigrationUrl, "utf8");
+  const compatibilityGuard = sql.match(
+    /do \$\$\s*begin\s*if not exists\s*\([\s\S]*?from pg_catalog\.pg_constraint[\s\S]*?conrelid\s*=\s*'public\.releases'::regclass[\s\S]*?conname\s*=\s*'releases_id_project_org_key'[\s\S]*?\)\s*then\s*alter table public\.releases\s+add constraint releases_id_project_org_key\s+unique \(id, project_id, organization_id\);\s*end if;\s*end\s*\$\$;/i,
+  );
+  const compatibilityKeyPosition = compatibilityGuard?.index ?? -1;
+  const installationForeignKeyPosition = sql.search(
+    /foreign key \(release_id, project_id, organization_id\)\s+references public\.releases\(id, project_id, organization_id\)/i,
+  );
+
+  assert.ok(compatibilityGuard, "the later workflow migration catalog-guards the compatibility key");
+  assert.ok(installationForeignKeyPosition >= 0, "workflow installations retain their composite tenant foreign key");
+  assert.ok(
+    compatibilityKeyPosition < installationForeignKeyPosition,
+    "the compatibility key must exist before the later composite foreign key is created",
   );
 });
 
-test("pgcrypto calls in replayed migrations are schema-qualified (catches relying on the migration session search path)", async () => {
+test("pgcrypto digest calls in replayed migrations use the extensions schema (catches public, other, or bare resolution)", async () => {
   const migrationFiles = (await readdir(migrationsUrl)).filter((file) => file.endsWith(".sql"));
-  const bareDigestCalls = (await Promise.all(migrationFiles.map(async (file) => {
+  const digestCalls = (await Promise.all(migrationFiles.map(async (file) => {
     const sql = await readFile(new URL(file, migrationsUrl), "utf8");
-    return [...sql.matchAll(/(?<![\w.])digest\s*\(/gi)].map(() => file);
+    return [...sql.matchAll(/(?<![\w$."])(?:(?<schema>"(?:[^"]|"")*"|[a-z_][\w$]*)\s*\.\s*)?digest\s*\(/gi)]
+      .map((match) => ({
+        file,
+        schema: match.groups?.schema?.replace(/^"|"$/g, "").replace(/""/g, "\"").toLowerCase() ?? null,
+      }));
   }))).flat();
+  const incorrectlyQualifiedCalls = digestCalls.filter(({ schema }) => schema !== "extensions");
 
-  assert.deepEqual(bareDigestCalls, []);
+  assert.ok(digestCalls.length > 0, "the contract observes at least one digest call");
+  assert.deepEqual(incorrectlyQualifiedCalls, []);
 });

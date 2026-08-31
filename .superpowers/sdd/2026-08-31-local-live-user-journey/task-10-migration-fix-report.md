@@ -314,3 +314,267 @@ git add -f .superpowers/sdd/2026-08-31-local-live-user-journey/task-10-migration
 git commit -m "fix: order release tenant key before installation FK"
 git rev-parse HEAD
 ```
+
+## Fix round 4: upgrade compatibility and Supabase-style pgcrypto fixture
+
+### Root cause and minimal fix
+
+Moving `releases_id_project_org_key` into the already-versioned
+`20260830094622_trusted_release_installations.sql` repaired fresh replay but
+removed the only creation of that named key from the next migration. A database
+that already recorded the older form of `20260830094622` therefore would not
+execute the newly inserted statement and could reach the workflow installation
+composite FK without the expected named tenant key.
+
+Fresh replay still creates the key unconditionally in `20260830094622`. The
+start of `20260830120000_phased_workflow_substrate.sql` now also checks
+`pg_catalog.pg_constraint` for that key on `public.releases` and creates it only
+when absent. Neither the trusted release-installation composite FK nor the later
+workflow-installation composite FK was removed or weakened.
+
+The migration contract now:
+
+- proves the strengthened `verification_runs_eligibility_check` is restored
+  after the legacy `eligible = false` backfill;
+- requires every observed migration `digest(...)` invocation, including bare,
+  quoted-schema, and unquoted-schema forms, to resolve through `extensions`;
+- requires the later migration's catalog-guarded compatibility key to precede
+  its composite release FK while retaining the fresh-replay assertion.
+
+The standalone local RLS harness now creates the Supabase-style `extensions`
+schema and installs `pgcrypto` into it with `WITH SCHEMA extensions`.
+
+### TDD RED evidence
+
+The compatibility contract was added before the migration fix and run with:
+
+```sh
+scratch_dir=$(mktemp -d /tmp/page2webmcp-migration-round4-red.XXXXXX)
+mkdir -p "$scratch_dir/packages/database/src"
+ln -s "$PWD/supabase" "$scratch_dir/supabase"
+PATH=/usr/local/bin:/usr/bin:/bin /usr/local/bin/node node_modules/typescript/bin/tsc \
+  --module NodeNext --moduleResolution NodeNext --target ES2022 --esModuleInterop --skipLibCheck \
+  --rootDir packages/database/src --outDir "$scratch_dir/packages/database/src" \
+  packages/database/src/trusted-release-installations-migration.test.ts
+PATH=/usr/local/bin:/usr/bin:/bin /usr/local/bin/node --test \
+  "$scratch_dir/packages/database/src/trusted-release-installations-migration.test.js"
+```
+
+Result: `5/6` passed. The partial-upgrade test alone failed with `the later
+workflow migration catalog-guards the compatibility key`.
+
+The two strengthened existing-behavior contracts were mutation-checked after
+the test changes but before the production fix. Temporarily renaming the
+restored eligibility constraint, then running:
+
+```sh
+PATH=/usr/local/bin:/usr/bin:/bin /usr/local/bin/node --test \
+  --test-name-pattern="restores the eligibility constraint" \
+  "$scratch_dir/packages/database/src/trusted-release-installations-migration.test.js"
+```
+
+failed `0/1` with `the eligibility constraint is restored`. Temporarily changing
+one call from `extensions.digest` to `public.digest`, then running:
+
+```sh
+PATH=/usr/local/bin:/usr/bin:/bin /usr/local/bin/node --test \
+  --test-name-pattern="pgcrypto digest calls" \
+  "$scratch_dir/packages/database/src/trusted-release-installations-migration.test.js"
+```
+
+failed `0/1` and reported exactly:
+
+```text
+{
+  file: '20260830120000_phased_workflow_substrate.sql',
+  schema: 'public'
+}
+```
+
+Both temporary mutations were restored before implementation.
+
+The behavioral local-harness RED command was:
+
+```sh
+PAGE2WEBMCP_NATIVE_TYPESCRIPT_TESTS=true \
+PAGE2WEBMCP_NODE_BINARY=/usr/local/bin/node \
+  bash scripts/test-rls-local.sh
+```
+
+Result: the disposable PostgreSQL instance failed at the first workflow digest
+with `ERROR: schema "extensions" does not exist`, proving that the old harness
+installed pgcrypto into the wrong schema for the replayed migrations.
+
+### Focused and migration-contract GREEN evidence
+
+After the guarded compatibility block and fixture correction, the focused
+compile/test command above passed `6/6` tests. The full migration-contract suite
+used:
+
+```sh
+scratch_dir=$(mktemp -d /tmp/page2webmcp-migration-contracts-round4.XXXXXX)
+mkdir -p "$scratch_dir/packages/database/src"
+ln -s "$PWD/supabase" "$scratch_dir/supabase"
+rg --files packages/database/src -g '*migration.test.ts' | sort | xargs \
+  env PATH=/usr/local/bin:/usr/bin:/bin /usr/local/bin/node node_modules/typescript/bin/tsc \
+    --module NodeNext --moduleResolution NodeNext --target ES2022 --esModuleInterop --skipLibCheck \
+    --rootDir packages/database/src --outDir "$scratch_dir/packages/database/src"
+PATH=/usr/local/bin:/usr/bin:/bin /usr/local/bin/node --test \
+  "$scratch_dir"/packages/database/src/*migration.test.js
+```
+
+Result: `24/24` tests passed.
+
+Re-running the local RLS command after installing pgcrypto into `extensions`
+successfully replayed the targeted workflow migration and all migrations through
+`20260831090000_source_configuration.sql`. The overall script then stopped at a
+separate pre-existing standalone-fixture gap:
+
+```text
+psql:supabase/migrations/20260831100000_release_artifact_storage.sql:11:
+ERROR: relation "storage.buckets" does not exist
+```
+
+No Storage fixture expansion was made in this round because the requested
+change was specifically the pgcrypto/Supabase extension layout. The ephemeral
+local cluster was removed by the script's cleanup trap.
+
+### Fresh PostgreSQL 17 lexical replay
+
+A new `postgres:17` container with no host port binding was bootstrapped with
+the same minimal Supabase-owned prerequisites used by the prior replay rounds:
+
+```sh
+set -euo pipefail
+replay_container="page2webmcp-migration-r4-fresh-$$"
+cleanup_replay() {
+  docker stop "$replay_container" >/dev/null 2>&1 || true
+}
+trap cleanup_replay EXIT
+docker run --rm -d --name "$replay_container" \
+  -e POSTGRES_HOST_AUTH_METHOD=trust postgres:17 >/dev/null
+for attempt in 1 2 3 4 5 6 7 8 9 10; do
+  if docker exec "$replay_container" pg_isready -U postgres -d postgres >/dev/null 2>&1; then break; fi
+  sleep 1
+done
+docker exec "$replay_container" psql -v ON_ERROR_STOP=1 -U postgres -d postgres -c "
+  create schema extensions;
+  create extension pgcrypto with schema extensions;
+  create schema auth;
+  create table auth.users (id uuid primary key, email text not null, email_confirmed_at timestamptz);
+  create table auth.sessions (id uuid primary key, user_id uuid not null references auth.users(id), not_after timestamptz);
+  create function auth.uid() returns uuid language sql stable as 'select nullif(current_setting(''request.jwt.claim.sub'', true), '''')::uuid';
+  create schema storage;
+  create table storage.buckets (id text primary key, name text not null, public boolean, file_size_limit bigint, allowed_mime_types text[]);
+  create role anon nologin;
+  create role authenticated nologin;
+" >/dev/null
+migration_count=0
+for migration in supabase/migrations/*.sql; do
+  docker exec -i "$replay_container" \
+    psql -q -v ON_ERROR_STOP=1 -U postgres -d postgres < "$migration"
+  migration_count=$((migration_count + 1))
+done
+```
+
+The catalog verification returned:
+
+```text
+server_version=17.11 (Debian 17.11-1.pgdg13+2)
+migration_count=16
+pgcrypto_schema=extensions
+release_key_count=1
+eligibility_check_count=1
+release_tenant_fk_count=2
+```
+
+Thus all `16/16` migrations replayed lexically, the eligibility check and named
+tenant key were present, and both composite release tenant FKs remained.
+
+### Simulated partial-upgrade PostgreSQL 17 replay
+
+A second new no-host-port PostgreSQL 17 container was bootstrapped identically.
+The first seven migrations were replayed through
+`20260830094622_trusted_release_installations.sql`. To simulate an already
+recorded migration whose named key is absent without weakening its existing
+composite FK, its equivalent unique constraint was renamed to its legacy name:
+
+```sh
+before_upgrade_count=0
+for migration in supabase/migrations/*.sql; do
+  docker exec -i "$upgrade_container" \
+    psql -q -v ON_ERROR_STOP=1 -U postgres -d postgres < "$migration"
+  before_upgrade_count=$((before_upgrade_count + 1))
+  if [[ "$(basename "$migration")" == "20260830094622_trusted_release_installations.sql" ]]; then
+    break
+  fi
+done
+docker exec "$upgrade_container" psql -v ON_ERROR_STOP=1 -U postgres -d postgres -c "
+  alter table public.releases
+    rename constraint releases_id_project_org_key to legacy_releases_id_project_org_key;
+" >/dev/null
+```
+
+Pre-upgrade catalog state:
+
+```text
+pre_upgrade_migration_count=7
+pre_upgrade_named_key_count=0
+pre_upgrade_release_installation_fk_count=1
+```
+
+The later migration and every remaining migration were then applied:
+
+```sh
+after_upgrade_count=0
+apply_remaining=false
+for migration in supabase/migrations/*.sql; do
+  if [[ "$(basename "$migration")" == "20260830120000_phased_workflow_substrate.sql" ]]; then
+    apply_remaining=true
+  fi
+  if [[ "$apply_remaining" == "true" ]]; then
+    docker exec -i "$upgrade_container" \
+      psql -q -v ON_ERROR_STOP=1 -U postgres -d postgres < "$migration"
+    after_upgrade_count=$((after_upgrade_count + 1))
+  fi
+done
+```
+
+Post-upgrade catalog verification returned:
+
+```text
+server_version=17.11 (Debian 17.11-1.pgdg13+2)
+post_upgrade_migration_count=9
+post_upgrade_named_key_count=1
+post_upgrade_eligibility_check_count=1
+post_upgrade_release_tenant_fk_count=2
+```
+
+The catalog guard therefore exercised its creation branch and the full upgrade
+path retained both composite FKs. The `--rm` cleanup traps removed both replay
+containers; no existing container was stopped or reused.
+
+### Round-4 verification
+
+```sh
+PATH=/usr/local/bin:/usr/bin:/bin /usr/local/bin/node \
+  node_modules/typescript/bin/tsc --project tsconfig.base.json --noEmit
+PATH=/usr/local/bin:/usr/bin:/bin /usr/local/bin/node scripts/check-source.mjs
+bash -n scripts/test-rls-local.sh
+git diff --check
+```
+
+Result: typecheck, source security policy, shell syntax, and diff checks all
+exited 0.
+
+Round-4 commit command:
+
+```sh
+git add packages/database/src/trusted-release-installations-migration.test.ts \
+  scripts/test-rls-local.sh \
+  supabase/migrations/20260830120000_phased_workflow_substrate.sql
+git add -f .superpowers/sdd/2026-08-31-local-live-user-journey/task-10-migration-fix-report.md
+git diff --cached --check
+git commit -m "fix: preserve migration upgrade compatibility"
+git rev-parse HEAD
+```

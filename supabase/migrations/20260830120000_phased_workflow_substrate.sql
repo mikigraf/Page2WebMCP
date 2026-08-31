@@ -1,6 +1,22 @@
 -- Additive authoritative workflow substrate. The existing analysis queue stays
 -- intact as a compatibility projection and retains its analysis-only trigger.
 
+-- Compatibility for databases that recorded the original trusted-installation
+-- migration before it began creating this tenant key for fresh replays.
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_catalog.pg_constraint
+    where conrelid = 'public.releases'::regclass
+      and conname = 'releases_id_project_org_key'
+  ) then
+    alter table public.releases
+      add constraint releases_id_project_org_key unique (id, project_id, organization_id);
+  end if;
+end
+$$;
+
 alter table private.idempotency_keys drop constraint idempotency_operation_check;
 alter table private.idempotency_keys
   add constraint idempotency_operation_check
