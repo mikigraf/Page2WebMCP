@@ -29,7 +29,12 @@
     "worker": "node --env-file-if-exists=.env.local .dist/worker/apps/worker/src/main.js",
     "build:worker": "tsc --project tsconfig.worker.json",
     "build": "pnpm --filter @page2webmcp/acme-support build && pnpm --filter @page2webmcp/control-plane build && pnpm build:worker",
-    "release:readiness": "tsx scripts/check-release-readiness.ts --hermetic"
+    "release:readiness": "tsx scripts/check-release-readiness.ts --hermetic",
+    "local:up": "node scripts/local-supabase.mjs up",
+    "local:reset": "node scripts/local-supabase.mjs reset",
+    "local:status": "node scripts/local-supabase.mjs status",
+    "local:down": "node scripts/local-supabase.mjs down",
+    "dev:local-live": "node scripts/dev-local-live.mjs"
   },
   "devDependencies": {
     "@playwright/test": "1.62.1",
@@ -39,6 +44,7 @@
     "@types/react-dom": "19.2.5",
     "eslint": "9.39.5",
     "eslint-config-next": "16.3.3",
+    "supabase": "2.116.0",
     "tsx": "4.23.12"
   },
   "dependencies": {

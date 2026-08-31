@@ -2,6 +2,7 @@ node_modules/
 .next/
 .env*
 !.env.example
+.page2webmcp/
 coverage/
 playwright-report/
 test-results/
