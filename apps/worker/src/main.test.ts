@@ -128,7 +128,10 @@ async function runFailure(environment: Record<string, string>): Promise<unknown>
         PATH: process.env.PATH ?? "",
         ...environment,
       },
-      timeout: 10_000,
+      // The full Node test runner starts hundreds of files concurrently. The
+      // worker must fail before repository construction, but process startup
+      // itself can exceed ten seconds under that aggregate load.
+      timeout: 30_000,
       maxBuffer: 32 * 1_024,
     });
   } catch (error) {
