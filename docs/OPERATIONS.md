@@ -26,6 +26,25 @@ pnpm local:down
 
 `local:up` starts Docker Supabase and bootstraps runtime roles. `local:reset` resets only the CLI-managed local database, replays every migration in lexical order, loads fixture-only seed data, verifies the applied migration ledger, and rotates the local runtime secrets. `dev:local-live` starts the control plane and one real selected worker; it does not start Acme.
 
+The conditional OpenAPI acceptance test owns the application processes so it can prove a real restart. Start only the Docker stack, leave control-plane port `3100` free, and provide all of these controls before running `pnpm exec tsx --test e2e/local-live-openapi.test.ts`:
+
+```text
+PAGE2WEBMCP_E2E_CONTROL_URL=http://127.0.0.1:3100
+PAGE2WEBMCP_E2E_INSTALL_PAGE_URL=<real non-Acme HTTPS install page>
+PAGE2WEBMCP_E2E_LOCAL_LIVE=true
+PAGE2WEBMCP_E2E_PROCESS_CONTROL=owned
+PAGE2WEBMCP_E2E_SOURCE_URL=<real non-Acme HTTPS OpenAPI document>
+PAGE2WEBMCP_LOCAL_RELEASE_VERIFIER_ORIGIN=<real loopback native verifier>
+PAGE2WEBMCP_LOCAL_STACK=true
+PAGE2WEBMCP_OPENAPI_TARGET_ORIGIN=<exact HTTPS target origin>
+PAGE2WEBMCP_OPENAPI_TEST_PAGE_URL=<same-origin real test page>
+PAGE2WEBMCP_PROVIDER_MODE=openapi
+PAGE2WEBMCP_RELEASE_VERIFIER_TOKEN=<32-4096 character verifier token>
+PAGE2WEBMCP_STORAGE_MODE=postgres
+```
+
+`PAGE2WEBMCP_E2E_PROCESS_CONTROL=owned` is the operator handshake authorizing the test to start and terminate only its own two generations of the `dev:local-live` launcher. The test checks the pinned CLI status and fixed Docker endpoints, runs the journey with one control-plane/worker generation, stops the launcher and waits for its supervised children plus port `3100` to close, starts a second generation, reloads the persisted release, and submits a new analysis to the restarted worker. A missing handshake, an occupied port, a different local topology, or any missing external source/verifier/install control skips or fails closed; a second HTTP client alone is not restart evidence.
+
 | Service | Local address |
 | --- | --- |
 | Supabase API, Auth, and Storage | `http://127.0.0.1:54321` |

@@ -1,11 +1,18 @@
 import assert from "node:assert/strict";
+import type { ChildProcess } from "node:child_process";
+import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
+import { createConnection } from "node:net";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
+
+const workspaceRoot = fileURLToPath(new URL("../", import.meta.url));
 
 const requiredEnvironment = [
   "PAGE2WEBMCP_E2E_CONTROL_URL",
   "PAGE2WEBMCP_E2E_INSTALL_PAGE_URL",
   "PAGE2WEBMCP_E2E_LOCAL_LIVE",
+  "PAGE2WEBMCP_E2E_PROCESS_CONTROL",
   "PAGE2WEBMCP_E2E_SOURCE_URL",
   "PAGE2WEBMCP_LOCAL_RELEASE_VERIFIER_ORIGIN",
   "PAGE2WEBMCP_LOCAL_STACK",
@@ -20,6 +27,7 @@ const missingEnvironment = requiredEnvironment.filter((name) => {
   const value = process.env[name];
   if (!value) return true;
   if (name === "PAGE2WEBMCP_E2E_LOCAL_LIVE" || name === "PAGE2WEBMCP_LOCAL_STACK") return value !== "true";
+  if (name === "PAGE2WEBMCP_E2E_PROCESS_CONTROL") return value !== "owned";
   if (name === "PAGE2WEBMCP_PROVIDER_MODE") return value !== "openapi";
   if (name === "PAGE2WEBMCP_STORAGE_MODE") return value !== "postgres";
   return false;
@@ -28,7 +36,7 @@ const missingEnvironment = requiredEnvironment.filter((name) => {
 type Capability = Readonly<{
   id: string;
   riskTier: "R0" | "R1" | "R2" | "R3";
-  status: "proposed" | "approved" | "blocked" | "rejected";
+  status: "proposed" | "reviewed" | "verified" | "blocked";
   version: number;
 }>;
 
@@ -51,16 +59,22 @@ test("Docker local-live persists a non-Acme OpenAPI release with exact Storage i
   skip: missingEnvironment.length > 0
     ? `LOCAL_LIVE_CONTROLS_REQUIRED: ${missingEnvironment.join(",")}`
     : false,
-  timeout: 240_000,
+  timeout: 420_000,
 }, async (context) => {
   const controlOrigin = exactOrigin(environment("PAGE2WEBMCP_E2E_CONTROL_URL"), "http:");
-  assert.ok(isExactLoopbackOrigin(controlOrigin), "local-live control plane must be exact loopback HTTP");
+  assert.equal(controlOrigin, "http://127.0.0.1:3100");
   const sourceUrl = exactNonFixtureHttpsUrl(environment("PAGE2WEBMCP_E2E_SOURCE_URL"));
   const targetOrigin = exactOrigin(environment("PAGE2WEBMCP_OPENAPI_TARGET_ORIGIN"), "https:");
   const testPageUrl = exactNonFixtureHttpsUrl(environment("PAGE2WEBMCP_OPENAPI_TEST_PAGE_URL"));
   const installPageUrl = exactNonFixtureHttpsUrl(environment("PAGE2WEBMCP_E2E_INSTALL_PAGE_URL"));
   assert.equal(new URL(testPageUrl).origin, targetOrigin);
   assert.equal(new URL(installPageUrl).origin, targetOrigin);
+
+  await assertDocumentedDockerTopology();
+  await assertControlPortFree();
+  let localLive = await LocalLiveProcesses.start(controlOrigin);
+  const initialLauncherPid = localLive.pid;
+  context.after(async () => { await localLive.stop(); });
 
   const email = `page2webmcp-local-live-${randomUUID()}@example.test`;
   const password = `Local-live-${randomUUID()}-9a!`;
@@ -97,7 +111,7 @@ test("Docker local-live persists a non-Acme OpenAPI release with exact Storage i
   let approved = 0;
   for (const capability of analysis.capabilities) {
     if (capability.status !== "proposed") {
-      if (capability.status === "approved") approved += 1;
+      if (capability.status === "reviewed") approved += 1;
       continue;
     }
     const action = capability.riskTier === "R3" ? "block" : "approve";
@@ -105,7 +119,7 @@ test("Docker local-live persists a non-Acme OpenAPI release with exact Storage i
       `/api/capabilities/${capability.id}/review`,
       { action, expectedVersion: capability.version },
     );
-    assert.equal(reviewed.capability.status, action === "approve" ? "approved" : "blocked");
+    assert.equal(reviewed.capability.status, action === "approve" ? "reviewed" : "blocked");
     if (action === "approve") approved += 1;
   }
   assert.ok(approved > 0, "release requires at least one approved non-R3 capability");
@@ -145,6 +159,11 @@ test("Docker local-live persists a non-Acme OpenAPI release with exact Storage i
   assert.equal(installed.installation.status, "verified");
   assert.equal(installed.installation.verifierIdentity?.mode, "local_live");
 
+  await localLive.stop();
+  await assertControlPortFree();
+  localLive = await LocalLiveProcesses.start(controlOrigin);
+  assert.notEqual(localLive.pid, initialLauncherPid);
+
   const resumed = new ControlPlaneSession(controlOrigin);
   await resumed.post("/api/auth/login", { email, password }, { authenticated: false });
   const detail = await resumed.get<{
@@ -163,6 +182,15 @@ test("Docker local-live persists a non-Acme OpenAPI release with exact Storage i
   assert.equal(detail.release?.installation.contentHash, release.contentHash);
   assert.equal(detail.release?.installation.localOnly, true);
 
+  const restartedWorker = await resumed.post<{ runId: string; status: string }>(
+    "/api/projects/analyze", { projectId: project.id },
+  );
+  assert.notEqual(restartedWorker.runId, enqueued.runId);
+  const restartedAnalysis = await pollAnalysis(resumed, restartedWorker.runId);
+  assert.equal(restartedAnalysis.run.status, "succeeded");
+  assert.equal(restartedAnalysis.result?.providerProvenance?.mode, "openapi");
+  assert.equal(restartedAnalysis.result?.providerProvenance?.fixture, false);
+
   context.diagnostic(JSON.stringify({
     code: "LOCAL_LIVE_OPENAPI_EVIDENCE",
     projectId: project.id,
@@ -171,6 +199,8 @@ test("Docker local-live persists a non-Acme OpenAPI release with exact Storage i
     artifactUrl: release.url,
     contentHash: release.contentHash,
     integrity: release.sri,
+    initialAnalysisRunId: enqueued.runId,
+    restartedAnalysisRunId: restartedWorker.runId,
     liveSuccess: false,
   }));
 });
@@ -205,13 +235,232 @@ function exactNonFixtureHttpsUrl(value: string): string {
   return url.toString();
 }
 
-function isExactLoopbackOrigin(value: string): boolean {
-  const url = new URL(value);
-  return url.protocol === "http:" && isLoopback(url.hostname) && value === url.origin;
-}
-
 function isLoopback(hostname: string): boolean {
   return hostname === "127.0.0.1" || hostname === "[::1]";
+}
+
+async function assertDocumentedDockerTopology(): Promise<void> {
+  const version = await runBoundedCommand(["exec", "supabase", "--version"]);
+  assert.equal(version.trim(), "2.116.0", "LOCAL_DOCKER_TOPOLOGY_REQUIRED");
+  const values = parseSupabaseStatus(await runBoundedCommand(["exec", "supabase", "status", "-o", "env"]));
+  assert.equal(values.get("API_URL"), "http://127.0.0.1:54321", "LOCAL_DOCKER_TOPOLOGY_REQUIRED");
+  assert.equal(values.get("STUDIO_URL"), "http://127.0.0.1:54323", "LOCAL_DOCKER_TOPOLOGY_REQUIRED");
+  assert.equal(values.get("INBUCKET_URL"), "http://127.0.0.1:54324", "LOCAL_DOCKER_TOPOLOGY_REQUIRED");
+  let database: URL;
+  try {
+    database = new URL(requiredStatusValue(values, "DB_URL"));
+  } catch {
+    throw new Error("LOCAL_DOCKER_TOPOLOGY_REQUIRED");
+  }
+  assert.equal(database.protocol, "postgresql:", "LOCAL_DOCKER_TOPOLOGY_REQUIRED");
+  assert.equal(database.hostname, "127.0.0.1", "LOCAL_DOCKER_TOPOLOGY_REQUIRED");
+  assert.equal(database.port, "54322", "LOCAL_DOCKER_TOPOLOGY_REQUIRED");
+  assert.equal(database.pathname, "/postgres", "LOCAL_DOCKER_TOPOLOGY_REQUIRED");
+  assert.equal(database.username, "postgres", "LOCAL_DOCKER_TOPOLOGY_REQUIRED");
+  assert.equal(database.search, "", "LOCAL_DOCKER_TOPOLOGY_REQUIRED");
+  assert.equal(database.hash, "", "LOCAL_DOCKER_TOPOLOGY_REQUIRED");
+}
+
+function runBoundedCommand(args: readonly string[]): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const child = spawn("pnpm", args, {
+      cwd: workspaceRoot,
+      env: process.env,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let outputBytes = 0;
+    let settled = false;
+    const rejectSafely = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(new Error("LOCAL_DOCKER_TOPOLOGY_REQUIRED"));
+    };
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      rejectSafely();
+    }, 30_000);
+    timer.unref?.();
+    for (const stream of [child.stdout, child.stderr]) {
+      stream?.on("data", (chunk: Buffer) => {
+        outputBytes += chunk.byteLength;
+        if (outputBytes > 65_536) {
+          child.kill("SIGTERM");
+          return;
+        }
+        if (stream === child.stdout) stdout += chunk.toString("utf8");
+      });
+    }
+    child.once("error", rejectSafely);
+    child.once("exit", (code) => {
+      if (settled) return;
+      if (code !== 0 || outputBytes > 65_536) return rejectSafely();
+      settled = true;
+      clearTimeout(timer);
+      resolve(stdout);
+    });
+  });
+}
+
+function parseSupabaseStatus(output: string): Map<string, string> {
+  const values = new Map<string, string>();
+  for (const line of output.split(/\r?\n/)) {
+    if (!line) continue;
+    const match = /^([A-Z][A-Z0-9_]*)=("(?:[^"\\]|\\.)*")$/.exec(line);
+    if (!match || values.has(match[1]!)) throw new Error("LOCAL_DOCKER_TOPOLOGY_REQUIRED");
+    let value: unknown;
+    try {
+      value = JSON.parse(match[2]!);
+    } catch {
+      throw new Error("LOCAL_DOCKER_TOPOLOGY_REQUIRED");
+    }
+    if (typeof value !== "string" || value.length > 4_096 || /[\r\n]/.test(value)) {
+      throw new Error("LOCAL_DOCKER_TOPOLOGY_REQUIRED");
+    }
+    values.set(match[1]!, value);
+  }
+  return values;
+}
+
+function requiredStatusValue(values: ReadonlyMap<string, string>, name: string): string {
+  const value = values.get(name);
+  if (!value) throw new Error("LOCAL_DOCKER_TOPOLOGY_REQUIRED");
+  return value;
+}
+
+async function assertControlPortFree(): Promise<void> {
+  assert.equal(await controlPortOpen(), false, "LOCAL_LIVE_CONTROL_PORT_IN_USE");
+}
+
+function controlPortOpen(): Promise<boolean> {
+  return new Promise((resolve, reject) => {
+    const socket = createConnection({ host: "127.0.0.1", port: 3100 });
+    const timer = setTimeout(() => {
+      socket.destroy();
+      reject(new Error("LOCAL_LIVE_CONTROL_PORT_UNRESPONSIVE"));
+    }, 2_000);
+    timer.unref?.();
+    socket.once("connect", () => {
+      clearTimeout(timer);
+      socket.destroy();
+      resolve(true);
+    });
+    socket.once("error", (error: NodeJS.ErrnoException) => {
+      clearTimeout(timer);
+      socket.destroy();
+      if (error.code === "ECONNREFUSED") resolve(false);
+      else reject(new Error("LOCAL_LIVE_CONTROL_PORT_UNRESPONSIVE"));
+    });
+  });
+}
+
+class LocalLiveProcesses {
+  readonly #child: ChildProcess;
+  readonly #exit: Promise<void>;
+  #stopped = false;
+
+  private constructor(child: ChildProcess) {
+    this.#child = child;
+    this.#exit = new Promise((resolve) => {
+      child.once("error", () => resolve());
+      child.once("exit", () => resolve());
+    });
+  }
+
+  get pid(): number {
+    assert.ok(this.#child.pid, "LOCAL_LIVE_LAUNCH_FAILED");
+    return this.#child.pid;
+  }
+
+  static async start(controlOrigin: string): Promise<LocalLiveProcesses> {
+    const child = spawn(process.execPath, ["scripts/dev-local-live.mjs"], {
+      cwd: workspaceRoot,
+      env: process.env,
+      stdio: "ignore",
+      detached: process.platform !== "win32",
+    });
+    const processes = new LocalLiveProcesses(child);
+    try {
+      await waitForControlReady(child, controlOrigin);
+      return processes;
+    } catch {
+      await processes.stop();
+      throw new Error("LOCAL_LIVE_LAUNCH_FAILED");
+    }
+  }
+
+  async stop(): Promise<void> {
+    if (this.#stopped) return;
+    this.#stopped = true;
+    signalOwnedProcess(this.#child, "SIGTERM");
+    if (!await settlesWithin(this.#exit, 10_000)) {
+      signalOwnedProcess(this.#child, "SIGKILL");
+      if (!await settlesWithin(this.#exit, 5_000)) throw new Error("LOCAL_LIVE_STOP_FAILED");
+    }
+    const deadline = Date.now() + 15_000;
+    while (Date.now() < deadline) {
+      if (!await controlPortOpen()) return;
+      await delay(100);
+    }
+    throw new Error("LOCAL_LIVE_STOP_FAILED");
+  }
+}
+
+async function waitForControlReady(child: ChildProcess, controlOrigin: string): Promise<void> {
+  const deadline = Date.now() + 90_000;
+  while (Date.now() < deadline) {
+    if (!child.pid || child.exitCode !== null || child.signalCode !== null) {
+      throw new Error("LOCAL_LIVE_LAUNCH_FAILED");
+    }
+    if (await controlReady(controlOrigin)) return;
+    await delay(250);
+  }
+  throw new Error("LOCAL_LIVE_LAUNCH_FAILED");
+}
+
+async function controlReady(controlOrigin: string): Promise<boolean> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 2_000);
+  timer.unref?.();
+  try {
+    const response = await fetch(`${controlOrigin}/api/auth/csrf`, {
+      headers: { origin: controlOrigin, "sec-fetch-site": "same-origin" },
+      redirect: "error",
+      signal: controller.signal,
+    });
+    if (response.status !== 200 || response.url !== `${controlOrigin}/api/auth/csrf`
+      || !/^application\/json(?:;|$)/i.test(response.headers.get("content-type") ?? "")) return false;
+    const body = await response.text();
+    if (Buffer.byteLength(body, "utf8") > 16_384) return false;
+    const parsed = JSON.parse(body) as { csrfToken?: unknown };
+    return typeof parsed.csrfToken === "string" && /^v1\./.test(parsed.csrfToken);
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function signalOwnedProcess(child: ChildProcess, signal: NodeJS.Signals): void {
+  if (!child.pid || child.exitCode !== null || child.signalCode !== null) return;
+  try {
+    if (process.platform === "win32") child.kill(signal);
+    else process.kill(-child.pid, signal);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+  }
+}
+
+async function settlesWithin(promise: Promise<void>, timeoutMs: number): Promise<boolean> {
+  return await Promise.race([
+    promise.then(() => true),
+    delay(timeoutMs).then(() => false),
+  ]);
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function pollAnalysis(session: ControlPlaneSession, runId: string): Promise<{
