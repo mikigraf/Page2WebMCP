@@ -5,6 +5,8 @@ import {
 } from "../../../packages/providers/src/openapi.ts";
 import { createNodeOpenApiResolver, createNodeOpenApiTransport } from "./node-network.ts";
 import { createOpenApiAnalysisAdapter, type AnalysisAdapter } from "./workflow.ts";
+import { parsePersistedSourceConfiguration } from "../../../packages/database/src/control-plane.ts";
+import type { SelectedProviderProbeContext } from "../../../packages/operations/src/readiness.ts";
 
 type RuntimeEnvironment = Readonly<Record<string, string | undefined>>;
 const HOSTED_PUBLIC_ORIGIN =
@@ -22,6 +24,7 @@ export type ConfiguredOpenApiProductionAdapter = Readonly<{
   probe(input: Readonly<{
     selectedReleaseHash: string;
     publicOrigin: string;
+    context: SelectedProviderProbeContext;
     signal: AbortSignal;
   }>): Promise<void>;
 }>;
@@ -44,22 +47,22 @@ export function createConfiguredOpenApiProductionAdapter(
   });
   return {
     analyze,
-    async probe({ selectedReleaseHash, publicOrigin, signal }) {
-      if (!HASH.test(selectedReleaseHash) || publicOrigin !== HOSTED_PUBLIC_ORIGIN || !(signal instanceof AbortSignal)) {
+    async probe({ selectedReleaseHash, publicOrigin, context, signal }) {
+      if (!HASH.test(selectedReleaseHash) || publicOrigin !== HOSTED_PUBLIC_ORIGIN
+        || context?.sourceType !== "openapi" || !HASH.test(context.sourceIdentityHash)
+        || !(signal instanceof AbortSignal)) {
         throw new Error("OPENAPI_PROVIDER_PROBE_FAILED");
       }
       try {
-        await fetchOpenApiSource(`${publicOrigin}/${selectedReleaseHash}.js`, {
+        parsePersistedSourceConfiguration("openapi", context.sourceConfiguration);
+        await fetchOpenApiSource(context.sourceUrl, {
           resolver,
           transport,
           maxBytes: 65_536,
           maxRedirects: 0,
           signal,
         });
-      } catch (error) {
-        // The immutable artifact is JavaScript, so reaching it through the
-        // OpenAPI DNS/TLS policy must stop at the expected media-type gate.
-        if (error instanceof Error && error.message === "OPENAPI_CONTENT_TYPE_BLOCKED") return;
+      } catch {
         throw new Error("OPENAPI_PROVIDER_PROBE_FAILED");
       }
     },

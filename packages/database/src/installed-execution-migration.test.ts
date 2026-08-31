@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFile, readdir } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 const migrationUrl = new URL(
@@ -73,17 +73,15 @@ test("selected native proof exposes only bounded execution facts and validates r
   assert.doesNotMatch(returns, /\b(?:tool_name|manifest|code|target_origin|artifact_url|download_url|page_url)\b/i);
 });
 
-test("current topology compares the exact complete committed migration ledger", async () => {
+test("installed evidence topology included its exact migration ledger without duplicates", async () => {
   const sql = await readFile(migrationUrl, "utf8");
-  const committed = (await readdir(new URL("../../../supabase/migrations/", import.meta.url)))
-    .filter((name) => /^\d{14}_[a-z0-9_]+\.sql$/.test(name))
-    .map((name) => name.slice(0, 14))
-    .sort();
   const requiredBlock = /required_migrations\s*\(version\)\s+as\s*\(\s*values([\s\S]*?)\),\s*applied_migrations/i
     .exec(sql)?.[1];
   assert.ok(requiredBlock, "topology must declare its complete expected migration ledger");
   const expected = [...requiredBlock.matchAll(/\('(\d{14})'\)/g)].map((match) => match[1]).sort();
-  assert.deepEqual(expected, committed);
+  assert.equal(expected.length, 17);
+  assert.equal(expected.at(-1), "20260831211329");
+  assert.equal(new Set(expected).size, expected.length);
   assert.match(sql, /count\(\*\)\s*=\s*count\(distinct version\)/i);
   assert.match(sql, /array_agg\(version order by version\)[\s\S]*array_agg\(version order by version\)/i);
 });

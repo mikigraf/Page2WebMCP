@@ -3,7 +3,9 @@ import { createHash } from "node:crypto";
 import type {
   NativeInstallationProof,
   ProductionProviderProvenance,
+  SelectedProviderProbeContext,
 } from "../../operations/src/readiness.ts";
+import { parsePersistedSourceConfiguration } from "./control-plane.ts";
 
 type MaintenanceQueryResult = Readonly<{ rows: readonly Record<string, unknown>[] }>;
 type MaintenanceReadinessClient = Readonly<{
@@ -27,6 +29,7 @@ export type MaintenanceReadinessRepository = Readonly<{
     selectedReleasePersisted: boolean;
     sessionIdentityDigest: string;
   }>>;
+  loadSelectedProviderProbeContext(hash: string): Promise<SelectedProviderProbeContext | undefined>;
   findSelectedNativeInstallationProof(hash: string): Promise<NativeInstallationProof | undefined>;
   close(): Promise<void>;
 }>;
@@ -179,6 +182,31 @@ export function createMaintenanceReadinessRepository(
         client.release();
       }
     },
+    async loadSelectedProviderProbeContext(hash) {
+      if (!HASH.test(hash)) throw new Error("READINESS_RELEASE_HASH_INVALID");
+      const client = await pool.connect();
+      try {
+        await client.query("begin");
+        await client.query("set transaction read only");
+        await client.query("set local role page2webmcp_maintenance");
+        await configureTransactionBounds(client, timeout);
+        const role = await client.query(ROLE_AUDIT_QUERY);
+        validatedRoleIdentity(role.rows[0], "page2webmcp_maintenance");
+        const result = await client.query(
+          "select * from private.selected_provider_probe_context($1)",
+          [hash],
+        );
+        if (result.rows.length > 1) throw new Error("READINESS_PROVIDER_CONTEXT_INVALID");
+        const context = result.rows[0] ? mapProviderProbeContext(result.rows[0]) : undefined;
+        await client.query("commit");
+        return context;
+      } catch (error) {
+        try { await client.query("rollback"); } catch { /* preserve the original bounded error */ }
+        throw error;
+      } finally {
+        client.release();
+      }
+    },
     close: () => pool.end(),
   };
 }
@@ -224,6 +252,88 @@ const TOPOLOGY_COLUMNS = [
   "migrations_current",
   "rls_verified",
 ] as const;
+
+const PROVIDER_CONTEXT_COLUMNS = [
+  "source_type",
+  "source_url",
+  "source_configuration",
+  "source_identity_hash",
+  "github_installation_id",
+  "github_repository_id",
+  "github_owner",
+  "github_repository",
+  "github_ref",
+  "github_commit_sha",
+  "github_target_origin",
+] as const;
+
+function exactHttpsUrl(value: unknown): value is string {
+  if (typeof value !== "string" || value.length === 0 || value.length > 4_096) return false;
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" && !url.username && !url.password;
+  } catch { return false; }
+}
+
+function positiveSafeInteger(value: unknown): number | undefined {
+  const normalized = typeof value === "string" && /^[1-9][0-9]{0,15}$/.test(value) ? Number(value) : value;
+  return Number.isSafeInteger(normalized) && Number(normalized) > 0 ? Number(normalized) : undefined;
+}
+
+function mapProviderProbeContext(row: Record<string, unknown>): SelectedProviderProbeContext {
+  if (Object.keys(row).sort().join(",") !== [...PROVIDER_CONTEXT_COLUMNS].sort().join(",")
+    || !HASH.test(String(row.source_identity_hash ?? "")) || !exactHttpsUrl(row.source_url)) {
+    throw new Error("READINESS_PROVIDER_CONTEXT_INVALID");
+  }
+  const sourceType = row.source_type;
+  if (sourceType !== "openapi" && sourceType !== "website" && sourceType !== "github") {
+    throw new Error("READINESS_PROVIDER_CONTEXT_INVALID");
+  }
+  if ((sourceType === "website" || sourceType === "github")
+    && (!row.source_configuration || typeof row.source_configuration !== "object"
+      || Array.isArray(row.source_configuration)
+      || Object.keys(row.source_configuration).length !== 1
+      || (row.source_configuration as Record<string, unknown>).kind !== sourceType)) {
+    throw new Error("READINESS_PROVIDER_CONTEXT_INVALID");
+  }
+  let sourceConfiguration: ReturnType<typeof parsePersistedSourceConfiguration>;
+  try { sourceConfiguration = parsePersistedSourceConfiguration(sourceType, row.source_configuration); }
+  catch { throw new Error("READINESS_PROVIDER_CONTEXT_INVALID"); }
+  const common = {
+    sourceType,
+    sourceUrl: row.source_url,
+    sourceIdentityHash: row.source_identity_hash as string,
+    sourceConfiguration,
+  } as const;
+  const githubValues = PROVIDER_CONTEXT_COLUMNS.slice(4).map((column) => row[column]);
+  if (sourceType !== "github") {
+    if (githubValues.some((value) => value !== null)) throw new Error("READINESS_PROVIDER_CONTEXT_INVALID");
+    return common as SelectedProviderProbeContext;
+  }
+  const installationId = positiveSafeInteger(row.github_installation_id);
+  const repositoryId = positiveSafeInteger(row.github_repository_id);
+  const owner = row.github_owner;
+  const repository = row.github_repository;
+  const ref = row.github_ref;
+  const commitSha = row.github_commit_sha;
+  const targetOrigin = row.github_target_origin;
+  if (!installationId || !repositoryId || typeof owner !== "string"
+    || !/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/.test(owner)
+    || typeof repository !== "string" || !/^[A-Za-z0-9._-]{1,100}$/.test(repository)
+    || typeof ref !== "string" || !/^refs\/heads\/[A-Za-z0-9](?:[A-Za-z0-9._/-]{0,252})$/.test(ref)
+    || ref.split("/").some((part) => part === "" || part === "." || part === "..")
+    || typeof commitSha !== "string" || !/^[0-9a-f]{40}$/.test(commitSha)
+    || !exactHttpsUrl(targetOrigin) || new URL(targetOrigin).origin !== targetOrigin
+    || common.sourceUrl !== `https://github.com/${owner}/${repository}`) {
+    throw new Error("READINESS_PROVIDER_CONTEXT_INVALID");
+  }
+  return {
+    ...common,
+    sourceType: "github",
+    sourceConfiguration: { kind: "github" },
+    binding: { installationId, repositoryId, owner, repository, ref, commitSha, targetOrigin },
+  };
+}
 
 function exactProviderMode(provider: ProductionProviderProvenance): ProductionProviderProvenance["mode"] {
   const exact = provider.mode === "openapi"

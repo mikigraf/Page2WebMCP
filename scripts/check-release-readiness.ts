@@ -20,6 +20,7 @@ import {
   evaluateDeploymentReadiness,
   type NativeInstallationProof,
   type ReadinessMode,
+  type SelectedProviderProbeContext,
 } from "../packages/operations/src/readiness.ts";
 
 const HOSTED_PUBLIC_ORIGIN =
@@ -103,9 +104,65 @@ export async function runReadinessCli(
   if (!selectedHash || !HASH.test(selectedHash)) {
     return result("skipped", "LIVE_INSTALLATION_EVIDENCE_REQUIRED", 2);
   }
+  const createApplicationRepository = dependencies.createApplicationRepository
+    ?? ((input) => createApplicationReadinessRepository(input));
+  let applicationRepository: ApplicationReadinessRepository | undefined;
+  let applicationIdentity: Readonly<{ sessionIdentityDigest: string }>;
+  try {
+    applicationRepository = createApplicationRepository({
+      connectionString: environment.DATABASE_URL!,
+      mode: mode === "live" ? "live" : "local-live",
+    });
+    applicationIdentity = await applicationRepository.inspectApplicationRole();
+  } catch {
+    return result("failed", "APPLICATION_DATABASE_READINESS_FAILED", 1);
+  } finally {
+    try { await applicationRepository?.close(); } catch { /* diagnostic export must stay redacted */ }
+  }
+
+  const createRepository = dependencies.createMaintenanceRepository
+    ?? ((input) => createMaintenanceReadinessRepository(input));
+  let repository: MaintenanceReadinessRepository | undefined;
+  let proof: NativeInstallationProof | undefined;
+  let providerContext: SelectedProviderProbeContext | undefined;
+  let topology: Readonly<{
+    migrationsCurrent: boolean;
+    rlsVerified: boolean;
+    selectedReleasePersisted: boolean;
+    sessionIdentityDigest: string;
+  }>;
+  try {
+    repository = createRepository({
+      connectionString: environment.PAGE2WEBMCP_MAINTENANCE_DATABASE_URL!,
+      mode: mode === "live" ? "live" : "local-live",
+    });
+    topology = await repository.inspectSelectedReleaseTopology(
+      selectedHash,
+      provider.provenance,
+      mode === "local-live",
+    );
+    if (mode === "live") providerContext = await repository.loadSelectedProviderProbeContext(selectedHash);
+    if (topology.selectedReleasePersisted
+      && topology.sessionIdentityDigest !== applicationIdentity.sessionIdentityDigest && mode === "live") {
+      proof = await repository.findSelectedNativeInstallationProof(selectedHash);
+    }
+  } catch {
+    return result("failed", "MAINTENANCE_DATABASE_READINESS_FAILED", 1);
+  } finally {
+    try { await repository?.close(); } catch { /* diagnostic export must stay redacted */ }
+  }
+  if (topology.sessionIdentityDigest === applicationIdentity.sessionIdentityDigest) {
+    return result("failed", "DATABASE_ROLE_SEPARATION_FAILED", 1);
+  }
+  if (!topology.selectedReleasePersisted || mode === "live" && !providerContext) {
+    return result("skipped", "LIVE_INSTALLATION_EVIDENCE_REQUIRED", 2);
+  }
   if (mode === "live") {
     try {
-      await probeSelectedProvider(provider, selectedHash, controls.publicOrigin);
+      if (!providerContext || providerContext.sourceType !== provider.provenance.mode) {
+        throw new Error("PROVIDER_CONTEXT_MISMATCH");
+      }
+      await probeSelectedProvider(provider, selectedHash, controls.publicOrigin, providerContext);
     } catch {
       return result("skipped", "LIVE_CONTROLS_REQUIRED", 2);
     }
@@ -134,54 +191,6 @@ export async function runReadinessCli(
     return result("failed", "RELEASE_VERIFIER_READINESS_FAILED", 1);
   }
 
-  const createApplicationRepository = dependencies.createApplicationRepository
-    ?? ((input) => createApplicationReadinessRepository(input));
-  let applicationRepository: ApplicationReadinessRepository | undefined;
-  let applicationIdentity: Readonly<{ sessionIdentityDigest: string }>;
-  try {
-    applicationRepository = createApplicationRepository({
-      connectionString: environment.DATABASE_URL!,
-      mode: mode === "live" ? "live" : "local-live",
-    });
-    applicationIdentity = await applicationRepository.inspectApplicationRole();
-  } catch {
-    return result("failed", "APPLICATION_DATABASE_READINESS_FAILED", 1);
-  } finally {
-    try { await applicationRepository?.close(); } catch { /* diagnostic export must stay redacted */ }
-  }
-
-  const createRepository = dependencies.createMaintenanceRepository
-    ?? ((input) => createMaintenanceReadinessRepository(input));
-  let repository: MaintenanceReadinessRepository | undefined;
-  let proof: NativeInstallationProof | undefined;
-  let topology: Readonly<{
-    migrationsCurrent: boolean;
-    rlsVerified: boolean;
-    selectedReleasePersisted: boolean;
-    sessionIdentityDigest: string;
-  }>;
-  try {
-    repository = createRepository({
-      connectionString: environment.PAGE2WEBMCP_MAINTENANCE_DATABASE_URL!,
-      mode: mode === "live" ? "live" : "local-live",
-    });
-    topology = await repository.inspectSelectedReleaseTopology(
-      selectedHash,
-      provider.provenance,
-      mode === "local-live",
-    );
-    if (topology.sessionIdentityDigest !== applicationIdentity.sessionIdentityDigest && mode === "live") {
-      proof = await repository.findSelectedNativeInstallationProof(selectedHash);
-    }
-  } catch {
-    return result("failed", "MAINTENANCE_DATABASE_READINESS_FAILED", 1);
-  } finally {
-    try { await repository?.close(); } catch { /* diagnostic export must stay redacted */ }
-  }
-  if (topology.sessionIdentityDigest === applicationIdentity.sessionIdentityDigest) {
-    return result("failed", "DATABASE_ROLE_SEPARATION_FAILED", 1);
-  }
-
   const output = evaluateDeploymentReadiness({
     mode,
     ...local,
@@ -204,6 +213,7 @@ async function probeSelectedProvider(
   provider: ReturnType<typeof createProductionProvider>,
   selectedReleaseHash: string,
   publicOrigin: string,
+  context: SelectedProviderProbeContext,
 ): Promise<void> {
   const controller = new AbortController();
   let rejectTimeout!: (error: Error) => void;
@@ -214,12 +224,17 @@ async function probeSelectedProvider(
     rejectTimeout(error);
   }, PROVIDER_PROBE_TIMEOUT_MS);
   timer.unref?.();
+  const operation = Promise.resolve().then(() => provider.probe({
+    selectedReleaseHash, publicOrigin, context, signal: controller.signal,
+  }));
   try {
-    await Promise.race([
-      provider.probe({ selectedReleaseHash, publicOrigin, signal: controller.signal }),
-      timeout,
-    ]);
+    await Promise.race([operation, timeout]);
+  } catch (error) {
+    controller.abort(error);
+    await Promise.allSettled([operation]);
+    throw error;
   } finally {
+    controller.abort(new Error("PROVIDER_PROBE_CLOSED"));
     clearTimeout(timer);
   }
 }
@@ -324,15 +339,21 @@ async function localFacts() {
   const installedExecution = await readFile(new URL(
     "../supabase/migrations/20260831211329_installed_execution_evidence.sql", import.meta.url,
   ), "utf8");
+  const selectedProviderContext = await readFile(new URL(
+    "../supabase/migrations/20260901000000_selected_provider_probe_context.sql", import.meta.url,
+  ), "utf8");
   const task6 = await readFile(new URL(
     "../supabase/migrations/20260830094622_trusted_release_installations.sql", import.meta.url,
   ), "utf8");
   return {
     versionDrift: checkPackageVersionDrift(packageJson),
-    migrationsCurrent: migrations.includes("20260831211329_installed_execution_evidence.sql"),
+    migrationsCurrent: migrations.includes("20260831211329_installed_execution_evidence.sql")
+      && migrations.includes("20260901000000_selected_provider_probe_context.sql"),
     rlsVerified: /selected_native_installation_proof/i.test(installedExecution)
       && /confirmed_mutation_effect_count\s*=\s*1/i.test(installedExecution)
       && /grant execute[^;]+page2webmcp_maintenance/is.test(installedExecution)
+      && /selected_provider_probe_context/i.test(selectedProviderContext)
+      && /grant execute[^;]+page2webmcp_maintenance/is.test(selectedProviderContext)
       && /force row level security/i.test(task6),
   };
 }

@@ -59,6 +59,39 @@ export type ProductionProviderProvenance =
   | Readonly<{ mode: "website"; adapter: "browser-use-v4"; adapterVersion: 4; fixture: false }>
   | Readonly<{ mode: "github"; adapter: "github-app"; adapterVersion: 20260310; fixture: false }>;
 
+type SelectedSourceIdentity = Readonly<{
+  sourceUrl: string;
+  sourceIdentityHash: string;
+}>;
+
+export type SelectedProviderProbeContext =
+  | SelectedSourceIdentity & Readonly<{
+    sourceType: "openapi";
+    sourceConfiguration: Readonly<{
+      kind: "openapi";
+      targetOrigin: string;
+      testPageUrl: string;
+      environment: "test" | "staging" | "production";
+    }>;
+  }>
+  | SelectedSourceIdentity & Readonly<{
+    sourceType: "website";
+    sourceConfiguration: Readonly<{ kind: "website" }>;
+  }>
+  | SelectedSourceIdentity & Readonly<{
+    sourceType: "github";
+    sourceConfiguration: Readonly<{ kind: "github" }>;
+    binding: Readonly<{
+      installationId: number;
+      repositoryId: number;
+      owner: string;
+      repository: string;
+      ref: string;
+      commitSha: string;
+      targetOrigin: string;
+    }>;
+  }>;
+
 export type NativeInstallationProof = Readonly<{
   selectedReleaseHash: string;
   releaseContentHash: string;

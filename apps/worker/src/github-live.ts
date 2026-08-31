@@ -8,6 +8,12 @@ import {
 } from "../../../packages/providers/src/github.ts";
 import type { GitHubSandboxPort } from "../../../packages/providers/src/github-sandbox.ts";
 import { createGitHubAnalysisAdapter, type AnalysisAdapter } from "./workflow.ts";
+import {
+  createNodePinnedJsonTransport,
+  type NodePinnedJsonResponse,
+  type NodePinnedJsonTransport,
+} from "./node-network.ts";
+import type { SelectedProviderProbeContext } from "../../../packages/operations/src/readiness.ts";
 
 const GITHUB_API_ORIGIN = "https://api.github.com";
 const GITHUB_API_VERSION = "2026-03-10";
@@ -43,13 +49,23 @@ export type ConfiguredGitHubWorkflow = ConfiguredGitHubAnalysis & Readonly<{
 type GitHubLiveDependencies = Readonly<{
   fetch: Fetch;
   clock?: () => Date;
+  controlTransport?: NodePinnedJsonTransport;
 }>;
 
 type GitHubProviderProbeInput = Readonly<{
   selectedReleaseHash: string;
   publicOrigin: string;
+  context: SelectedProviderProbeContext;
   signal: AbortSignal;
 }>;
+
+const REQUIRED_GITHUB_PERMISSIONS = Object.freeze({
+  checks: "write",
+  contents: "write",
+  deployments: "read",
+  metadata: "read",
+  pull_requests: "write",
+} as const);
 
 function compareStrings(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
@@ -63,6 +79,11 @@ function exactTargetOrigin(value: unknown): value is string {
   } catch {
     return false;
   }
+}
+
+function boundedBearerToken(value: unknown, minimum: number, maximum: number): value is string {
+  return typeof value === "string" && value.length >= minimum && value.length <= maximum
+    && value.trim() === value && /^[\u0021-\u007e]+$/.test(value);
 }
 
 function parseBindings(value: string | undefined): ConfiguredGitHubRepository[] {
@@ -123,7 +144,7 @@ export function githubConfigurationInvalidKeys(environment: RuntimeEnvironment):
     invalid.push("PAGE2WEBMCP_GITHUB_SANDBOX_ORIGIN");
   }
   const sandboxToken = environment.PAGE2WEBMCP_GITHUB_SANDBOX_TOKEN;
-  if (!sandboxToken || sandboxToken.length < 32 || sandboxToken.length > 512) {
+  if (!boundedBearerToken(sandboxToken, 32, 512)) {
     invalid.push("PAGE2WEBMCP_GITHUB_SANDBOX_TOKEN");
   }
   return invalid.sort(compareStrings);
@@ -167,41 +188,54 @@ function asRecord(value: unknown, code = "GITHUB_API_RESPONSE_INVALID"): Record<
   return value as Record<string, unknown>;
 }
 
-async function readBoundedResponse(response: Response, maximum: number, code: string): Promise<Buffer> {
-  const reader = response.body?.getReader();
-  if (!reader) throw new Error(code);
-  const chunks: Buffer[] = [];
-  let length = 0;
-  for (;;) {
-    const chunk = await reader.read();
-    if (chunk.done) break;
-    length += chunk.value.byteLength;
-    if (length > maximum) {
-      await reader.cancel();
-      throw new Error(code);
-    }
-    chunks.push(Buffer.from(chunk.value));
-  }
-  return Buffer.concat(chunks, length);
-}
-
 function sha(value: unknown, code: string): string {
   if (typeof value !== "string" || !/^[a-f0-9]{40}$/.test(value)) throw new Error(code);
   return value;
+}
+
+function hasRequiredGitHubPermissions(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const permissions = value as Record<string, unknown>;
+  return Object.entries(REQUIRED_GITHUB_PERMISSIONS).every(([name, access]) => permissions[name] === access);
+}
+
+function pinnedJson(
+  response: NodePinnedJsonResponse,
+  expectedUrl: string,
+  code: string,
+  maximum = MAX_READINESS_BYTES,
+): Record<string, unknown> {
+  const declared = response.headers["content-length"];
+  if (response.url !== expectedUrl || response.status !== 200
+    || response.headers["set-cookie"] !== undefined
+    || response.headers["content-type"]?.split(";", 1)[0]?.trim().toLowerCase() !== "application/json"
+    || declared !== undefined && (!/^\d+$/.test(declared) || Number(declared) > maximum)
+    || !(response.body instanceof Uint8Array) || response.body.byteLength === 0
+    || response.body.byteLength > maximum) throw new Error(code);
+  try { return asRecord(JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(response.body)), code); }
+  catch { throw new Error(code); }
 }
 
 function branchName(ref: string): string {
   return ref.slice("refs/heads/".length);
 }
 
-function linkedSignal(parent: AbortSignal): Readonly<{ signal: AbortSignal; close(): void }> {
+function linkedSignal(parent: AbortSignal): Readonly<{
+  signal: AbortSignal;
+  abort(reason?: unknown): void;
+  close(): void;
+}> {
   const controller = new AbortController();
   const abort = () => controller.abort(parent.reason ?? new Error("GITHUB_REQUEST_CANCELLED"));
   if (parent.aborted) abort();
   else parent.addEventListener("abort", abort, { once: true });
   const timer = setTimeout(() => controller.abort(new Error("GITHUB_REQUEST_DEADLINE_EXCEEDED")), REQUEST_DEADLINE_MS);
   timer.unref?.();
-  return { signal: controller.signal, close: () => { clearTimeout(timer); parent.removeEventListener("abort", abort); } };
+  return {
+    signal: controller.signal,
+    abort: (reason = new Error("GITHUB_REQUEST_CANCELLED")) => controller.abort(reason),
+    close: () => { clearTimeout(timer); parent.removeEventListener("abort", abort); },
+  };
 }
 
 function createGitHubRequest(fetcher: Fetch, appId: string, privateKey: ReturnType<typeof createPrivateKey>, clock: () => Date) {
@@ -285,31 +319,96 @@ export function createConfiguredGitHubAnalysis(
   const appId = environment.PAGE2WEBMCP_GITHUB_APP_ID;
   if (!appId) throw new Error("GITHUB_LIVE_CONFIGURATION_REQUIRED");
   const request = createGitHubRequest(dependencies.fetch, appId, privateKey, clock);
+  const revokeInstallationToken = async (token: string): Promise<void> => {
+    await request("/installation/token", {
+      token,
+      signal: new AbortController().signal,
+      method: "DELETE",
+      expected: [204],
+    });
+  };
   const probe = async (input: GitHubProviderProbeInput): Promise<void> => {
     if (!/^[0-9a-f]{64}$/.test(input?.selectedReleaseHash ?? "")
-      || input.publicOrigin !== HOSTED_PUBLIC_ORIGIN || !(input.signal instanceof AbortSignal)) {
+      || input.publicOrigin !== HOSTED_PUBLIC_ORIGIN || !(input.signal instanceof AbortSignal)
+      || input.context?.sourceType !== "github" || !/^[0-9a-f]{64}$/.test(input.context.sourceIdentityHash)
+      || Object.keys(input.context.sourceConfiguration).length !== 1
+      || input.context.sourceConfiguration.kind !== "github") {
       throw new Error("GITHUB_PROVIDER_PROBE_FAILED");
     }
+    const selected = input.context.binding;
+    const configured = bindings.find((binding) => binding.repositoryId === selected.repositoryId);
+    if (!configured || configured.installationId !== selected.installationId
+      || configured.owner !== selected.owner || configured.repository !== selected.repository
+      || configured.ref !== selected.ref || configured.targetOrigin !== selected.targetOrigin
+      || input.context.sourceUrl !== `https://github.com/${selected.owner}/${selected.repository}`
+      || !/^[0-9a-f]{40}$/.test(selected.commitSha)) {
+      throw new Error("GITHUB_PROVIDER_PROBE_FAILED");
+    }
+    let installationToken: string | undefined;
     try {
       const app = asRecord(await request("/app", {
         appAuthentication: true,
         signal: input.signal,
       }));
       if (!Number.isSafeInteger(app.id) || String(app.id) !== appId
-        || typeof app.slug !== "string" || !/^[a-z0-9](?:[a-z0-9-]{0,99})$/.test(app.slug)) {
+        || typeof app.slug !== "string" || !/^[a-z0-9](?:[a-z0-9-]{0,99})$/.test(app.slug)
+        || !hasRequiredGitHubPermissions(app.permissions)) {
         throw new Error("GITHUB_PROVIDER_PROBE_FAILED");
       }
-      await Promise.all(bindings.map(async (binding) => {
-        const installation = asRecord(await request(`${repositoryPath(binding)}/installation`, {
-          appAuthentication: true,
-          signal: input.signal,
-        }));
-        if (installation.id !== binding.installationId || String(installation.app_id) !== appId) {
-          throw new Error("GITHUB_PROVIDER_PROBE_FAILED");
-        }
+      const installation = asRecord(await request(`${repositoryPath(configured)}/installation`, {
+        appAuthentication: true,
+        signal: input.signal,
       }));
+      const account = asRecord(installation.account, "GITHUB_PROVIDER_PROBE_FAILED");
+      if (installation.id !== selected.installationId || String(installation.app_id) !== appId
+        || installation.repository_selection !== "selected" || account.login !== selected.owner
+        || !hasRequiredGitHubPermissions(installation.permissions)) {
+        throw new Error("GITHUB_PROVIDER_PROBE_FAILED");
+      }
+      const tokenValue = asRecord(await request(`/app/installations/${selected.installationId}/access_tokens`, {
+        appAuthentication: true,
+        signal: input.signal,
+        method: "POST",
+        expected: [201],
+        body: { repository_ids: [selected.repositoryId], permissions: REQUIRED_GITHUB_PERMISSIONS },
+      }));
+      const repositories = tokenValue.repositories;
+      if (!boundedBearerToken(tokenValue.token, 20, 4_096)) {
+        throw new Error("GITHUB_PROVIDER_PROBE_FAILED");
+      }
+      installationToken = tokenValue.token;
+      if (!Array.isArray(repositories) || repositories.length !== 1) {
+        throw new Error("GITHUB_PROVIDER_PROBE_FAILED");
+      }
+      const repository = asRecord(repositories[0], "GITHUB_PROVIDER_PROBE_FAILED");
+      if (repository.id !== selected.repositoryId
+        || repository.full_name !== `${selected.owner}/${selected.repository}`) {
+        throw new Error("GITHUB_PROVIDER_PROBE_FAILED");
+      }
+      const liveRepository = asRecord(await request(repositoryPath(selected), {
+        token: installationToken,
+        signal: input.signal,
+      }));
+      if (liveRepository.id !== selected.repositoryId
+        || liveRepository.full_name !== `${selected.owner}/${selected.repository}`) {
+        throw new Error("GITHUB_PROVIDER_PROBE_FAILED");
+      }
+      const refPath = selected.ref.slice("refs/".length).split("/").map(encodeURIComponent).join("/");
+      const ref = asRecord(await request(`${repositoryPath(selected)}/git/ref/${refPath}`, {
+        token: installationToken,
+        signal: input.signal,
+      }));
+      const object = asRecord(ref.object, "GITHUB_PROVIDER_PROBE_FAILED");
+      if (ref.ref !== selected.ref || object.type !== "commit" || object.sha !== selected.commitSha) {
+        throw new Error("GITHUB_PROVIDER_PROBE_FAILED");
+      }
     } catch {
       throw new Error("GITHUB_PROVIDER_PROBE_FAILED");
+    } finally {
+      if (installationToken) {
+        try { await revokeInstallationToken(installationToken); }
+        catch { throw new Error("GITHUB_PROVIDER_PROBE_FAILED"); }
+      }
     }
   };
   const byRepository = new Map(bindings.map((binding) => [`${binding.owner}/${binding.repository}`, binding]));
@@ -329,25 +428,28 @@ export function createConfiguredGitHubAnalysis(
         expected: [201],
         body: {
           repository_ids: [binding.repositoryId],
-          permissions: { checks: "write", contents: "write", deployments: "read", metadata: "read", pull_requests: "write" },
+          permissions: REQUIRED_GITHUB_PERMISSIONS,
         },
       }));
+      if (!boundedBearerToken(value.token, 20, 4_096)) throw new Error("GITHUB_TOKEN_SCOPE_MISMATCH");
+      const token = value.token;
       const repositories = value.repositories;
-      if (!Array.isArray(repositories) || repositories.length !== 1) throw new Error("GITHUB_TOKEN_SCOPE_MISMATCH");
-      const repository = asRecord(repositories[0], "GITHUB_TOKEN_SCOPE_MISMATCH");
-      if (repository.id !== binding.repositoryId || repository.full_name !== `${binding.owner}/${binding.repository}`
-        || typeof value.token !== "string" || typeof value.expires_at !== "string") {
+      try {
+        if (!Array.isArray(repositories) || repositories.length !== 1) throw new Error("GITHUB_TOKEN_SCOPE_MISMATCH");
+        const repository = asRecord(repositories[0], "GITHUB_TOKEN_SCOPE_MISMATCH");
+        if (repository.id !== binding.repositoryId || repository.full_name !== `${binding.owner}/${binding.repository}`
+          || typeof value.expires_at !== "string") {
+          throw new Error("GITHUB_TOKEN_SCOPE_MISMATCH");
+        }
+        return { ...selection, token, expiresAt: value.expires_at };
+      } catch {
+        try { await revokeInstallationToken(token); }
+        catch { throw new Error("GITHUB_TOKEN_REVOCATION_FAILED"); }
         throw new Error("GITHUB_TOKEN_SCOPE_MISMATCH");
       }
-      return { ...selection, token: value.token, expiresAt: value.expires_at };
     },
     revoke: async (token) => {
-      await request("/installation/token", {
-        token,
-        signal: new AbortController().signal,
-        method: "DELETE",
-        expected: [204],
-      });
+      await revokeInstallationToken(token);
     },
   };
   const snapshot: GitHubSnapshotPort = {
@@ -575,26 +677,26 @@ export function createConfiguredGitHubWorkflow(
   const github = createConfiguredGitHubAnalysis(environment, dependencies);
   const originValue = environment.PAGE2WEBMCP_GITHUB_SANDBOX_ORIGIN;
   const token = environment.PAGE2WEBMCP_GITHUB_SANDBOX_TOKEN;
-  if (!exactTargetOrigin(originValue) || !token || token.length < 32 || token.length > 512) {
+  if (!exactTargetOrigin(originValue) || !boundedBearerToken(token, 32, 512)) {
     throw new Error("GITHUB_SANDBOX_CONFIGURATION_REQUIRED");
   }
+  const sandboxTransport = dependencies.controlTransport ?? createNodePinnedJsonTransport();
   const sandbox: GitHubSandboxPort = {
     run: async (input) => {
       const url = `${originValue}/v1/github/verify`;
       const lifecycle = linkedSignal(input.signal);
       try {
-        const response = await dependencies.fetch(url, {
-          method: "POST", redirect: "error", signal: lifecycle.signal,
+        const body = JSON.stringify({ ...input, signal: undefined });
+        const response = await sandboxTransport.request({
+          url,
+          method: "POST",
+          signal: lifecycle.signal,
           headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
-          body: JSON.stringify({ ...input, signal: undefined }),
+          body,
+          maxResponseBytes: MAX_RESPONSE_BYTES,
         });
-        if (response.url !== url || response.status !== 200
-          || response.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase() !== "application/json") {
-          throw new Error("GITHUB_SANDBOX_RESPONSE_INVALID");
-        }
-        const bytes = Buffer.from(await response.arrayBuffer());
-        if (bytes.byteLength > MAX_RESPONSE_BYTES) throw new Error("GITHUB_SANDBOX_RESPONSE_TOO_LARGE");
-        try { return JSON.parse(bytes.toString("utf8")); } catch { throw new Error("GITHUB_SANDBOX_RESPONSE_INVALID"); }
+        return pinnedJson(response, url, "GITHUB_SANDBOX_RESPONSE_INVALID", MAX_RESPONSE_BYTES) as
+          Awaited<ReturnType<GitHubSandboxPort["run"]>>;
       } finally {
         lifecycle.close();
       }
@@ -608,13 +710,12 @@ export function createConfiguredGitHubWorkflow(
     const nonce = randomBytes(32).toString("hex");
     const url = `${originValue}/v1/readiness`;
     const lifecycle = linkedSignal(input.signal);
-    try {
-      await Promise.all([
-        github.probe(input),
-        (async () => {
-          const response = await dependencies.fetch(url, {
+    const operations = [
+      async () => github.probe({ ...input, signal: lifecycle.signal }),
+      async () => {
+          const response = await sandboxTransport.request({
+            url,
             method: "GET",
-            redirect: "error",
             signal: lifecycle.signal,
             headers: {
               accept: "application/json",
@@ -623,18 +724,7 @@ export function createConfiguredGitHubWorkflow(
               "x-page2webmcp-release-hash": input.selectedReleaseHash,
             },
           });
-          const mediaType = response.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase();
-          const declared = response.headers.get("content-length");
-          if (response.url !== url || response.redirected || response.status !== 200
-            || response.headers.has("set-cookie") || mediaType !== "application/json"
-            || declared !== null && (!/^\d+$/.test(declared) || Number(declared) > MAX_READINESS_BYTES)) {
-            throw new Error("GITHUB_PROVIDER_PROBE_FAILED");
-          }
-          const bytes = await readBoundedResponse(response, MAX_READINESS_BYTES, "GITHUB_PROVIDER_PROBE_FAILED");
-          if (bytes.byteLength === 0 || bytes.byteLength > MAX_READINESS_BYTES) {
-            throw new Error("GITHUB_PROVIDER_PROBE_FAILED");
-          }
-          const value = asRecord(JSON.parse(bytes.toString("utf8")), "GITHUB_PROVIDER_PROBE_FAILED");
+          const value = pinnedJson(response, url, "GITHUB_PROVIDER_PROBE_FAILED");
           const expected = {
             protocolVersion: 1,
             status: "ready",
@@ -649,11 +739,19 @@ export function createConfiguredGitHubWorkflow(
             || Object.entries(expected).some(([key, expectedValue]) => value[key] !== expectedValue)) {
             throw new Error("GITHUB_PROVIDER_PROBE_FAILED");
           }
-        })(),
-      ]);
-    } catch {
-      throw new Error("GITHUB_PROVIDER_PROBE_FAILED");
-    } finally { lifecycle.close(); }
+      },
+    ].map(async (operation) => {
+      try { await operation(); }
+      catch (error) { lifecycle.abort(error); throw error; }
+    });
+    try {
+      const settled = await Promise.allSettled(operations);
+      if (settled.some((result) => result.status === "rejected")) throw new Error("GITHUB_PROVIDER_PROBE_FAILED");
+    } catch { throw new Error("GITHUB_PROVIDER_PROBE_FAILED"); }
+    finally {
+      lifecycle.abort(new Error("GITHUB_REQUEST_CANCELLED"));
+      lifecycle.close();
+    }
   };
   const api = (() => {
     const appId = environment.PAGE2WEBMCP_GITHUB_APP_ID;

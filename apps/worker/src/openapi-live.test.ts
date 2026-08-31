@@ -81,14 +81,14 @@ test("configured OpenAPI factory consumes per-run context and ignores deployment
   assert.equal("authorization" in requests[0]!.headers, false);
 });
 
-test("OpenAPI readiness freshly exercises bounded DNS and HTTPS against the selected immutable artifact", async () => {
+test("OpenAPI readiness freshly exercises bounded DNS and HTTPS against the selected release source", async () => {
   const requests: Parameters<OpenApiProviderControls["transport"]["request"]>[0][] = [];
-  let bodyDiscarded = false;
+  const source = JSON.stringify({ openapi: "3.1.0", info: { title: "Widgets", version: "1" }, paths: {} });
   const provider = createConfiguredOpenApiProductionAdapter(
     { PAGE2WEBMCP_PROVIDER_MODE: "openapi" },
     {
       resolver: { resolve: async (hostname) => {
-        assert.equal(hostname, "bimqgiedckdurqiywctl.supabase.co");
+        assert.equal(hostname, "specs.widgets.example");
         return ["93.184.216.34"];
       } },
       transport: { request: async (request) => {
@@ -97,14 +97,9 @@ test("OpenAPI readiness freshly exercises bounded DNS and HTTPS against the sele
           status: 200,
           url: request.url,
           connectedAddress: "93.184.216.34",
-          tls: { authorized: true, servername: "bimqgiedckdurqiywctl.supabase.co", protocol: "TLSv1.3" },
-          headers: { "content-type": "application/javascript" },
-          body: { [Symbol.asyncIterator]() {
-            return {
-              next: async () => ({ done: false, value: new TextEncoder().encode("must-not-be-read") }),
-              return: async () => { bodyDiscarded = true; return { done: true, value: undefined }; },
-            };
-          } },
+          tls: { authorized: true, servername: "specs.widgets.example", protocol: "TLSv1.3" },
+          headers: { "content-type": "application/json" },
+          body: { async *[Symbol.asyncIterator]() { yield new TextEncoder().encode(source); } },
         };
       } },
     },
@@ -112,11 +107,22 @@ test("OpenAPI readiness freshly exercises bounded DNS and HTTPS against the sele
   await provider.probe({
     selectedReleaseHash: "a".repeat(64),
     publicOrigin: "https://bimqgiedckdurqiywctl.supabase.co/storage/v1/object/public/page2webmcp-releases",
+    context: {
+      sourceType: "openapi",
+      sourceUrl: "https://specs.widgets.example/openapi.json",
+      sourceIdentityHash: "b".repeat(64),
+      sourceConfiguration: {
+        kind: "openapi",
+        targetOrigin: "https://widgets.example",
+        testPageUrl: "https://widgets.example/webmcp-test",
+        environment: "production",
+      },
+    },
     signal: new AbortController().signal,
   });
   assert.equal(requests.length, 1);
   assert.deepEqual(requests[0], {
-    url: `https://bimqgiedckdurqiywctl.supabase.co/storage/v1/object/public/page2webmcp-releases/${"a".repeat(64)}.js`,
+    url: "https://specs.widgets.example/openapi.json",
     method: "GET",
     headers: { accept: "application/json, application/openapi+json, application/yaml, application/x-yaml, text/yaml" },
     pinnedAddresses: ["93.184.216.34"],
@@ -124,7 +130,29 @@ test("OpenAPI readiness freshly exercises bounded DNS and HTTPS against the sele
     credentials: "omit",
     signal: requests[0]!.signal,
   });
-  assert.equal(bodyDiscarded, true);
+});
+
+test("OpenAPI readiness rejects a descriptor for a different provider before network access", async () => {
+  let requested = false;
+  const provider = createConfiguredOpenApiProductionAdapter(
+    { PAGE2WEBMCP_PROVIDER_MODE: "openapi" },
+    {
+      resolver: { resolve: async () => { requested = true; return ["93.184.216.34"]; } },
+      transport: { request: async () => { throw new Error("UNUSED"); } },
+    },
+  );
+  await assert.rejects(provider.probe({
+    selectedReleaseHash: "a".repeat(64),
+    publicOrigin: "https://bimqgiedckdurqiywctl.supabase.co/storage/v1/object/public/page2webmcp-releases",
+    context: {
+      sourceType: "website",
+      sourceUrl: "https://widgets.example",
+      sourceIdentityHash: "b".repeat(64),
+      sourceConfiguration: { kind: "website" },
+    },
+    signal: new AbortController().signal,
+  }), /^Error: OPENAPI_PROVIDER_PROBE_FAILED$/);
+  assert.equal(requested, false);
 });
 
 test("OpenAPI readiness redacts an unreachable or rejected artifact transport", async () => {
@@ -138,6 +166,15 @@ test("OpenAPI readiness redacts an unreachable or rejected artifact transport", 
   await assert.rejects(provider.probe({
     selectedReleaseHash: "a".repeat(64),
     publicOrigin: "https://bimqgiedckdurqiywctl.supabase.co/storage/v1/object/public/page2webmcp-releases",
+    context: {
+      sourceType: "openapi",
+      sourceUrl: "https://specs.widgets.example/openapi.json",
+      sourceIdentityHash: "b".repeat(64),
+      sourceConfiguration: {
+        kind: "openapi", targetOrigin: "https://widgets.example",
+        testPageUrl: "https://widgets.example/review", environment: "staging",
+      },
+    },
     signal: new AbortController().signal,
   }), /^Error: OPENAPI_PROVIDER_PROBE_FAILED$/);
 });

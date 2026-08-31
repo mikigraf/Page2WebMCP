@@ -72,10 +72,32 @@ function topologyRow() {
   };
 }
 
+function probeContextRow() {
+  return {
+    source_type: "openapi",
+    source_url: "https://specs.widgets.example/openapi.json",
+    source_configuration: {
+      kind: "openapi",
+      targetOrigin: "https://widgets.example",
+      testPageUrl: "https://widgets.example/webmcp-test",
+      environment: "production",
+    },
+    source_identity_hash: "d".repeat(64),
+    github_installation_id: null,
+    github_repository_id: null,
+    github_owner: null,
+    github_repository: null,
+    github_ref: null,
+    github_commit_sha: null,
+    github_target_origin: null,
+  };
+}
+
 function fakePool(
   roleOverrides: Record<string, unknown> = {},
   rows = [proofRow()],
   expectedRole: "page2webmcp_app" | "page2webmcp_maintenance" = "page2webmcp_maintenance",
+  contextRows: readonly Record<string, unknown>[] = [probeContextRow()],
 ) {
   const queries: Array<{ text: string; values?: readonly unknown[] }> = [];
   let released = 0;
@@ -113,6 +135,7 @@ function fakePool(
           }] };
         }
         if (text.includes("private.selected_release_readiness_topology")) return { rows: [topologyRow()] };
+        if (text.includes("private.selected_provider_probe_context")) return { rows: contextRows };
         if (text.includes("private.selected_native_installation_proof")) return { rows };
         return { rows: [] };
       },
@@ -248,6 +271,40 @@ test("maintenance readiness reads only the exact selected hash through the bound
   assert.equal(fake.released(), 1);
   await repository.close();
   assert.equal(fake.ended(), 1);
+});
+
+test("maintenance readiness loads a typed source descriptor only from the exact selected release", async () => {
+  const fake = fakePool();
+  const repository = createMaintenanceReadinessRepository({
+    connectionString: "postgresql://redacted.invalid/db", mode: "live", pool: fake.pool,
+  });
+  assert.deepEqual(await repository.loadSelectedProviderProbeContext(selectedHash), {
+    sourceType: "openapi",
+    sourceUrl: "https://specs.widgets.example/openapi.json",
+    sourceIdentityHash: "d".repeat(64),
+    sourceConfiguration: {
+      kind: "openapi", targetOrigin: "https://widgets.example",
+      testPageUrl: "https://widgets.example/webmcp-test", environment: "production",
+    },
+  });
+  assert.deepEqual(fake.queries.filter(({ text }) => text.includes("selected_provider_probe_context")), [{
+    text: "select * from private.selected_provider_probe_context($1)", values: [selectedHash],
+  }]);
+});
+
+test("maintenance readiness distinguishes an absent selected context from malformed or duplicate contexts", async () => {
+  const absent = fakePool({}, [], "page2webmcp_maintenance", []);
+  const absentRepository = createMaintenanceReadinessRepository({
+    connectionString: "postgresql://redacted.invalid/db", mode: "live", pool: absent.pool,
+  });
+  assert.equal(await absentRepository.loadSelectedProviderProbeContext(selectedHash), undefined);
+
+  const duplicate = fakePool({}, [], "page2webmcp_maintenance", [probeContextRow(), probeContextRow()]);
+  const duplicateRepository = createMaintenanceReadinessRepository({
+    connectionString: "postgresql://redacted.invalid/db", mode: "live", pool: duplicate.pool,
+  });
+  await assert.rejects(duplicateRepository.loadSelectedProviderProbeContext(selectedHash),
+    /^Error: READINESS_PROVIDER_CONTEXT_INVALID$/);
 });
 
 test("maintenance readiness rejects every privilege, ownership, and assumable-role escape", async () => {

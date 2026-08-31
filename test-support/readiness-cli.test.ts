@@ -17,6 +17,17 @@ const artifactBytes = Buffer.from("export const selected = true;", "utf8");
 const selectedHash = createHash("sha256").update(artifactBytes).digest("hex");
 const hosted = "https://bimqgiedckdurqiywctl.supabase.co/storage/v1/object/public/page2webmcp-releases";
 const local = "http://127.0.0.1:54321/storage/v1/object/public/page2webmcp-releases";
+const selectedContext = {
+  sourceType: "openapi" as const,
+  sourceUrl: "https://specs.widgets.example/openapi.json",
+  sourceIdentityHash: "e".repeat(64),
+  sourceConfiguration: {
+    kind: "openapi" as const,
+    targetOrigin: "https://widgets.example",
+    testPageUrl: "https://widgets.example/webmcp-test",
+    environment: "production" as const,
+  },
+};
 
 async function spawn(args: string[], environment: Record<string, string | undefined> = {}) {
   return run(process.execPath, ["--import", "tsx", script, ...args], {
@@ -56,7 +67,12 @@ function response(url: string, bytes = artifactBytes): Response {
   return value;
 }
 
-function dependencies(order: string[], expectedLocalOnly = false): ReadinessCliDependencies {
+function dependencies(
+  order: string[],
+  expectedLocalOnly = false,
+  selectedReleasePersisted = true,
+  context: typeof selectedContext | undefined = selectedContext,
+): ReadinessCliDependencies {
   return {
     constructProvider: () => {
       order.push("provider");
@@ -64,10 +80,11 @@ function dependencies(order: string[], expectedLocalOnly = false): ReadinessCliD
         provenance: { mode: "openapi", adapter: "bounded-openapi", adapterVersion: 1, fixture: false },
         analysisSourceTypes: ["openapi"],
         analyze: async () => { throw new Error("UNUSED"); },
-        probe: async ({ selectedReleaseHash, publicOrigin, signal }) => {
+        probe: async ({ selectedReleaseHash, publicOrigin, context, signal }) => {
           order.push("provider-probe");
           assert.equal(selectedReleaseHash, selectedHash);
           assert.equal(publicOrigin, hosted);
+          assert.deepEqual(context, selectedContext);
           assert.equal(signal.aborted, false);
         },
       };
@@ -105,9 +122,14 @@ function dependencies(order: string[], expectedLocalOnly = false): ReadinessCliD
           return {
             migrationsCurrent: true,
             rlsVerified: true,
-            selectedReleasePersisted: true,
+            selectedReleasePersisted,
             sessionIdentityDigest: "d".repeat(64),
           };
+        },
+        loadSelectedProviderProbeContext: async (hash) => {
+          order.push("database-provider-context");
+          assert.equal(hash, selectedHash);
+          return context;
         },
         findSelectedNativeInstallationProof: async (hash) => {
           order.push("database-query");
@@ -216,7 +238,19 @@ test("complete controls without an exact selected hash remain installation-evide
   assert.deepEqual(order, ["provider"]);
 });
 
-test("live constructs the provider before active artifact, verifier, and exact-hash database checks", async () => {
+test("a syntactically valid nonexistent selected hash remains installation-evidence-required", async () => {
+  const order: string[] = [];
+  assert.deepEqual(await runReadinessCli(
+    ["--live"], completeEnvironment(), dependencies(order, false, false, undefined),
+  ), {
+    output: { status: "skipped", code: "LIVE_INSTALLATION_EVIDENCE_REQUIRED", liveSuccess: false },
+    exitCode: 2,
+  });
+  assert.equal(order.includes("provider-probe"), false);
+  assert.equal(order.includes("artifact"), false);
+});
+
+test("live loads the exact selected-release context before probing its provider", async () => {
   const order: string[] = [];
   const outcome = await runReadinessCli(["--live"], completeEnvironment(), dependencies(order));
   assert.deepEqual(outcome, {
@@ -224,8 +258,9 @@ test("live constructs the provider before active artifact, verifier, and exact-h
     exitCode: 2,
   });
   assert.deepEqual(order, [
-    "provider", "provider-probe", "artifact", "verifier", "application-database-construction", "application-database-audit",
-    "application-database-close", "database-construction", "database-topology", "database-query", "database-close",
+    "provider", "application-database-construction", "application-database-audit", "application-database-close",
+    "database-construction", "database-topology", "database-provider-context", "database-query", "database-close",
+    "provider-probe", "artifact", "verifier",
   ]);
 });
 
@@ -248,7 +283,11 @@ test("a syntactically valid but unreachable or revoked provider fails closed bef
     output: { status: "skipped", code: "LIVE_CONTROLS_REQUIRED", liveSuccess: false },
     exitCode: 2,
   });
-  assert.deepEqual(order, ["provider-probe"]);
+  assert.deepEqual(order, [
+    "application-database-construction", "application-database-audit", "application-database-close",
+    "database-construction", "database-topology", "database-provider-context", "database-query", "database-close",
+    "provider-probe",
+  ]);
   assert.doesNotMatch(JSON.stringify(outcome), /revoked credential/);
 });
 
@@ -305,7 +344,11 @@ test("artifact bytes are actively hashed and a mismatch stops before verifier or
   assert.deepEqual(outcome, {
     output: { status: "failed", code: "ARTIFACT_INTEGRITY_FAILED", liveSuccess: false }, exitCode: 1,
   });
-  assert.deepEqual(order, ["provider", "provider-probe", "artifact"]);
+  assert.deepEqual(order, [
+    "provider", "application-database-construction", "application-database-audit", "application-database-close",
+    "database-construction", "database-topology", "database-provider-context", "database-query", "database-close",
+    "provider-probe", "artifact",
+  ]);
 });
 
 test("local-live runs its selected-provider topology diagnostics but can never claim live success", async () => {

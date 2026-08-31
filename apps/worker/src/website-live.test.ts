@@ -127,7 +127,10 @@ function controlHarness(input: Readonly<{
           ? { kmsKeyIdDigest: headers.get("x-page2webmcp-kms-key-id-digest") }
           : {}),
         ...(control === "browser-use-v4"
-          ? { apiVersion: "v4", model: "browser-use-2.0" }
+          ? {
+            gateway: "page2webmcp-browser-use-v4",
+            upstream: { apiVersion: "v4", authenticated: true, model: "browser-use-2.0" },
+          }
           : {}),
       });
     }
@@ -350,12 +353,26 @@ test("website control inventory is exact, sorted, validates values, and never re
 
 test("website readiness freshly checks every authenticated control without creating a browser session or policy", async () => {
   const harness = controlHarness();
-  await probeConfiguredWebsiteControls(environment(), { controlTransport: harness.transport }, {
+  const network = networkControls(harness.expiresAt);
+  let targetRequestUrl: string | undefined;
+  await probeConfiguredWebsiteControls(environment(), {
+    controlTransport: harness.transport,
+    resolver: network.resolver,
+    transport: { request: async (request) => {
+      targetRequestUrl = request.url;
+      return network.transport.request(request);
+    } },
+  }, {
     selectedReleaseHash: "a".repeat(64),
     publicOrigin: environment().PAGE2WEBMCP_PUBLIC_ORIGIN,
+    context: {
+      sourceType: "website", sourceUrl: "https://widgets.example/app",
+      sourceIdentityHash: "b".repeat(64), sourceConfiguration: { kind: "website" },
+    },
     signal: new AbortController().signal,
   });
   const probes = harness.calls.filter(({ url }) => url.endsWith(WEBSITE_LIVE_READINESS_PATH));
+  assert.equal(targetRequestUrl, "https://widgets.example/app");
   assert.deepEqual(probes.map(({ headers }) => headers.get("x-page2webmcp-control")).sort(), [
     "authentication-handoff",
     "browser-lease-store",
@@ -377,11 +394,52 @@ test("website readiness freshly checks every authenticated control without creat
 
 test("website readiness rejects one revoked control with a stable non-secret error", async () => {
   const harness = controlHarness({ rejectedReadinessControl: "evidence-store" });
-  await assert.rejects(probeConfiguredWebsiteControls(environment(), { controlTransport: harness.transport }, {
+  await assert.rejects(probeConfiguredWebsiteControls(environment(), {
+    controlTransport: harness.transport, ...networkControls(harness.expiresAt),
+  }, {
     selectedReleaseHash: "a".repeat(64),
     publicOrigin: environment().PAGE2WEBMCP_PUBLIC_ORIGIN,
+    context: {
+      sourceType: "website", sourceUrl: "https://widgets.example/app",
+      sourceIdentityHash: "b".repeat(64), sourceConfiguration: { kind: "website" },
+    },
     signal: new AbortController().signal,
   }), /^Error: WEBSITE_PROVIDER_PROBE_FAILED$/);
+});
+
+test("website readiness aborts and settles all target/control siblings after the first failure", async () => {
+  let abortedSiblings = 0;
+  const waitForAbort = async (signal: AbortSignal): Promise<never> => await new Promise((_resolve, reject) => {
+    const abort = () => { abortedSiblings += 1; reject(signal.reason); };
+    signal.addEventListener("abort", abort, { once: true });
+    if (signal.aborted) abort();
+  });
+  const controlTransport: NodePinnedJsonTransport = {
+    request: async ({ url, headers, signal }) => {
+      if (headers["x-page2webmcp-control"] === "evidence-store") {
+        return { status: 401, url, headers: { "content-type": "application/json" }, body: new Uint8Array() };
+      }
+      return await waitForAbort(signal);
+    },
+  };
+  const probe = probeConfiguredWebsiteControls(environment(), {
+    controlTransport,
+    resolver: { resolve: async () => [publicAddress], resolveTxt: async () => [] },
+    transport: { request: async ({ signal }) => await waitForAbort(signal) },
+  }, {
+    selectedReleaseHash: "a".repeat(64),
+    publicOrigin: environment().PAGE2WEBMCP_PUBLIC_ORIGIN,
+    context: {
+      sourceType: "website", sourceUrl: "https://widgets.example/app",
+      sourceIdentityHash: "b".repeat(64), sourceConfiguration: { kind: "website" },
+    },
+    signal: new AbortController().signal,
+  });
+  await assert.rejects(Promise.race([
+    probe,
+    new Promise((_, reject) => setTimeout(() => reject(new Error("TEST_TIMEOUT")), 500)),
+  ]), /^Error: WEBSITE_PROVIDER_PROBE_FAILED$/);
+  assert.equal(abortedSiblings, 9);
 });
 
 test("website adapter rejects noncanonical source configuration before issuing a policy", async () => {

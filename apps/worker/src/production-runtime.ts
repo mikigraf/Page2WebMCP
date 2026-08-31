@@ -20,6 +20,7 @@ import {
 } from "./github-workflow.ts";
 import { processNextAnalysis } from "./runner.ts";
 import type { AnalysisAdapter } from "./workflow.ts";
+import type { SelectedProviderProbeContext } from "../../../packages/operations/src/readiness.ts";
 
 type RuntimeEnvironment = Record<string, string | undefined>;
 
@@ -37,6 +38,7 @@ export type ProductionProvider = Readonly<{
   probe(input: Readonly<{
     selectedReleaseHash: string;
     publicOrigin: string;
+    context: SelectedProviderProbeContext;
     signal: AbortSignal;
   }>): Promise<void>;
   github?: ReturnType<typeof createConfiguredGitHubWorkflow>;

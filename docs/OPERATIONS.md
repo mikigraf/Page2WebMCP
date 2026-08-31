@@ -75,6 +75,8 @@ The source and target inputs are exact HTTPS. `testPageUrl` is same-origin with 
 
 Select `PAGE2WEBMCP_PROVIDER_MODE=website`. The factory is Browser Use API v4 with model `browser-use-2.0`, exact target allowlists, ephemeral sessions, and recording/profile/workspace/memory/uploads/downloads disabled. Every listed control is required:
 
+`PAGE2WEBMCP_BROWSER_USE_API_ORIGIN` is the exact HTTPS origin of an operator-deployed Page2WebMCP Browser Use v4 gateway, not `api.browser-use.com`. The gateway owns the Page2WebMCP `/v1/readiness` and session-control contract, forwards only the bounded v4 operations, and must attest that its configured upstream accepted the supplied Browser Use key and selected `browser-use-2.0`.
+
 ```text
 PAGE2WEBMCP_BROWSER_USE_API_KEY
 PAGE2WEBMCP_BROWSER_USE_API_ORIGIN

@@ -145,6 +145,20 @@ test("GitHub provider construction rejects controls that fail canonical inspecti
   );
 });
 
+test("a non-printable GitHub sandbox bearer fails startup before repository work", () => {
+  const repository = new InMemoryControlPlaneRepository();
+  let claims = 0;
+  repository.claimAnalysis = async () => { claims += 1; return undefined; };
+  const environment = configuredEnvironment();
+  environment.PAGE2WEBMCP_GITHUB_SANDBOX_TOKEN = `${"x".repeat(32)}\r\n`;
+  assert.deepEqual(inspectProductionProviderConfiguration(environment), {
+    code: "GITHUB_LIVE_CONFIGURATION_REQUIRED", keys: ["PAGE2WEBMCP_GITHUB_SANDBOX_TOKEN"],
+  });
+  assert.throws(() => createProductionWorkerRuntime(repository, environment, { fetch }),
+    /^Error: GITHUB_LIVE_CONFIGURATION_REQUIRED$/);
+  assert.equal(claims, 0);
+});
+
 test("a provider constructed before repository creation is reused without reconstruction", () => {
   const provider = createProductionProvider({ PAGE2WEBMCP_PROVIDER_MODE: "openapi" }, {
     fetch: async () => { throw new Error("NO_NETWORK_DURING_CONSTRUCTION"); },

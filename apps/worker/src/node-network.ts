@@ -11,6 +11,7 @@ const MAX_DNS_ANSWERS_PLUS_ONE = 17;
 const DEFAULT_MAX_JSON_REQUEST_BYTES = 64 * 1_024;
 const MAX_JSON_REQUEST_BYTES = 160 * 1_024;
 const MAX_JSON_RESPONSE_BYTES = 64 * 1_024;
+const MAX_JSON_RESPONSE_OVERRIDE_BYTES = 2 * 1_024 * 1_024;
 const MAX_PINNED_HEADER_COUNT = 16;
 const MAX_PINNED_HEADER_VALUE_BYTES = 4_096;
 const MAX_PINNED_AUTHORIZATION_BYTES = "Bearer ".length + 4_096;
@@ -33,6 +34,7 @@ type NodePinnedJsonRequestBase = Readonly<{
   url: string;
   headers: Readonly<Record<string, string>>;
   signal: AbortSignal;
+  maxResponseBytes?: number;
 }>;
 
 export type NodePinnedJsonRequest = NodePinnedJsonRequestBase & (
@@ -163,12 +165,15 @@ function websiteAbortReason(signal: AbortSignal): Error {
 
 function validPinnedJsonRequest(input: NodePinnedJsonRequest): URL | undefined {
   const maxBodyBytes = input?.maxBodyBytes ?? DEFAULT_MAX_JSON_REQUEST_BYTES;
+  const maxResponseBytes = input?.maxResponseBytes ?? MAX_JSON_RESPONSE_BYTES;
   const validBody = input?.method === "GET"
     ? input.body === undefined && input.maxBodyBytes === undefined
     : input?.method === "POST" && typeof input.body === "string"
       && Buffer.byteLength(input.body, "utf8") <= maxBodyBytes;
   if (!input || !validBody
     || !Number.isInteger(maxBodyBytes) || maxBodyBytes < 1 || maxBodyBytes > MAX_JSON_REQUEST_BYTES
+    || !Number.isInteger(maxResponseBytes) || maxResponseBytes < 1
+    || maxResponseBytes > MAX_JSON_RESPONSE_OVERRIDE_BYTES
     || !input.headers || !validPinnedJsonHeaders(input.headers)) return undefined;
   try {
     const url = new URL(input.url);
@@ -210,6 +215,7 @@ export function createNodePinnedJsonTransport(
       if (!url) throw new Error("WEBSITE_CONTROL_REQUEST_INVALID");
       if (input.signal.aborted) throw websiteAbortReason(input.signal);
       const hostname = url.hostname.replace(/^\[|\]$/g, "");
+      const maxResponseBytes = input.maxResponseBytes ?? MAX_JSON_RESPONSE_BYTES;
       let resolved: readonly string[];
       try { resolved = await dependencies.resolver.resolve(hostname, input.signal); }
       catch {
@@ -283,7 +289,7 @@ export function createNodePinnedJsonTransport(
             }
             const declared = response.headers["content-length"];
             if (typeof declared === "string"
-              && (!/^\d+$/.test(declared) || Number(declared) > MAX_JSON_RESPONSE_BYTES)) {
+              && (!/^\d+$/.test(declared) || Number(declared) > maxResponseBytes)) {
               const error = new Error("WEBSITE_CONTROL_RESPONSE_TOO_LARGE");
               destroy(error);
               finishReject(error);
@@ -295,7 +301,7 @@ export function createNodePinnedJsonTransport(
               if (settled) return;
               const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
               length += bytes.byteLength;
-              if (length > MAX_JSON_RESPONSE_BYTES) {
+              if (length > maxResponseBytes) {
                 const error = new Error("WEBSITE_CONTROL_RESPONSE_TOO_LARGE");
                 destroy(error);
                 finishReject(error);

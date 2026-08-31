@@ -1,7 +1,11 @@
 import { createHash, randomBytes } from "node:crypto";
 import { Resolver } from "node:dns/promises";
 import type { WebsiteEvidence, WebsiteObservationInput } from "../../../packages/providers/src/website-evidence.ts";
-import type { WebsiteOwnershipChallenge, WebsiteProviderControls } from "../../../packages/providers/src/website.ts";
+import {
+  preflightWebsiteSource,
+  type WebsiteOwnershipChallenge,
+  type WebsiteProviderControls,
+} from "../../../packages/providers/src/website.ts";
 import { validateTargetUrl } from "../../../packages/security/src/security.ts";
 import {
   createNodeOpenApiResolver,
@@ -11,6 +15,7 @@ import {
   type NodePinnedJsonTransport,
 } from "./node-network.ts";
 import { createWebsiteAnalysisAdapter, type AnalysisAdapter } from "./workflow.ts";
+import type { SelectedProviderProbeContext } from "../../../packages/operations/src/readiness.ts";
 
 type RuntimeEnvironment = Readonly<Record<string, string | undefined>>;
 
@@ -130,7 +135,11 @@ function abortReason(signal: AbortSignal): Error {
     : new Error("WEBSITE_CONTROL_ABORTED");
 }
 
-function linkedSignal(parent: AbortSignal): Readonly<{ signal: AbortSignal; close(): void }> {
+function linkedSignal(parent: AbortSignal): Readonly<{
+  signal: AbortSignal;
+  abort(reason?: unknown): void;
+  close(): void;
+}> {
   const controller = new AbortController();
   const abort = () => controller.abort(abortReason(parent));
   if (parent.aborted) abort(); else parent.addEventListener("abort", abort, { once: true });
@@ -138,6 +147,7 @@ function linkedSignal(parent: AbortSignal): Readonly<{ signal: AbortSignal; clos
   timer.unref?.();
   return {
     signal: controller.signal,
+    abort: (reason = new Error("WEBSITE_CONTROL_ABORTED")) => controller.abort(reason),
     close: () => { clearTimeout(timer); parent.removeEventListener("abort", abort); },
   };
 }
@@ -334,19 +344,25 @@ export type WebsiteLiveDependencies = Readonly<{
 type WebsiteProbeInput = Readonly<{
   selectedReleaseHash: string;
   publicOrigin: string;
+  context: SelectedProviderProbeContext;
   signal: AbortSignal;
 }>;
 
 export async function probeConfiguredWebsiteControls(
   environmentValue: RuntimeEnvironment,
-  dependencies: Pick<WebsiteLiveDependencies, "controlTransport">,
+  dependencies: Pick<WebsiteLiveDependencies, "controlTransport" | "resolver" | "transport">,
   input: WebsiteProbeInput,
 ): Promise<void> {
   const environment = configuredEnvironment(environmentValue);
   if (!/^[0-9a-f]{64}$/.test(input?.selectedReleaseHash ?? "")
     || input.publicOrigin !== environment.PAGE2WEBMCP_PUBLIC_ORIGIN
+    || input.context?.sourceType !== "website"
+    || !/^[0-9a-f]{64}$/.test(input.context.sourceIdentityHash)
+    || !same(input.context.sourceConfiguration, { kind: "website" })
+    || !validateTargetUrl(input.context.sourceUrl).ok
     || !(input.signal instanceof AbortSignal)) throw new Error("WEBSITE_PROVIDER_PROBE_FAILED");
   const transport = dependencies?.controlTransport ?? createNodePinnedJsonTransport();
+  const network = configuredNetwork(dependencies?.resolver, dependencies?.transport);
   const nonce = randomBytes(32).toString("hex");
   const commonHeaders = {
     accept: "application/json",
@@ -364,7 +380,10 @@ export async function probeConfiguredWebsiteControls(
       bearer(environment.PAGE2WEBMCP_BROWSER_LEASE_STORE_TOKEN), {}],
     ["browser-use-v4", environment.PAGE2WEBMCP_BROWSER_USE_API_ORIGIN,
       { "x-browser-use-api-key": environment.PAGE2WEBMCP_BROWSER_USE_API_KEY },
-      { apiVersion: "v4", model: "browser-use-2.0" }],
+      {
+        gateway: "page2webmcp-browser-use-v4",
+        upstream: { apiVersion: "v4", authenticated: true, model: "browser-use-2.0" },
+      }],
     ["cdp-observer", environment.PAGE2WEBMCP_CDP_OBSERVER_ORIGIN,
       bearer(environment.PAGE2WEBMCP_CDP_OBSERVER_TOKEN), {}],
     ["egress-policy-store", environment.PAGE2WEBMCP_EGRESS_POLICY_ORIGIN,
@@ -379,10 +398,21 @@ export async function probeConfiguredWebsiteControls(
       { ...bearer(environment.PAGE2WEBMCP_SECRET_STORE_TOKEN), "x-page2webmcp-kms-key-id-digest": kmsKeyIdDigest },
       { kmsKeyIdDigest }],
   ] as const;
-  try {
-    await Promise.all(probes.map(async ([control, origin, authorization, expectedExtra]) => {
+  const fanout = linkedSignal(input.signal);
+  const operations = [
+    async () => {
+      await preflightWebsiteSource(input.context.sourceUrl, {
+        ...network,
+        hostedScriptOrigin: new URL(environment.PAGE2WEBMCP_PUBLIC_ORIGIN).origin,
+        maxBytes: MAX_CONTROL_BYTES,
+        maxRedirects: 0,
+        timeoutMs: CONTROL_TIMEOUT_MS,
+        signal: fanout.signal,
+      });
+    },
+    ...probes.map(([control, origin, authorization, expectedExtra]) => async () => {
       const url = `${origin}${WEBSITE_LIVE_READINESS_PATH}`;
-      const lifecycle = linkedSignal(input.signal);
+      const lifecycle = linkedSignal(fanout.signal);
       try {
         const response = await transport.request({
           url,
@@ -402,9 +432,18 @@ export async function probeConfiguredWebsiteControls(
             ...expectedExtra,
           })) throw new Error("WEBSITE_PROVIDER_PROBE_FAILED");
       } finally { lifecycle.close(); }
-    }));
-  } catch {
-    throw new Error("WEBSITE_PROVIDER_PROBE_FAILED");
+    }),
+  ].map(async (operation) => {
+    try { await operation(); }
+    catch (error) { fanout.abort(error); throw error; }
+  });
+  try {
+    const settled = await Promise.allSettled(operations);
+    if (settled.some((result) => result.status === "rejected")) throw new Error("WEBSITE_PROVIDER_PROBE_FAILED");
+  } catch { throw new Error("WEBSITE_PROVIDER_PROBE_FAILED"); }
+  finally {
+    fanout.abort(new Error("WEBSITE_CONTROL_ABORTED"));
+    fanout.close();
   }
 }
 
