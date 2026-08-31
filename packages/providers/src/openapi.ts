@@ -97,7 +97,12 @@ async function readBoundedBody(response: OpenApiFetchResponse, maximum: number, 
   const iterator = response.body[Symbol.asyncIterator]();
   try {
     for (;;) {
-      const next = await iterator.next();
+      let next: IteratorResult<Uint8Array>;
+      try { next = await iterator.next(); }
+      catch {
+        if (signal.aborted) throw signal.reason;
+        throw new Error("OPENAPI_FETCH_FAILED");
+      }
       if (next.done) break;
       const chunk = next.value;
       if (signal.aborted) throw signal.reason;

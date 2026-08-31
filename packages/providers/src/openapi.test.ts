@@ -103,6 +103,11 @@ test("rejects empty, malformed, excessive, mixed, private, reserved, and metadat
     ["198.51.100.1"], ["203.0.113.1"], ["224.0.0.1"], ["240.0.0.1"],
     ["::"], ["::1"], ["fc00::1"], ["fe80::1"], ["ff02::1"], ["2001:db8::1"],
     ["2002::1"], ["2001::1"], ["2001:10::1"], ["::ffff:7f00:1"],
+    ["3fff::1"], ["2001:2::1"], ["2001:20::1"], ["2001:30::1"],
+    ["2606:4700:4700::1111", "3fff::1"],
+    ["2606:4700:4700::1111", "2001:2::1"],
+    ["2606:4700:4700::1111", "2001:20::1"],
+    ["2606:4700:4700::1111", "2001:30::1"],
   ];
   for (const addresses of blockedAnswers) {
     let transportCalls = 0;
@@ -211,6 +216,13 @@ test("enforces content type, streaming byte cap, redirect cap, and total deadlin
   }), /^Error: OPENAPI_RESPONSE_TOO_LARGE$/);
   await assert.rejects(() => fetchOpenApiSource("https://specs.widgets.example/openapi.json", {
     ...base,
+    transport: { request: async (request) => ({
+      ...response(200, request.url, { "content-type": "application/json" }),
+      body: { async *[Symbol.asyncIterator]() { yield "not bytes" as never; } },
+    }) },
+  }), /^Error: OPENAPI_TRANSPORT_POLICY_VIOLATION$/);
+  await assert.rejects(() => fetchOpenApiSource("https://specs.widgets.example/openapi.json", {
+    ...base,
     maxRedirects: 0,
     transport: { request: async (request) => response(302, request.url, { location: "/again" }) },
   }), /^Error: OPENAPI_REDIRECT_LIMIT_EXCEEDED$/);
@@ -223,6 +235,31 @@ test("enforces content type, streaming byte cap, redirect cap, and total deadlin
     }) },
   }), /^Error: OPENAPI_FETCH_TIMEOUT$/);
   assert.equal(aborted, true);
+});
+
+test("maps secret-bearing mid-body socket failures to a stable fetch error", async () => {
+  const leakedDetail = "read ECONNRESET peer=203.0.113.7 token=live-secret-never-log";
+  let returned = false;
+  const streamError = Object.assign(new Error(leakedDetail), { code: "ECONNRESET" });
+  const responseBody: AsyncIterable<Uint8Array> = {
+    [Symbol.asyncIterator]() {
+      return {
+        next: async () => { throw streamError; },
+        return: async () => { returned = true; return { done: true as const, value: undefined }; },
+      };
+    },
+  };
+  await assert.rejects(fetchOpenApiSource("https://specs.widgets.example/openapi.json", {
+    resolver: { resolve: async () => ["93.184.216.34"] },
+    transport: { request: async (request) => ({
+      ...response(200, request.url, { "content-type": "application/json" }),
+      body: responseBody,
+    }) },
+  }), (error: unknown) => error instanceof Error
+    && error.message === "OPENAPI_FETCH_FAILED"
+    && !error.message.includes(leakedDetail)
+    && !error.message.includes("live-secret"));
+  assert.equal(returned, true);
 });
 
 test("caller cancellation rejects promptly even when a transport ignores its signal", async () => {

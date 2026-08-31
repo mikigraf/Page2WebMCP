@@ -1,6 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createDiscoveryFirewall, sanitizeEvidence, validateRedirectChain, validateTargetUrl } from "./security.ts";
+import {
+  createDiscoveryFirewall,
+  sanitizeEvidence,
+  validateRedirectChain,
+  validateResolvedAddress,
+  validateTargetUrl,
+} from "./security.ts";
 
 test("security policy rejects unsafe targets and mutations during discovery", () => {
   assert.equal(validateTargetUrl("http://127.0.0.1:3000").ok, false);
@@ -13,6 +19,25 @@ test("target validation blocks loopback, non-public IPv4, and IPv6 literal addre
     "https://0.0.0.0/", "https://224.0.0.1/", "https://[::]/", "https://[::1]/", "https://[fc00::1]/", "https://[fe80::1]/", "https://[ff00::1]/",
     "https://[::ffff:192.168.1.1]/", "https://[::127.0.0.1]/", "https://192.88.99.1/"
   ]) assert.deepEqual(validateTargetUrl(target), { ok: false, code: "PRIVATE_NETWORK_BLOCKED" });
+});
+
+test("resolved-address validation blocks documentation and special-purpose IPv6 prefixes by CIDR", () => {
+  for (const address of [
+    "3fff::1",
+    "3fff:0fff:ffff:ffff:ffff:ffff:ffff:ffff",
+    "2001:2::1",
+    "2001:20::1",
+    "2001:2f:ffff::1",
+    "2001:30::1",
+    "2001:3f:ffff::1",
+  ]) {
+    assert.deepEqual(validateResolvedAddress(address), { ok: false, code: "PRIVATE_NETWORK_BLOCKED" });
+    assert.deepEqual(validateTargetUrl(`https://[${address}]/`), { ok: false, code: "PRIVATE_NETWORK_BLOCKED" });
+  }
+  for (const address of ["2001:4860:4860::8888", "2606:4700:4700::1111", "3fff:1000::1"]) {
+    assert.deepEqual(validateResolvedAddress(address), { ok: true });
+    assert.deepEqual(validateTargetUrl(`https://[${address}]/`), { ok: true });
+  }
 });
 
 test("target validation canonicalizes alternate IPv4 forms before applying the blocklist", () => {
