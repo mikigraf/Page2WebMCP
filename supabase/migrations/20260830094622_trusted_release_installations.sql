@@ -120,6 +120,9 @@ alter table public.verification_runs
     and not checks @? '$[*] ? (@.status == "failed")'
   ));
 
+alter table public.releases
+  add constraint releases_id_project_org_key unique (id, project_id, organization_id);
+
 create table public.release_installations (
   id uuid primary key default gen_random_uuid(),
   organization_id uuid not null references public.organizations(id),

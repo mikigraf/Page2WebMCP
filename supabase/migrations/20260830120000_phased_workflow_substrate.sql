@@ -10,8 +10,6 @@ alter table public.analysis_evidence
   add constraint analysis_evidence_id_project_org_key unique (id, project_id, organization_id);
 alter table public.verification_runs
   add constraint verification_runs_id_project_org_key unique (id, project_id, organization_id);
-alter table public.releases
-  add constraint releases_id_project_org_key unique (id, project_id, organization_id);
 
 create table public.project_sources (
   id uuid primary key default gen_random_uuid(),
