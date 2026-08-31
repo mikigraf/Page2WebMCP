@@ -96,11 +96,16 @@ test("production requires an exact HTTPS public origin for CSRF validation", () 
   }));
 });
 
-test("live provider mode remains fail closed until explicit controls are configured", () => {
-  assert.throws(
-    () => validateRuntimeConfiguration({ ...production, PAGE2WEBMCP_PROVIDER_MODE: "live" }),
-    /LIVE_PROVIDER_UNSUPPORTED/
-  );
+test("shared configuration recognizes only exact untrimmed provider mode spellings", () => {
+  for (const mode of ["local", "openapi", "website", "github"]) {
+    assert.doesNotThrow(() => validateRuntimeConfiguration({ ...production, PAGE2WEBMCP_PROVIDER_MODE: mode }));
+  }
+  for (const mode of ["", "live", "OpenAPI", " openapi", "openapi "]) {
+    assert.throws(
+      () => validateRuntimeConfiguration({ ...production, PAGE2WEBMCP_PROVIDER_MODE: mode }),
+      /^Error: INVALID_PROVIDER_MODE$/,
+    );
+  }
 });
 
 test("the standalone worker fails before polling without durable storage", () => {
@@ -117,11 +122,25 @@ test("the standalone worker fails before polling without durable storage", () =>
       PAGE2WEBMCP_PROVIDER_MODE: "live",
       DATABASE_URL: "postgresql:\/\/database.example\/page2webmcp"
     }),
-    /LIVE_PROVIDER_UNSUPPORTED/
+    /INVALID_PROVIDER_MODE/
   );
-  assert.doesNotThrow(() => validateWorkerRuntimeConfiguration({
+  assert.throws(() => validateWorkerRuntimeConfiguration({
     PAGE2WEBMCP_STORAGE_MODE: "postgres",
     PAGE2WEBMCP_PROVIDER_MODE: "local",
+    DATABASE_URL: "postgresql://database.example/page2webmcp"
+  }), /^Error: WORKER_PROVIDER_MODE_REQUIRED$/);
+  assert.throws(() => validateWorkerRuntimeConfiguration({
+    PAGE2WEBMCP_STORAGE_MODE: "postgres",
+    DATABASE_URL: "postgresql://database.example/page2webmcp"
+  }), /^Error: WORKER_PROVIDER_MODE_REQUIRED$/);
+  assert.doesNotThrow(() => validateWorkerRuntimeConfiguration({
+    PAGE2WEBMCP_STORAGE_MODE: "postgres",
+    PAGE2WEBMCP_PROVIDER_MODE: "openapi",
+    DATABASE_URL: "postgresql://database.example/page2webmcp"
+  }));
+  assert.doesNotThrow(() => validateWorkerRuntimeConfiguration({
+    PAGE2WEBMCP_STORAGE_MODE: "postgres",
+    PAGE2WEBMCP_PROVIDER_MODE: "website",
     DATABASE_URL: "postgresql://database.example/page2webmcp"
   }));
   assert.doesNotThrow(() => validateWorkerRuntimeConfiguration({

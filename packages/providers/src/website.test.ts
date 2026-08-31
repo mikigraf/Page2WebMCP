@@ -110,6 +110,20 @@ test("website preflight rejects bad status/content type/size/time and reports re
   assert.equal(restrictive.csp.allowsHostedScript, false);
 });
 
+test("website preflight maps secret-bearing body stream failures to a stable code", async () => {
+  const secretBearingBody: AsyncIterable<Uint8Array> = {
+    [Symbol.asyncIterator]() {
+      return {
+        next: async () => { throw new Error("ECONNRESET token=live-secret-never-log"); },
+      };
+    },
+  };
+  await assert.rejects(
+    preflightWebsiteSource(`${targetOrigin}/`, controls(async () => response({ body: secretBearingBody }))),
+    /^Error: WEBSITE_FETCH_FAILED$/,
+  );
+});
+
 test("website preflight requires exact authorized modern-TLS transport attestation", async () => {
   await assert.rejects(preflightWebsiteSource(`${targetOrigin}/`, controls(async () => response({
     tls: { authorized: false, servername: "widgets.example", protocol: "TLSv1.3" } as unknown as WebsiteHttpResponse["tls"],

@@ -21,9 +21,10 @@ export function validateWorkerRuntimeConfiguration(environment: RuntimeEnvironme
 }
 
 function validateSharedRuntimeConfiguration(environment: RuntimeEnvironment, allowTestMemory: boolean): void {
-  if (environment.PAGE2WEBMCP_PROVIDER_MODE
-    && !["local", "github"].includes(environment.PAGE2WEBMCP_PROVIDER_MODE)) {
-    throw new Error("LIVE_PROVIDER_UNSUPPORTED");
+  const providerMode = environment.PAGE2WEBMCP_PROVIDER_MODE;
+  if (providerMode !== undefined
+    && !["local", "openapi", "website", "github"].includes(providerMode)) {
+    throw new Error("INVALID_PROVIDER_MODE");
   }
   const storageMode = environment.PAGE2WEBMCP_STORAGE_MODE ?? "postgres";
   if (storageMode === "memory") {
@@ -36,6 +37,9 @@ function validateSharedRuntimeConfiguration(environment: RuntimeEnvironment, all
     if (!environment.DATABASE_URL) throw new Error("DATABASE_URL_REQUIRED");
   } else {
     throw new Error("INVALID_STORAGE_MODE");
+  }
+  if (!allowTestMemory && (providerMode === undefined || providerMode === "local")) {
+    throw new Error("WORKER_PROVIDER_MODE_REQUIRED");
   }
 
 }

@@ -190,9 +190,15 @@ function assertControls(controls: BrowserUseCloudV4Controls): void {
   }
 }
 
+function assertProviderSessionId(
+  result: Awaited<ReturnType<BrowserUseCloudV4Controls["transport"]["start"]>>,
+): string {
+  if (!result || !validateIdentifier(result.providerSessionId)) throw new Error("BROWSER_PROVIDER_RESPONSE_INVALID");
+  return result.providerSessionId;
+}
+
 function assertRawSession(result: Awaited<ReturnType<BrowserUseCloudV4Controls["transport"]["start"]>>): void {
-  if (!result || !validateIdentifier(result.providerSessionId)
-    || typeof result.liveUrl !== "string" || !result.liveUrl.startsWith("https://")
+  if (typeof result.liveUrl !== "string" || !result.liveUrl.startsWith("https://")
     || typeof result.cdpUrl !== "string" || !result.cdpUrl.startsWith("wss://")) {
     throw new Error("BROWSER_PROVIDER_RESPONSE_INVALID");
   }
@@ -242,9 +248,9 @@ export async function withBrowserUseCloudV4Session<T>(
   try {
     if (deadline.signal.aborted) throw deadline.signal.reason;
     const started = await controls.transport.start(request, deadline.signal);
+    providerSessionId = assertProviderSessionId(started);
     if (deadline.signal.aborted) throw deadline.signal.reason;
     assertRawSession(started);
-    providerSessionId = started.providerSessionId;
     if (started.appliedPolicyDigest !== policyDigest) throw new Error("BROWSER_PROVIDER_CONTROL_ATTESTATION_FAILED");
     const liveReference = await captureReference(controls, started.liveUrl, "browser_live_url", input.expiresAt);
     references.push(liveReference);

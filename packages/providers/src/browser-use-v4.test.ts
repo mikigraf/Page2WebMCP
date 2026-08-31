@@ -172,6 +172,34 @@ test("Browser Use session claims once and cleans up/reconciles after failure and
   assert.deepEqual(events.slice(-3), ["cancel-stop:cancelled", "cancel-reconcile", "cancel-release"]);
 });
 
+test("Browser Use reconciles a created provider session even when later start fields are invalid", async () => {
+  const events: string[] = [];
+  await assert.rejects(withBrowserUseCloudV4Session({
+    organizationId: "org-1", projectId: "project-1", runId: "run-partial-start", targetOrigin, expiresAt,
+    proxyPolicyReference: { reference: "secretref:proxy-policy", expiresAt },
+  }, controls({
+    leases: {
+      claim: async () => ({ leaseId: "lease-partial-start" }),
+      release: async () => { events.push("release"); },
+    },
+    transport: {
+      start: async (request) => ({
+        providerSessionId: "provider-partial-start",
+        liveUrl: "not-an-https-url",
+        cdpUrl: "wss://cdp.invalid/partial",
+        appliedPolicyDigest: browserUseCloudV4PolicyDigest(request),
+      }),
+      stop: async (id, reason) => { events.push(`stop:${id}:${reason}`); },
+      reconcile: async (id) => { events.push(`reconcile:${id}`); },
+    },
+  }), async () => undefined), /^Error: BROWSER_PROVIDER_RESPONSE_INVALID$/);
+  assert.deepEqual(events, [
+    "stop:provider-partial-start:failed",
+    "reconcile:provider-partial-start",
+    "release",
+  ]);
+});
+
 test("durable auth handoff resumes only on bounded deterministic same-origin evidence", async () => {
   const opens: unknown[] = [];
   const closes: unknown[] = [];
@@ -260,6 +288,39 @@ test("Browser Use provider startup receives cancellation and releases its durabl
   setImmediate(() => controller.abort());
   await assert.rejects(pending, /BROWSER_SESSION_ABORTED/);
   assert.deepEqual(events, ["release"]);
+});
+
+test("Browser Use cleans a session created concurrently with cancellation", async () => {
+  const controller = new AbortController();
+  const events: string[] = [];
+  await assert.rejects(withBrowserUseCloudV4Session({
+    organizationId: "org-1", projectId: "project-1", runId: "run-start-race", targetOrigin, expiresAt,
+    proxyPolicyReference: { reference: "secretref:proxy-policy", expiresAt },
+  }, controls({
+    signal: controller.signal,
+    leases: {
+      claim: async () => ({ leaseId: "lease-start-race" }),
+      release: async () => { events.push("release"); },
+    },
+    transport: {
+      start: async (request) => {
+        controller.abort();
+        return {
+          providerSessionId: "provider-start-race",
+          liveUrl: "https://live.invalid/race",
+          cdpUrl: "wss://cdp.invalid/race",
+          appliedPolicyDigest: browserUseCloudV4PolicyDigest(request),
+        };
+      },
+      stop: async (id, reason) => { events.push(`stop:${id}:${reason}`); },
+      reconcile: async (id) => { events.push(`reconcile:${id}`); },
+    },
+  }), async () => undefined), /^Error: BROWSER_SESSION_ABORTED$/);
+  assert.deepEqual(events, [
+    "stop:provider-start-race:cancelled",
+    "reconcile:provider-start-race",
+    "release",
+  ]);
 });
 
 test("Browser Use session expiry aborts a stalled action and reconciles provider state", async () => {

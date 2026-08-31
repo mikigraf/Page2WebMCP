@@ -147,7 +147,12 @@ async function readBoundedBody(
   let length = 0;
   try {
     for (;;) {
-      const item = await iterator.next();
+      let item: IteratorResult<Uint8Array>;
+      try { item = await iterator.next(); }
+      catch {
+        if (signal.aborted) throw signal.reason;
+        throw new Error("WEBSITE_FETCH_FAILED");
+      }
       if (item.done) break;
       if (signal.aborted) throw signal.reason;
       if (!(item.value instanceof Uint8Array)) throw new Error("WEBSITE_TRANSPORT_POLICY_VIOLATION");

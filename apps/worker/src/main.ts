@@ -8,20 +8,23 @@ import {
 import { randomUUID } from "node:crypto";
 import { createProductionWorkerRuntime, processProductionWorkerIteration } from "./production-runtime.ts";
 
-validateWorkerRuntimeConfiguration();
-const repository = getControlPlaneRepository();
-const runtime = createProductionWorkerRuntime(repository);
 const shutdown = new AbortController();
 const workerId = `worker-${randomUUID()}`;
 const pollMs = boundedInteger(process.env.PAGE2WEBMCP_WORKER_POLL_MS, 1_000, 100, 30_000);
 let consecutiveFailures = 0;
+let repository: ControlPlaneRepository | undefined;
+let observabilityRegistered = false;
 
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.once(signal, () => shutdown.abort());
 }
 
-await registerObservability();
 try {
+  validateWorkerRuntimeConfiguration();
+  repository = getControlPlaneRepository();
+  const runtime = createProductionWorkerRuntime(repository);
+  await registerObservability();
+  observabilityRegistered = true;
   while (!shutdown.signal.aborted) {
     try {
       const processed = await processProductionWorkerIteration(repository, runtime, workerId, shutdown.signal);
@@ -40,7 +43,10 @@ try {
     }
   }
 } finally {
-  await Promise.allSettled([closeRepository(repository), shutdownObservability()]);
+  await Promise.allSettled([
+    repository ? closeRepository(repository) : Promise.resolve(),
+    observabilityRegistered ? shutdownObservability() : Promise.resolve(),
+  ]);
 }
 
 function boundedInteger(value: string | undefined, fallback: number, minimum: number, maximum: number): number {

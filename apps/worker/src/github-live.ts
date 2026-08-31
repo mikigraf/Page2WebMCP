@@ -92,6 +92,33 @@ function parseBindings(value: string | undefined): ConfiguredGitHubRepository[] 
   return bindings;
 }
 
+export function githubConfigurationInvalidKeys(environment: RuntimeEnvironment): string[] {
+  const invalid: string[] = [];
+  if (!/^[1-9][0-9]{0,19}$/.test(environment.PAGE2WEBMCP_GITHUB_APP_ID ?? "")) {
+    invalid.push("PAGE2WEBMCP_GITHUB_APP_ID");
+  }
+  const privateKeyValue = environment.PAGE2WEBMCP_GITHUB_PRIVATE_KEY_BASE64;
+  try {
+    if (!privateKeyValue || Buffer.byteLength(privateKeyValue, "utf8") > 32 * 1_024
+      || !/^[A-Za-z0-9+/]+={0,2}$/.test(privateKeyValue)) throw new Error("invalid");
+    const decoded = Buffer.from(privateKeyValue, "base64");
+    if (decoded.byteLength < 256 || decoded.byteLength > 16 * 1_024
+      || decoded.toString("base64") !== privateKeyValue) throw new Error("invalid");
+    const key = createPrivateKey(decoded);
+    if (key.type !== "private" || !["rsa", "rsa-pss"].includes(key.asymmetricKeyType ?? "")) throw new Error("invalid");
+  } catch { invalid.push("PAGE2WEBMCP_GITHUB_PRIVATE_KEY_BASE64"); }
+  try { parseBindings(environment.PAGE2WEBMCP_GITHUB_REPOSITORY_BINDINGS); }
+  catch { invalid.push("PAGE2WEBMCP_GITHUB_REPOSITORY_BINDINGS"); }
+  if (!exactTargetOrigin(environment.PAGE2WEBMCP_GITHUB_SANDBOX_ORIGIN)) {
+    invalid.push("PAGE2WEBMCP_GITHUB_SANDBOX_ORIGIN");
+  }
+  const sandboxToken = environment.PAGE2WEBMCP_GITHUB_SANDBOX_TOKEN;
+  if (!sandboxToken || sandboxToken.length < 32 || sandboxToken.length > 512) {
+    invalid.push("PAGE2WEBMCP_GITHUB_SANDBOX_TOKEN");
+  }
+  return invalid.sort(compareStrings);
+}
+
 function base64Url(value: string | Buffer): string {
   return Buffer.from(value).toString("base64url");
 }

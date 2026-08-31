@@ -3,7 +3,12 @@ import { createHash, generateKeyPairSync } from "node:crypto";
 import test from "node:test";
 import { InMemoryControlPlaneRepository, type AnalysisResult, type RepositoryActor } from "../../../packages/database/src/control-plane.ts";
 import { WorkflowController } from "../../../packages/database/src/workflow.ts";
-import { createProductionWorkerRuntime, processProductionWorkerIteration, type ProductionWorkerRuntime } from "./production-runtime.ts";
+import {
+  createProductionWorkerRuntime,
+  inspectProductionProviderConfiguration,
+  processProductionWorkerIteration,
+  type ProductionWorkerRuntime,
+} from "./production-runtime.ts";
 
 const owner: RepositoryActor = {
   id: "11111111-1111-4111-8111-111111111111",
@@ -25,6 +30,137 @@ function configuredEnvironment() {
     PAGE2WEBMCP_GITHUB_SANDBOX_TOKEN: "sandbox_ephemeral_control_token_abcdefghijklmnopqrstuvwxyz",
   };
 }
+
+const websiteKeys = [
+  "PAGE2WEBMCP_AUTH_HANDOFF_ORIGIN",
+  "PAGE2WEBMCP_AUTH_HANDOFF_TOKEN",
+  "PAGE2WEBMCP_BROWSER_LEASE_STORE_ORIGIN",
+  "PAGE2WEBMCP_BROWSER_LEASE_STORE_TOKEN",
+  "PAGE2WEBMCP_BROWSER_USE_API_KEY",
+  "PAGE2WEBMCP_BROWSER_USE_API_ORIGIN",
+  "PAGE2WEBMCP_CDP_OBSERVER_ORIGIN",
+  "PAGE2WEBMCP_CDP_OBSERVER_TOKEN",
+  "PAGE2WEBMCP_EGRESS_POLICY_ORIGIN",
+  "PAGE2WEBMCP_EGRESS_POLICY_TOKEN",
+  "PAGE2WEBMCP_EGRESS_PROXY_ORIGIN",
+  "PAGE2WEBMCP_EGRESS_PROXY_TOKEN",
+  "PAGE2WEBMCP_EVIDENCE_STORE_ORIGIN",
+  "PAGE2WEBMCP_EVIDENCE_STORE_TOKEN",
+  "PAGE2WEBMCP_OWNERSHIP_STORE_ORIGIN",
+  "PAGE2WEBMCP_OWNERSHIP_STORE_TOKEN",
+  "PAGE2WEBMCP_PUBLIC_ORIGIN",
+  "PAGE2WEBMCP_SECRET_STORE_KMS_KEY_ID",
+  "PAGE2WEBMCP_SECRET_STORE_ORIGIN",
+  "PAGE2WEBMCP_SECRET_STORE_TOKEN",
+] as const;
+
+function configuredWebsiteEnvironment(): Record<string, string> {
+  return {
+    PAGE2WEBMCP_PROVIDER_MODE: "website",
+    PAGE2WEBMCP_AUTH_HANDOFF_ORIGIN: "https://auth-handoff.example",
+    PAGE2WEBMCP_AUTH_HANDOFF_TOKEN: "auth_handoff_control_token_abcdefghijklmnopqrstuvwxyz",
+    PAGE2WEBMCP_BROWSER_LEASE_STORE_ORIGIN: "https://browser-leases.example",
+    PAGE2WEBMCP_BROWSER_LEASE_STORE_TOKEN: "browser_lease_control_token_abcdefghijklmnopqrstuvwxyz",
+    PAGE2WEBMCP_BROWSER_USE_API_KEY: "bu_test_cloud_key_abcdefghijklmnopqrstuvwxyz",
+    PAGE2WEBMCP_BROWSER_USE_API_ORIGIN: "https://browser-gateway.example",
+    PAGE2WEBMCP_CDP_OBSERVER_ORIGIN: "https://cdp-observer.example",
+    PAGE2WEBMCP_CDP_OBSERVER_TOKEN: "cdp_observer_control_token_abcdefghijklmnopqrstuvwxyz",
+    PAGE2WEBMCP_EGRESS_POLICY_ORIGIN: "https://egress-policy.example",
+    PAGE2WEBMCP_EGRESS_POLICY_TOKEN: "egress_policy_control_token_abcdefghijklmnopqrstuvwxyz",
+    PAGE2WEBMCP_EGRESS_PROXY_ORIGIN: "https://egress-proxy.example",
+    PAGE2WEBMCP_EGRESS_PROXY_TOKEN: "egress_proxy_control_token_abcdefghijklmnopqrstuvwxyz",
+    PAGE2WEBMCP_EVIDENCE_STORE_ORIGIN: "https://evidence-store.example",
+    PAGE2WEBMCP_EVIDENCE_STORE_TOKEN: "evidence_store_control_token_abcdefghijklmnopqrstuvwxyz",
+    PAGE2WEBMCP_OWNERSHIP_STORE_ORIGIN: "https://ownership-store.example",
+    PAGE2WEBMCP_OWNERSHIP_STORE_TOKEN: "ownership_store_control_token_abcdefghijklmnopqrstuvwxyz",
+    PAGE2WEBMCP_PUBLIC_ORIGIN: "https://storage.example/storage/v1/object/public/page2webmcp-releases",
+    PAGE2WEBMCP_SECRET_STORE_KMS_KEY_ID: "kms://page2webmcp/browser-session-secrets",
+    PAGE2WEBMCP_SECRET_STORE_ORIGIN: "https://secret-store.example",
+    PAGE2WEBMCP_SECRET_STORE_TOKEN: "secret_store_control_token_abcdefghijklmnopqrstuvwxyz",
+  };
+}
+
+test("pure selected-provider inspection returns sorted key names and never values", () => {
+  const website = inspectProductionProviderConfiguration({ PAGE2WEBMCP_PROVIDER_MODE: "website" });
+  assert.deepEqual(website, { code: "WEBSITE_LIVE_CONFIGURATION_REQUIRED", keys: websiteKeys });
+  assert.doesNotMatch(JSON.stringify(website), /token_|https:\/\//);
+
+  const invalid = configuredWebsiteEnvironment();
+  invalid.PAGE2WEBMCP_AUTH_HANDOFF_TOKEN = "secret-value-too-short";
+  invalid.PAGE2WEBMCP_PUBLIC_ORIGIN = "https://storage.example";
+  assert.deepEqual(inspectProductionProviderConfiguration(invalid), {
+    code: "WEBSITE_LIVE_CONFIGURATION_REQUIRED",
+    keys: ["PAGE2WEBMCP_AUTH_HANDOFF_TOKEN", "PAGE2WEBMCP_PUBLIC_ORIGIN"],
+  });
+
+  assert.deepEqual(inspectProductionProviderConfiguration({ PAGE2WEBMCP_PROVIDER_MODE: "openapi" }), {
+    code: "PRODUCTION_PROVIDER_CONFIGURATION_READY", keys: [],
+  });
+  assert.deepEqual(inspectProductionProviderConfiguration({ PAGE2WEBMCP_PROVIDER_MODE: "github" }), {
+    code: "GITHUB_LIVE_CONFIGURATION_REQUIRED",
+    keys: [
+      "PAGE2WEBMCP_GITHUB_APP_ID",
+      "PAGE2WEBMCP_GITHUB_PRIVATE_KEY_BASE64",
+      "PAGE2WEBMCP_GITHUB_REPOSITORY_BINDINGS",
+      "PAGE2WEBMCP_GITHUB_SANDBOX_ORIGIN",
+      "PAGE2WEBMCP_GITHUB_SANDBOX_TOKEN",
+    ],
+  });
+  assert.deepEqual(inspectProductionProviderConfiguration({
+    ...configuredEnvironment(), PAGE2WEBMCP_GITHUB_REPOSITORY_BINDINGS: "[{}]",
+  }), {
+    code: "GITHUB_LIVE_CONFIGURATION_REQUIRED", keys: ["PAGE2WEBMCP_GITHUB_REPOSITORY_BINDINGS"],
+  });
+  assert.deepEqual(inspectProductionProviderConfiguration({ PAGE2WEBMCP_PROVIDER_MODE: "local" }), {
+    code: "WORKER_PROVIDER_MODE_REQUIRED", keys: ["PAGE2WEBMCP_PROVIDER_MODE"],
+  });
+});
+
+test("missing selected website controls fail before every repository claim path", () => {
+  const repository = new InMemoryControlPlaneRepository();
+  let analysisClaims = 0;
+  let workflowReconciles = 0;
+  let workflowClaims = 0;
+  repository.claimAnalysis = async () => { analysisClaims += 1; return undefined; };
+  repository.reconcileWorkflows = async () => { workflowReconciles += 1; return 0; };
+  repository.claimWorkflowTask = async () => { workflowClaims += 1; return undefined; };
+  assert.throws(
+    () => createProductionWorkerRuntime(repository, { PAGE2WEBMCP_PROVIDER_MODE: "website" }, { fetch }),
+    /^Error: WEBSITE_LIVE_CONFIGURATION_REQUIRED$/,
+  );
+  assert.deepEqual({ analysisClaims, workflowReconciles, workflowClaims }, {
+    analysisClaims: 0, workflowReconciles: 0, workflowClaims: 0,
+  });
+});
+
+test("OpenAPI and website runtimes expose one source and never enter GitHub workflow claims", async () => {
+  for (const [mode, environment] of [
+    ["openapi", { PAGE2WEBMCP_PROVIDER_MODE: "openapi" }],
+    ["website", configuredWebsiteEnvironment()],
+  ] as const) {
+    const repository = new InMemoryControlPlaneRepository();
+    const claimedSourceTypes: Array<readonly string[] | undefined> = [];
+    let workflowReconciles = 0;
+    let workflowClaims = 0;
+    repository.claimAnalysis = async (_workerId, _leaseMs, sourceTypes) => {
+      claimedSourceTypes.push(sourceTypes);
+      return undefined;
+    };
+    repository.reconcileWorkflows = async () => { workflowReconciles += 1; return 0; };
+    repository.claimWorkflowTask = async () => { workflowClaims += 1; return undefined; };
+    const runtime = createProductionWorkerRuntime(repository, environment, {
+      fetch: async () => { throw new Error("NO_CONTROL_OR_GITHUB_CALL_DURING_CONSTRUCTION"); },
+    });
+    assert.deepEqual(runtime.analysisSourceTypes, [mode]);
+    assert.equal(runtime.workflows, undefined);
+    assert.equal(await processProductionWorkerIteration(
+      repository, runtime, `${mode}-worker`, new AbortController().signal,
+    ), false);
+    assert.deepEqual(claimedSourceTypes, [[mode]]);
+    assert.equal(workflowReconciles, 0);
+    assert.equal(workflowClaims, 0);
+  }
+});
 
 test("production runtime validates GitHub controls before the repository can be claimed", () => {
   const repository = new InMemoryControlPlaneRepository();
@@ -77,6 +213,7 @@ test("production runtime construction accepts only the real configured GitHub fa
   const repository = new InMemoryControlPlaneRepository();
   const runtime = createProductionWorkerRuntime(repository, configuredEnvironment(), { fetch });
   assert.equal(typeof runtime.analyze, "function");
+  assert.ok(runtime.workflows);
   assert.equal(typeof runtime.workflows.runNext, "function");
   assert.equal("setAnalysisAdapterForTest" in runtime, false);
 });
