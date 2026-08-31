@@ -89,8 +89,8 @@ test("Docker local-live persists a non-Acme OpenAPI release with exact Storage i
   assert.match(enqueued.runId, /^[0-9a-f-]{36}$/i);
   const analysis = await pollAnalysis(session, enqueued.runId);
   assert.equal(analysis.run.status, "succeeded");
-  assert.equal(analysis.result?.providerMode, "openapi");
-  assert.equal(analysis.result?.providerFixture, false);
+  assert.equal(analysis.result?.providerProvenance?.mode, "openapi");
+  assert.equal(analysis.result?.providerProvenance?.fixture, false);
   assert.ok((analysis.result?.evidence?.length ?? 0) > 0);
   assert.ok(analysis.capabilities.length > 0, "real source must produce at least one capability");
 
@@ -110,11 +110,11 @@ test("Docker local-live persists a non-Acme OpenAPI release with exact Storage i
   }
   assert.ok(approved > 0, "release requires at least one approved non-R3 capability");
 
-  const verified = await session.post<{ verification: { eligible: boolean; mode?: string } }>(
+  const verified = await session.post<{ verification: { eligible: boolean; verificationMode?: string } }>(
     "/api/capabilities/verify", { projectId: project.id, analysisRunId: enqueued.runId },
   );
   assert.equal(verified.verification.eligible, true);
-  assert.equal(verified.verification.mode, "local_live");
+  assert.equal(verified.verification.verificationMode, "local_live");
 
   const publication = await session.post<{ release: PublishedRelease }>(
     `/api/projects/${project.id}/releases`, { analysisRunId: enqueued.runId },
@@ -136,12 +136,14 @@ test("Docker local-live persists a non-Acme OpenAPI release with exact Storage i
   assert.equal(createHash("sha256").update(served).digest("hex"), release.contentHash);
   assert.equal(`sha384-${createHash("sha384").update(served).digest("base64")}`, release.sri);
 
-  const installed = await session.post<{ installation: { status: string; verificationMode?: string } }>(
+  const installed = await session.post<{
+    installation: { status: string; verifierIdentity?: { mode?: string } };
+  }>(
     `/api/projects/${project.id}/releases/${release.id}/installation`,
     { pageUrl: installPageUrl },
   );
   assert.equal(installed.installation.status, "verified");
-  assert.equal(installed.installation.verificationMode, "local_live");
+  assert.equal(installed.installation.verifierIdentity?.mode, "local_live");
 
   const resumed = new ControlPlaneSession(controlOrigin);
   await resumed.post("/api/auth/login", { email, password }, { authenticated: false });
@@ -214,14 +216,20 @@ function isLoopback(hostname: string): boolean {
 
 async function pollAnalysis(session: ControlPlaneSession, runId: string): Promise<{
   run: { status: string; errorCode?: string };
-  result?: { providerMode?: string; providerFixture?: boolean; evidence?: unknown[] };
+  result?: {
+    providerProvenance?: { mode?: string; fixture?: boolean };
+    evidence?: unknown[];
+  };
   capabilities: Capability[];
 }> {
   const deadline = Date.now() + 180_000;
   while (Date.now() < deadline) {
     const analysis = await session.get<{
       run: { status: string; errorCode?: string };
-      result?: { providerMode?: string; providerFixture?: boolean; evidence?: unknown[] };
+      result?: {
+        providerProvenance?: { mode?: string; fixture?: boolean };
+        evidence?: unknown[];
+      };
       capabilities: Capability[];
     }>(`/api/analysis-runs/${runId}`);
     if (analysis.run.status === "succeeded") return analysis;
