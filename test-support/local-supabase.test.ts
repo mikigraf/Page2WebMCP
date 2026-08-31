@@ -1,15 +1,21 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { chmod, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 // @ts-expect-error JavaScript operational script has no declaration file.
-import { bootstrapLocalRuntimeRoles } from "../scripts/local-runtime-roles.mjs";
+import { bootstrapLocalRuntimeRoles, validateOwnerDatabaseUrl } from "../scripts/local-runtime-roles.mjs";
 
 const workspaceRoot = fileURLToPath(new URL("../", import.meta.url));
+const localStatus = {
+  apiUrl: "http://127.0.0.1:54321",
+  publishableKey: "sb_publishable_local-browser-safe-key",
+  serviceKey: "sb_secret_local-server-only-key-value"
+};
+const migrationVersions = ["20260830190000", "20260831120000"];
 
 test("local Supabase lifecycle is pinned, uses the pnpm CLI boundary, and declares the public release bucket", async () => {
   const packageJson = JSON.parse(await readFile(join(workspaceRoot, "package.json"), "utf8")) as {
@@ -44,7 +50,7 @@ test("runtime role bootstrap rejects a non-loopback owner URL without printing o
   }
 });
 
-test("local status invokes Supabase only through pnpm exec and never prints status credentials", async () => {
+test("local status verifies the pinned CLI, parses machine env output, and never prints status credentials", async () => {
   const directory = await mkdtemp(join(tmpdir(), "page2webmcp-local-status-"));
   const bin = join(directory, "bin");
   const log = join(directory, "pnpm-arguments.log");
@@ -53,7 +59,19 @@ test("local status invokes Supabase only through pnpm exec and never prints stat
     await writeFile(join(directory, "supabase/migrations/20260830190000_workflow_event_observability.sql"), "-- fixture\n");
     await mkdir(bin);
     const fakePnpm = join(bin, "pnpm");
-    await writeFile(fakePnpm, `#!/bin/sh\nprintf '%s\\n' "$@" > "$PAGE2WEBMCP_PNPM_LOG"\nprintf '%s\\n' '{"API_URL":"http://127.0.0.1:54321","DB_URL":"postgresql://postgres:owner-secret@127.0.0.1:54322/postgres","SERVICE_ROLE_KEY":"service-secret"}'\n`);
+    await writeFile(fakePnpm, `#!/bin/sh
+printf '%s\\n' "$@" >> "$PAGE2WEBMCP_PNPM_LOG"
+printf '%s\\n' -- >> "$PAGE2WEBMCP_PNPM_LOG"
+if [ "$*" = "exec supabase --version" ]; then
+  printf '%s\\n' '2.116.0'
+else
+  printf '%s\\n' 'API_URL="http://127.0.0.1:54321"'
+  printf '%s\\n' 'DB_URL="postgresql://postgres:owner-secret@127.0.0.1:54322/postgres"'
+  printf '%s\\n' 'ANON_KEY="sb_publishable_local-browser-safe-key"'
+  printf '%s\\n' 'SERVICE_ROLE_KEY="service-secret"'
+  printf '%s\\n' 'STUDIO_URL="http://127.0.0.1:54323"'
+fi
+`);
     await chmod(fakePnpm, 0o755);
 
     const result = await run("scripts/local-supabase.mjs", ["status"], directory, {
@@ -62,25 +80,60 @@ test("local status invokes Supabase only through pnpm exec and never prints stat
     });
 
     assert.equal(result.code, 0);
-    assert.equal(await readFile(log, "utf8"), "exec\nsupabase\nstatus\n-o\njson\n");
+    assert.equal(await readFile(log, "utf8"), [
+      "exec", "supabase", "--version", "--",
+      "exec", "supabase", "status", "-o", "env", "--"
+    ].join("\n") + "\n");
     assert.match(result.stdout, /API_URL: http:\/\/127\.0\.0\.1:54321/);
+    assert.match(result.stdout, /STUDIO_URL: http:\/\/127\.0\.0\.1:54323/);
     assert.doesNotMatch(`${result.stdout}\n${result.stderr}`, /owner-secret|service-secret/);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
 });
 
-test("runtime role bootstrap writes three bounded distinct login URLs and verifies their one-role memberships", async () => {
+test("local lifecycle fails closed before stack commands when the executable version drifts", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "page2webmcp-local-version-"));
+  const bin = join(directory, "bin");
+  const log = join(directory, "pnpm-arguments.log");
+  try {
+    await mkdir(join(directory, "supabase/migrations"), { recursive: true });
+    await writeFile(join(directory, "supabase/migrations/20260830190000_workflow_event_observability.sql"), "-- fixture\n");
+    await mkdir(bin);
+    const fakePnpm = join(bin, "pnpm");
+    await writeFile(fakePnpm, `#!/bin/sh
+printf '%s\\n' "$@" >> "$PAGE2WEBMCP_PNPM_LOG"
+printf '%s\\n' -- >> "$PAGE2WEBMCP_PNPM_LOG"
+printf '%s\\n' '2.115.0'
+`);
+    await chmod(fakePnpm, 0o755);
+
+    const result = await run("scripts/local-supabase.mjs", ["status"], directory, {
+      PATH: `${bin}:${process.env.PATH}`,
+      PAGE2WEBMCP_PNPM_LOG: log
+    });
+
+    assert.equal(result.code, 2);
+    assert.equal(result.stderr, "LOCAL_SUPABASE_VERSION_MISMATCH\n");
+    assert.equal(await readFile(log, "utf8"), "exec\nsupabase\n--version\n--\n");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("runtime role bootstrap writes one atomic mode-0600 environment with fresh isolated credentials", async () => {
   const directory = await mkdtemp(join(tmpdir(), "page2webmcp-local-roles-success-"));
   const destination = join(directory, ".page2webmcp/local.env");
-  const client = fakeBootstrapClient();
+  const firstClient = fakeBootstrapClient(migrationVersions);
   try {
     const result = await bootstrapLocalRuntimeRoles(
       "postgresql://postgres:owner-secret@127.0.0.1:54322/postgres",
       destination,
-      { createClient: () => client }
+      { createClient: () => firstClient },
+      { localStatus, expectedMigrationVersions: migrationVersions }
     );
-    const environment = Object.fromEntries((await readFile(destination, "utf8")).trim().split("\n").map((line) => {
+    const firstText = await readFile(destination, "utf8");
+    const environment = Object.fromEntries(firstText.trim().split("\n").map((line) => {
       const separator = line.indexOf("=");
       return [line.slice(0, separator), line.slice(separator + 1)];
     }));
@@ -92,20 +145,167 @@ test("runtime role bootstrap writes three bounded distinct login URLs and verifi
 
     assert.equal(result.length, 3);
     assert.equal(new Set(urls).size, 3);
-    for (const value of urls) {
+    const expectedLogins = ["page2webmcp_app_local", "page2webmcp_worker_local", "page2webmcp_maintenance_local"];
+    for (const [index, value] of urls.entries()) {
       const parsed = new URL(value!);
       assert.equal(parsed.hostname, "127.0.0.1");
       assert.equal(parsed.port, "54322");
       assert.equal(parsed.pathname, "/postgres");
+      assert.equal(parsed.username, expectedLogins[index]);
       assert.match(parsed.password, /^[A-Za-z0-9_-]{43}$/);
       assert.notEqual(parsed.password, "owner-secret");
     }
-    assert.deepEqual(client.membershipAssertions, [
-      ["page2webmcp_local_app", "page2webmcp_app"],
-      ["page2webmcp_local_worker", "page2webmcp_worker"],
-      ["page2webmcp_local_maintenance", "page2webmcp_maintenance"]
+    assert.deepEqual(firstClient.membershipAssertions, [
+      ["page2webmcp_app_local", "page2webmcp_app"],
+      ["page2webmcp_worker_local", "page2webmcp_worker"],
+      ["page2webmcp_maintenance_local", "page2webmcp_maintenance"]
     ]);
+    assert.deepEqual(firstClient.migrationAssertions, migrationVersions);
+    assert.equal(environment.NEXT_PUBLIC_SUPABASE_URL, localStatus.apiUrl);
+    assert.equal(environment.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY, localStatus.publishableKey);
+    assert.equal(environment.PAGE2WEBMCP_SUPABASE_URL, localStatus.apiUrl);
+    assert.equal(environment.PAGE2WEBMCP_SUPABASE_SECRET_KEY, localStatus.serviceKey);
+    assert.match(environment.PAGE2WEBMCP_SESSION_SECRET!, /^[A-Za-z0-9_-]{43}$/);
+    assert.doesNotMatch(firstText, /owner-secret|PAGE2WEBMCP_OWNER_DATABASE_URL|NEXT_PUBLIC_SUPABASE_SECRET/);
+    assert.equal((await stat(destination)).mode & 0o777, 0o600);
+    assert.deepEqual((await readdir(join(directory, ".page2webmcp"))).sort(), ["local.env"]);
+    assert.equal(firstClient.ended, true);
+
+    const secondClient = fakeBootstrapClient(migrationVersions);
+    await bootstrapLocalRuntimeRoles(
+      "postgresql://postgres:owner-secret@127.0.0.1:54322/postgres",
+      destination,
+      { createClient: () => secondClient },
+      { localStatus, expectedMigrationVersions: migrationVersions }
+    );
+    const secondText = await readFile(destination, "utf8");
+    const secondEnvironment = Object.fromEntries(secondText.trim().split("\n").map((line) => {
+      const separator = line.indexOf("=");
+      return [line.slice(0, separator), line.slice(separator + 1)];
+    }));
+    assert.notEqual(secondEnvironment.PAGE2WEBMCP_SESSION_SECRET, environment.PAGE2WEBMCP_SESSION_SECRET);
+    assert.notEqual(secondEnvironment.PAGE2WEBMCP_APP_DATABASE_URL, environment.PAGE2WEBMCP_APP_DATABASE_URL);
+    assert.equal((await stat(destination)).mode & 0o777, 0o600);
+    assert.deepEqual((await readdir(join(directory, ".page2webmcp"))).sort(), ["local.env"]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("runtime role bootstrap refuses to persist credentials until every committed migration is applied", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "page2webmcp-local-migrations-"));
+  const destination = join(directory, ".page2webmcp/local.env");
+  const client = fakeBootstrapClient([migrationVersions[0]!]);
+  try {
+    await assert.rejects(bootstrapLocalRuntimeRoles(
+      "postgresql://postgres:owner-secret@127.0.0.1:54322/postgres",
+      destination,
+      { createClient: () => client },
+      { localStatus, expectedMigrationVersions: migrationVersions }
+    ), /^Error: LOCAL_MIGRATION_HISTORY_INCOMPLETE$/);
+    assert.equal(await exists(destination), false);
     assert.equal(client.ended, true);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("owner bootstrap accepts only the canonical local Postgres endpoints", () => {
+  assert.equal(
+    validateOwnerDatabaseUrl("postgresql://postgres:secret@127.0.0.1:54322/postgres").hostname,
+    "127.0.0.1"
+  );
+  assert.equal(
+    validateOwnerDatabaseUrl("postgresql://postgres:secret@[::1]:54322/postgres").hostname,
+    "[::1]"
+  );
+  for (const value of [
+    "postgresql://postgres:secret@localhost:54322/postgres",
+    "postgresql://postgres:secret@127.0.0.2:54322/postgres",
+    "postgresql://postgres:secret@127.0.0.1:54323/postgres",
+    "postgresql://postgres:secret@127.0.0.1:54322/other"
+  ]) assert.throws(() => validateOwnerDatabaseUrl(value), /^Error: LOCAL_OWNER_DATABASE_URL_LOOPBACK_REQUIRED$/);
+});
+
+test("local-live launcher isolates app and worker credentials and runs worker TypeScript directly", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "page2webmcp-local-launcher-"));
+  const bin = join(directory, "bin");
+  const log = join(directory, "children.tsv");
+  const terminated = join(directory, "terminated.log");
+  const localDirectory = join(directory, ".page2webmcp");
+  try {
+    await mkdir(bin);
+    await mkdir(localDirectory, { mode: 0o700 });
+    const fakePnpm = join(bin, "pnpm");
+    await writeFile(fakePnpm, `#!/bin/sh
+case "$*" in
+  *worker*) kind=worker ;;
+  *) kind=app ;;
+esac
+printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' \
+  "$kind" "$*" "\${DATABASE_URL-}" "\${PAGE2WEBMCP_LOCAL_STACK-}" "\${PAGE2WEBMCP_STORAGE_MODE-}" \
+  "\${PAGE2WEBMCP_APP_DATABASE_URL-}" "\${PAGE2WEBMCP_WORKER_DATABASE_URL-}" "\${PAGE2WEBMCP_MAINTENANCE_DATABASE_URL-}" \
+  "\${NEXT_PUBLIC_SUPABASE_URL-}" "\${NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY-}" "\${PAGE2WEBMCP_SUPABASE_URL-}" \
+  "\${PAGE2WEBMCP_SUPABASE_SECRET_KEY-}" "\${PAGE2WEBMCP_SESSION_SECRET-}" \
+  "\${PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN-}" "\${PAGE2WEBMCP_PUBLIC_ORIGIN-}" "\${PAGE2WEBMCP_PROVIDER_MODE-}" >> "$PAGE2WEBMCP_CHILD_LOG"
+if [ "$kind" = worker ]; then
+  sleep 1
+  exit 7
+fi
+trap 'printf "%s\\n" app-terminated >> "$PAGE2WEBMCP_TERMINATED_LOG"; exit 0' TERM INT
+while :; do sleep 1; done
+`);
+    await chmod(fakePnpm, 0o755);
+    const localEnv = [
+      "PAGE2WEBMCP_APP_DATABASE_URL=postgresql://page2webmcp_app_local:app-password@127.0.0.1:54322/postgres?options=-c+role%3Dpage2webmcp_app",
+      "PAGE2WEBMCP_WORKER_DATABASE_URL=postgresql://page2webmcp_worker_local:worker-password@127.0.0.1:54322/postgres?options=-c+role%3Dpage2webmcp_worker",
+      "PAGE2WEBMCP_MAINTENANCE_DATABASE_URL=postgresql://page2webmcp_maintenance_local:maintenance-password@127.0.0.1:54322/postgres?options=-c+role%3Dpage2webmcp_maintenance",
+      `NEXT_PUBLIC_SUPABASE_URL=${localStatus.apiUrl}`,
+      `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=${localStatus.publishableKey}`,
+      `PAGE2WEBMCP_SUPABASE_URL=${localStatus.apiUrl}`,
+      `PAGE2WEBMCP_SUPABASE_SECRET_KEY=${localStatus.serviceKey}`,
+      "PAGE2WEBMCP_SESSION_SECRET=local-session-secret-with-more-than-32-bytes"
+    ].join("\n") + "\n";
+    const localEnvPath = join(localDirectory, "local.env");
+    await writeFile(localEnvPath, localEnv, { mode: 0o600 });
+    await chmod(localEnvPath, 0o600);
+
+    const result = await run("scripts/dev-local-live.mjs", [], directory, {
+      PATH: `${bin}:${process.env.PATH}`,
+      PAGE2WEBMCP_CHILD_LOG: log,
+      PAGE2WEBMCP_TERMINATED_LOG: terminated,
+      PAGE2WEBMCP_PROVIDER_MODE: "openapi",
+      PAGE2WEBMCP_APP_DATABASE_URL: "must-not-be-inherited",
+      PAGE2WEBMCP_WORKER_DATABASE_URL: "must-not-be-inherited",
+      PAGE2WEBMCP_MAINTENANCE_DATABASE_URL: "must-not-be-inherited",
+      PAGE2WEBMCP_SESSION_SECRET: "must-not-be-inherited"
+    });
+
+    assert.equal(result.code, 7);
+    assert.equal(await readFile(terminated, "utf8"), "app-terminated\n");
+    assert.doesNotMatch(`${result.stdout}\n${result.stderr}`, /app-password|worker-password|service-key|session-secret/);
+    const records = (await readFile(log, "utf8")).trim().split("\n").map((line) => line.split("\t"));
+    assert.equal(records.length, 2);
+    const app = records.find(([kind]) => kind === "app")!;
+    const worker = records.find(([kind]) => kind === "worker")!;
+    assert.equal(app[1], "--filter @page2webmcp/control-plane dev -- --port 3100");
+    assert.equal(worker[1], "exec tsx apps/worker/src/main.ts");
+    assert.deepEqual(app.slice(2), [
+      "postgresql://page2webmcp_app_local:app-password@127.0.0.1:54322/postgres?options=-c+role%3Dpage2webmcp_app",
+      "true", "postgres", "", "", "",
+      localStatus.apiUrl, localStatus.publishableKey, localStatus.apiUrl, localStatus.serviceKey,
+      "local-session-secret-with-more-than-32-bytes",
+      "http://127.0.0.1:3100",
+      "http://127.0.0.1:54321/storage/v1/object/public/page2webmcp-releases",
+      "openapi"
+    ]);
+    assert.deepEqual(worker.slice(2), [
+      "postgresql://page2webmcp_worker_local:worker-password@127.0.0.1:54322/postgres?options=-c+role%3Dpage2webmcp_worker",
+      "true", "postgres", "", "", "", "", "", "", "", "",
+      "http://127.0.0.1:3100",
+      "http://127.0.0.1:54321/storage/v1/object/public/page2webmcp-releases",
+      "openapi"
+    ]);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -115,15 +315,21 @@ async function exists(path: string) {
   return existsSync(path);
 }
 
-function fakeBootstrapClient() {
+function fakeBootstrapClient(appliedMigrationVersions: readonly string[] = []) {
   const applicationRoles = ["page2webmcp_app", "page2webmcp_worker", "page2webmcp_maintenance"];
   const membershipAssertions: string[][] = [];
+  const migrationAssertions: string[] = [];
   return {
     ended: false,
     membershipAssertions,
+    migrationAssertions,
     async connect() {},
     async end() { this.ended = true; },
     async query(text: string, values?: unknown[]) {
+      if (text.includes("supabase_migrations.schema_migrations")) {
+        migrationAssertions.push(...appliedMigrationVersions);
+        return { rows: appliedMigrationVersions.map((version) => ({ version })) };
+      }
       if (text.includes("from pg_roles")) return {
         rows: applicationRoles.map((rolname) => ({ rolname, rolcanlogin: false, rolinherit: false, rolsuper: false, rolbypassrls: false }))
       };
@@ -131,7 +337,8 @@ function fakeBootstrapClient() {
         const logins = values?.[0] as string[];
         return {
           rows: logins.map((login) => {
-            const role = login.replace("page2webmcp_local_", "page2webmcp_");
+            const role = login.replace(/_(?:app|worker|maintenance)_local$/, (suffix) =>
+              `_${suffix.slice(1, -6)}`);
             membershipAssertions.push([login, role]);
             return { login, application_role: role, rolinherit: false, rolsuper: false, rolbypassrls: false };
           })

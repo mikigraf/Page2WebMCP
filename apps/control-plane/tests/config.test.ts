@@ -15,6 +15,15 @@ const production = {
   DATABASE_URL: "postgresql://database.example/page2webmcp"
 };
 
+const localProduction = {
+  ...production,
+  PAGE2WEBMCP_LOCAL_STACK: "true",
+  NEXT_PUBLIC_SUPABASE_URL: "http://127.0.0.1:54321",
+  PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN: "http://127.0.0.1:3100",
+  PAGE2WEBMCP_SUPABASE_URL: "http://127.0.0.1:54321",
+  PAGE2WEBMCP_PUBLIC_ORIGIN: "http://127.0.0.1:54321/storage/v1/object/public/page2webmcp-releases"
+};
+
 test("production configuration requires a strong session secret and durable database", () => {
   assert.throws(
     () => validateRuntimeConfiguration({ ...production, PAGE2WEBMCP_SESSION_SECRET: "short" }),
@@ -73,7 +82,7 @@ test("production requires public Supabase configuration and rejects browser-expo
   );
 });
 
-test("production requires an exact HTTPS public origin for CSRF validation", () => {
+test("production permits HTTP Auth and control origins only for the explicit IP-literal local stack", () => {
   assert.throws(
     () => validateRuntimeConfiguration({ ...production, PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN: "" }),
     /INVALID_CONTROL_PLANE_PUBLIC_ORIGIN/
@@ -92,11 +101,31 @@ test("production requires an exact HTTPS public origin for CSRF validation", () 
     }),
     /INVALID_CONTROL_PLANE_PUBLIC_ORIGIN/
   );
-  assert.doesNotThrow(() => validateRuntimeConfiguration({
+  assert.throws(() => validateRuntimeConfiguration({
     ...production,
     PAGE2WEBMCP_TEST_MODE: "true",
+    NEXT_PUBLIC_SUPABASE_URL: "http://127.0.0.1:54321",
     PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN: "http://127.0.0.1:3100"
+  }), /SUPABASE_CONFIGURATION_REQUIRED|INVALID_CONTROL_PLANE_PUBLIC_ORIGIN/);
+  assert.doesNotThrow(() => validateRuntimeConfiguration(localProduction));
+  assert.doesNotThrow(() => validateRuntimeConfiguration({
+    ...localProduction,
+    NEXT_PUBLIC_SUPABASE_URL: "http://[::1]:54321",
+    PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN: "http://[::1]:3100"
   }));
+  for (const overrides of [
+    { PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN: "http://localhost:3100" },
+    { PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN: "http://127.0.0.2:3100" },
+    { PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN: "http://127.0.0.1:3100/path" },
+    { PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN: "http://user@127.0.0.1:3100" },
+    { NEXT_PUBLIC_SUPABASE_URL: "http://localhost:54321" },
+    { NEXT_PUBLIC_SUPABASE_URL: "http://127.0.0.2:54321" },
+    { NEXT_PUBLIC_SUPABASE_URL: "http://127.0.0.1:54321/auth/v1" },
+    { NEXT_PUBLIC_SUPABASE_URL: "http://127.0.0.1:54321?unsafe=true" }
+  ]) assert.throws(
+    () => validateRuntimeConfiguration({ ...localProduction, ...overrides }),
+    /SUPABASE_CONFIGURATION_REQUIRED|INVALID_CONTROL_PLANE_PUBLIC_ORIGIN/
+  );
 });
 
 test("production requires this app's exact hosted Supabase Storage artifact topology", () => {

@@ -9,10 +9,9 @@ export function validateRuntimeConfiguration(environment: RuntimeEnvironment = p
   validateReleaseArtifactStorageConfiguration(environment);
   validateSupabaseConfiguration(environment);
   const publicOrigin = exactUrl(environment.PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN ?? "");
-  const permitsHttp = environment.PAGE2WEBMCP_TEST_MODE === "true";
   if (!publicOrigin
-    || publicOrigin.origin !== publicOrigin.toString().replace(/\/$/, "")
-    || (publicOrigin.protocol !== "https:" && !(permitsHttp && publicOrigin.protocol === "http:"))) {
+    || !exactOrigin(publicOrigin)
+    || (publicOrigin.protocol !== "https:" && !localStackHttpOrigin(publicOrigin, environment))) {
     throw new Error("INVALID_CONTROL_PLANE_PUBLIC_ORIGIN");
   }
   validateSharedRuntimeConfiguration(environment, true);
@@ -51,9 +50,8 @@ function validateSupabaseConfiguration(environment: RuntimeEnvironment): void {
   const key = environment.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY
     ?? environment.NEXT_PUBLIC_SUPABASE_ANON_KEY
     ?? "";
-  const permitsHttp = environment.PAGE2WEBMCP_TEST_MODE === "true";
-  if (!url || url.origin !== url.toString().replace(/\/$/, "")
-    || (url.protocol !== "https:" && !(permitsHttp && url.protocol === "http:"))
+  if (!url || !exactOrigin(url)
+    || (url.protocol !== "https:" && !localStackHttpOrigin(url, environment))
     || key.length < 20 || unsafeSupabaseBrowserKey(key)) {
     throw new Error("SUPABASE_CONFIGURATION_REQUIRED");
   }
@@ -64,6 +62,17 @@ function validateSupabaseConfiguration(environment: RuntimeEnvironment): void {
       throw new Error("SUPABASE_SECRET_EXPOSURE_BLOCKED");
     }
   }
+}
+
+function exactOrigin(url: URL): boolean {
+  return !url.username && !url.password && !url.search && !url.hash && url.pathname === "/";
+}
+
+function localStackHttpOrigin(url: URL, environment: RuntimeEnvironment): boolean {
+  return environment.PAGE2WEBMCP_LOCAL_STACK === "true"
+    && url.protocol === "http:"
+    && ["127.0.0.1", "[::1]"].includes(url.hostname)
+    && exactOrigin(url);
 }
 
 function exactUrl(value: string): URL | undefined {

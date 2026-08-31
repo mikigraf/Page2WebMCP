@@ -80,6 +80,7 @@ export interface AuthService {
 type AuthServiceOptions = Readonly<{
   createClient: SupabaseAuthClientFactory;
   now?: () => Date;
+  environment?: Record<string, string | undefined>;
 }>;
 
 export class AuthError extends Error {
@@ -89,8 +90,12 @@ export class AuthError extends Error {
   }
 }
 
-function expiredCookies(request: Request, cookieWrites: readonly string[] = []): string[] {
-  const secure = process.env.NODE_ENV === "production" || new URL(request.url).protocol === "https:";
+function expiredCookies(
+  request: Request,
+  cookieWrites: readonly string[] = [],
+  environment: Record<string, string | undefined> = process.env
+): string[] {
+  const secure = secureCookie(request, environment);
   const names = new Set(parseCookies(request).map(({ name }) => name).filter((name) => name.startsWith("sb-")));
   for (const cookie of cookieWrites) {
     const name = cookie.slice(0, cookie.indexOf("="));
@@ -99,8 +104,13 @@ function expiredCookies(request: Request, cookieWrites: readonly string[] = []):
   return [...names].sort().map((name) => serializeSupabaseCookie(name, "", { maxAge: 0 }, secure));
 }
 
-function sessionFailure(request: Request, code: "SESSION_EXPIRED" | "SESSION_REVOKED", cookies: string[]): never {
-  throw new AuthError(code, expiredCookies(request, cookies));
+function sessionFailure(
+  request: Request,
+  code: "SESSION_EXPIRED" | "SESSION_REVOKED",
+  cookies: string[],
+  environment: Record<string, string | undefined>
+): never {
+  throw new AuthError(code, expiredCookies(request, cookies, environment));
 }
 
 function providerError(error: AuthProviderError | null, fallback = "AUTH_PROVIDER_ERROR"): void {
@@ -114,12 +124,12 @@ function providerError(error: AuthProviderError | null, fallback = "AUTH_PROVIDE
   throw new AuthError(fallback);
 }
 
-function cookieCollector(request: Request): {
+function cookieCollector(request: Request, environment: Record<string, string | undefined>): {
   writes: string[];
   setCookies: (cookies: readonly SupabaseCookieWrite[]) => void;
 } {
   const writes: string[] = [];
-  const secure = process.env.NODE_ENV === "production" || new URL(request.url).protocol === "https:";
+  const secure = secureCookie(request, environment);
   return {
     writes,
     setCookies(cookies) {
@@ -132,8 +142,9 @@ function cookieCollector(request: Request): {
 
 export function createSupabaseAuthService(options: AuthServiceOptions): AuthService {
   const now = options.now ?? (() => new Date());
+  const environment = options.environment ?? process.env;
   const context = (request: Request) => {
-    const collector = cookieCollector(request);
+    const collector = cookieCollector(request, environment);
     return { client: options.createClient(request, collector.setCookies), cookies: collector.writes };
   };
   return {
@@ -142,23 +153,23 @@ export function createSupabaseAuthService(options: AuthServiceOptions): AuthServ
       const userResult = await client.auth.getUser();
       if (userResult.error) {
         const marker = `${userResult.error.code ?? ""} ${userResult.error.message ?? ""}`.toLowerCase();
-        sessionFailure(request, marker.includes("expir") ? "SESSION_EXPIRED" : "SESSION_REVOKED", cookies);
+        sessionFailure(request, marker.includes("expir") ? "SESSION_EXPIRED" : "SESSION_REVOKED", cookies, environment);
       }
       if (!userResult.data.user) return undefined;
       const user = userResult.data.user;
       if (!user.email_confirmed_at && !user.confirmed_at) {
-        throw new AuthError("EMAIL_VERIFICATION_REQUIRED", expiredCookies(request, cookies));
+        throw new AuthError("EMAIL_VERIFICATION_REQUIRED", expiredCookies(request, cookies, environment));
       }
       const claimsResult = await client.auth.getClaims();
-      if (claimsResult.error || !claimsResult.data.claims) sessionFailure(request, "SESSION_REVOKED", cookies);
+      if (claimsResult.error || !claimsResult.data.claims) sessionFailure(request, "SESSION_REVOKED", cookies, environment);
       const claims = claimsResult.data.claims;
       const subject = typeof claims.sub === "string" ? claims.sub : undefined;
       const sessionId = typeof claims.session_id === "string" ? claims.session_id : undefined;
       const expires = typeof claims.exp === "number" && Number.isSafeInteger(claims.exp) ? claims.exp : undefined;
       if (!subject || subject !== user.id || !sessionId
         || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(sessionId)
-        || !expires) sessionFailure(request, "SESSION_REVOKED", cookies);
-      if (expires <= Math.floor(now().getTime() / 1_000)) sessionFailure(request, "SESSION_EXPIRED", cookies);
+        || !expires) sessionFailure(request, "SESSION_REVOKED", cookies, environment);
+      if (expires <= Math.floor(now().getTime() / 1_000)) sessionFailure(request, "SESSION_EXPIRED", cookies, environment);
       return {
         id: user.id,
         ...(user.email ? { email: user.email } : {}),
@@ -173,7 +184,7 @@ export function createSupabaseAuthService(options: AuthServiceOptions): AuthServ
       const emailVerificationRequired = result.data.session === null;
       if (emailVerificationRequired) return { emailVerificationRequired, cookies };
       if (!result.data.user || (!result.data.user.email_confirmed_at && !result.data.user.confirmed_at)) {
-        throw new AuthError("SIGNUP_FAILED", expiredCookies(request, cookies));
+        throw new AuthError("SIGNUP_FAILED", expiredCookies(request, cookies, environment));
       }
       return {
         emailVerificationRequired,
@@ -190,7 +201,7 @@ export function createSupabaseAuthService(options: AuthServiceOptions): AuthServ
       providerError(result.error, "AUTH_REQUIRED");
       if (!result.data.user || !result.data.session) throw new AuthError("AUTH_REQUIRED");
       if (!result.data.user.email_confirmed_at && !result.data.user.confirmed_at) {
-        throw new AuthError("EMAIL_VERIFICATION_REQUIRED", expiredCookies(request, cookies));
+        throw new AuthError("EMAIL_VERIFICATION_REQUIRED", expiredCookies(request, cookies, environment));
       }
       return { cookies, user: { id: result.data.user.id, ...(result.data.user.email ? { email: result.data.user.email } : {}) } };
     },
@@ -200,7 +211,7 @@ export function createSupabaseAuthService(options: AuthServiceOptions): AuthServ
       providerError(result.error, "AUTH_CALLBACK_FAILED");
       if (!result.data.user || !result.data.session) throw new AuthError("AUTH_CALLBACK_FAILED");
       if (!result.data.user.email_confirmed_at && !result.data.user.confirmed_at) {
-        throw new AuthError("EMAIL_VERIFICATION_REQUIRED", expiredCookies(request, cookies));
+        throw new AuthError("EMAIL_VERIFICATION_REQUIRED", expiredCookies(request, cookies, environment));
       }
       return { cookies, user: { id: result.data.user.id, ...(result.data.user.email ? { email: result.data.user.email } : {}) } };
     },
@@ -209,12 +220,12 @@ export function createSupabaseAuthService(options: AuthServiceOptions): AuthServ
       const result = await client.auth.refreshSession();
       if (result.error) {
         try { providerError(result.error, "SESSION_EXPIRED"); } catch (error) {
-          if (error instanceof AuthError) throw new AuthError(error.code, expiredCookies(request, cookies));
+          if (error instanceof AuthError) throw new AuthError(error.code, expiredCookies(request, cookies, environment));
           throw error;
         }
       }
       if (!result.data.user || !result.data.session) {
-        throw new AuthError("SESSION_EXPIRED", expiredCookies(request, cookies));
+        throw new AuthError("SESSION_EXPIRED", expiredCookies(request, cookies, environment));
       }
       return { cookies, user: { id: result.data.user.id, ...(result.data.user.email ? { email: result.data.user.email } : {}) } };
     },
@@ -222,7 +233,7 @@ export function createSupabaseAuthService(options: AuthServiceOptions): AuthServ
       const { client, cookies } = context(request);
       const result = await client.auth.getClaims();
       if (result.error || !result.data.claims) {
-        throw new AuthError("SESSION_REVOKED", expiredCookies(request, cookies));
+        throw new AuthError("SESSION_REVOKED", expiredCookies(request, cookies, environment));
       }
       return { cookies };
     },
@@ -245,7 +256,7 @@ export function createSupabaseAuthService(options: AuthServiceOptions): AuthServ
       providerError(result.error, "SIGNOUT_FAILED");
       return { cookies };
     },
-    clearSessionCookies: expiredCookies
+    clearSessionCookies: (request) => expiredCookies(request, [], environment)
   };
 }
 
@@ -277,8 +288,7 @@ function configuredValues(environment: Record<string, string | undefined> = proc
     ?? "";
   let url: URL;
   try { url = new URL(rawUrl); } catch { throw new AuthError("SUPABASE_CONFIGURATION_REQUIRED"); }
-  const permitsHttp = environment.PAGE2WEBMCP_TEST_MODE === "true";
-  if ((url.protocol !== "https:" && !(permitsHttp && url.protocol === "http:"))
+  if ((url.protocol !== "https:" && !localStackHttpOrigin(url, environment))
     || url.username || url.password || url.search || url.hash || url.pathname !== "/"
     || publishableKey.length < 20
     || unsafeSupabaseBrowserKey(publishableKey)) {
@@ -287,11 +297,40 @@ function configuredValues(environment: Record<string, string | undefined> = proc
   return { url: url.origin, publishableKey };
 }
 
+function localStackHttpOrigin(
+  url: URL,
+  environment: Record<string, string | undefined>
+): boolean {
+  return environment.PAGE2WEBMCP_LOCAL_STACK === "true"
+    && url.protocol === "http:"
+    && ["127.0.0.1", "[::1]"].includes(url.hostname)
+    && !url.username && !url.password && !url.search && !url.hash && url.pathname === "/";
+}
+
+function secureCookie(request: Request, environment: Record<string, string | undefined>): boolean {
+  const requestUrl = new URL(request.url);
+  if (requestUrl.protocol === "https:") return true;
+  if (environment.NODE_ENV !== "production") return false;
+  const configured = exactConfiguredControlOrigin(environment.PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN ?? "", environment);
+  return !configured || requestUrl.username !== "" || requestUrl.password !== ""
+    || requestUrl.protocol !== "http:" || requestUrl.origin !== configured;
+}
+
+function exactConfiguredControlOrigin(
+  value: string,
+  environment: Record<string, string | undefined>
+): string | undefined {
+  let url: URL;
+  try { url = new URL(value); } catch { return undefined; }
+  return localStackHttpOrigin(url, environment) ? url.origin : undefined;
+}
+
 export function createConfiguredSupabaseAuthService(
   environment: Record<string, string | undefined> = process.env
 ): AuthService {
   const config = configuredValues(environment);
   return createSupabaseAuthService({
+    environment,
     createClient(request, setCookies) {
       return createServerClient(config.url, config.publishableKey, {
         auth: { flowType: "pkce", autoRefreshToken: false, detectSessionInUrl: false, persistSession: true },

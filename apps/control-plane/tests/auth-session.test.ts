@@ -28,6 +28,36 @@ test("production auth has no fixture-credential fallback", () => {
   }), /SUPABASE_CONFIGURATION_REQUIRED/);
 });
 
+test("production Auth permits HTTP only for the explicit canonical IP-literal local stack", () => {
+  const base = {
+    NODE_ENV: "production",
+    NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: "sb_publishable_local-browser-safe-key"
+  };
+  assert.throws(() => createConfiguredSupabaseAuthService({
+    ...base,
+    PAGE2WEBMCP_TEST_MODE: "true",
+    NEXT_PUBLIC_SUPABASE_URL: "http://127.0.0.1:54321"
+  }), /^AuthError: SUPABASE_CONFIGURATION_REQUIRED$/);
+  for (const url of ["http://127.0.0.1:54321", "http://[::1]:54321"]) {
+    assert.doesNotThrow(() => createConfiguredSupabaseAuthService({
+      ...base,
+      PAGE2WEBMCP_LOCAL_STACK: "true",
+      NEXT_PUBLIC_SUPABASE_URL: url
+    }));
+  }
+  for (const url of [
+    "http://localhost:54321",
+    "http://127.0.0.2:54321",
+    "http://127.0.0.1:54321/auth/v1",
+    "http://127.0.0.1:54321?unsafe=true",
+    "http://user@127.0.0.1:54321"
+  ]) assert.throws(() => createConfiguredSupabaseAuthService({
+    ...base,
+    PAGE2WEBMCP_LOCAL_STACK: "true",
+    NEXT_PUBLIC_SUPABASE_URL: url
+  }), /^AuthError: SUPABASE_CONFIGURATION_REQUIRED$/);
+});
+
 test("the explicit hermetic fixture still returns a server-verifiable session identifier", async () => {
   const service = createFixtureAuthService({ now: clock });
   const actor = authenticate("owner@example.test", "fixture-password")!;

@@ -1,34 +1,90 @@
 import { randomBytes } from "node:crypto";
-import { mkdir, rename, writeFile } from "node:fs/promises";
+import { chmod, mkdir, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import pg from "pg";
 
 const LOCAL_OWNER_URL_ERROR = "LOCAL_OWNER_DATABASE_URL_LOOPBACK_REQUIRED";
 const LOCAL_ENVIRONMENT_PATH = ".page2webmcp/local.env";
 const RUNTIME_ROLES = [
-  { environmentKey: "PAGE2WEBMCP_APP_DATABASE_URL", login: "page2webmcp_local_app", role: "page2webmcp_app", limit: 10 },
-  { environmentKey: "PAGE2WEBMCP_WORKER_DATABASE_URL", login: "page2webmcp_local_worker", role: "page2webmcp_worker", limit: 5 },
-  { environmentKey: "PAGE2WEBMCP_MAINTENANCE_DATABASE_URL", login: "page2webmcp_local_maintenance", role: "page2webmcp_maintenance", limit: 2 }
+  { environmentKey: "PAGE2WEBMCP_APP_DATABASE_URL", login: "page2webmcp_app_local", role: "page2webmcp_app", limit: 10 },
+  { environmentKey: "PAGE2WEBMCP_WORKER_DATABASE_URL", login: "page2webmcp_worker_local", role: "page2webmcp_worker", limit: 5 },
+  { environmentKey: "PAGE2WEBMCP_MAINTENANCE_DATABASE_URL", login: "page2webmcp_maintenance_local", role: "page2webmcp_maintenance", limit: 2 }
 ];
 
 export async function bootstrapLocalRuntimeRoles(
   ownerDatabaseUrl,
   destination = resolve(process.cwd(), LOCAL_ENVIRONMENT_PATH),
-  dependencies = { createClient: (connectionString) => new pg.Client({ connectionString }) }
+  dependencies = { createClient: (connectionString) => new pg.Client({ connectionString }) },
+  options = {}
 ) {
   const ownerUrl = validateOwnerDatabaseUrl(ownerDatabaseUrl);
+  const localStatus = validateLocalStatus(options.localStatus);
+  const expectedMigrationVersions = validateMigrationVersions(options.expectedMigrationVersions);
   const client = dependencies.createClient(ownerUrl.toString());
   const credentials = RUNTIME_ROLES.map((runtimeRole) => ({ ...runtimeRole, password: randomBytes(32).toString("base64url") }));
   try {
     await client.connect();
+    await assertAppliedMigrationHistory(client, expectedMigrationVersions);
     await assertBoundedApplicationRoles(client);
     for (const credential of credentials) await configureLogin(client, credential);
     await assertRuntimeLoginMemberships(client, credentials);
   } finally {
     await client.end().catch(() => undefined);
   }
-  await writeLocalEnvironment(destination, credentials, ownerUrl);
+  await writeLocalEnvironment(destination, credentials, ownerUrl, localStatus);
   return credentials.map(({ environmentKey, login, role }) => ({ environmentKey, login, role }));
+}
+
+function validateLocalStatus(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+    || value.apiUrl !== "http://127.0.0.1:54321"
+    || !safeBrowserKey(value.publishableKey)
+    || !boundedSecret(value.serviceKey)
+    || value.publishableKey === value.serviceKey) {
+    throw new Error("LOCAL_SUPABASE_STATUS_INVALID");
+  }
+  return {
+    apiUrl: value.apiUrl,
+    publishableKey: value.publishableKey,
+    serviceKey: value.serviceKey
+  };
+}
+
+function safeBrowserKey(value) {
+  if (typeof value !== "string" || value.length < 20 || value.length > 4_096
+    || value.trim() !== value || /[\r\n]/.test(value) || /service[_-]?role|sb_secret_/i.test(value)) return false;
+  const parts = value.split(".");
+  if (parts.length !== 3) return true;
+  try {
+    const claims = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+    return claims && typeof claims === "object" && !Array.isArray(claims) && claims.role === "anon";
+  } catch {
+    return false;
+  }
+}
+
+function boundedSecret(value) {
+  return typeof value === "string" && value.length >= 32 && value.length <= 4_096
+    && value.trim() === value && !/[\r\n]/.test(value);
+}
+
+function validateMigrationVersions(value) {
+  if (!Array.isArray(value) || value.length < 1
+    || value.some((version) => typeof version !== "string" || !/^\d{14}$/.test(version))
+    || new Set(value).size !== value.length) {
+    throw new Error("LOCAL_MIGRATION_HISTORY_INCOMPLETE");
+  }
+  return [...value].sort();
+}
+
+async function assertAppliedMigrationHistory(client, expectedMigrationVersions) {
+  const result = await client.query(
+    "select version from supabase_migrations.schema_migrations order by version"
+  );
+  const applied = new Set(result.rows.map((row) => row.version).filter((version) => typeof version === "string"));
+  if (expectedMigrationVersions.some((version) => !applied.has(version))) {
+    throw new Error("LOCAL_MIGRATION_HISTORY_INCOMPLETE");
+  }
 }
 
 async function assertRuntimeLoginMemberships(client, credentials) {
@@ -55,7 +111,7 @@ export function validateOwnerDatabaseUrl(value) {
     throw new Error(LOCAL_OWNER_URL_ERROR);
   }
   if (parsed.protocol !== "postgresql:"
-    || parsed.hostname !== "127.0.0.1"
+    || !["127.0.0.1", "[::1]"].includes(parsed.hostname)
     || parsed.port !== "54322"
     || parsed.pathname !== "/postgres"
     || parsed.username !== "postgres"
@@ -97,7 +153,7 @@ async function configureLogin(client, credential) {
   await client.query(`grant ${credential.role} to ${credential.login}`);
 }
 
-async function writeLocalEnvironment(destination, credentials, ownerUrl) {
+async function writeLocalEnvironment(destination, credentials, ownerUrl, localStatus) {
   await mkdir(dirname(destination), { recursive: true, mode: 0o700 });
   const lines = credentials.map(({ environmentKey, password, role }) => {
     const runtimeUrl = new URL(ownerUrl);
@@ -106,9 +162,22 @@ async function writeLocalEnvironment(destination, credentials, ownerUrl) {
     runtimeUrl.searchParams.set("options", `-c role=${role}`);
     return `${environmentKey}=${runtimeUrl.toString()}`;
   });
+  lines.push(
+    `NEXT_PUBLIC_SUPABASE_URL=${localStatus.apiUrl}`,
+    `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=${localStatus.publishableKey}`,
+    `PAGE2WEBMCP_SUPABASE_URL=${localStatus.apiUrl}`,
+    `PAGE2WEBMCP_SUPABASE_SECRET_KEY=${localStatus.serviceKey}`,
+    `PAGE2WEBMCP_SESSION_SECRET=${randomBytes(32).toString("base64url")}`
+  );
   const temporary = `${destination}.${process.pid}.tmp`;
-  await writeFile(temporary, `${lines.join("\n")}\n`, { encoding: "utf8", mode: 0o600 });
-  await rename(temporary, destination);
+  try {
+    await writeFile(temporary, `${lines.join("\n")}\n`, { encoding: "utf8", mode: 0o600 });
+    await chmod(temporary, 0o600);
+    await rename(temporary, destination);
+  } catch (error) {
+    await rm(temporary, { force: true }).catch(() => undefined);
+    throw error;
+  }
 }
 
 async function main() {

@@ -227,3 +227,46 @@ test("Supabase cookies are server-only and securely scoped", () => {
     "sb-control-auth=opaque-value; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=3600");
   assert.throws(() => serializeSupabaseCookie("bad cookie", "x", {}, true), /INVALID_AUTH_COOKIE/);
 });
+
+test("production cookies drop Secure only for requests to the configured local-stack control origin", async () => {
+  const service = createSupabaseAuthService({
+    environment: {
+      NODE_ENV: "production",
+      PAGE2WEBMCP_LOCAL_STACK: "true",
+      PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN: "http://127.0.0.1:3100"
+    },
+    createClient(_request, setCookies) {
+      setCookies([{ name: "sb-control-auth", value: "opaque", options: { sameSite: "lax" } }]);
+      return client({
+        signInWithPassword: async () => ({
+          data: {
+            user: { id: USER_ID, email_confirmed_at: now.toISOString() },
+            session: { access_token: "not-returned" }
+          },
+          error: null
+        })
+      });
+    }
+  });
+
+  const local = await service.signIn(
+    new Request("http://127.0.0.1:3100/api/auth/login", { method: "POST" }),
+    "person@example.test",
+    "strong password"
+  );
+  const wrongLoopbackPort = await service.signIn(
+    new Request("http://127.0.0.1:3101/api/auth/login", { method: "POST" }),
+    "person@example.test",
+    "strong password"
+  );
+  const remote = await service.signIn(
+    new Request("http://control.example/api/auth/login", { method: "POST" }),
+    "person@example.test",
+    "strong password"
+  );
+
+  assert.equal(local.cookies.length, 1);
+  assert.doesNotMatch(local.cookies[0]!, /; Secure(?:;|$)/);
+  assert.match(wrongLoopbackPort.cookies[0]!, /; Secure(?:;|$)/);
+  assert.match(remote.cookies[0]!, /; Secure(?:;|$)/);
+});
