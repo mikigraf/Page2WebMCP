@@ -7,6 +7,7 @@ import {
   requireActor,
   successResponse
 } from "../../../../src/api.ts";
+import { analysisOutcome } from "../../../../src/analysis-outcome.ts";
 
 const RunIdSchema = z.string().uuid();
 
@@ -28,7 +29,13 @@ export async function GET(
     const capabilities = result
       ? await repository.listAnalysisCapabilities(actor, run.id)
       : [];
-    return successResponse({ run, projectId: run.projectId, result, capabilities }, requestId);
+    return successResponse({
+      run,
+      projectId: run.projectId,
+      result,
+      capabilities,
+      analysisOutcome: analysisOutcome(result, capabilities.length),
+    }, requestId);
   } catch (error) {
     return errorResponse(error, requestId, request);
   }

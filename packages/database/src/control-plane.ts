@@ -310,6 +310,47 @@ export type ReleaseInstallationRequest = Omit<ReleaseInstallationRecord,
   "id" | "organizationId" | "projectId" | "actorId" | "createdAt" | "verifiedAt" | "verifierIdentity">
   & Readonly<{ verifierIdentity: VerifierIdentityRecord }>;
 
+export type GitHubDraftPullRequestRecord = Readonly<{
+  id: string;
+  organizationId: string;
+  projectId: string;
+  workflowRunId: string;
+  taskId: string;
+  analysisRunId: string;
+  sourceSnapshotId: string;
+  projectSourceId: string;
+  phase: "publish" | "install_verify";
+  installationId: number;
+  repositoryId: number;
+  owner: string;
+  repository: string;
+  requestedRef: string;
+  baseCommitSha: string;
+  patchDigest: string;
+  branch: string;
+  number: number;
+  url: string;
+  headCommitSha: string;
+  draft: true;
+  merged: false;
+  check: Readonly<{
+    externalId: string;
+    status: "queued" | "in_progress" | "completed";
+    conclusion?: "action_required" | "cancelled" | "failure" | "neutral" | "success" | "skipped" | "stale" | "timed_out";
+  }>;
+  sandboxReference: string;
+  previewReference?: string;
+  sideEffectIdempotencyKey: string;
+  sideEffectInputHash: string;
+  outputHash: string;
+  outputReference: string;
+  createdAt: string;
+}>;
+
+export type SaveGitHubDraftPullRequestRequest = Omit<GitHubDraftPullRequestRecord,
+  "id" | "organizationId" | "projectId" | "taskId" | "sourceSnapshotId" | "projectSourceId"
+  | "phase" | "url" | "createdAt">;
+
 export type AuditEventRecord = {
   id: string;
   organizationId: string;
@@ -390,6 +431,25 @@ export interface ControlPlaneRepository extends WorkflowRepository {
     taskId: string,
     leaseGeneration: number,
   ): Promise<WorkflowExecutionMaterial>;
+  getGitHubDraftPullRequestForTask(
+    workerId: string,
+    taskId: string,
+    leaseGeneration: number,
+  ): Promise<GitHubDraftPullRequestRecord | undefined>;
+  saveGitHubDraftPullRequest(
+    workerId: string,
+    taskId: string,
+    leaseGeneration: number,
+    input: SaveGitHubDraftPullRequestRequest,
+  ): Promise<GitHubDraftPullRequestRecord>;
+  getLatestGitHubDraftPullRequest(
+    actor: RepositoryActor,
+    workflowRunId: string,
+  ): Promise<GitHubDraftPullRequestRecord | undefined>;
+  getLatestGitHubDraftPullRequestForProject(
+    actor: RepositoryActor,
+    projectId: string,
+  ): Promise<GitHubDraftPullRequestRecord | undefined>;
   listCapabilities(actor: RepositoryActor, projectId: string): Promise<CapabilityRecord[]>;
   listAnalysisCapabilities(actor: RepositoryActor, runId: string): Promise<CapabilityRecord[]>;
   reviewCapability(actor: RepositoryActor, capabilityId: string, input: ReviewInput): Promise<CapabilityRecord>;
@@ -400,6 +460,8 @@ export interface ControlPlaneRepository extends WorkflowRepository {
   getPreviousRelease(actor: RepositoryActor, projectId: string, releaseId: string): Promise<ReleaseRecord | undefined>;
   saveReleaseInstallation(actor: RepositoryActor, projectId: string,
     input: ReleaseInstallationRequest): Promise<ReleaseInstallationRecord>;
+  getLatestReleaseInstallation(actor: RepositoryActor, projectId: string,
+    releaseId: string): Promise<ReleaseInstallationRecord | undefined>;
   getReleaseArtifact(contentHash: string): Promise<ReleaseRecord>;
   listAuditEvents(actor: RepositoryActor): Promise<AuditEventRecord[]>;
   reset(): Promise<void>;
@@ -691,6 +753,7 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
   readonly #releaseByHash = new Map<string, string[]>();
   readonly #releaseByRun = new Map<string, string>();
   readonly #releaseInstallations = new Map<string, ReleaseInstallationRecord>();
+  readonly #gitHubDraftPullRequests = new Map<string, GitHubDraftPullRequestRecord>();
   readonly #idempotency = new Map<string, IdempotencyRecord>();
   readonly #analysisAvailableAt = new Map<string, string>();
   readonly #analysisSources = new Map<string, Readonly<{
@@ -1255,6 +1318,82 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
       analysis,
       capabilities,
     });
+  }
+
+  async getGitHubDraftPullRequestForTask(
+    workerId: string,
+    taskId: string,
+    leaseGeneration: number,
+  ): Promise<GitHubDraftPullRequestRecord | undefined> {
+    const task = this.#workflowTask(taskId);
+    this.#assertWorkflowLease(workerId, task, leaseGeneration);
+    const result = [...this.#gitHubDraftPullRequests.values()].find((item) => item.taskId === task.id);
+    return result ? copy(result) : undefined;
+  }
+
+  async saveGitHubDraftPullRequest(
+    workerId: string,
+    taskId: string,
+    leaseGeneration: number,
+    input: SaveGitHubDraftPullRequestRequest,
+  ): Promise<GitHubDraftPullRequestRecord> {
+    const task = this.#workflowTask(taskId);
+    this.#assertWorkflowLease(workerId, task, leaseGeneration);
+    const material = await this.getWorkflowExecutionMaterial(workerId, taskId, leaseGeneration);
+    const run = this.#workflowRuns.get(task.workflowRunId);
+    const snapshot = run ? this.#sourceSnapshots.get(run.sourceSnapshotId) : undefined;
+    const source = snapshot ? this.#projectSources.get(snapshot.projectSourceId) : undefined;
+    if (!run || !snapshot || !source || input.workflowRunId !== run.id
+      || input.analysisRunId !== material.analysisRunId
+      || !["publish", "install_verify"].includes(task.phase)) throw new RepositoryError("INVALID_STATE");
+    const record = normalizeGitHubDraftPullRequest({
+      ...input,
+      id: randomUUID(),
+      organizationId: run.organizationId,
+      projectId: run.projectId,
+      workflowRunId: run.id,
+      taskId: task.id,
+      analysisRunId: material.analysisRunId,
+      sourceSnapshotId: snapshot.id,
+      projectSourceId: source.id,
+      phase: task.phase as "publish" | "install_verify",
+      url: `https://github.com/${input.owner}/${input.repository}/pull/${input.number}`,
+      createdAt: this.#now(),
+    }, material);
+    const existing = [...this.#gitHubDraftPullRequests.values()].find((item) => item.taskId === task.id);
+    if (existing) {
+      if (canonicalJson(withoutGitHubRecordIdentity(existing))
+        !== canonicalJson(withoutGitHubRecordIdentity(record))) throw new RepositoryError("IDEMPOTENCY_CONFLICT");
+      return copy(existing);
+    }
+    this.#gitHubDraftPullRequests.set(record.id, record);
+    return copy(record);
+  }
+
+  async getLatestGitHubDraftPullRequest(
+    actor: RepositoryActor,
+    workflowRunId: string,
+  ): Promise<GitHubDraftPullRequestRecord | undefined> {
+    const run = this.#workflowRunForActor(actor, workflowRunId);
+    const result = [...this.#gitHubDraftPullRequests.values()]
+      .filter((item) => item.workflowRunId === run.id && item.organizationId === actor.organizationId)
+      .sort((left, right) => Number(right.phase === "install_verify") - Number(left.phase === "install_verify")
+        || compareCodePoints(right.createdAt, left.createdAt) || compareCodePoints(right.id, left.id))[0];
+    return result ? copy(result) : undefined;
+  }
+
+  async getLatestGitHubDraftPullRequestForProject(
+    actor: RepositoryActor,
+    projectId: string,
+  ): Promise<GitHubDraftPullRequestRecord | undefined> {
+    const project = this.#assertProject(actor, projectId);
+    if (project.sourceType !== "github") return undefined;
+    const result = [...this.#gitHubDraftPullRequests.values()]
+      .filter((item) => item.projectId === project.id && item.organizationId === actor.organizationId)
+      .sort((left, right) => compareCodePoints(right.createdAt, left.createdAt)
+        || Number(right.phase === "install_verify") - Number(left.phase === "install_verify")
+        || compareCodePoints(right.id, left.id))[0];
+    return result ? copy(result) : undefined;
   }
 
   async heartbeatWorkflowTask(workerId: string, taskId: string, leaseGeneration: number): Promise<WorkflowTaskRecord> {
@@ -2152,6 +2291,20 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
     return copy(record);
   }
 
+  async getLatestReleaseInstallation(
+    actor: RepositoryActor,
+    projectId: string,
+    releaseId: string,
+  ): Promise<ReleaseInstallationRecord | undefined> {
+    this.#assertProject(actor, projectId);
+    await this.getRelease(actor, projectId, releaseId);
+    const record = [...this.#releaseInstallations.values()]
+      .filter((item) => item.organizationId === actor.organizationId
+        && item.projectId === projectId && item.releaseId === releaseId)
+      .at(-1);
+    return record ? copy(record) : undefined;
+  }
+
   async listAuditEvents(actor: RepositoryActor): Promise<AuditEventRecord[]> {
     if (actor.role !== "owner") throw new RepositoryError("FORBIDDEN");
     return this.#audit.filter((event) => event.organizationId === actor.organizationId)
@@ -2173,6 +2326,7 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
     this.#releaseByHash.clear();
     this.#releaseByRun.clear();
     this.#releaseInstallations.clear();
+    this.#gitHubDraftPullRequests.clear();
     this.#idempotency.clear();
     this.#analysisAvailableAt.clear();
     this.#analysisSources.clear();
@@ -2235,6 +2389,94 @@ export function normalizeReleaseInstallation(
     verifierIdentity: copy(input.verifierIdentity),
     attestation,
   };
+}
+
+function withoutGitHubRecordIdentity(record: GitHubDraftPullRequestRecord): Omit<GitHubDraftPullRequestRecord, "id" | "createdAt"> {
+  const identity = { ...record } as {
+    -readonly [Key in keyof GitHubDraftPullRequestRecord]?: GitHubDraftPullRequestRecord[Key]
+  };
+  delete identity.id;
+  delete identity.createdAt;
+  return identity as Omit<GitHubDraftPullRequestRecord, "id" | "createdAt">;
+}
+
+export function normalizeGitHubDraftPullRequest(
+  input: GitHubDraftPullRequestRecord,
+  material: WorkflowExecutionMaterial,
+): GitHubDraftPullRequestRecord {
+  const sourceEvidence = material.analysis.evidence.find(({ source }) => source === "github");
+  let evidence: Record<string, unknown> | undefined;
+  try {
+    const value: unknown = sourceEvidence ? JSON.parse(sourceEvidence.content) : undefined;
+    evidence = isPlainRecord(value) ? value : undefined;
+  } catch {
+    evidence = undefined;
+  }
+  const expectedUrl = `https://github.com/${input.owner}/${input.repository}/pull/${input.number}`;
+  const checkKeys = Object.keys(input.check).sort(compareCodePoints).join(",");
+  const allowedConclusions = [
+    "action_required", "cancelled", "failure", "neutral", "success", "skipped", "stale", "timed_out",
+  ];
+  if (material.sourceType !== "github" || material.workflowRunId !== input.workflowRunId
+    || material.projectId !== input.projectId || material.sourceSnapshotId !== input.sourceSnapshotId
+    || material.analysisRunId !== input.analysisRunId
+    || input.organizationId.length === 0 || !["publish", "install_verify"].includes(input.phase)
+    || !Number.isSafeInteger(input.installationId) || input.installationId <= 0
+    || !Number.isSafeInteger(input.repositoryId) || input.repositoryId <= 0
+    || !/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/.test(input.owner)
+    || !/^[A-Za-z0-9._-]{1,100}$/.test(input.repository)
+    || !/^refs\/(?:heads|tags)\/[A-Za-z0-9](?:[A-Za-z0-9._/-]{0,252})$/.test(input.requestedRef)
+    || input.requestedRef.split("/").some((part) => part === "." || part === "..")
+    || !/^[a-f0-9]{40}$/.test(input.baseCommitSha) || !/^[a-f0-9]{64}$/.test(input.patchDigest)
+    || !/^page2webmcp\/[a-f0-9]{16}$/.test(input.branch)
+    || !Number.isSafeInteger(input.number) || input.number <= 0 || input.number > 2_147_483_647
+    || input.url !== expectedUrl || !/^[a-f0-9]{40}$/.test(input.headCommitSha)
+    || input.headCommitSha === input.baseCommitSha || input.draft !== true || input.merged !== false
+    || !/^wfx_[a-f0-9]{64}$/.test(input.check.externalId)
+    || !["queued", "in_progress", "completed"].includes(input.check.status)
+    || input.check.conclusion !== undefined && !allowedConclusions.includes(input.check.conclusion)
+    || !["externalId,status", "conclusion,externalId,status"].includes(checkKeys)
+    || !/^urn:sha256:[a-f0-9]{64}$/.test(input.sandboxReference)
+    || input.previewReference !== undefined && !/^urn:sha256:[a-f0-9]{64}$/.test(input.previewReference)
+    || input.phase === "install_verify" && (input.check.status !== "completed" || input.check.conclusion !== "success")
+    || !/^wfx_[a-f0-9]{64}$/.test(input.sideEffectIdempotencyKey)
+    || !/^[a-f0-9]{64}$/.test(input.sideEffectInputHash) || !/^[a-f0-9]{64}$/.test(input.outputHash)
+    || input.outputReference !== `urn:sha256:${input.outputHash}`
+    || evidence?.adapter !== "github-nextjs-source" || evidence.adapterVersion !== 1
+    || evidence.installationId !== input.installationId || evidence.repositoryId !== input.repositoryId
+    || evidence.repository !== `${input.owner}/${input.repository}` || evidence.requestedRef !== input.requestedRef
+    || evidence.commitSha !== input.baseCommitSha) throw new RepositoryError("INVALID_STATE");
+  return copy(input);
+}
+
+export function gitHubDraftPullRequestMatchesRequest(
+  record: GitHubDraftPullRequestRecord,
+  input: SaveGitHubDraftPullRequestRequest,
+): boolean {
+  const expected: SaveGitHubDraftPullRequestRequest = {
+    workflowRunId: record.workflowRunId,
+    analysisRunId: record.analysisRunId,
+    installationId: record.installationId,
+    repositoryId: record.repositoryId,
+    owner: record.owner,
+    repository: record.repository,
+    requestedRef: record.requestedRef,
+    baseCommitSha: record.baseCommitSha,
+    patchDigest: record.patchDigest,
+    branch: record.branch,
+    number: record.number,
+    headCommitSha: record.headCommitSha,
+    draft: record.draft,
+    merged: record.merged,
+    check: record.check,
+    sandboxReference: record.sandboxReference,
+    ...(record.previewReference ? { previewReference: record.previewReference } : {}),
+    sideEffectIdempotencyKey: record.sideEffectIdempotencyKey,
+    sideEffectInputHash: record.sideEffectInputHash,
+    outputHash: record.outputHash,
+    outputReference: record.outputReference,
+  };
+  return canonicalJson(expected) === canonicalJson(input);
 }
 
 function validVerifierIdentity(

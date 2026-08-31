@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { InMemoryControlPlaneRepository, RepositoryError } from "../../../packages/database/src/control-plane.ts";
+import {
+  InMemoryControlPlaneRepository,
+  RepositoryError,
+  type GitHubDraftPullRequestRecord,
+} from "../../../packages/database/src/control-plane.ts";
 import { normalizeProjectInput } from "../src/projects.ts";
 import { GET as listProjects } from "../app/api/projects/route.ts";
 import { GET as projectDetail } from "../app/api/projects/[projectId]/route.ts";
@@ -113,6 +117,103 @@ test("project list/detail APIs resume durable state across reloads with opaque c
   assert.deepEqual(body.source.sourceConfiguration, { kind: "website" });
   assert.equal(body.latestAnalysis.id, run.id);
   assert.equal(body.latestAnalysis.status, "queued");
+});
+
+test("GitHub project detail recovers the latest durable draft PR without browser session state", async () => {
+  const repository = installTestRepository();
+  const project = await repository.createProject(owner, {
+    name: "Durable GitHub result",
+    sourceType: "github",
+    url: "https://github.com/bright-tools/widget-console",
+    idempotencyKey: "durable-github-result-project",
+    inputHash: "durable-github-result-project",
+  });
+  const analysis = await repository.enqueueAnalysis(owner, {
+    projectId: project.id,
+    idempotencyKey: "durable-github-result-analysis",
+    inputHash: "durable-github-result-analysis",
+  });
+  repository.getLatestAnalysis = async () => ({
+    ...analysis,
+    status: "succeeded",
+    completedAt: "2026-08-31T11:59:00.000Z",
+  });
+  repository.getAnalysisResult = async () => ({ capabilities: [], diagnostics: [], evidence: [] });
+  repository.listAnalysisCapabilities = async () => [];
+  const draftPullRequest: GitHubDraftPullRequestRecord = {
+    id: "55555555-5555-4555-8555-555555555555",
+    organizationId: owner.organizationId,
+    projectId: project.id,
+    workflowRunId: "66666666-6666-4666-8666-666666666666",
+    taskId: "77777777-7777-4777-8777-777777777777",
+    analysisRunId: analysis.id,
+    sourceSnapshotId: "99999999-9999-4999-8999-999999999999",
+    projectSourceId: "aaaaaaaa-1111-4111-8111-111111111111",
+    phase: "install_verify",
+    installationId: 41,
+    repositoryId: 90210,
+    owner: "bright-tools",
+    repository: "widget-console",
+    requestedRef: "refs/heads/main",
+    baseCommitSha: "a".repeat(40),
+    patchDigest: "b".repeat(64),
+    branch: "page2webmcp/0123456789abcdef",
+    number: 19,
+    url: "https://github.com/bright-tools/widget-console/pull/19",
+    headCommitSha: "c".repeat(40),
+    draft: true,
+    merged: false,
+    check: { externalId: `wfx_${"d".repeat(64)}`, status: "completed", conclusion: "success" },
+    sandboxReference: `urn:sha256:${"e".repeat(64)}`,
+    previewReference: `urn:sha256:${"f".repeat(64)}`,
+    sideEffectIdempotencyKey: `wfx_${"1".repeat(64)}`,
+    sideEffectInputHash: "2".repeat(64),
+    outputHash: "3".repeat(64),
+    outputReference: `urn:sha256:${"3".repeat(64)}`,
+    createdAt: "2026-08-31T12:00:00.000Z",
+  };
+  repository.getLatestGitHubDraftPullRequestForProject = async (actor, projectId) => {
+    assert.equal(actor.organizationId, owner.organizationId);
+    assert.equal(projectId, project.id);
+    return draftPullRequest;
+  };
+
+  const detail = await projectDetail(
+    new Request(`https://control.example/api/projects/${project.id}`, {
+      headers: authenticatedHeaders(owner),
+    }),
+    { params: Promise.resolve({ projectId: project.id }) },
+  );
+  assert.equal(detail.status, 200);
+  const body = await detail.json();
+  assert.deepEqual(body.draftPullRequest, {
+    repository: { owner: "bright-tools", name: "widget-console" },
+    number: 19,
+    url: "https://github.com/bright-tools/widget-console/pull/19",
+    branch: "page2webmcp/0123456789abcdef",
+    baseCommitSha: "a".repeat(40),
+    headCommitSha: "c".repeat(40),
+    check: { externalId: `wfx_${"d".repeat(64)}`, status: "completed", conclusion: "success" },
+    phase: "install_verify",
+    draft: true,
+    merged: false,
+    createdAt: "2026-08-31T12:00:00.000Z",
+  });
+
+  repository.getLatestAnalysis = async () => ({
+    ...analysis,
+    id: "88888888-8888-4888-8888-888888888888",
+    status: "succeeded",
+    completedAt: "2026-08-31T12:01:00.000Z",
+  });
+  const newerAnalysisDetail = await projectDetail(
+    new Request(`https://control.example/api/projects/${project.id}`, {
+      headers: authenticatedHeaders(owner),
+    }),
+    { params: Promise.resolve({ projectId: project.id }) },
+  );
+  assert.equal(newerAnalysisDetail.status, 200);
+  assert.equal((await newerAnalysisDetail.json()).draftPullRequest, undefined);
 });
 
 test("project detail returns OpenAPI verification context as the authoritative source after refresh", async () => {

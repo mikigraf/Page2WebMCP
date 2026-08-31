@@ -341,7 +341,8 @@ test("draft PR provider composition is usable only as a stable controller side e
 });
 
 test("reviewed GitHub workflow reaches sandbox, draft PR, successful check, and preview without merge or install", async () => {
-  const repository = new InMemoryControlPlaneRepository();
+  let repositoryNow = new Date("2026-08-31T12:00:00.000Z");
+  const repository = new InMemoryControlPlaneRepository(() => repositoryNow);
   const project = await repository.createProject(owner, {
     name: "Reviewed widget workflow",
     sourceType: "github",
@@ -440,5 +441,60 @@ test("reviewed GitHub workflow reaches sandbox, draft PR, successful check, and 
   assert.equal(sandboxRuns, 3);
   const published = (await repository.listWorkflowTasks(owner, run.id)).find(({ phase }) => phase === "publish");
   assert.match(published?.outputReference ?? "", /^urn:sha256:/);
+  const draft = await repository.getLatestGitHubDraftPullRequest(owner, run.id);
+  const recoveredForProject = await repository.getLatestGitHubDraftPullRequestForProject(owner, project.id);
+  assert.equal(recoveredForProject?.id, draft?.id);
+  await assert.rejects(
+    repository.getLatestGitHubDraftPullRequestForProject({
+      ...owner,
+      organizationId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    }, project.id),
+    (error: unknown) => error instanceof RepositoryError && error.code === "NOT_FOUND",
+  );
+  assert.deepEqual(draft && {
+    repository: `${draft.owner}/${draft.repository}`,
+    repositoryId: draft.repositoryId,
+    requestedRef: draft.requestedRef,
+    number: draft.number,
+    url: draft.url,
+    branch: draft.branch,
+    baseCommitSha: draft.baseCommitSha,
+    headCommitSha: draft.headCommitSha,
+    check: draft.check,
+    phase: draft.phase,
+    draft: draft.draft,
+    merged: draft.merged,
+  }, {
+    repository: "bright-tools/widget-console",
+    repositoryId: 90210,
+    requestedRef: "refs/heads/main",
+    number: 19,
+    url: "https://github.com/bright-tools/widget-console/pull/19",
+    branch: "page2webmcp/" + draft!.branch.split("/")[1],
+    baseCommitSha: "a".repeat(40),
+    headCommitSha: "e".repeat(40),
+    check: {
+      externalId: draft!.check.externalId,
+      status: "completed",
+      conclusion: "success",
+    },
+    phase: "install_verify",
+    draft: true,
+    merged: false,
+  });
+  assert.match(draft!.branch, /^page2webmcp\/[a-f0-9]{16}$/);
+  assert.match(draft!.check.externalId, /^wfx_[a-f0-9]{64}$/);
   assert.doesNotMatch(JSON.stringify(await repository.listWorkflowTasks(owner, run.id)), /ghs_worker_ephemeral|merged":true|installed":true/);
+
+  repositoryNow = new Date("2026-08-31T13:00:00.000Z");
+  const newerRun = await repository.startWorkflow(owner, {
+    projectId: project.id,
+    analysisRunId: analysis.id,
+    idempotencyKey: "start-newer-reviewed-github-workflow",
+    inputHash: "start-newer-reviewed-github-workflow",
+  });
+  for (let index = 0; index < 10; index += 1) assert.ok(await controller.runNext(`github-newer-production-${index}`));
+  const latestForProject = await repository.getLatestGitHubDraftPullRequestForProject(owner, project.id);
+  assert.equal(latestForProject?.workflowRunId, newerRun.id);
+  assert.equal(latestForProject?.phase, "publish");
 });

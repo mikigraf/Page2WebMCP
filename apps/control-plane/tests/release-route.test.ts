@@ -602,6 +602,7 @@ test("publication derives verification from persisted state and requires R1 revi
     },
     previousRelease: null,
     installed: false,
+    attestation: null,
   });
 
   const duplicate = await publish(
@@ -1072,6 +1073,32 @@ test("installed-target route records only an exact normal native WebMCP observat
     params: Promise.resolve({ projectId: project.id, releaseId: release.id }),
   });
   assert.equal((await duplicate.json()).installation.id, installation.id);
+
+  const detail = await projectDetail(
+    new Request(`https://control.example/api/projects/${project.id}`, {
+      headers: authenticatedHeaders(owner),
+    }),
+    { params: Promise.resolve({ projectId: project.id }) },
+  );
+  assert.equal(detail.status, 200, JSON.stringify(await detail.clone().json()));
+  const recovered = (await detail.json()).release.installation;
+  assert.equal(recovered.installed, true);
+  assert.deepEqual(recovered.attestation, {
+    id: installation.id,
+    status: "verified",
+    delivery: "hosted",
+    pageUrl: "https://acme.example/account",
+    selfHostedUrl: null,
+    webMcpImplementation: "native",
+    verifierMode: "hermetic",
+    registeredTools: ["create_support_ticket", "find_order"],
+    executedContentHash: release.contentHash,
+    normalPageLoad: true,
+    routeInterception: false,
+    injectedRegistration: false,
+    syntheticHarness: false,
+    verifiedAt: installation.verifiedAt,
+  });
 });
 
 test("an exact self-host verification can supersede pending hosted CSP evidence without overwriting unrelated evidence", async () => {

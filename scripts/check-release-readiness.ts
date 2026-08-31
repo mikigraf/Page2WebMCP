@@ -339,6 +339,9 @@ async function localFacts() {
   const singleInstallationProof = await readFile(new URL(
     "../supabase/migrations/20260901010000_single_installation_proof.sql", import.meta.url,
   ), "utf8");
+  const durableResultSurfaces = await readFile(new URL(
+    "../supabase/migrations/20260901020000_durable_result_surfaces.sql", import.meta.url,
+  ), "utf8");
   const selectedProviderContext = await readFile(new URL(
     "../supabase/migrations/20260901000000_selected_provider_probe_context.sql", import.meta.url,
   ), "utf8");
@@ -349,12 +352,15 @@ async function localFacts() {
     versionDrift: checkPackageVersionDrift(packageJson),
     migrationsCurrent: migrations.includes("20260831211329_installed_execution_evidence.sql")
       && migrations.includes("20260901000000_selected_provider_probe_context.sql")
-      && migrations.includes("20260901010000_single_installation_proof.sql"),
+      && migrations.includes("20260901010000_single_installation_proof.sql")
+      && migrations.includes("20260901020000_durable_result_surfaces.sql"),
     rlsVerified: /selected_native_installation_proof/i.test(singleInstallationProof)
       && /confirmed_mutation_effect_count\s*=\s*1/i.test(singleInstallationProof)
       && /grant execute[^;]+page2webmcp_maintenance/is.test(singleInstallationProof)
       && /selected_provider_probe_context/i.test(selectedProviderContext)
       && /grant execute[^;]+page2webmcp_maintenance/is.test(selectedProviderContext)
+      && /github_draft_pull_requests/i.test(durableResultSurfaces)
+      && /force row level security/i.test(durableResultSurfaces)
       && /force row level security/i.test(task6),
   };
 }

@@ -172,7 +172,8 @@ const defaultSandboxLimits: GitHubSandboxLimits = Object.freeze({
  * from the immutable commit before any sandbox or GitHub mutation is allowed.
  */
 export function createGitHubProductionWorkflowSideEffect(configuration: Readonly<{
-  repository: Pick<ControlPlaneRepository, "getWorkflowExecutionMaterial">;
+  repository: Pick<ControlPlaneRepository,
+    "getWorkflowExecutionMaterial" | "getGitHubDraftPullRequestForTask" | "saveGitHubDraftPullRequest">;
   bindings: readonly Readonly<GitHubRepositorySelection & { targetOrigin: string }>[];
   clock: () => Date;
   tokens: GitHubSessionControls["tokens"];
@@ -182,7 +183,9 @@ export function createGitHubProductionWorkflowSideEffect(configuration: Readonly
   preview?: GitHubPreviewPort;
   sandboxLimits?: GitHubSandboxLimits;
 }>): WorkflowSideEffectPort {
-  if (!configuration?.repository?.getWorkflowExecutionMaterial || configuration.bindings.length === 0
+  if (!configuration?.repository?.getWorkflowExecutionMaterial
+    || !configuration.repository.getGitHubDraftPullRequestForTask
+    || !configuration.repository.saveGitHubDraftPullRequest || configuration.bindings.length === 0
     || !configuration.tokens || !configuration.snapshot || !configuration.sandbox?.run
     || !configuration.draftPullRequest || typeof configuration.clock !== "function") {
     throw new Error("GITHUB_PRODUCTION_WORKFLOW_CONTROLS_REQUIRED");
@@ -263,13 +266,61 @@ export function createGitHubProductionWorkflowSideEffect(configuration: Readonly
         sourceNativeReference: material.analysis.evidence.find(({ source }) => source === "source")?.reference,
       });
       const outputHash = sha256(content);
-      return { outputHash, outputReference: `urn:sha256:${outputHash}` };
+      const result = { outputHash, outputReference: `urn:sha256:${outputHash}` };
+      if (draft && sandboxReference) {
+        const stored = await configuration.repository.saveGitHubDraftPullRequest(
+          request.workerId,
+          request.taskId,
+          request.leaseGeneration,
+          {
+            workflowRunId: material.workflowRunId,
+            analysisRunId: material.analysisRunId,
+            installationId: selection.installationId,
+            repositoryId: selection.repositoryId,
+            owner: selection.owner,
+            repository: selection.repository,
+            requestedRef: selection.ref,
+            baseCommitSha: draft.baseCommitSha,
+            patchDigest: change.patchDigest,
+            branch: draft.branch,
+            number: draft.number,
+            headCommitSha: draft.headCommitSha,
+            draft: draft.draft,
+            merged: draft.merged,
+            check: draft.check,
+            sandboxReference,
+            ...(previewReference ? { previewReference } : {}),
+            sideEffectIdempotencyKey: request.idempotencyKey,
+            sideEffectInputHash: request.inputHash,
+            ...result,
+          },
+        );
+        if (stored.outputHash !== result.outputHash || stored.outputReference !== result.outputReference) {
+          throw new Error("GITHUB_WORKFLOW_OUTPUT_STORE_MISMATCH");
+        }
+      }
+      return result;
     });
   };
+  const lookup = async (request: WorkflowSideEffectRequest): Promise<WorkflowSideEffectResult | undefined> => {
+    if (!GITHUB_PRODUCTION_EFFECT_KINDS.includes(request.kind as typeof GITHUB_PRODUCTION_EFFECT_KINDS[number])
+      || request.signal.aborted) throw new Error("GITHUB_WORKFLOW_EFFECT_REQUEST_INVALID");
+    if (!(["publish", "install_verify"] as const).includes(request.phase as "publish" | "install_verify")) {
+      return undefined;
+    }
+    const stored = await configuration.repository.getGitHubDraftPullRequestForTask(
+      request.workerId, request.taskId, request.leaseGeneration,
+    );
+    if (!stored) return undefined;
+    if (stored.workflowRunId !== request.workflowRunId
+      || stored.sideEffectIdempotencyKey !== request.idempotencyKey
+      || stored.sideEffectInputHash !== request.inputHash) throw new Error("GITHUB_WORKFLOW_OUTPUT_STORE_MISMATCH");
+    return { outputHash: stored.outputHash, outputReference: stored.outputReference };
+  };
   return {
-    lookup: async () => undefined,
+    lookup,
     execute: operate,
-    reconcile: operate,
+    reconcile: async (request) => await lookup(request) ?? operate(request),
     cleanup: async () => undefined,
   };
 }

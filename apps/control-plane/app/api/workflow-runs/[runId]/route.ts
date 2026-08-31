@@ -12,6 +12,8 @@ import {
   workflowPresentation,
 } from "../../../../src/workflow-presentation.ts";
 import { observeWorkflowStatus } from "../../../../../../packages/observability/src/workflow-runtime.ts";
+import { analysisOutcome } from "../../../../src/analysis-outcome.ts";
+import { gitHubDraftPullRequestProjection } from "../../../../src/github-result.ts";
 
 const RunIdSchema = z.string().uuid();
 
@@ -50,8 +52,11 @@ export async function GET(request: Request, context: { params: Promise<{ runId: 
       evidence,
       capabilityPlans,
     });
+    const draftPullRequest = project.sourceType === "github"
+      ? await repository.getLatestGitHubDraftPullRequest(actor, workflow.id)
+      : undefined;
     const outcome = project.sourceType === "github"
-      ? workflow.status === "succeeded"
+      ? workflow.status === "succeeded" && draftPullRequest
         ? "tested_patch_draft_pull_request_check_preview_reconciled"
         : workflow.status === "failed" || workflow.status === "cancelled"
           ? "github_workflow_terminal_without_installation"
@@ -71,9 +76,11 @@ export async function GET(request: Request, context: { params: Promise<{ runId: 
       capabilities,
       capabilityReviews: capabilities.map(capabilityReviewPresentation),
       diagnostics: analysis?.diagnostics ?? [],
+      analysisOutcome: analysisOutcome(analysis, capabilities.length),
       presentation,
       operational,
       outcome,
+      ...(draftPullRequest ? { draftPullRequest: gitHubDraftPullRequestProjection(draftPullRequest) } : {}),
     }, requestId);
   } catch (error) {
     return errorResponse(error, requestId, request);

@@ -542,6 +542,10 @@ test("Postgres repository persists and recovers the fixture lifecycle", {
     const installation = await repository.saveReleaseInstallation(actor, project.id, installationInput);
     assert.equal(installation.artifactUrl, release.artifactUrl);
     assert.notEqual(installation.id, pendingInstallation.id);
+    assert.equal(
+      (await repository.getLatestReleaseInstallation(actor, project.id, release.id))?.id,
+      installation.id,
+    );
     await assert.rejects(repository.saveReleaseInstallation(actor, project.id, {
       ...installationInput,
       artifactUrl: `https://unrelated.example/${release.contentHash}.js`,

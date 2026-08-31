@@ -82,6 +82,11 @@ for (const sourceType of ["website", "openapi", "github"] as const) {
     const body = await status.json();
     assert.equal(body.run.status, "succeeded");
     assert.equal(body.projectId, project.id);
+    assert.deepEqual(body.analysisOutcome, {
+      status: "supported",
+      capabilityCount: sourceType === "github" ? 1 : 3,
+      diagnostics: [],
+    });
     if (sourceType === "github") {
       assert.equal(body.result.draftPullRequest, undefined);
       assert.equal(body.capabilities.length, 1);
@@ -150,6 +155,15 @@ test("mixed OpenAPI analysis preserves unsupported-operation diagnostics through
       reason: "api_key_header",
     }]);
     assert.equal(body.capabilities.length, 1);
+    assert.deepEqual(body.analysisOutcome, {
+      status: "supported",
+      capabilityCount: 1,
+      diagnostics: [{
+        code: "SERVER_ADAPTER_REQUIRED",
+        operationKey: "GET /private",
+        reason: "api_key_header",
+      }],
+    });
     assert.match(body.capabilities[0].stableName, /^get_operation_/);
   } finally {
     setAnalysisAdapterForTest(fixtureAnalysisAdapter);
@@ -208,6 +222,15 @@ test("all-unsupported OpenAPI analysis exposes exact diagnostics without an inve
       reason: "api_key_header",
     }]);
     assert.equal(body.result.release, undefined);
+    assert.deepEqual(body.analysisOutcome, {
+      status: "unsupported",
+      capabilityCount: 0,
+      diagnostics: [{
+        code: "SERVER_ADAPTER_REQUIRED",
+        operationKey: "GET /private",
+        reason: "api_key_header",
+      }],
+    });
   } finally {
     setAnalysisAdapterForTest(fixtureAnalysisAdapter);
   }

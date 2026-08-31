@@ -89,6 +89,7 @@ test("upgrade migration advances readiness to the exact complete 19-migration le
   const committed = (await readdir(new URL("../../../supabase/migrations/", import.meta.url)))
     .filter((name) => /^\d{14}_[a-z0-9_]+\.sql$/.test(name))
     .map((name) => name.slice(0, 14))
+    .filter((version) => version <= "20260901010000")
     .sort();
   const requiredBlock = /required_migrations\s*\(version\)\s+as\s*\(\s*values([\s\S]*?)\),\s*applied_migrations/i
     .exec(sql)?.[1];

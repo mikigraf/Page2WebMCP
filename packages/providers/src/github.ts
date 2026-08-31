@@ -158,7 +158,11 @@ export type GitHubDraftPullRequestResult = Readonly<{
   installed: false;
   baseCommitSha: string;
   headCommitSha: string;
-  check: Readonly<{ externalId: string; status: string; conclusion?: string }>;
+  check: Readonly<{
+    externalId: string;
+    status: "queued" | "in_progress" | "completed";
+    conclusion?: "action_required" | "cancelled" | "failure" | "neutral" | "success" | "skipped" | "stale" | "timed_out";
+  }>;
 }>;
 
 export type GitHubPreviewPort = Readonly<{
@@ -480,6 +484,13 @@ export async function reconcileGitHubDraftPullRequest(
     || !["queued", "in_progress", "completed"].includes(String(check.status))) {
     throw new Error("GITHUB_CHECK_RECONCILIATION_MISMATCH");
   }
+  const status = String(check.status) as GitHubDraftPullRequestResult["check"]["status"];
+  const conclusion = typeof check.conclusion === "string"
+    ? check.conclusion as NonNullable<GitHubDraftPullRequestResult["check"]["conclusion"]>
+    : undefined;
+  if (conclusion !== undefined && ![
+    "action_required", "cancelled", "failure", "neutral", "success", "skipped", "stale", "timed_out",
+  ].includes(conclusion)) throw new Error("GITHUB_CHECK_RECONCILIATION_MISMATCH");
   return {
     branch,
     number: Number(pr.number),
@@ -490,8 +501,8 @@ export async function reconcileGitHubDraftPullRequest(
     headCommitSha,
     check: {
       externalId: checkKey,
-      status: String(check.status),
-      ...(typeof check.conclusion === "string" ? { conclusion: check.conclusion } : {}),
+      status,
+      ...(conclusion ? { conclusion } : {}),
     },
   };
 }

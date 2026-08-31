@@ -641,6 +641,16 @@ test("eligible publication is content addressed and idempotent", async () => {
   assert.equal(installation.status, "verified");
   assert.notEqual(installation.id, pendingInstallation.id);
   assert.equal((await repository.saveReleaseInstallation(owner, project.id, installationInput)).id, installation.id);
+  assert.equal((await repository.getLatestReleaseInstallation(owner, project.id, release.id))?.id, installation.id);
+  const pendingAfterVerified = await repository.saveReleaseInstallation(owner, project.id, {
+    ...pendingInstallationInput,
+    idempotencyKey: "install-pending-after-verified",
+    inputHash: "6".repeat(64),
+  });
+  assert.equal(
+    (await repository.getLatestReleaseInstallation(owner, project.id, release.id))?.id,
+    pendingAfterVerified.id,
+  );
   await assert.rejects(repository.saveReleaseInstallation(editor, project.id, {
     ...installationInput,
     idempotencyKey: "install-editor",

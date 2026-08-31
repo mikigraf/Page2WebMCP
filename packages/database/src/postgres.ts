@@ -7,6 +7,7 @@ import {
 import {
   capabilityPlanDigest,
   capabilityStateDigest,
+  gitHubDraftPullRequestMatchesRequest,
   normalizeAnalysisDiagnostics,
   normalizeAnalysisSourceTypes,
   normalizeProviderProvenance,
@@ -14,6 +15,7 @@ import {
   normalizeSourceConfiguration,
   normalizeReleaseArtifactIdentity,
   normalizeReleaseInstallation,
+  normalizeGitHubDraftPullRequest,
   persistedReleaseArtifactIdentity,
   releaseFailures,
   RepositoryError,
@@ -28,6 +30,7 @@ import {
   type CreateProjectRequest,
   type AuthenticatedIdentity,
   type IdempotentRequest,
+  type GitHubDraftPullRequestRecord,
   type ProjectPage,
   type ProjectPageRequest,
   type ProjectRecord,
@@ -36,6 +39,7 @@ import {
   type ReleaseRecord,
   type ReleaseInstallationRecord,
   type ReleaseInstallationRequest,
+  type SaveGitHubDraftPullRequestRequest,
   type RepositoryActor,
   type ReviewInput,
   type SourceType,
@@ -100,6 +104,26 @@ const RELEASE_INSTALLATION_COLUMNS =
   "confirmed_mutation_confirmation, confirmed_mutation_reversible, confirmed_mutation_succeeded, " +
   "confirmed_mutation_effect_count, final_state_mutation_tool_name, final_state_source, final_state_verified, " +
   "created_at, verified_at";
+const GITHUB_DRAFT_PULL_REQUEST_COLUMNS =
+  "id, organization_id, project_id, workflow_run_id, task_id, analysis_run_id, source_snapshot_id, " +
+  "project_source_id, phase, installation_id, repository_id, owner, repository, requested_ref, base_commit_sha, " +
+  "patch_digest, branch, pull_request_number, pull_request_url, head_commit_sha, draft, merged, check_external_id, " +
+  "check_status, check_conclusion, sandbox_reference, preview_reference, side_effect_idempotency_key, " +
+  "side_effect_input_hash, output_hash, output_reference, created_at";
+
+async function setWorkerWorkflowLeaseContext(
+  db: Db,
+  workerId: string,
+  taskId: string,
+  leaseGeneration: number,
+): Promise<void> {
+  await db.query(
+    "select set_config('page2webmcp.workflow_task_id', $1, true), " +
+    "set_config('page2webmcp.worker_id', $2, true), " +
+    "set_config('page2webmcp.lease_generation', $3, true)",
+    [taskId, workerId, String(leaseGeneration)],
+  );
+}
 
 export class PostgresControlPlaneRepository implements ControlPlaneRepository {
   readonly #pool: pg.Pool;
@@ -814,6 +838,121 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
         analysis,
         capabilities: storedCapabilities,
       };
+    });
+  }
+
+  async getGitHubDraftPullRequestForTask(
+    workerId: string,
+    taskId: string,
+    leaseGeneration: number,
+  ): Promise<GitHubDraftPullRequestRecord | undefined> {
+    return this.#transaction({ kind: "worker" }, async (client) => {
+      await this.#assertWorkerWorkflowLease(client, workerId, taskId, leaseGeneration);
+      await setWorkerWorkflowLeaseContext(client, workerId, taskId, leaseGeneration);
+      const result = await client.query(
+        `select ${GITHUB_DRAFT_PULL_REQUEST_COLUMNS} from public.github_draft_pull_requests ` +
+        "where task_id = $1 limit 1",
+        [taskId],
+      );
+      return result.rows[0] ? mapGitHubDraftPullRequest(result.rows[0]) : undefined;
+    });
+  }
+
+  async saveGitHubDraftPullRequest(
+    workerId: string,
+    taskId: string,
+    leaseGeneration: number,
+    input: SaveGitHubDraftPullRequestRequest,
+  ): Promise<GitHubDraftPullRequestRecord> {
+    const material = await this.getWorkflowExecutionMaterial(workerId, taskId, leaseGeneration);
+    return this.#transaction({ kind: "worker" }, async (client) => {
+      await this.#assertWorkerWorkflowLease(client, workerId, taskId, leaseGeneration);
+      await setWorkerWorkflowLeaseContext(client, workerId, taskId, leaseGeneration);
+      const context = await client.query(
+        "select task.organization_id, task.project_id, task.workflow_run_id, task.phase, " +
+        "run.reviewed_analysis_run_id, run.source_snapshot_id, snapshot.project_source_id " +
+        "from private.workflow_tasks task join public.workflow_runs run on run.id = task.workflow_run_id " +
+        "join public.source_snapshots snapshot on snapshot.id = run.source_snapshot_id " +
+        "where task.id = $1 limit 1",
+        [taskId],
+      );
+      const row = context.rows[0];
+      if (!row || !["publish", "install_verify"].includes(String(row.phase))
+        || String(row.workflow_run_id) !== input.workflowRunId
+        || String(row.reviewed_analysis_run_id) !== input.analysisRunId) throw new RepositoryError("INVALID_STATE");
+      const id = randomUUID();
+      const url = `https://github.com/${input.owner}/${input.repository}/pull/${input.number}`;
+      const inserted = await client.query(
+        "insert into public.github_draft_pull_requests " +
+        "(id, organization_id, project_id, workflow_run_id, task_id, analysis_run_id, source_snapshot_id, " +
+        "project_source_id, phase, installation_id, repository_id, owner, repository, requested_ref, base_commit_sha, " +
+        "patch_digest, branch, pull_request_number, pull_request_url, head_commit_sha, draft, merged, check_external_id, " +
+        "check_status, check_conclusion, sandbox_reference, preview_reference, side_effect_idempotency_key, " +
+        "side_effect_input_hash, output_hash, output_reference) " +
+        "values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25," +
+        "$26,$27,$28,$29,$30,$31) on conflict (task_id) do nothing " +
+        `returning ${GITHUB_DRAFT_PULL_REQUEST_COLUMNS}`,
+        [id, row.organization_id, row.project_id, row.workflow_run_id, taskId, row.reviewed_analysis_run_id,
+          row.source_snapshot_id, row.project_source_id, row.phase, input.installationId, input.repositoryId,
+          input.owner, input.repository, input.requestedRef, input.baseCommitSha, input.patchDigest, input.branch,
+          input.number, url, input.headCommitSha, input.draft, input.merged, input.check.externalId,
+          input.check.status, input.check.conclusion ?? null, input.sandboxReference, input.previewReference ?? null,
+          input.sideEffectIdempotencyKey, input.sideEffectInputHash, input.outputHash, input.outputReference],
+      );
+      let record = inserted.rows[0] ? mapGitHubDraftPullRequest(inserted.rows[0]) : undefined;
+      if (!record) {
+        const existing = await client.query(
+          `select ${GITHUB_DRAFT_PULL_REQUEST_COLUMNS} from public.github_draft_pull_requests ` +
+          "where task_id = $1 limit 1",
+          [taskId],
+        );
+        record = existing.rows[0] ? mapGitHubDraftPullRequest(existing.rows[0]) : undefined;
+      }
+      if (!record || !gitHubDraftPullRequestMatchesRequest(record, input)) {
+        throw new RepositoryError("IDEMPOTENCY_CONFLICT");
+      }
+      return normalizeGitHubDraftPullRequest(record, material);
+    });
+  }
+
+  async getLatestGitHubDraftPullRequest(
+    actor: RepositoryActor,
+    workflowRunId: string,
+  ): Promise<GitHubDraftPullRequestRecord | undefined> {
+    return this.#transaction({ kind: "app", actor }, async (client) => {
+      const run = await client.query(
+        "select id, project_id from public.workflow_runs where id = $1 and organization_id = $2 limit 1",
+        [workflowRunId, actor.organizationId],
+      );
+      if (!run.rows[0]) throw new RepositoryError("NOT_FOUND");
+      const result = await client.query(
+        `select ${GITHUB_DRAFT_PULL_REQUEST_COLUMNS} from public.github_draft_pull_requests ` +
+        "where workflow_run_id = $1 and organization_id = $2 " +
+        "order by (phase = 'install_verify') desc, created_at desc, id desc limit 1",
+        [workflowRunId, actor.organizationId],
+      );
+      return result.rows[0] ? mapGitHubDraftPullRequest(result.rows[0]) : undefined;
+    });
+  }
+
+  async getLatestGitHubDraftPullRequestForProject(
+    actor: RepositoryActor,
+    projectId: string,
+  ): Promise<GitHubDraftPullRequestRecord | undefined> {
+    return this.#transaction({ kind: "app", actor }, async (client) => {
+      const project = await client.query(
+        "select id, source_type from public.projects where id = $1 and organization_id = $2 limit 1",
+        [projectId, actor.organizationId],
+      );
+      if (!project.rows[0]) throw new RepositoryError("NOT_FOUND");
+      if (String(project.rows[0].source_type) !== "github") return undefined;
+      const result = await client.query(
+        `select ${GITHUB_DRAFT_PULL_REQUEST_COLUMNS} from public.github_draft_pull_requests ` +
+        "where project_id = $1 and organization_id = $2 " +
+        "order by created_at desc, (phase = 'install_verify') desc, id desc limit 1",
+        [projectId, actor.organizationId],
+      );
+      return result.rows[0] ? mapGitHubDraftPullRequest(result.rows[0]) : undefined;
     });
   }
 
@@ -2080,6 +2219,28 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
     });
   }
 
+  async getLatestReleaseInstallation(
+    actor: RepositoryActor,
+    projectId: string,
+    releaseId: string,
+  ): Promise<ReleaseInstallationRecord | undefined> {
+    return this.#transaction({ kind: "app", actor }, async (client) => {
+      await this.#project(client, actor, projectId);
+      const release = await client.query(
+        "select id from public.releases where id = $1 and project_id = $2 and organization_id = $3 limit 1",
+        [releaseId, projectId, actor.organizationId],
+      );
+      if (!release.rows[0]) throw new RepositoryError("NOT_FOUND");
+      const result = await client.query(
+        `select ${RELEASE_INSTALLATION_COLUMNS} from public.release_installations ` +
+        "where release_id = $1 and project_id = $2 and organization_id = $3 " +
+        "order by created_at desc, id desc limit 1",
+        [releaseId, projectId, actor.organizationId],
+      );
+      return result.rows[0] ? mapReleaseInstallation(result.rows[0]) : undefined;
+    });
+  }
+
   async listAuditEvents(actor: RepositoryActor): Promise<AuditEventRecord[]> {
     if (actor.role !== "owner") throw new RepositoryError("FORBIDDEN");
     return this.#transaction({ kind: "app", actor }, async (client) => {
@@ -2096,7 +2257,7 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
   async reset(): Promise<void> {
     if (process.env.NODE_ENV !== "test") throw new RepositoryError("FORBIDDEN");
     await this.#pool.query(
-      "truncate public.release_installations, public.installations, public.verification_checks, public.capability_plans, public.workflow_evidence, " +
+      "truncate public.github_draft_pull_requests, public.release_installations, public.installations, public.verification_checks, public.capability_plans, public.workflow_evidence, " +
       "public.workflow_events, private.workflow_commands, private.workflow_tasks, public.workflow_runs, " +
       "public.source_snapshots, public.project_sources, public.audit_events, public.releases, " +
       "public.verification_runs, public.capability_reviews, " +
@@ -2337,6 +2498,54 @@ function mapVerification(row: QueryResultRow): VerificationRecord {
     csp: row.csp_result as VerificationRecord["csp"], verificationMode: row.verification_mode as VerificationRecord["verificationMode"],
     eligible: Boolean(row.eligible), failures: row.failures as string[], ...provenance,
     createdAt: iso(row.created_at) };
+}
+
+function mapGitHubDraftPullRequest(row: QueryResultRow): GitHubDraftPullRequestRecord {
+  const status = String(row.check_status);
+  const conclusion = row.check_conclusion === null || row.check_conclusion === undefined
+    ? undefined : String(row.check_conclusion);
+  if (!["publish", "install_verify"].includes(String(row.phase))
+    || !["queued", "in_progress", "completed"].includes(status)
+    || conclusion !== undefined && ![
+      "action_required", "cancelled", "failure", "neutral", "success", "skipped", "stale", "timed_out",
+    ].includes(conclusion)
+    || row.draft !== true || row.merged !== false) throw new RepositoryError("INVALID_STATE");
+  return {
+    id: String(row.id),
+    organizationId: String(row.organization_id),
+    projectId: String(row.project_id),
+    workflowRunId: String(row.workflow_run_id),
+    taskId: String(row.task_id),
+    analysisRunId: String(row.analysis_run_id),
+    sourceSnapshotId: String(row.source_snapshot_id),
+    projectSourceId: String(row.project_source_id),
+    phase: row.phase as GitHubDraftPullRequestRecord["phase"],
+    installationId: Number(row.installation_id),
+    repositoryId: Number(row.repository_id),
+    owner: String(row.owner),
+    repository: String(row.repository),
+    requestedRef: String(row.requested_ref),
+    baseCommitSha: String(row.base_commit_sha),
+    patchDigest: String(row.patch_digest),
+    branch: String(row.branch),
+    number: Number(row.pull_request_number),
+    url: String(row.pull_request_url),
+    headCommitSha: String(row.head_commit_sha),
+    draft: true,
+    merged: false,
+    check: {
+      externalId: String(row.check_external_id),
+      status: status as GitHubDraftPullRequestRecord["check"]["status"],
+      ...(conclusion ? { conclusion: conclusion as NonNullable<GitHubDraftPullRequestRecord["check"]["conclusion"]> } : {}),
+    },
+    sandboxReference: String(row.sandbox_reference),
+    ...(row.preview_reference ? { previewReference: String(row.preview_reference) } : {}),
+    sideEffectIdempotencyKey: String(row.side_effect_idempotency_key),
+    sideEffectInputHash: String(row.side_effect_input_hash),
+    outputHash: String(row.output_hash),
+    outputReference: String(row.output_reference),
+    createdAt: iso(row.created_at),
+  };
 }
 
 function mapReleaseInstallation(row: QueryResultRow): ReleaseInstallationRecord {

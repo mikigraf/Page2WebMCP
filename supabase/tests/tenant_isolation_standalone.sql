@@ -46,6 +46,7 @@ begin
     'public.capability_reviews'::regclass,
     'public.verification_runs'::regclass,
     'public.releases'::regclass,
+    'public.github_draft_pull_requests'::regclass,
     'public.audit_events'::regclass,
     'private.analysis_jobs'::regclass,
     'private.idempotency_keys'::regclass,
@@ -70,6 +71,17 @@ begin
   if has_table_privilege('page2webmcp_worker', 'public.projects', 'select')
     or has_table_privilege('page2webmcp_worker', 'public.projects', 'update') then
     raise exception 'worker role has unused public-table privileges';
+  end if;
+
+  if not has_table_privilege('page2webmcp_app', 'public.github_draft_pull_requests', 'select')
+    or has_table_privilege('page2webmcp_app', 'public.github_draft_pull_requests', 'insert')
+    or has_table_privilege('page2webmcp_app', 'public.github_draft_pull_requests', 'update')
+    or has_table_privilege('page2webmcp_app', 'public.github_draft_pull_requests', 'delete')
+    or not has_table_privilege('page2webmcp_worker', 'public.github_draft_pull_requests', 'select')
+    or not has_table_privilege('page2webmcp_worker', 'public.github_draft_pull_requests', 'insert')
+    or has_table_privilege('page2webmcp_worker', 'public.github_draft_pull_requests', 'update')
+    or has_table_privilege('page2webmcp_worker', 'public.github_draft_pull_requests', 'delete') then
+    raise exception 'GitHub result table grants exceed append-only worker and read-only app requirements';
   end if;
 
   if not has_table_privilege('page2webmcp_worker', 'public.project_sources', 'select')
@@ -117,7 +129,8 @@ begin
   if has_table_privilege('authenticated', 'public.projects', 'insert')
     or has_table_privilege('authenticated', 'public.projects', 'update')
     or has_table_privilege('authenticated', 'public.analysis_runs', 'insert')
-    or has_table_privilege('authenticated', 'public.capability_reviews', 'insert') then
+    or has_table_privilege('authenticated', 'public.capability_reviews', 'insert')
+    or has_table_privilege('authenticated', 'public.github_draft_pull_requests', 'select') then
     raise exception 'the public Data API can bypass server lifecycle invariants';
   end if;
 end

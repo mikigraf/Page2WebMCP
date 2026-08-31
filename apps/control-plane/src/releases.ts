@@ -192,7 +192,23 @@ export type ReleaseInstallationGuide = Readonly<{
   csp: VerificationRecord["csp"];
   selfHost: { required: boolean; guidance: string };
   previousRelease: null | { id: string; contentHash: string; integrity: string; artifactUrl: string };
-  installed: false;
+  installed: boolean;
+  attestation: null | Readonly<{
+    id: string;
+    status: ReleaseInstallationRecord["status"];
+    delivery: ReleaseInstallationRecord["delivery"];
+    pageUrl: string;
+    selfHostedUrl: string | null;
+    webMcpImplementation: ReleaseInstallationRecord["webMcpImplementation"];
+    verifierMode: NonNullable<ReleaseInstallationRecord["verifierIdentity"]>["mode"];
+    registeredTools: readonly string[];
+    executedContentHash: string | null;
+    normalPageLoad: boolean;
+    routeInterception: boolean;
+    injectedRegistration: boolean;
+    syntheticHarness: boolean;
+    verifiedAt: string | null;
+  }>;
 }>;
 
 export type ResumableReleaseResult = Readonly<{
@@ -224,10 +240,13 @@ export async function recoverLatestPublishedRelease(
   const target = await resolveReleaseTarget(repository, actor, projectId, release.analysisRunId, release);
   if (target.targetOrigin !== release.allowedOrigin) throw new ApiError("INVALID_STATE", 409);
   const previous = await repository.getPreviousRelease(actor, projectId, release.id);
+  const installation = await repository.getLatestReleaseInstallation(actor, projectId, release.id);
   return {
     id: release.id,
     url: identity.artifactUrl,
-    installation: buildReleaseInstallationGuide(release, verification, previous, target.verificationPageUrl),
+    installation: buildReleaseInstallationGuide(
+      release, verification, previous, target.verificationPageUrl, installation,
+    ),
   };
 }
 
@@ -236,6 +255,7 @@ export function buildReleaseInstallationGuide(
   verification: VerificationRecord,
   previous: ReleaseRecord | undefined,
   verificationPageUrl: string,
+  installation?: ReleaseInstallationRecord,
 ): ReleaseInstallationGuide {
   const identity = persistedReleaseArtifactIdentity(release);
   if (!identity) throw new ApiError("INVALID_STATE", 409);
@@ -250,6 +270,9 @@ export function buildReleaseInstallationGuide(
     throw new ApiError("INVALID_STATE", 409);
   }
   const previousIdentity = previous ? persistedReleaseArtifactIdentity(previous) : undefined;
+  const persistedAttestation = installation
+    ? releaseInstallationProjection(release, installation)
+    : null;
   return {
     artifactUrl: identity.artifactUrl,
     downloadUrl: identity.downloadUrl,
@@ -274,7 +297,48 @@ export function buildReleaseInstallationGuide(
       integrity: previous.sri,
       artifactUrl: previousIdentity.artifactUrl,
     } : null,
-    installed: false,
+    installed: persistedAttestation?.status === "verified"
+      && persistedAttestation.webMcpImplementation === "native",
+    attestation: persistedAttestation,
+  };
+}
+
+function releaseInstallationProjection(
+  release: ReleaseRecord,
+  installation: ReleaseInstallationRecord,
+): NonNullable<ReleaseInstallationGuide["attestation"]> {
+  const identity = persistedReleaseArtifactIdentity(release);
+  const report = installation.attestation;
+  if (!identity || !installation.verifierIdentity
+    || installation.releaseId !== release.id || installation.projectId !== release.projectId
+    || installation.organizationId !== release.organizationId
+    || installation.artifactUrl !== identity.artifactUrl || installation.downloadUrl !== identity.downloadUrl
+    || installation.localOnly !== identity.localOnly || installation.targetOrigin !== release.allowedOrigin
+    || installation.artifactContentHash !== release.contentHash || installation.integrity !== release.sri
+    || report.observedArtifactUrl !== identity.artifactUrl || report.observedDownloadUrl !== identity.downloadUrl
+    || report.observedLocalOnly !== identity.localOnly || report.observedIntegrity !== release.sri
+    || report.observedTargetOrigin !== release.allowedOrigin || report.servedContentHash !== release.contentHash
+    || installation.status === "verified" && (
+      installation.webMcpImplementation !== "native" || report.executedContentHash !== release.contentHash
+      || report.normalPageLoad !== true || report.routeInterception !== false
+      || report.injectedRegistration !== false || report.syntheticHarness !== false
+      || report.executionEvidence === null || !installation.verifiedAt
+    )) throw new ApiError("INVALID_STATE", 409);
+  return {
+    id: installation.id,
+    status: installation.status,
+    delivery: installation.delivery,
+    pageUrl: installation.pageUrl,
+    selfHostedUrl: installation.selfHostedUrl ?? null,
+    webMcpImplementation: installation.webMcpImplementation,
+    verifierMode: installation.verifierIdentity.mode,
+    registeredTools: [...report.registeredTools],
+    executedContentHash: report.executedContentHash,
+    normalPageLoad: report.normalPageLoad,
+    routeInterception: report.routeInterception,
+    injectedRegistration: report.injectedRegistration,
+    syntheticHarness: report.syntheticHarness,
+    verifiedAt: installation.verifiedAt ?? null,
   };
 }
 
