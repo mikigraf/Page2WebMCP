@@ -229,6 +229,32 @@ test("OpenAPI verification context is canonical, changes source identity, and is
   assert.notEqual(changedSnapshot?.sourceIdentityHash, snapshot.sourceIdentityHash);
 });
 
+test("OpenAPI verification page queries are rejected before source persistence", async () => {
+  assert.throws(() => parsePersistedSourceConfiguration("openapi", {
+    kind: "openapi",
+    targetOrigin: "https://widgets.example",
+    testPageUrl: "https://widgets.example/webmcp-test?tenant=secret",
+    environment: "test",
+  }), (error: unknown) => error instanceof RepositoryError && error.code === "OPENAPI_VERIFICATION_CONTEXT_REQUIRED");
+
+  const repository = new InMemoryControlPlaneRepository();
+  await assert.rejects(repository.createProject(owner, {
+    name: "Invalid OpenAPI page",
+    sourceType: "openapi",
+    url: "https://api.widgets.example/openapi.json",
+    sourceConfiguration: {
+      kind: "openapi",
+      targetOrigin: "https://widgets.example",
+      testPageUrl: "https://widgets.example/webmcp-test?tenant=secret",
+      environment: "test",
+    },
+    idempotencyKey: "openapi-query-page",
+    inputHash: "openapi-query-page",
+  }), (error: unknown) => error instanceof RepositoryError
+    && error.code === "OPENAPI_VERIFICATION_CONTEXT_REQUIRED");
+  assert.deepEqual(await repository.listProjects(owner), []);
+});
+
 test("OpenAPI analysis rejects legacy-unconfigured sources while preserving tenant isolation", async () => {
   const repository = new InMemoryControlPlaneRepository();
   const otherOwner = { ...owner, id: "99999999-9999-4999-8999-999999999999", organizationId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" };
@@ -848,8 +874,9 @@ test("candidate hashes are validated and a later verification cannot be overwrit
   assert.equal(release.code, "export const candidate = 'second';");
 });
 
-test("identical code remains attributable to each exact analysis run", async () => {
-  const repository = new InMemoryControlPlaneRepository();
+test("latest published release recovery is tenant scoped and carries its exact verification", async () => {
+  let instant = Date.parse("2026-08-31T12:00:00.000Z");
+  const repository = new InMemoryControlPlaneRepository(() => new Date(instant++));
   const project = await repository.createProject(owner, {
     name: "Acme Support",
     sourceType: "website",
@@ -901,4 +928,12 @@ test("identical code remains attributable to each exact analysis run", async () 
   assert.notEqual(releases[0].analysisRunId, releases[1].analysisRunId);
   assert.equal(releases[0].contentHash, releases[1].contentHash);
   assert.equal((await repository.getReleaseArtifact(releases[0].contentHash)).code, "export const same = true;");
+  const latest = await repository.getLatestPublishedRelease(owner, project.id);
+  assert.equal(latest?.release.id, releases[1].id);
+  assert.equal(latest?.verification.analysisRunId, releases[1].analysisRunId);
+  assert.equal(latest?.verification.capabilityStateDigest, releases[1].capabilityStateDigest);
+  assert.equal(latest?.verification.candidateContentHash, releases[1].contentHash);
+  assert.deepEqual(latest?.verification.csp, { hosted: "allowed" });
+  await assert.rejects(repository.getLatestPublishedRelease(outsider, project.id), (error: unknown) =>
+    error instanceof RepositoryError && error.code === "NOT_FOUND");
 });

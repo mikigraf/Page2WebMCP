@@ -4,6 +4,7 @@ import test from "node:test";
 import { POST as verify } from "../app/api/capabilities/verify/route.ts";
 import { GET as getArtifact } from "../app/api/releases/[artifact]/route.ts";
 import { POST as publishCompatibility } from "../app/api/releases/publish/route.ts";
+import { GET as projectDetail } from "../app/api/projects/[projectId]/route.ts";
 import { POST as publish } from "../app/api/projects/[projectId]/releases/route.ts";
 import { POST as verifyInstallation } from "../app/api/projects/[projectId]/releases/[releaseId]/installation/route.ts";
 import { compileWebMcpRelease } from "../../../packages/compiler/src/compiler.ts";
@@ -770,6 +771,24 @@ test("both publication routes use Storage and OpenAPI binds its immutable snapsh
   assert.deepEqual(observedTargets, [targetOrigin, targetOrigin]);
   assert.equal(release.installation.verificationPageUrl, `${targetOrigin}/webmcp-test`);
   assert.notEqual(targetOrigin, new URL(project.url).origin);
+
+  setReleaseArtifactStoreForTest({ publish: async () => { throw new Error("RECOVERY_MUST_NOT_UPLOAD"); } });
+  setReleaseVerificationPortForTest({
+    mode: "hermetic",
+    verifyCandidate: async () => { throw new Error("RECOVERY_MUST_NOT_VERIFY"); },
+    verifyInstalled: async () => { throw new Error("RECOVERY_MUST_NOT_VERIFY"); },
+  });
+  const detail = await projectDetail(
+    new Request(`https://control.example/api/projects/${project.id}`, { headers: authenticatedHeaders(owner) }),
+    { params: Promise.resolve({ projectId: project.id }) },
+  );
+  assert.equal(detail.status, 200, JSON.stringify(await detail.clone().json()));
+  const recovered = (await detail.json()).release;
+  assert.deepEqual(Object.keys(recovered).sort(), ["id", "installation", "url"]);
+  assert.equal(recovered.id, release.id);
+  assert.equal(recovered.url, release.artifactUrl);
+  assert.equal(recovered.installation.verificationPageUrl, `${targetOrigin}/webmcp-test`);
+  assert.equal("code" in recovered, false);
 });
 
 test("release guides preserve local-only and the previous persisted Storage URL", async () => {
@@ -798,6 +817,28 @@ test("release guides preserve local-only and the previous persisted Storage URL"
     integrity: first.sri,
     artifactUrl: first.artifactUrl,
   });
+
+  setReleaseArtifactStoreForTest({ publish: async () => { throw new Error("RECOVERY_MUST_NOT_UPLOAD"); } });
+  setReleaseVerificationPortForTest({
+    mode: "hermetic",
+    verifyCandidate: async () => { throw new Error("RECOVERY_MUST_NOT_VERIFY"); },
+    verifyInstalled: async () => { throw new Error("RECOVERY_MUST_NOT_VERIFY"); },
+  });
+  const resumed = await projectDetail(
+    new Request(`https://control.example/api/projects/${project.id}`, { headers: authenticatedHeaders(owner) }),
+    { params: Promise.resolve({ projectId: project.id }) },
+  );
+  assert.equal(resumed.status, 200, JSON.stringify(await resumed.clone().json()));
+  const resumedRelease = (await resumed.json()).release;
+  assert.equal(resumedRelease.id, second.id);
+  assert.equal(resumedRelease.url, second.artifactUrl);
+  assert.deepEqual(resumedRelease.installation.previousRelease, {
+    id: first.id,
+    contentHash: first.contentHash,
+    integrity: first.sri,
+    artifactUrl: first.artifactUrl,
+  });
+  assert.equal(JSON.stringify(resumedRelease).includes(second.code), false);
 
   const localRepository = new InMemoryControlPlaneRepository();
   installTestRepository(localRepository);

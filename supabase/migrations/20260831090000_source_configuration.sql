@@ -51,7 +51,7 @@ as $$
 $$;
 
 -- PostgreSQL has no WHATWG URL serializer. Keep the persisted test-page
--- surface intentionally smaller: canonical printable ASCII paths and queries
+-- surface intentionally smaller: canonical printable ASCII paths
 -- only, so database acceptance cannot exceed the application URL parser.
 create function private.canonical_https_test_page_characters(value text)
 returns boolean
@@ -61,7 +61,7 @@ security invoker
 set search_path = pg_catalog
 as $$
   select value <> ''
-    and translate(value, 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~/?&=', '') = '';
+    and translate(value, 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~/', '') = '';
 $$;
 
 create function private.canonical_https_test_page(origin text, page_url text)
@@ -72,16 +72,14 @@ security invoker
 set search_path = pg_catalog
 as $$
 declare
-  path_and_query text;
   path text;
   segment text;
 begin
   if not private.canonical_https_origin(origin) or page_url is null
-    or position('#' in page_url) > 0 or position(' ' in page_url) > 0
+    or position('?' in page_url) > 0 or position('#' in page_url) > 0 or position(' ' in page_url) > 0
     or left(page_url, char_length(origin) + 1) <> origin || '/' then return false; end if;
-  path_and_query := substring(page_url from char_length(origin) + 1);
-  if not private.canonical_https_test_page_characters(path_and_query) then return false; end if;
-  path := split_part(path_and_query, '?', 1);
+  path := substring(page_url from char_length(origin) + 1);
+  if not private.canonical_https_test_page_characters(path) then return false; end if;
   if position(E'\\' in path) > 0 then return false; end if;
   foreach segment in array string_to_array(path, '/') loop
     if not private.canonical_https_test_page_segment(segment) then return false; end if;

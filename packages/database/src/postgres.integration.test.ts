@@ -129,6 +129,14 @@ test("Postgres copies canonical OpenAPI verification context into an immutable a
     assert.deepEqual(stored.rows[0]?.source_configuration, configuration);
     const claimed = await repository.claimAnalysis("postgres-source-configuration-worker", 60_000);
     assert.deepEqual(claimed?.sourceConfiguration, configuration);
+    await assert.rejects(admin.query(
+      "update public.project_sources set source_configuration = $2::jsonb where project_id = $1 and active",
+      [project.id, JSON.stringify({
+        ...configuration,
+        testPageUrl: `${configuration.testPageUrl}?session=secret`,
+      })],
+    ), (error: unknown) => (error as { code?: string }).code === "23514");
+    assert.deepEqual((await repository.getActiveProjectSource(actor, project.id)).sourceConfiguration, configuration);
   } finally {
     await repository.close();
     await admin.end();
@@ -474,6 +482,11 @@ test("Postgres repository persists and recovers the fixture lifecycle", { skip: 
     assert.notEqual(secondRelease.id, release.id);
     assert.equal(secondRelease.contentHash, release.contentHash);
     assert.notEqual(secondRelease.analysisRunId, release.analysisRunId);
+    const latestPublished = await repository.getLatestPublishedRelease(actor, project.id);
+    assert.equal(latestPublished?.release.id, secondRelease.id);
+    assert.equal(latestPublished?.verification.analysisRunId, secondRelease.analysisRunId);
+    assert.equal(latestPublished?.verification.capabilityStateDigest, secondRelease.capabilityStateDigest);
+    assert.equal(latestPublished?.verification.candidateContentHash, secondRelease.contentHash);
 
     const diagnosticRun = await repository.enqueueAnalysis(actor, {
       projectId: project.id,
@@ -514,6 +527,8 @@ test("Postgres repository persists and recovers the fixture lifecycle", { skip: 
       role: "owner"
     };
     await assert.rejects(repository.getProject(outsider, project.id), (error: unknown) =>
+      error instanceof RepositoryError && error.code === "NOT_FOUND");
+    await assert.rejects(repository.getLatestPublishedRelease(outsider, project.id), (error: unknown) =>
       error instanceof RepositoryError && error.code === "NOT_FOUND");
 
     const forgedViewer: RepositoryActor = {

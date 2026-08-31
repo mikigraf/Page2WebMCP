@@ -5,6 +5,7 @@ import {
   completeOperation,
   loadWorkflow,
   operationKey,
+  reconcileProjectRecovery,
   reconcileProjectWorkflow,
   saveWorkflow
 } from "../src/client-workflow.ts";
@@ -76,9 +77,22 @@ test("OpenAPI recovery state keeps bounded verification context and fails closed
   }));
   assert.equal(loadWorkflow(storage), undefined);
   assert.equal(storage.getItem("page2webmcp.workflow.v1"), null);
+
+  storage.setItem("page2webmcp.workflow.v1", JSON.stringify({
+    sourceType: "openapi",
+    url: "https://api.acme.example/openapi.json",
+    sourceConfiguration: {
+      kind: "openapi",
+      targetOrigin: "https://app.acme.example",
+      testPageUrl: "https://app.acme.example/checkout?session=secret",
+      environment: "test"
+    }
+  }));
+  assert.equal(loadWorkflow(storage), undefined);
+  assert.equal(storage.getItem("page2webmcp.workflow.v1"), null);
 });
 
-test("authoritative refresh preserves compatible workflow and release recovery only for the same source and analysis", () => {
+test("authoritative refresh derives release recovery from the server on reload and a new tab", () => {
   const current = {
     sourceType: "openapi" as const,
     url: "https://api.acme.example/openapi.json",
@@ -91,16 +105,36 @@ test("authoritative refresh preserves compatible workflow and release recovery o
     projectId: "project-1",
     analysisRunId: "analysis-1",
     workflowRunId: "workflow-1",
-    releaseUrl: "https://releases.acme.example/project-1"
+    releaseUrl: "https://stale.example/release.js"
   };
   const authoritative = {
     sourceType: current.sourceType,
     url: current.url,
     sourceConfiguration: current.sourceConfiguration,
     projectId: current.projectId,
-    analysisRunId: current.analysisRunId
+    analysisRunId: current.analysisRunId,
+    releaseUrl: "https://storage.example/exact-release.js"
   };
-  assert.deepEqual(reconcileProjectWorkflow(current, authoritative), current);
+  assert.deepEqual(reconcileProjectWorkflow(current, authoritative), {
+    ...current,
+    releaseUrl: authoritative.releaseUrl
+  });
+  assert.deepEqual(reconcileProjectWorkflow(undefined, authoritative), authoritative);
+
+  const exactRelease = {
+    id: "release-1",
+    url: authoritative.releaseUrl,
+    installation: { verificationPageUrl: "https://app.acme.example/checkout" }
+  };
+  const newTab = reconcileProjectRecovery(undefined, {
+    sourceType: authoritative.sourceType,
+    url: authoritative.url,
+    sourceConfiguration: authoritative.sourceConfiguration,
+    projectId: authoritative.projectId,
+    analysisRunId: authoritative.analysisRunId,
+  }, exactRelease);
+  assert.strictEqual(newTab.release, exactRelease);
+  assert.equal(newTab.workflow.releaseUrl, exactRelease.url);
 
   assert.deepEqual(reconcileProjectWorkflow(current, { ...authoritative, projectId: "project-2" }), {
     ...authoritative,

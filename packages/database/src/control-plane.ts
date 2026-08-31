@@ -205,6 +205,11 @@ export type ReleaseRecord = {
   createdAt: string;
 } & ReleaseArtifactIdentity;
 
+export type PublishedReleaseState = Readonly<{
+  release: ReleaseRecord;
+  verification: VerificationRecord;
+}>;
+
 export type ReleaseInstallationRecord = {
   id: string;
   organizationId: string;
@@ -317,6 +322,7 @@ export interface ControlPlaneRepository extends WorkflowRepository {
   saveVerification(actor: RepositoryActor, projectId: string, input: VerificationRequest): Promise<VerificationRecord>;
   publishRelease(actor: RepositoryActor, input: PublishRequest): Promise<ReleaseRecord>;
   getRelease(actor: RepositoryActor, projectId: string, releaseId: string): Promise<ReleaseRecord>;
+  getLatestPublishedRelease(actor: RepositoryActor, projectId: string): Promise<PublishedReleaseState | undefined>;
   getPreviousRelease(actor: RepositoryActor, projectId: string, releaseId: string): Promise<ReleaseRecord | undefined>;
   saveReleaseInstallation(actor: RepositoryActor, projectId: string,
     input: ReleaseInstallationRequest): Promise<ReleaseInstallationRecord>;
@@ -440,7 +446,7 @@ function canonicalHttpsUrl(value: string): string {
   } catch {
     throw new RepositoryError("INVALID_STATE");
   }
-  if (url.protocol !== "https:" || url.username || url.password || url.hash) {
+  if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash) {
     throw new RepositoryError("INVALID_STATE");
   }
   return url.toString();
@@ -1936,6 +1942,28 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
       throw new RepositoryError("NOT_FOUND");
     }
     return copy(release);
+  }
+
+  async getLatestPublishedRelease(
+    actor: RepositoryActor,
+    projectId: string,
+  ): Promise<PublishedReleaseState | undefined> {
+    this.#assertProject(actor, projectId);
+    const release = [...this.#releases.values()]
+      .filter((candidate) => candidate.organizationId === actor.organizationId && candidate.projectId === projectId)
+      .sort((left, right) => compareCodePoints(right.createdAt, left.createdAt)
+        || compareCodePoints(right.id, left.id))[0];
+    if (!release) return undefined;
+    const verification = this.#verifications.get(release.analysisRunId);
+    const candidate = this.#verificationCandidates.get(release.analysisRunId);
+    if (!verification?.eligible || !candidate || verification.projectId !== projectId
+      || verification.analysisRunId !== release.analysisRunId
+      || verification.capabilityStateDigest !== release.capabilityStateDigest
+      || verification.candidateContentHash !== release.contentHash
+      || !candidateMatches(candidate, release)) {
+      throw new RepositoryError("INVALID_STATE");
+    }
+    return copy({ release, verification });
   }
 
   async getPreviousRelease(

@@ -21,7 +21,7 @@ export type PersistedWorkflow = {
 };
 
 export type AuthoritativeProjectWorkflow = Pick<PersistedWorkflow,
-  "sourceType" | "url" | "sourceConfiguration" | "projectId" | "analysisRunId"> & {
+  "sourceType" | "url" | "sourceConfiguration" | "projectId" | "analysisRunId" | "releaseUrl"> & {
   projectId: string;
 };
 
@@ -117,8 +117,21 @@ export function reconcileProjectWorkflow(
   if (!compatible) return authoritative;
   return {
     ...authoritative,
-    ...(recovered.workflowRunId ? { workflowRunId: recovered.workflowRunId } : {}),
-    ...(recovered.releaseUrl ? { releaseUrl: recovered.releaseUrl } : {})
+    ...(recovered.workflowRunId ? { workflowRunId: recovered.workflowRunId } : {})
+  };
+}
+
+export function reconcileProjectRecovery<T extends { url: string }>(
+  recovered: PersistedWorkflow | undefined,
+  authoritative: Omit<AuthoritativeProjectWorkflow, "releaseUrl">,
+  release: T | undefined,
+): Readonly<{ workflow: PersistedWorkflow; release: T | undefined }> {
+  return {
+    workflow: reconcileProjectWorkflow(recovered, {
+      ...authoritative,
+      ...(release ? { releaseUrl: release.url } : {}),
+    }),
+    release,
   };
 }
 
@@ -134,7 +147,11 @@ function isSourceConfiguration(sourceType: SourceType, value: unknown): value is
   if (!isBoundedUrl(configuration.targetOrigin) || !isBoundedUrl(configuration.testPageUrl)
     || !["test", "staging", "production"].includes(String(configuration.environment))) return false;
   try {
-    return new URL(String(configuration.targetOrigin)).origin === new URL(String(configuration.testPageUrl)).origin;
+    const target = new URL(String(configuration.targetOrigin));
+    const testPage = new URL(String(configuration.testPageUrl));
+    return !target.username && !target.password && target.pathname === "/" && !target.search && !target.hash
+      && !testPage.username && !testPage.password && !testPage.search && !testPage.hash
+      && target.origin === testPage.origin;
   } catch {
     return false;
   }

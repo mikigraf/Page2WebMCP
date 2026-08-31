@@ -30,6 +30,7 @@ import {
   type ProjectPage,
   type ProjectPageRequest,
   type ProjectRecord,
+  type PublishedReleaseState,
   type PublishRequest,
   type ReleaseRecord,
   type ReleaseInstallationRecord,
@@ -1878,6 +1879,41 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
       );
       if (!result.rows[0]) throw new RepositoryError("NOT_FOUND");
       return mapRelease(result.rows[0]);
+    });
+  }
+
+  async getLatestPublishedRelease(
+    actor: RepositoryActor,
+    projectId: string,
+  ): Promise<PublishedReleaseState | undefined> {
+    return this.#transaction({ kind: "app", actor }, async (client) => {
+      await this.#project(client, actor, projectId);
+      const releaseResult = await client.query(
+        "select id, organization_id, project_id, analysis_run_id, capability_state_digest, content_hash, sri, code, " +
+        "allowed_origin, manifest, artifact_url, download_url, local_only, status, created_at from public.releases " +
+        "where project_id = $1 and organization_id = $2 and status = 'published' " +
+        "order by created_at desc, id desc limit 1",
+        [projectId, actor.organizationId]
+      );
+      if (!releaseResult.rows[0]) return undefined;
+      const release = mapRelease(releaseResult.rows[0]);
+      const verificationResult = await client.query(
+        "select id, project_id, analysis_run_id, capability_state_digest, candidate_content_hash, schema_valid, " +
+        "candidate_code, candidate_allowed_origin, candidate_manifest, authenticated, replay_passes, " +
+        "no_secret_leakage, browser_execution, selection_score, checks, csp_result, verification_mode, " +
+        "eligible, failures, created_at from public.verification_runs " +
+        "where project_id = $1 and organization_id = $2 and analysis_run_id = $3 " +
+        "and capability_state_digest = $4 and candidate_content_hash = $5 and eligible " +
+        "and candidate_code = $6 and candidate_allowed_origin = $7 and candidate_manifest = $8::jsonb " +
+        "order by revision desc, id desc limit 1",
+        [projectId, actor.organizationId, release.analysisRunId, release.capabilityStateDigest,
+          release.contentHash, release.code, release.allowedOrigin, JSON.stringify(release.manifest ?? {})]
+      );
+      if (!verificationResult.rows[0]) throw new RepositoryError("INVALID_STATE");
+      const verification = mapVerification(verificationResult.rows[0]);
+      const candidate = mapVerificationCandidate(verificationResult.rows[0]);
+      if (!candidateMatches(candidate, release)) throw new RepositoryError("INVALID_STATE");
+      return { release, verification };
     });
   }
 

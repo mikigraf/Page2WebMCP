@@ -64,7 +64,7 @@ test("project entry persists scoped fixture sources with opaque IDs", async () =
 });
 
 test("OpenAPI project creation requires a same-origin HTTPS verification context", async () => {
-  installTestRepository(new InMemoryControlPlaneRepository());
+  const repository = installTestRepository(new InMemoryControlPlaneRepository());
   const missing = await POST(request("POST", {
     sourceType: "openapi",
     url: "https://api.acme.example/openapi.json"
@@ -84,6 +84,20 @@ test("OpenAPI project creation requires a same-origin HTTPS verification context
   }, undefined, "openapi-context-invalid"));
   assert.equal(mismatched.status, 400);
   assert.equal((await mismatched.json()).code, "OPENAPI_VERIFICATION_CONTEXT_REQUIRED");
+
+  const queryBearingPage = await POST(request("POST", {
+    sourceType: "openapi",
+    url: "https://api.acme.example/openapi.json",
+    sourceConfiguration: {
+      kind: "openapi",
+      targetOrigin: "https://acme.example",
+      testPageUrl: "https://acme.example/checkout?session=tenant-a",
+      environment: "test"
+    }
+  }, undefined, "openapi-context-query"));
+  assert.equal(queryBearingPage.status, 400);
+  assert.equal((await queryBearingPage.json()).code, "OPENAPI_VERIFICATION_CONTEXT_REQUIRED");
+  assert.equal((await repository.listProjects(owner)).length, 0);
 
   const strictWebsite = await POST(request("POST", {
     sourceType: "website",

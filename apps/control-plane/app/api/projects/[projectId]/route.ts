@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { getControlPlaneRepository } from "../../../../../../packages/database/src/factory.ts";
 import { ApiError, createRequestId, errorResponse, requireActor, successResponse } from "../../../../src/api.ts";
+import { recoverLatestPublishedRelease } from "../../../../src/releases.ts";
 
 const ProjectIdSchema = z.string().uuid();
 
@@ -21,7 +22,8 @@ export async function GET(
     const capabilities = latestAnalysis?.status === "succeeded"
       ? await repository.listAnalysisCapabilities(actor, latestAnalysis.id)
       : [];
-    return successResponse({ project, source, latestAnalysis, capabilities }, requestId);
+    const release = await recoverLatestPublishedRelease(repository, actor, project.id);
+    return successResponse({ project, source, latestAnalysis, capabilities, release }, requestId);
   } catch (error) {
     return errorResponse(error, requestId, request);
   }

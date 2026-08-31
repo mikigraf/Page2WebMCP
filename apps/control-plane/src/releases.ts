@@ -11,6 +11,7 @@ import {
   type CandidateRelease,
   type CapabilityRecord,
   type ControlPlaneRepository,
+  type PublishedReleaseState,
   type ReleaseRecord,
   type ReleaseInstallationRecord,
   type RepositoryActor,
@@ -188,6 +189,37 @@ export type ReleaseInstallationGuide = Readonly<{
   previousRelease: null | { id: string; contentHash: string; integrity: string; artifactUrl: string };
   installed: false;
 }>;
+
+export type ResumableReleaseResult = Readonly<{
+  id: string;
+  url: string;
+  installation: ReleaseInstallationGuide;
+}>;
+
+export async function recoverLatestPublishedRelease(
+  repository: ControlPlaneRepository,
+  actor: RepositoryActor,
+  projectId: string,
+): Promise<ResumableReleaseResult | undefined> {
+  const state: PublishedReleaseState | undefined = await repository.getLatestPublishedRelease(actor, projectId);
+  if (!state) return undefined;
+  const { release, verification } = state;
+  const identity = persistedReleaseArtifactIdentity(release);
+  if (!verification.eligible || release.organizationId !== actor.organizationId || release.projectId !== projectId
+    || verification.projectId !== projectId || verification.analysisRunId !== release.analysisRunId
+    || verification.capabilityStateDigest !== release.capabilityStateDigest
+    || verification.candidateContentHash !== release.contentHash || !identity) {
+    throw new ApiError("INVALID_STATE", 409);
+  }
+  const target = await resolveReleaseTarget(repository, actor, projectId, release.analysisRunId, release);
+  if (target.targetOrigin !== release.allowedOrigin) throw new ApiError("INVALID_STATE", 409);
+  const previous = await repository.getPreviousRelease(actor, projectId, release.id);
+  return {
+    id: release.id,
+    url: identity.artifactUrl,
+    installation: buildReleaseInstallationGuide(release, verification, previous, target.verificationPageUrl),
+  };
+}
 
 export function buildReleaseInstallationGuide(
   release: ReleaseRecord,

@@ -9,7 +9,7 @@ import {
   completeOperation,
   loadWorkflow,
   operationKey,
-  reconcileProjectWorkflow,
+  reconcileProjectRecovery,
   saveWorkflow,
   type PersistedWorkflow,
   type SourceConfiguration,
@@ -116,7 +116,6 @@ export function ProjectEntry({ authState }: Readonly<{ authState?: "verified" | 
       setProjectId(restored.projectId);
       setAnalysisRunId(restored.analysisRunId);
       setWorkflowRunId(restored.workflowRunId);
-      setReleaseUrl(restored.releaseUrl);
       if (restored.projectId) void refreshProject(restored.projectId, controller.signal).catch((error: unknown) => {
         if (!controller.signal.aborted) setMessage(`Project recovery failed: ${errorCode(error)}`);
       });
@@ -365,24 +364,26 @@ export function ProjectEntry({ authState }: Readonly<{ authState?: "verified" | 
       source?: ProjectSource;
       latestAnalysis?: { id: string; status: AnalysisStatus["run"]["status"] };
       capabilities?: Capability[];
+      release?: ReleaseResult;
     } & ApiFailure>(`/api/projects/${encodeURIComponent(id)}`, { cache: "no-store", ...(signal ? { signal } : {}) });
     if (!response.ok || !body.project || !body.source) throw new Error(body.code ?? "PROJECT_LOAD_FAILED");
     const storage = browserStorage();
-    const recovered = reconcileProjectWorkflow(storage ? loadWorkflow(storage) : undefined, {
+    const recovery = reconcileProjectRecovery(storage ? loadWorkflow(storage) : undefined, {
       sourceType: body.source.sourceType,
       url: body.source.sourceUrl,
       sourceConfiguration: body.source.sourceConfiguration,
       projectId: body.project.id,
-      analysisRunId: body.latestAnalysis?.id
-    });
+      analysisRunId: body.latestAnalysis?.id,
+    }, body.release);
+    const recovered = recovery.workflow;
     applySource(body.source);
     setProjectId(body.project.id);
     setAnalysisRunId(body.latestAnalysis?.id);
     setCapabilities(body.capabilities ?? []);
     setWorkflowRunId(recovered.workflowRunId);
-    setReleaseUrl(recovered.releaseUrl);
+    setReleaseUrl(body.release?.url);
+    setRelease(recovery.release);
     if (!recovered.workflowRunId) setGitHubOutcome(undefined);
-    if (!recovered.releaseUrl) setRelease(undefined);
     persistWorkflow(recovered);
     return { ...body, project: body.project, source: body.source };
   }
@@ -869,7 +870,9 @@ function validateSourceConfiguration(configuration: SourceConfiguration): string
   try {
     const target = new URL(configuration.targetOrigin);
     const testPage = new URL(configuration.testPageUrl);
-    if (target.protocol !== "https:" || testPage.protocol !== "https:" || target.origin !== testPage.origin) {
+    if (target.protocol !== "https:" || testPage.protocol !== "https:" || target.origin !== testPage.origin
+      || target.username || target.password || target.pathname !== "/" || target.search || target.hash
+      || testPage.username || testPage.password || testPage.search || testPage.hash) {
       return "OpenAPI verification context invalid: TEST_PAGE_SAME_ORIGIN_REQUIRED";
     }
   } catch {

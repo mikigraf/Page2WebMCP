@@ -43,9 +43,9 @@ test("source-configuration migration rejects test-page spellings that the URL pa
   for (const pageUrl of canonicalizationCandidates) {
     assert.notEqual(new URL(pageUrl).toString(), pageUrl);
   }
-  const canonicalWithPathAndQuery = `${origin}/webmcp-test?tenant=example&mode=read`;
-  assert.equal(new URL(canonicalWithPathAndQuery).toString(), canonicalWithPathAndQuery);
-  const acceptedCharacters = new Set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~/?&=");
+  const canonicalWithQuery = `${origin}/webmcp-test?tenant=example&mode=read`;
+  assert.equal(new URL(canonicalWithQuery).toString(), canonicalWithQuery);
+  const acceptedCharacters = new Set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~/");
   for (const pageUrl of [
     `${origin}/line\nbreak`, `${origin}/tab\tvalue`, `${origin}/back\`tick`, `${origin}/braces{}`,
     `${origin}/quote"`, `${origin}/single'`, `${origin}/angle<>`, `${origin}/percent%2f`,
@@ -56,8 +56,16 @@ test("source-configuration migration rejects test-page spellings that the URL pa
   assert.match(sql, /lower\(segment\) not in \('\.', '\.\.', '%2e', '\.%2e', '%2e\.', '%2e%2e'\)/);
   assert.match(sql, /position\(E'\\\\' in path\) > 0/);
   assert.match(sql, /create function private\.canonical_https_test_page_characters\(value text\)/);
-  assert.match(sql, /translate\(value, 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789\-\._~\/\?&=', ''\) = ''/);
-  assert.match(sql, /path_and_query := substring\(page_url from char_length\(origin\) \+ 1\)/);
-  assert.match(sql, /path := split_part\(path_and_query, '\?', 1\)/);
+  assert.match(sql, /translate\(value, 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789\-\._~\/', ''\) = ''/);
+  assert.match(sql, /position\('\?' in page_url\) > 0/);
+  assert.match(sql, /path := substring\(page_url from char_length\(origin\) \+ 1\)/);
   assert.match(sql, /position\('#' in page_url\) > 0/);
+});
+
+test("applied source-configuration databases are hardened against OpenAPI test-page queries", async () => {
+  const hardeningUrl = new URL("../../../supabase/migrations/20260831111000_openapi_test_page_no_query.sql", import.meta.url);
+  const sql = await readFile(hardeningUrl, "utf8");
+  assert.match(sql, /create or replace function private\.canonical_https_test_page\(origin text, page_url text\)/);
+  assert.match(sql, /position\('\?' in page_url\) > 0/);
+  assert.doesNotMatch(sql, /delete from|update public\.project_sources/i);
 });
