@@ -8,6 +8,8 @@ import {
   attestReleaseInstallation,
   configuredReleaseVerificationPort,
   type CandidateVerificationReport,
+  type ReleaseVerifierHttpRequest,
+  type ReleaseVerifierHttpResponse,
   type ReleaseVerificationPort,
 } from "../src/release-verification.ts";
 
@@ -48,6 +50,31 @@ function report(overrides: Partial<CandidateVerificationReport> = {}): Candidate
   };
 }
 
+function candidateInput() {
+  return {
+    code: release.code,
+    contentHash: release.contentHash,
+    integrity: release.integrity,
+    manifest: release.manifest,
+    targetOrigin: release.allowedOrigin,
+    expectedTools,
+  };
+}
+
+function httpResponse(
+  url: string,
+  body: unknown,
+  overrides: Partial<ReleaseVerifierHttpResponse> = {},
+): ReleaseVerifierHttpResponse {
+  return {
+    status: 200,
+    url,
+    headers: { "content-type": "application/json" },
+    body: Buffer.from(JSON.stringify(body)),
+    ...overrides,
+  };
+}
+
 test("candidate verification sends and accepts only the exact reviewed bytes under a trusted loader", async () => {
   let observedCode = "";
   const port: ReleaseVerificationPort = {
@@ -58,20 +85,20 @@ test("candidate verification sends and accepts only the exact reviewed bytes und
     },
     verifyInstalled: async () => { throw new Error("UNUSED"); },
   };
-  const attestation = await attestReleaseCandidate({
-    code: release.code,
-    contentHash: release.contentHash,
-    integrity: release.integrity,
-    manifest: release.manifest,
-    targetOrigin: release.allowedOrigin,
-    expectedTools,
-  }, port, new AbortController().signal);
+  const attestation = await attestReleaseCandidate(candidateInput(), port, new AbortController().signal);
 
   assert.equal(observedCode, release.code);
   assert.equal(attestation.browserExecution, true);
   assert.equal(attestation.noSecretLeakage, true);
   assert.equal(attestation.selectionScore, 20);
   assert.deepEqual(attestation.checks.map(({ name }) => name), [...REQUIRED_CANDIDATE_CHECKS]);
+  assert.deepEqual(attestation.verifierIdentity, {
+    protocolVersion: 1,
+    mode: "hermetic",
+    webMcpImplementation: "native",
+    verifierOriginDigest: "3fbdec91e0f941c39471af79d071c09048a2a4bdcb8c53adbc03a2d7c27efcbf",
+  });
+  assert.deepEqual(attestation.report.registeredTools, expectedTools);
 });
 
 test("candidate verification rejects forged loader, byte, tool, request, and check-set attestations", async (context) => {
@@ -90,14 +117,8 @@ test("candidate verification rejects forged loader, byte, tool, request, and che
         verifyCandidate: async () => report(overrides),
         verifyInstalled: async () => { throw new Error("UNUSED"); },
       };
-      await assert.rejects(attestReleaseCandidate({
-        code: release.code,
-        contentHash: release.contentHash,
-        integrity: release.integrity,
-        manifest: release.manifest,
-        targetOrigin: release.allowedOrigin,
-        expectedTools,
-      }, port, new AbortController().signal), /CANDIDATE_VERIFICATION_INVALID|WRONG_STATE/);
+      await assert.rejects(attestReleaseCandidate(candidateInput(), port, new AbortController().signal),
+        /CANDIDATE_VERIFICATION_INVALID|WRONG_STATE/);
     });
   }
 });
@@ -111,14 +132,7 @@ test("candidate verification preserves an exact typed failure while failing brow
     verifyCandidate: async () => failed,
     verifyInstalled: async () => { throw new Error("UNUSED"); },
   };
-  const attestation = await attestReleaseCandidate({
-    code: release.code,
-    contentHash: release.contentHash,
-    integrity: release.integrity,
-    manifest: release.manifest,
-    targetOrigin: release.allowedOrigin,
-    expectedTools,
-  }, port, new AbortController().signal);
+  const attestation = await attestReleaseCandidate(candidateInput(), port, new AbortController().signal);
   assert.equal(attestation.browserExecution, false);
   assert.deepEqual(attestation.checks.find(({ name }) => name === "final_state"), {
     name: "final_state", status: "failed", code: "WRONG_STATE",
@@ -127,6 +141,275 @@ test("candidate verification preserves an exact typed failure while failing brow
 
 test("production verification is unavailable without exact live controls", () => {
   assert.throws(() => configuredReleaseVerificationPort({}), /RELEASE_VERIFIER_CONFIGURATION_REQUIRED/);
+});
+
+test("configured live verification authenticates readiness immediately before candidate execution", async () => {
+  const origin = "https://verifier.example";
+  const token = "v".repeat(32);
+  const requests: ReleaseVerifierHttpRequest[] = [];
+  const port = configuredReleaseVerificationPort({
+    PAGE2WEBMCP_RELEASE_VERIFIER_ORIGIN: origin,
+    PAGE2WEBMCP_RELEASE_VERIFIER_TOKEN: token,
+  }, {
+    mode: "live",
+    transport: {
+      request: async (input) => {
+        requests.push(input);
+        return input.url.endsWith("/v1/readiness")
+          ? httpResponse(input.url, { protocolVersion: 1, mode: "live", webMcpImplementation: "native" })
+          : httpResponse(input.url, report());
+      },
+    },
+  });
+
+  const attestation = await attestReleaseCandidate(candidateInput(), port, new AbortController().signal);
+  assert.deepEqual(requests.map(({ url }) => url), [
+    `${origin}/v1/readiness`,
+    `${origin}/v1/candidates/verify`,
+  ]);
+  for (const request of requests) {
+    assert.equal(request.method, "POST");
+    assert.equal(request.redirect, "error");
+    assert.equal(request.credentials, "omit");
+    assert.equal(request.headers.authorization, `Bearer ${token}`);
+    assert.equal(request.headers["content-type"], "application/json");
+  }
+  assert.deepEqual(JSON.parse(requests[0]!.body), {});
+  assert.deepEqual(attestation.verifierIdentity, {
+    protocolVersion: 1,
+    mode: "live",
+    webMcpImplementation: "native",
+    verifierOriginDigest: "d1b8790504951c2f3c74c61299b9cfb8634ca1b0dc8e3b6ae57475bc37790a25",
+  });
+  assert.deepEqual(attestation.report, report());
+});
+
+test("configured installation performs a fresh readiness handshake and returns its identity", async () => {
+  const origin = "https://verifier.example";
+  const paths: string[] = [];
+  const port = configuredReleaseVerificationPort({
+    PAGE2WEBMCP_RELEASE_VERIFIER_ORIGIN: origin,
+    PAGE2WEBMCP_RELEASE_VERIFIER_TOKEN: "v".repeat(32),
+  }, {
+    mode: "live",
+    transport: {
+      request: async (input) => {
+        paths.push(new URL(input.url).pathname);
+        return input.url.endsWith("/v1/readiness")
+          ? httpResponse(input.url, { protocolVersion: 1, mode: "live", webMcpImplementation: "native" })
+          : httpResponse(input.url, {
+            observedArtifactUrl: artifactUrl,
+            observedDownloadUrl: downloadUrl,
+            observedLocalOnly: false,
+            observedIntegrity: release.integrity,
+            executedArtifactUrl: artifactUrl,
+            servedContentHash: release.contentHash,
+            executedContentHash: release.contentHash,
+            observedTargetOrigin: release.allowedOrigin,
+            registeredTools: expectedTools,
+            webMcpImplementation: "native",
+            normalPageLoad: true,
+            routeInterception: false,
+            injectedRegistration: false,
+            syntheticHarness: false,
+            duplicateLoadHarmless: true,
+            csp: { hosted: "allowed" },
+          });
+      },
+    },
+  });
+
+  const attestation = await attestReleaseInstallation(installedInput(), port, new AbortController().signal);
+  assert.deepEqual(paths, ["/v1/readiness", "/v1/installations/verify"]);
+  assert.equal(attestation.verifierIdentity.mode, "live");
+  assert.equal(attestation.verifierIdentity.verifierOriginDigest,
+    "d1b8790504951c2f3c74c61299b9cfb8634ca1b0dc8e3b6ae57475bc37790a25");
+});
+
+test("verifier tokens accept the exact 32..4096 boundary and reject values outside it", () => {
+  const origin = "https://verifier.example";
+  const transport = { request: async () => { throw new Error("UNUSED"); } };
+  for (const length of [32, 4_096]) {
+    assert.doesNotThrow(() => configuredReleaseVerificationPort({
+      PAGE2WEBMCP_RELEASE_VERIFIER_ORIGIN: origin,
+      PAGE2WEBMCP_RELEASE_VERIFIER_TOKEN: "v".repeat(length),
+    }, { mode: "live", transport }));
+  }
+  for (const length of [31, 4_097]) {
+    assert.throws(() => configuredReleaseVerificationPort({
+      PAGE2WEBMCP_RELEASE_VERIFIER_ORIGIN: origin,
+      PAGE2WEBMCP_RELEASE_VERIFIER_TOKEN: "v".repeat(length),
+    }, { mode: "live", transport }), /RELEASE_VERIFIER_CONFIGURATION_REQUIRED/);
+  }
+});
+
+test("live verifier construction never reads the local verifier origin", () => {
+  const touched: string[] = [];
+  const environment = new Proxy({
+    PAGE2WEBMCP_RELEASE_VERIFIER_ORIGIN: "https://verifier.example",
+    PAGE2WEBMCP_RELEASE_VERIFIER_TOKEN: "v".repeat(32),
+  } as Record<string, string | undefined>, {
+    get(target, property, receiver) {
+      if (property === "PAGE2WEBMCP_LOCAL_RELEASE_VERIFIER_ORIGIN") {
+        throw new Error("LOCAL_VERIFIER_ENV_READ");
+      }
+      touched.push(String(property));
+      return Reflect.get(target, property, receiver);
+    },
+  });
+  assert.doesNotThrow(() => configuredReleaseVerificationPort(environment, {
+    mode: "live",
+    transport: { request: async () => { throw new Error("UNUSED"); } },
+  }));
+  assert.equal(touched.includes("PAGE2WEBMCP_LOCAL_RELEASE_VERIFIER_ORIGIN"), false);
+});
+
+test("local-live verifier accepts only an explicit exact loopback HTTP origin", async (context) => {
+  const token = "v".repeat(32);
+  const transport = { request: async () => { throw new Error("UNUSED"); } };
+  for (const [origin, digest] of [
+    ["http://127.0.0.1:7777", "30ae29fa7395154be25a9b54c9fdb97839b01400d7899ff0b361a0824c300715"],
+    ["http://[::1]:7777", "83088dad521bd93bc1e57b72cba3fc85425de05868e9285b76a9b6f03c3d42fc"],
+  ] as const) {
+    const port = configuredReleaseVerificationPort({
+      PAGE2WEBMCP_LOCAL_STACK: "true",
+      PAGE2WEBMCP_LOCAL_RELEASE_VERIFIER_ORIGIN: origin,
+      PAGE2WEBMCP_RELEASE_VERIFIER_TOKEN: token,
+    }, {
+      mode: "local_live",
+      transport: {
+        request: async (input) => httpResponse(input.url, {
+          protocolVersion: 1,
+          mode: "local_live",
+          webMcpImplementation: "native",
+        }),
+      },
+    });
+    assert.equal(port.mode, "local_live");
+    assert.deepEqual(await port.readiness(new AbortController().signal), {
+      protocolVersion: 1,
+      mode: "local_live",
+      webMcpImplementation: "native",
+      verifierOriginDigest: digest,
+    });
+  }
+  const invalid = [
+    ["local stack absent", undefined, "http://127.0.0.1:7777"],
+    ["localhost alias", "true", "http://localhost:7777"],
+    ["public address", "true", "http://192.0.2.1:7777"],
+    ["HTTPS loopback", "true", "https://127.0.0.1:7777"],
+    ["path present", "true", "http://127.0.0.1:7777/verifier"],
+    ["trailing slash", "true", "http://127.0.0.1:7777/"],
+    ["port absent", "true", "http://127.0.0.1"],
+  ] as const;
+  for (const [name, localStack, origin] of invalid) {
+    await context.test(name, () => {
+      assert.throws(() => configuredReleaseVerificationPort({
+        ...(localStack ? { PAGE2WEBMCP_LOCAL_STACK: localStack } : {}),
+        PAGE2WEBMCP_LOCAL_RELEASE_VERIFIER_ORIGIN: origin,
+        PAGE2WEBMCP_RELEASE_VERIFIER_TOKEN: token,
+      }, { mode: "local_live", transport }), /RELEASE_VERIFIER_CONFIGURATION_REQUIRED/);
+    });
+  }
+});
+
+test("readiness identity mismatches and absent non-hermetic readiness fail before execution", async (context) => {
+  const identity = {
+    protocolVersion: 1 as const,
+    mode: "local_live" as const,
+    webMcpImplementation: "native" as const,
+    verifierOriginDigest: "d".repeat(64),
+  };
+  let executions = 0;
+  await context.test("identity mode mismatch", async () => {
+    const port: ReleaseVerificationPort = {
+      mode: "live",
+      readiness: async () => identity,
+      verifyCandidate: async () => { executions += 1; return report(); },
+      verifyInstalled: async () => { throw new Error("UNUSED"); },
+    };
+    await assert.rejects(attestReleaseCandidate(candidateInput(), port, new AbortController().signal),
+      /RELEASE_VERIFIER_IDENTITY_INVALID/);
+  });
+  await context.test("missing live readiness", async () => {
+    const port: ReleaseVerificationPort = {
+      mode: "live",
+      verifyCandidate: async () => { executions += 1; return report(); },
+      verifyInstalled: async () => { throw new Error("UNUSED"); },
+    };
+    await assert.rejects(attestReleaseCandidate(candidateInput(), port, new AbortController().signal),
+      /RELEASE_VERIFIER_IDENTITY_REQUIRED/);
+  });
+  assert.equal(executions, 0);
+});
+
+test("readiness rejects redirect, status, MIME, cookies, credential dependence, and non-native schemas", async (context) => {
+  const origin = "https://verifier.example";
+  const base = { protocolVersion: 1, mode: "live", webMcpImplementation: "native" };
+  const cases: Array<[string, unknown, Partial<ReleaseVerifierHttpResponse>]> = [
+    ["redirected URL", base, { url: "https://other.example/v1/readiness" }],
+    ["redirect status", base, { status: 302 }],
+    ["wrong MIME", base, { headers: { "content-type": "text/plain" } }],
+    ["response cookie", base, { headers: { "content-type": "application/json", "set-cookie": "sid=secret" } }],
+    ["credential-dependent CORS", base, {
+      headers: { "content-type": "application/json", "access-control-allow-credentials": "true" },
+    }],
+    ["wrong mode", { ...base, mode: "local_live" }, {}],
+    ["wrong protocol", { ...base, protocolVersion: 2 }, {}],
+    ["compatibility shim", { ...base, webMcpImplementation: "compatibility_shim" }, {}],
+    ["extra field", { ...base, healthy: true }, {}],
+  ];
+  for (const [name, body, overrides] of cases) {
+    await context.test(name, async () => {
+      let candidateCalls = 0;
+      const port = configuredReleaseVerificationPort({
+        PAGE2WEBMCP_RELEASE_VERIFIER_ORIGIN: origin,
+        PAGE2WEBMCP_RELEASE_VERIFIER_TOKEN: "v".repeat(32),
+      }, {
+        mode: "live",
+        transport: {
+          request: async (input) => input.url.endsWith("/v1/readiness")
+            ? httpResponse(input.url, body, overrides)
+            : (candidateCalls += 1, httpResponse(input.url, report())),
+        },
+      });
+      await assert.rejects(attestReleaseCandidate(candidateInput(), port, new AbortController().signal),
+        /RELEASE_VERIFIER_RESPONSE_INVALID|RELEASE_VERIFIER_IDENTITY_INVALID/);
+      assert.equal(candidateCalls, 0);
+    });
+  }
+});
+
+test("readiness body is bounded and caller cancellation prevents candidate execution", async (context) => {
+  const origin = "https://verifier.example";
+  const environment = {
+    PAGE2WEBMCP_RELEASE_VERIFIER_ORIGIN: origin,
+    PAGE2WEBMCP_RELEASE_VERIFIER_TOKEN: "v".repeat(32),
+  };
+  await context.test("oversized body", async () => {
+    const port = configuredReleaseVerificationPort(environment, {
+      mode: "live",
+      transport: { request: async (input) => httpResponse(input.url, {}, { body: Buffer.alloc(65_537) }) },
+    });
+    await assert.rejects(port.readiness(new AbortController().signal), /RELEASE_VERIFIER_RESPONSE_INVALID/);
+  });
+  await context.test("caller abort", async () => {
+    let candidateCalls = 0;
+    const port = configuredReleaseVerificationPort(environment, {
+      mode: "live",
+      transport: {
+        request: (input) => new Promise((_resolve, reject) => {
+          if (!input.url.endsWith("/v1/readiness")) candidateCalls += 1;
+          input.signal.addEventListener("abort", () => reject(input.signal.reason), { once: true });
+        }),
+      },
+    });
+    const controller = new AbortController();
+    const pending = attestReleaseCandidate(candidateInput(), port, controller.signal);
+    controller.abort(new Error("TEST_CANCELLED"));
+    await assert.rejects(pending, /TEST_CANCELLED/);
+    assert.equal(candidateCalls, 0);
+  });
 });
 
 test("installed verification proves a normal unintercepted native WebMCP page loaded exact bytes", async () => {
@@ -158,6 +441,12 @@ test("installed verification proves a normal unintercepted native WebMCP page lo
     delivery: "hosted",
     csp: { hosted: "allowed" },
     webMcpImplementation: "native",
+    verifierIdentity: {
+      protocolVersion: 1,
+      mode: "hermetic",
+      webMcpImplementation: "native",
+      verifierOriginDigest: "3fbdec91e0f941c39471af79d071c09048a2a4bdcb8c53adbc03a2d7c27efcbf",
+    },
     report: {
       observedArtifactUrl: artifactUrl,
       observedDownloadUrl: downloadUrl,
@@ -216,6 +505,14 @@ test("installed verification rejects interception, injection, synthetic/shim suc
     await context.test(name, async () => {
       const port: ReleaseVerificationPort = {
         mode: name === "compatibility shim" ? "live" : "hermetic",
+        ...(name === "compatibility shim" ? {
+          readiness: async () => ({
+            protocolVersion: 1,
+            mode: "live" as const,
+            webMcpImplementation: "native" as const,
+            verifierOriginDigest: "d".repeat(64),
+          }),
+        } : {}),
         verifyCandidate: async () => { throw new Error("UNUSED"); },
         verifyInstalled: async () => ({ ...base, ...overrides }),
       };
@@ -254,6 +551,12 @@ test("CSP blocked hosted delivery remains uninstalled and requires exact-hash se
     delivery: "hosted",
     csp: { hosted: "blocked", directive: "script-src 'self'" },
     webMcpImplementation: "native",
+    verifierIdentity: {
+      protocolVersion: 1,
+      mode: "hermetic",
+      webMcpImplementation: "native",
+      verifierOriginDigest: "3fbdec91e0f941c39471af79d071c09048a2a4bdcb8c53adbc03a2d7c27efcbf",
+    },
     report: {
       observedArtifactUrl: artifactUrl,
       observedDownloadUrl: downloadUrl,

@@ -9,6 +9,10 @@ import type { OpenApiProviderControls } from "../../../packages/providers/src/op
 
 const MAX_DNS_ANSWERS_PLUS_ONE = 17;
 const MAX_JSON_BYTES = 64 * 1_024;
+const MAX_PINNED_HEADER_COUNT = 16;
+const MAX_PINNED_HEADER_VALUE_BYTES = 4_096;
+const MAX_PINNED_AUTHORIZATION_BYTES = "Bearer ".length + 4_096;
+const MAX_PINNED_HEADER_BYTES = 16 * 1_024;
 
 type ResolverBoundary = Readonly<{
   resolve4(hostname: string): Promise<readonly string[]>;
@@ -155,14 +159,30 @@ function websiteAbortReason(signal: AbortSignal): Error {
 function validPinnedJsonRequest(input: NodePinnedJsonRequest): URL | undefined {
   if (!input || input.method !== "POST" || typeof input.body !== "string"
     || Buffer.byteLength(input.body, "utf8") > MAX_JSON_BYTES || !input.headers
-    || Object.keys(input.headers).length === 0
-    || Object.entries(input.headers).some(([name, value]) => !/^[a-z0-9-]+$/.test(name)
-      || typeof value !== "string" || value.length === 0 || value.length > 4_096 || /[\r\n]/.test(value))) return undefined;
+    || !validPinnedJsonHeaders(input.headers)) return undefined;
   try {
     const url = new URL(input.url);
     if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash) return undefined;
     return url;
   } catch { return undefined; }
+}
+
+function validPinnedJsonHeaders(headers: Readonly<Record<string, string>>): boolean {
+  if (!headers || typeof headers !== "object" || Array.isArray(headers)) return false;
+  const entries = Object.entries(headers);
+  if (entries.length === 0 || entries.length > MAX_PINNED_HEADER_COUNT) return false;
+  let totalBytes = 0;
+  for (const [name, value] of entries) {
+    if (!/^[a-z0-9-]+$/.test(name) || typeof value !== "string" || value.length === 0 || /[\r\n]/.test(value)) {
+      return false;
+    }
+    const valueBytes = Buffer.byteLength(value, "utf8");
+    const valueLimit = name === "authorization" ? MAX_PINNED_AUTHORIZATION_BYTES : MAX_PINNED_HEADER_VALUE_BYTES;
+    if (valueBytes > valueLimit) return false;
+    totalBytes += Buffer.byteLength(name, "utf8") + valueBytes;
+    if (totalBytes > MAX_PINNED_HEADER_BYTES) return false;
+  }
+  return true;
 }
 
 /** Resolves and validates every address before constructing a credential-bearing HTTPS request. */

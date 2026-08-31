@@ -345,6 +345,43 @@ test("pinned JSON transport rejects private DNS before credential-bearing HTTPS 
   assert.equal(requestCalls, 0);
 });
 
+test("pinned JSON transport permits a 4096-byte bearer token without relaxing other header bounds", async () => {
+  const transport = createNodePinnedJsonTransport({
+    resolver: { resolve: async () => [] },
+    request: () => { throw new Error("UNUSED"); },
+  });
+  const request = (headers: Record<string, string>) => transport.request({
+    url: "https://control.widgets.example/v1/readiness",
+    method: "POST",
+    headers,
+    body: "{}",
+    signal: new AbortController().signal,
+  });
+  await assert.rejects(request({
+    authorization: `Bearer ${"v".repeat(4_096)}`,
+    "content-type": "application/json",
+  }), /^Error: WEBSITE_CONTROL_RETRYABLE$/);
+  await assert.rejects(request({
+    authorization: `Bearer ${"v".repeat(4_097)}`,
+    "content-type": "application/json",
+  }), /^Error: WEBSITE_CONTROL_REQUEST_INVALID$/);
+  await assert.rejects(request({
+    authorization: "Bearer bounded-token",
+    "x-control": "x".repeat(4_097),
+  }), /^Error: WEBSITE_CONTROL_REQUEST_INVALID$/);
+  await assert.rejects(request(Object.fromEntries(Array.from({ length: 17 }, (_, index) => [
+    `x-control-${index}`, "bounded",
+  ]))), /^Error: WEBSITE_CONTROL_REQUEST_INVALID$/);
+  await assert.rejects(request({
+    authorization: "Bearer bounded-token",
+    "x-control-a": "a".repeat(4_000),
+    "x-control-b": "b".repeat(4_000),
+    "x-control-c": "c".repeat(4_000),
+    "x-control-d": "d".repeat(4_000),
+    "x-control-e": "e".repeat(4_000),
+  }), /^Error: WEBSITE_CONTROL_REQUEST_INVALID$/);
+});
+
 test("pinned JSON transport writes credentials only after pinned TLS peer verification", async () => {
   let sentBody: string | undefined;
   let capturedOptions: RequestOptions | undefined;

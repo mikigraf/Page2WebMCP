@@ -1,17 +1,54 @@
+import { createHash } from "node:crypto";
 import {
   RELEASE_VERIFICATION_CHECK_NAMES,
   type ReleaseVerificationCheckName as CandidateVerificationCheckName,
   type ReleaseVerificationCheckRecord as ReleaseVerificationCheck,
   type ReleaseVerificationFailureCode,
 } from "../../../packages/database/src/control-plane.ts";
+import {
+  createNodePinnedJsonTransport,
+  type NodePinnedJsonTransport,
+} from "../../worker/src/node-network.ts";
 
 const HASH = /^[0-9a-f]{64}$/;
 const SRI = /^sha384-[A-Za-z0-9+/]+={0,2}$/;
 const MAX_REPORT_BYTES = 64 * 1_024;
 const VERIFICATION_DEADLINE_MS = 120_000;
+const HERMETIC_VERIFIER_IDENTIFIER = "page2webmcp:hermetic-release-verifier:v1";
 
 export const REQUIRED_CANDIDATE_CHECKS = RELEASE_VERIFICATION_CHECK_NAMES;
+export const RELEASE_VERIFIER_PROTOCOL_VERSION = 1;
 export type { CandidateVerificationCheckName, ReleaseVerificationCheck, ReleaseVerificationFailureCode };
+
+export type VerificationMode = "hermetic" | "local_live" | "live";
+
+export type VerifierIdentity = Readonly<{
+  protocolVersion: 1;
+  mode: VerificationMode;
+  webMcpImplementation: "native";
+  verifierOriginDigest: string;
+}>;
+
+export type ReleaseVerifierHttpRequest = Readonly<{
+  url: string;
+  method: "POST";
+  redirect: "error";
+  credentials: "omit";
+  headers: Readonly<Record<string, string>>;
+  body: string;
+  signal: AbortSignal;
+}>;
+
+export type ReleaseVerifierHttpResponse = Readonly<{
+  status: number;
+  url: string;
+  headers: Readonly<Record<string, string>>;
+  body: Uint8Array;
+}>;
+
+export type ReleaseVerifierHttpTransport = Readonly<{
+  request(input: ReleaseVerifierHttpRequest): Promise<ReleaseVerifierHttpResponse>;
+}>;
 
 export type CandidateVerificationInput = Readonly<{
   code: string;
@@ -72,14 +109,21 @@ export type InstalledAttestation = Readonly<{
   delivery: "hosted" | "self_hosted";
   csp: InstalledVerificationReport["csp"];
   webMcpImplementation: InstalledVerificationReport["webMcpImplementation"];
+  verifierIdentity: VerifierIdentity;
   report: InstalledVerificationReport;
 }>;
 
 export interface ReleaseVerificationPort {
-  readonly mode: "live" | "hermetic";
+  readonly mode: VerificationMode;
+  readonly readiness?: (signal: AbortSignal) => Promise<VerifierIdentity>;
   verifyCandidate(input: CandidateVerificationInput, signal: AbortSignal): Promise<CandidateVerificationReport>;
   verifyInstalled(input: InstalledVerificationInput, signal: AbortSignal): Promise<InstalledVerificationReport>;
 }
+
+export type ConfiguredReleaseVerificationPort = ReleaseVerificationPort & Readonly<{
+  mode: "live" | "local_live";
+  readiness(signal: AbortSignal): Promise<VerifierIdentity>;
+}>;
 
 export type CandidateAttestation = Readonly<{
   schema: boolean;
@@ -91,6 +135,8 @@ export type CandidateAttestation = Readonly<{
   checks: readonly ReleaseVerificationCheck[];
   csp: CandidateVerificationReport["csp"];
   verificationMode: ReleaseVerificationPort["mode"];
+  verifierIdentity: VerifierIdentity;
+  report: CandidateVerificationReport;
 }>;
 
 let testPort: ReleaseVerificationPort | undefined;
@@ -101,7 +147,10 @@ export function setReleaseVerificationPortForTest(port: ReleaseVerificationPort 
 }
 
 export function releaseVerificationPort(): ReleaseVerificationPort {
-  return testPort ?? configuredReleaseVerificationPort(process.env);
+  if (testPort) return testPort;
+  const mode = process.env.PAGE2WEBMCP_LOCAL_STACK === "true"
+    && process.env.PAGE2WEBMCP_LOCAL_RELEASE_VERIFIER_ORIGIN !== undefined ? "local_live" : "live";
+  return configuredReleaseVerificationPort(process.env, { mode });
 }
 
 export async function attestReleaseCandidate(
@@ -110,7 +159,10 @@ export async function attestReleaseCandidate(
   signal: AbortSignal,
 ): Promise<CandidateAttestation> {
   assertCandidateInput(input);
-  const report = await withDeadline((deadlineSignal) => port.verifyCandidate(input, deadlineSignal), signal);
+  const { verifierIdentity, report } = await withDeadline(async (deadlineSignal) => {
+    const identity = await verifiedIdentity(port, deadlineSignal);
+    return { verifierIdentity: identity, report: await port.verifyCandidate(input, deadlineSignal) };
+  }, signal);
   if (!report || typeof report !== "object"
     || report.observedContentHash !== input.contentHash
     || report.observedIntegrity !== input.integrity
@@ -130,6 +182,7 @@ export async function attestReleaseCandidate(
     || report.csp.directive !== undefined && !safeDirective(report.csp.directive)) {
     throw new Error("CANDIDATE_VERIFICATION_INVALID");
   }
+  const normalizedReport = normalizeCandidateReport(report, checks);
   return {
     schema: passed.has("schema") && passed.has("trusted_loader"),
     authenticated: passed.has("authentication") && passed.has("origin"),
@@ -138,8 +191,10 @@ export async function attestReleaseCandidate(
     browserExecution: allPassed,
     selectionScore: passed.has("tool_selection") ? 20 : 0,
     checks,
-    csp: { hosted: report.csp.hosted, ...(report.csp.directive ? { directive: report.csp.directive } : {}) },
+    csp: normalizedReport.csp,
     verificationMode: port.mode,
+    verifierIdentity,
+    report: normalizedReport,
   };
 }
 
@@ -149,7 +204,10 @@ export async function attestReleaseInstallation(
   signal: AbortSignal,
 ): Promise<InstalledAttestation> {
   assertInstalledInput(input, port.mode);
-  const report = await withDeadline((deadlineSignal) => port.verifyInstalled(input, deadlineSignal), signal);
+  const { verifierIdentity, report } = await withDeadline(async (deadlineSignal) => {
+    const identity = await verifiedIdentity(port, deadlineSignal);
+    return { verifierIdentity: identity, report: await port.verifyInstalled(input, deadlineSignal) };
+  }, signal);
   if (!report || typeof report !== "object"
     || report.observedArtifactUrl !== input.artifactUrl
     || report.observedDownloadUrl !== input.downloadUrl
@@ -179,7 +237,7 @@ export async function attestReleaseInstallation(
     || report.duplicateLoadHarmless !== true) {
     throw new Error("INSTALLED_VERIFICATION_INVALID");
   }
-  if (port.mode === "live" && report.webMcpImplementation !== "native") {
+  if (port.mode !== "hermetic" && report.webMcpImplementation !== "native") {
     throw new Error("WEBMCP_NATIVE_REQUIRED");
   }
   const normalizedReport = normalizeInstalledReport(report);
@@ -189,6 +247,7 @@ export async function attestReleaseInstallation(
       delivery: "hosted",
       csp: normalizedCsp(report.csp),
       webMcpImplementation: report.webMcpImplementation,
+      verifierIdentity,
       report: normalizedReport,
     };
   }
@@ -197,42 +256,212 @@ export async function attestReleaseInstallation(
     delivery: input.selfHostedUrl ? "self_hosted" : "hosted",
     csp: normalizedCsp(report.csp),
     webMcpImplementation: report.webMcpImplementation,
+    verifierIdentity,
     report: normalizedReport,
   };
 }
 
 export function configuredReleaseVerificationPort(
   environment: Record<string, string | undefined>,
-  dependencies: Readonly<{ fetch?: typeof fetch }> = {},
-): ReleaseVerificationPort {
-  const origin = exactHttpsOrigin(environment.PAGE2WEBMCP_RELEASE_VERIFIER_ORIGIN);
+  dependencies: Readonly<{
+    mode?: "live" | "local_live";
+    transport?: ReleaseVerifierHttpTransport;
+    fetch?: typeof fetch;
+  }> = {},
+): ConfiguredReleaseVerificationPort {
+  const mode = dependencies.mode ?? "live";
+  const origin = mode === "live"
+    ? exactHttpsOrigin(environment.PAGE2WEBMCP_RELEASE_VERIFIER_ORIGIN)
+    : environment.PAGE2WEBMCP_LOCAL_STACK === "true"
+      ? exactLoopbackHttpOrigin(environment.PAGE2WEBMCP_LOCAL_RELEASE_VERIFIER_ORIGIN)
+      : undefined;
   const token = environment.PAGE2WEBMCP_RELEASE_VERIFIER_TOKEN;
-  if (!origin || !token || token.length < 32 || token.length > 512) {
+  if (!origin || !validVerifierToken(token) || dependencies.transport && dependencies.fetch) {
     throw new Error("RELEASE_VERIFIER_CONFIGURATION_REQUIRED");
   }
-  const transport = dependencies.fetch ?? fetch;
+  const transport = dependencies.transport ?? (dependencies.fetch
+    ? fetchReleaseVerifierTransport(dependencies.fetch)
+    : mode === "live" ? pinnedReleaseVerifierTransport() : fetchReleaseVerifierTransport(fetch));
+  const verifierOriginDigest = createHash("sha256").update(origin).digest("hex");
   const request = async <T>(path: string, body: unknown, signal: AbortSignal): Promise<T> => {
-    const url = `${origin}${path}`;
-    const response = await transport(url, {
-      method: "POST",
-      redirect: "error",
-      credentials: "omit",
-      signal,
-      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    if (response.url !== url || response.status !== 200
-      || response.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase() !== "application/json") {
-      throw new Error("RELEASE_VERIFIER_RESPONSE_INVALID");
-    }
-    const bytes = Buffer.from(await response.arrayBuffer());
-    if (bytes.byteLength > MAX_REPORT_BYTES) throw new Error("RELEASE_VERIFIER_RESPONSE_INVALID");
-    try { return JSON.parse(bytes.toString("utf8")) as T; } catch { throw new Error("RELEASE_VERIFIER_RESPONSE_INVALID"); }
+    return await withDeadline(async (deadlineSignal) => {
+      const url = `${origin}${path}`;
+      const encodedBody = JSON.stringify(body);
+      const response = await transport.request({
+        url,
+        method: "POST",
+        redirect: "error",
+        credentials: "omit",
+        signal: deadlineSignal,
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+        body: encodedBody,
+      });
+      if (!validVerifierResponse(response, url)) throw new Error("RELEASE_VERIFIER_RESPONSE_INVALID");
+      try { return JSON.parse(Buffer.from(response.body).toString("utf8")) as T; }
+      catch { throw new Error("RELEASE_VERIFIER_RESPONSE_INVALID"); }
+    }, signal);
   };
   return {
-    mode: "live",
+    mode,
+    readiness: async (signal) => {
+      const response = await request<unknown>("/v1/readiness", {}, signal);
+      if (!validReadinessResponse(response, mode)) throw new Error("RELEASE_VERIFIER_IDENTITY_INVALID");
+      return {
+        protocolVersion: RELEASE_VERIFIER_PROTOCOL_VERSION,
+        mode,
+        webMcpImplementation: "native",
+        verifierOriginDigest,
+      };
+    },
     verifyCandidate: (input, signal) => request("/v1/candidates/verify", input, signal),
     verifyInstalled: (input, signal) => request("/v1/installations/verify", input, signal),
+  };
+}
+
+function pinnedReleaseVerifierTransport(): ReleaseVerifierHttpTransport {
+  const transport: NodePinnedJsonTransport = createNodePinnedJsonTransport();
+  return {
+    async request(input) {
+      assertVerifierHttpRequest(input, "https:");
+      return await transport.request({
+        url: input.url,
+        method: input.method,
+        headers: input.headers,
+        body: input.body,
+        signal: input.signal,
+      });
+    },
+  };
+}
+
+function fetchReleaseVerifierTransport(transport: typeof fetch): ReleaseVerifierHttpTransport {
+  if (typeof transport !== "function") throw new Error("RELEASE_VERIFIER_CONFIGURATION_REQUIRED");
+  return {
+    async request(input) {
+      assertVerifierHttpRequest(input);
+      const response = await transport(input.url, {
+        method: input.method,
+        redirect: input.redirect,
+        credentials: input.credentials,
+        headers: input.headers,
+        body: input.body,
+        signal: input.signal,
+      });
+      const declaredLength = response.headers.get("content-length");
+      if (declaredLength !== null && (!/^\d+$/.test(declaredLength)
+        || Number(declaredLength) > MAX_REPORT_BYTES)) throw new Error("RELEASE_VERIFIER_RESPONSE_INVALID");
+      return {
+        status: response.status,
+        url: response.url,
+        headers: Object.fromEntries(response.headers.entries()),
+        body: await boundedResponseBytes(response, input.signal),
+      };
+    },
+  };
+}
+
+function assertVerifierHttpRequest(input: ReleaseVerifierHttpRequest, protocol?: "https:"): void {
+  let url: URL;
+  try { url = new URL(input.url); }
+  catch { throw new Error("RELEASE_VERIFIER_CONFIGURATION_REQUIRED"); }
+  if (input.method !== "POST" || input.redirect !== "error" || input.credentials !== "omit"
+    || protocol && url.protocol !== protocol || url.username || url.password || url.search || url.hash
+    || typeof input.body !== "string" || Buffer.byteLength(input.body) > MAX_REPORT_BYTES
+    || input.signal.aborted) throw new Error("RELEASE_VERIFIER_RESPONSE_INVALID");
+}
+
+async function boundedResponseBytes(response: Response, signal: AbortSignal): Promise<Uint8Array> {
+  if (!response.body) return new Uint8Array();
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let length = 0;
+  try {
+    for (;;) {
+      if (signal.aborted) throw signal.reason ?? new Error("CANCELLED");
+      const { done, value } = await reader.read();
+      if (done) break;
+      length += value.byteLength;
+      if (length > MAX_REPORT_BYTES) {
+        await reader.cancel(new Error("RELEASE_VERIFIER_RESPONSE_INVALID"));
+        throw new Error("RELEASE_VERIFIER_RESPONSE_INVALID");
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const body = new Uint8Array(length);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return body;
+}
+
+function validVerifierResponse(response: ReleaseVerifierHttpResponse, expectedUrl: string): boolean {
+  const contentType = response && typeof response === "object"
+    ? headerValue(response.headers, "content-type")?.split(";", 1)[0]?.trim().toLowerCase()
+    : undefined;
+  return !!response && typeof response === "object"
+    && response.url === expectedUrl
+    && response.status === 200
+    && contentType === "application/json"
+    && !hasHeader(response.headers, "set-cookie")
+    && !hasHeader(response.headers, "set-cookie2")
+    && headerValue(response.headers, "access-control-allow-credentials")?.trim().toLowerCase() !== "true"
+    && response.body instanceof Uint8Array
+    && response.body.byteLength <= MAX_REPORT_BYTES;
+}
+
+function headerValue(headers: Readonly<Record<string, string>> | undefined, expectedName: string): string | undefined {
+  if (!headers || typeof headers !== "object") return undefined;
+  for (const [name, value] of Object.entries(headers)) {
+    if (name.toLowerCase() === expectedName && typeof value === "string") return value;
+  }
+  return undefined;
+}
+
+function hasHeader(headers: Readonly<Record<string, string>> | undefined, expectedName: string): boolean {
+  return !!headers && Object.keys(headers).some((name) => name.toLowerCase() === expectedName);
+}
+
+function validReadinessResponse(value: unknown, mode: "live" | "local_live"): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  const keys = Object.keys(record).sort(compareStrings);
+  return keys.length === 3
+    && keys[0] === "mode" && keys[1] === "protocolVersion" && keys[2] === "webMcpImplementation"
+    && record.protocolVersion === RELEASE_VERIFIER_PROTOCOL_VERSION
+    && record.mode === mode
+    && record.webMcpImplementation === "native";
+}
+
+async function verifiedIdentity(port: ReleaseVerificationPort, signal: AbortSignal): Promise<VerifierIdentity> {
+  const identity = port.readiness
+    ? await port.readiness(signal)
+    : port.mode === "hermetic" ? hermeticVerifierIdentity() : undefined;
+  if (!identity) throw new Error("RELEASE_VERIFIER_IDENTITY_REQUIRED");
+  const keys = Object.keys(identity).sort(compareStrings);
+  if (keys.length !== 4 || keys[0] !== "mode" || keys[1] !== "protocolVersion"
+    || keys[2] !== "verifierOriginDigest" || keys[3] !== "webMcpImplementation"
+    || identity.protocolVersion !== RELEASE_VERIFIER_PROTOCOL_VERSION
+    || identity.mode !== port.mode || identity.webMcpImplementation !== "native"
+    || !HASH.test(identity.verifierOriginDigest)) throw new Error("RELEASE_VERIFIER_IDENTITY_INVALID");
+  return {
+    protocolVersion: RELEASE_VERIFIER_PROTOCOL_VERSION,
+    mode: identity.mode,
+    webMcpImplementation: "native",
+    verifierOriginDigest: identity.verifierOriginDigest,
+  };
+}
+
+function hermeticVerifierIdentity(): VerifierIdentity {
+  return {
+    protocolVersion: RELEASE_VERIFIER_PROTOCOL_VERSION,
+    mode: "hermetic",
+    webMcpImplementation: "native",
+    verifierOriginDigest: createHash("sha256").update(HERMETIC_VERIFIER_IDENTIFIER).digest("hex"),
   };
 }
 
@@ -273,6 +502,27 @@ function assertInstalledInput(input: InstalledVerificationInput, mode: ReleaseVe
       throw new Error("INSTALLED_VERIFICATION_INVALID");
     }
   }
+}
+
+function normalizeCandidateReport(
+  report: CandidateVerificationReport,
+  checks: readonly ReleaseVerificationCheck[],
+): CandidateVerificationReport {
+  return {
+    observedContentHash: report.observedContentHash,
+    observedIntegrity: report.observedIntegrity,
+    observedReleaseId: report.observedReleaseId,
+    observedTargetOrigin: report.observedTargetOrigin,
+    registeredTools: [...report.registeredTools].sort(compareStrings),
+    trustedLoader: {
+      enforcedBeforeEvaluation: report.trustedLoader.enforcedBeforeEvaluation,
+      evaluatedContentHash: report.trustedLoader.evaluatedContentHash,
+    },
+    controlPlaneRequestsDuringExecution: report.controlPlaneRequestsDuringExecution,
+    modelRequestsDuringExecution: report.modelRequestsDuringExecution,
+    checks: [...checks],
+    csp: normalizedCsp(report.csp),
+  };
 }
 
 function normalizeInstalledReport(report: InstalledVerificationReport): InstalledVerificationReport {
@@ -347,6 +597,21 @@ function exactHttpsOrigin(value: string | undefined): string | undefined {
     const url = new URL(value);
     return url.protocol === "https:" && !url.username && !url.password && url.origin === value ? value : undefined;
   } catch { return undefined; }
+}
+
+function exactLoopbackHttpOrigin(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  try {
+    const url = new URL(value);
+    const hostname = url.hostname.replace(/^\[|\]$/g, "");
+    return url.protocol === "http:" && (hostname === "127.0.0.1" || hostname === "::1")
+      && url.port !== "" && !url.username && !url.password && url.origin === value ? value : undefined;
+  } catch { return undefined; }
+}
+
+function validVerifierToken(value: string | undefined): value is string {
+  return typeof value === "string" && value.length >= 32 && value.length <= 4_096
+    && /^[\u0021-\u007e]+$/.test(value) && !/[\r\n]/.test(value);
 }
 
 function compareStrings(left: string, right: string): number {
