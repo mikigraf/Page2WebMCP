@@ -74,6 +74,8 @@ alter table public.verification_runs
   add column csp_result jsonb,
   add column verification_mode text;
 
+alter table public.verification_runs drop constraint verification_runs_eligibility_check;
+
 update public.verification_runs
 set checks = '[
   {"name":"authentication","status":"failed","code":"INVALID_OUTPUT"},
@@ -105,7 +107,6 @@ alter table public.verification_runs
   add constraint verification_runs_csp_result_check check (private.valid_release_csp_result(csp_result)),
   add constraint verification_runs_verification_mode_check check (verification_mode in ('live', 'hermetic'));
 
-alter table public.verification_runs drop constraint verification_runs_eligibility_check;
 alter table public.verification_runs
   add constraint verification_runs_eligibility_check check (eligible = (
     schema_valid
@@ -136,7 +137,8 @@ create table public.release_installations (
   integrity text not null check (integrity ~ '^sha384-[A-Za-z0-9+/]+={0,2}$'),
   expected_tools jsonb not null check (jsonb_typeof(expected_tools) = 'array'
     and jsonb_array_length(expected_tools) between 1 and 100 and octet_length(expected_tools::text) <= 8192),
-  status text not null check (status in ('pending_self_host', 'verified', 'failed')),
+  status text not null constraint release_installations_status_value_check
+    check (status in ('pending_self_host', 'verified', 'failed')),
   delivery text not null check (delivery in ('hosted', 'self_hosted')),
   csp_status text not null check (csp_status in ('allowed', 'blocked')),
   csp_directive text check (csp_directive is null or
