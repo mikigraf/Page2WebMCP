@@ -326,7 +326,9 @@ test("Postgres dedicated analysis claims leave other source types queued", {
   }
 });
 
-test("Postgres repository persists and recovers the fixture lifecycle", { skip: !connectionString }, async () => {
+test("Postgres repository persists and recovers the fixture lifecycle", {
+  skip: !connectionString || !adminConnectionString,
+}, async () => {
   const pool = new pg.Pool({ connectionString, max: 2 });
   const role = await pool.query(
     "select rolsuper, rolbypassrls, rolinherit from pg_roles where rolname = current_user"
@@ -336,6 +338,7 @@ test("Postgres repository persists and recovers the fixture lifecycle", { skip: 
     error instanceof pg.DatabaseError && error.code === "42501");
   await pool.end();
 
+  const admin = new pg.Pool({ connectionString: adminConnectionString!, max: 1 });
   const repository = createPostgresRepository({ connectionString: connectionString!, maxConnections: 2 });
   const actor: RepositoryActor = {
     id: "11111111-1111-1111-1111-111111111111",
@@ -669,8 +672,64 @@ test("Postgres repository persists and recovers the fixture lifecycle", { skip: 
       }),
       (error: unknown) => error instanceof RepositoryError && error.code === "FORBIDDEN"
     );
+
+    await admin.query(
+      "update public.analysis_runs set provider_mode = 'website', provider_adapter = 'browser-use-v4', " +
+      "provider_adapter_version = 4, provider_fixture = false where id = $1",
+      [run.id],
+    );
+    await admin.query(
+      "update public.verification_runs set verification_mode = 'live' where id = $1",
+      [verification.id],
+    );
+    await admin.query(
+      `insert into public.release_installations (
+        id, organization_id, project_id, release_id, actor_id, page_url, artifact_url, self_hosted_url,
+        target_origin, artifact_content_hash, integrity, expected_tools, status, delivery, csp_status, csp_directive,
+        webmcp_implementation, attestation, idempotency_key, input_hash, download_url, local_only, verification_mode,
+        verifier_protocol_version, verifier_origin_digest, verifier_webmcp_implementation, observed_artifact_url,
+        observed_download_url, observed_local_only, observed_integrity, observed_target_origin, registered_tools,
+        executed_artifact_url, served_content_hash, executed_content_hash, normal_page_load, route_interception,
+        injected_registration, synthetic_harness, duplicate_load_harmless, authenticated_read_tool_name,
+        authenticated_read_authenticated, authenticated_read_succeeded, confirmed_mutation_tool_name,
+        confirmed_mutation_confirmation, confirmed_mutation_reversible, confirmed_mutation_succeeded,
+        confirmed_mutation_effect_count, final_state_mutation_tool_name, final_state_source, final_state_verified,
+        verified_at
+      )
+      select
+        splice.id, installation.organization_id, installation.project_id, installation.release_id,
+        installation.actor_id, installation.page_url, installation.artifact_url, installation.self_hosted_url,
+        installation.target_origin, installation.artifact_content_hash, installation.integrity,
+        installation.expected_tools, installation.status, installation.delivery, installation.csp_status,
+        installation.csp_directive, installation.webmcp_implementation, installation.attestation,
+        splice.idempotency_key, installation.input_hash, installation.download_url, installation.local_only, 'live',
+        installation.verifier_protocol_version, installation.verifier_origin_digest,
+        installation.verifier_webmcp_implementation, installation.observed_artifact_url,
+        installation.observed_download_url, installation.observed_local_only, installation.observed_integrity,
+        installation.observed_target_origin, installation.registered_tools, installation.executed_artifact_url,
+        installation.served_content_hash, installation.executed_content_hash, installation.normal_page_load,
+        splice.route_interception, installation.injected_registration, installation.synthetic_harness,
+        installation.duplicate_load_harmless, splice.read_tool, true, true, splice.mutation_tool, 'explicit', true,
+        true, 1, splice.mutation_tool, 'target', true, splice.verified_at
+      from public.release_installations installation
+      cross join (values
+        ('77777777-7777-4777-8777-777777777771'::uuid, 'postgres-installation-splice-normal',
+          '2026-08-31T20:00:00.000Z'::timestamptz, false, 'unrelated_read', 'unrelated_mutation'),
+        ('77777777-7777-4777-8777-777777777772'::uuid, 'postgres-installation-splice-execution',
+          '2026-08-31T20:01:00.000Z'::timestamptz, true, 'find_order', 'create_support_ticket')
+      ) as splice(id, idempotency_key, verified_at, route_interception, read_tool, mutation_tool)
+      where installation.id = $1`,
+      [installation.id],
+    );
+    const antiSplice = await admin.query(
+      "select count(*)::integer as count from private.selected_native_installation_proof($1)",
+      [release.contentHash],
+    );
+    assert.equal(antiSplice.rows[0]?.count, 0,
+      "normal-load and execution facts from different installation rows must not compose a live proof");
   } finally {
     await repository.close();
+    await admin.end();
   }
 });
 

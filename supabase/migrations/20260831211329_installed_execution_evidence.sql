@@ -199,42 +199,53 @@ set search_path = pg_catalog, pg_temp
 as $$
   select
     legacy.selected_release_hash,
-    legacy.release_content_hash,
-    legacy.release_integrity,
-    legacy.candidate_observed_integrity,
-    legacy.installation_observed_integrity,
-    legacy.served_content_hash,
-    legacy.executed_content_hash,
-    legacy.trusted_loader_content_hash,
-    legacy.release_verification_run_id,
-    legacy.candidate_verification_run_id,
-    legacy.candidate_mode,
-    legacy.installation_mode,
-    legacy.candidate_protocol_version,
-    legacy.installation_protocol_version,
-    legacy.candidate_verifier_origin_digest,
-    legacy.installation_verifier_origin_digest,
-    legacy.candidate_webmcp_implementation,
-    legacy.installation_webmcp_implementation,
+    release.content_hash,
+    release.sri,
+    candidate.observed_integrity,
+    installation.observed_integrity,
+    installation.served_content_hash,
+    installation.executed_content_hash,
+    candidate.trusted_loader_content_hash,
+    release.verification_run_id,
+    candidate.id,
+    candidate.verification_mode,
+    installation.verification_mode,
+    candidate.verifier_protocol_version,
+    installation.verifier_protocol_version,
+    candidate.verifier_origin_digest,
+    installation.verifier_origin_digest,
+    candidate.verifier_webmcp_implementation,
+    installation.verifier_webmcp_implementation,
     legacy.provider_mode,
     legacy.provider_adapter,
     legacy.provider_adapter_version,
     legacy.source_type,
     legacy.provider_fixture,
     legacy.source_fixture,
-    legacy.local_only,
-    legacy.target_identity_matches,
-    legacy.artifact_identity_matches,
-    legacy.capability_digest_matches,
-    legacy.expected_tools_digest,
-    legacy.registered_tools_digest,
-    legacy.expected_tool_count,
-    legacy.registered_tool_count,
-    legacy.normal_page_load,
-    legacy.route_interception,
-    legacy.injected_registration,
-    legacy.synthetic_harness,
-    legacy.duplicate_load_harmless,
+    release.local_only,
+    candidate.observed_target_origin = release.allowed_origin
+      and installation.observed_target_origin = release.allowed_origin
+      and candidate.observed_target_origin = installation.observed_target_origin,
+    installation.observed_artifact_url = release.artifact_url
+      and installation.observed_download_url = release.download_url
+      and installation.observed_local_only = release.local_only
+      and installation.artifact_url = release.artifact_url
+      and installation.download_url = release.download_url
+      and installation.local_only = release.local_only
+      and installation.artifact_content_hash = release.content_hash
+      and installation.integrity = release.sri,
+    candidate.capability_state_digest = release.capability_state_digest
+      and candidate.registered_tools = installation.expected_tools
+      and installation.registered_tools = installation.expected_tools,
+    encode(extensions.digest(installation.expected_tools::text, 'sha256'), 'hex'),
+    encode(extensions.digest(installation.registered_tools::text, 'sha256'), 'hex'),
+    jsonb_array_length(installation.expected_tools),
+    jsonb_array_length(installation.registered_tools),
+    installation.normal_page_load,
+    installation.route_interception,
+    installation.injected_registration,
+    installation.synthetic_harness,
+    installation.duplicate_load_harmless,
     installation.authenticated_read_authenticated and installation.authenticated_read_succeeded,
     installation.confirmed_mutation_confirmation = 'explicit'
       and installation.confirmed_mutation_reversible
@@ -260,24 +271,81 @@ as $$
         and (plan->'effects'->>'reversible')::boolean
         and plan->'effects'->>'confirmation' = 'always'
     ),
-    legacy.zero_control_plane_calls,
-    legacy.zero_model_calls,
-    legacy.trusted_loader_enforced,
-    legacy.candidate_checks_passed
+    candidate.control_plane_request_count = 0,
+    candidate.model_request_count = 0,
+    candidate.trusted_loader_enforced,
+    not candidate.checks @? '$[*] ? (@.status == "failed")'
   from private.selected_native_installation_proof_legacy_20260831120000(selected_hash) legacy
   join public.releases release
     on release.content_hash = legacy.release_content_hash
    and release.verification_run_id = legacy.release_verification_run_id
+  join public.verification_runs candidate
+    on candidate.id = legacy.candidate_verification_run_id
+   and candidate.id = release.verification_run_id
+   and candidate.project_id = release.project_id
+   and candidate.organization_id = release.organization_id
+   and candidate.analysis_run_id = release.analysis_run_id
+   and candidate.capability_state_digest = release.capability_state_digest
+   and candidate.candidate_content_hash = release.content_hash
   join public.release_installations installation
     on installation.release_id = release.id
-   and installation.artifact_content_hash = legacy.release_content_hash
-   and installation.observed_integrity = legacy.installation_observed_integrity
-   and installation.served_content_hash = legacy.served_content_hash
-   and installation.executed_content_hash = legacy.executed_content_hash
-   and installation.verification_mode = legacy.installation_mode
-   and installation.verifier_protocol_version = legacy.installation_protocol_version
-   and installation.verifier_origin_digest = legacy.installation_verifier_origin_digest
-  where installation.status = 'verified'
+   and installation.project_id = release.project_id
+   and installation.organization_id = release.organization_id
+  where release.content_hash = selected_hash
+    and release.status = 'published'
+    and release.local_only = false
+    and release.artifact_url =
+      'https://bimqgiedckdurqiywctl.supabase.co/storage/v1/object/public/page2webmcp-releases/'
+      || release.content_hash || '.js'
+    and release.download_url = release.artifact_url || '?download=page2webmcp-' || release.content_hash || '.js'
+    and candidate.eligible
+    and candidate.verification_mode = 'live'
+    and candidate.verifier_protocol_version is not null
+    and candidate.verifier_origin_digest is not null
+    and candidate.verifier_webmcp_implementation = 'native'
+    and candidate.observed_content_hash = release.content_hash
+    and candidate.observed_integrity = release.sri
+    and candidate.observed_release_id = release.manifest->>'releaseId'
+    and candidate.observed_target_origin = release.allowed_origin
+    and candidate.registered_tools = installation.expected_tools
+    and candidate.trusted_loader_enforced
+    and candidate.trusted_loader_content_hash = release.content_hash
+    and candidate.control_plane_request_count = 0
+    and candidate.model_request_count = 0
+    and not candidate.checks @? '$[*] ? (@.status == "failed")'
+    and installation.status = 'verified'
+    and installation.verified_at is not null
+    and installation.verification_mode = 'live'
+    and installation.verifier_origin_digest = candidate.verifier_origin_digest
+    and installation.verifier_protocol_version = candidate.verifier_protocol_version
+    and installation.verifier_webmcp_implementation = 'native'
+    and installation.webmcp_implementation = 'native'
+    and installation.artifact_url = release.artifact_url
+    and installation.download_url = release.download_url
+    and installation.local_only = false
+    and installation.observed_artifact_url = release.artifact_url
+    and installation.observed_download_url = release.download_url
+    and installation.observed_local_only = release.local_only
+    and installation.artifact_content_hash = release.content_hash
+    and installation.served_content_hash = release.content_hash
+    and installation.executed_content_hash = release.content_hash
+    and installation.observed_integrity = release.sri
+    and installation.integrity = release.sri
+    and installation.observed_target_origin = release.allowed_origin
+    and installation.target_origin = release.allowed_origin
+    and installation.registered_tools = installation.expected_tools
+    and installation.normal_page_load
+    and not installation.route_interception
+    and not installation.injected_registration
+    and not installation.synthetic_harness
+    and installation.duplicate_load_harmless
+    and (
+      (installation.delivery = 'hosted' and installation.executed_artifact_url = release.artifact_url)
+      or
+      (installation.delivery = 'self_hosted'
+        and installation.self_hosted_url is not null
+        and installation.executed_artifact_url = installation.self_hosted_url)
+    )
     and installation.authenticated_read_authenticated
     and installation.authenticated_read_succeeded
     and installation.confirmed_mutation_confirmation = 'explicit'

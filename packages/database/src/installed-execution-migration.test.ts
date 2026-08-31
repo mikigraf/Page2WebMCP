@@ -53,6 +53,20 @@ test("selected native proof exposes only bounded execution facts and validates r
   assert.match(sql, /order by installation\.verified_at desc, installation\.id desc[\s\S]*limit 1/i);
   assert.match(sql, /revoke all on function private\.selected_native_installation_proof_legacy_20260831120000\(text\)[\s\S]*page2webmcp_maintenance/i);
   assert.match(sql, /grant execute on function private\.selected_native_installation_proof\(text\) to page2webmcp_maintenance/i);
+  const proofBody = /create function private\.selected_native_installation_proof\(selected_hash text\)[\s\S]*?as \$\$([\s\S]*?)\$\$;/i
+    .exec(sql)?.[1] ?? "";
+  for (const installationFact of [
+    "installation_observed_integrity", "served_content_hash", "executed_content_hash", "installation_mode",
+    "installation_protocol_version", "installation_verifier_origin_digest", "installation_webmcp_implementation",
+    "target_identity_matches", "artifact_identity_matches", "capability_digest_matches", "expected_tools_digest",
+    "registered_tools_digest", "expected_tool_count", "registered_tool_count", "normal_page_load",
+    "route_interception", "injected_registration", "synthetic_harness", "duplicate_load_harmless",
+  ]) {
+    assert.doesNotMatch(proofBody, new RegExp(`legacy\\.${installationFact}\\b`, "i"),
+      `${installationFact} must come from the one constrained installation row`);
+  }
+  assert.match(proofBody,
+    /installation\.normal_page_load[\s\S]*not installation\.route_interception[\s\S]*installation\.authenticated_read_authenticated/i);
 
   const returns = /selected_native_installation_proof\(selected_hash text\)\s*returns table \(([\s\S]*?)\)\s*language/i
     .exec(sql)?.[1] ?? "";
