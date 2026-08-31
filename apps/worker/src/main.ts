@@ -6,7 +6,18 @@ import {
   shutdownObservability
 } from "../../../packages/observability/src/server.ts";
 import { randomUUID } from "node:crypto";
-import { createProductionWorkerRuntime, processProductionWorkerIteration } from "./production-runtime.ts";
+import {
+  createProductionWorkerRuntime,
+  inspectProductionProviderConfiguration,
+  processProductionWorkerIteration,
+} from "./production-runtime.ts";
+
+class WorkerStartupConfigurationError extends Error {
+  constructor(readonly code: string, readonly missingEnvironment: readonly string[]) {
+    super(code);
+    this.name = "WorkerStartupConfigurationError";
+  }
+}
 
 const shutdown = new AbortController();
 const workerId = `worker-${randomUUID()}`;
@@ -20,6 +31,10 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
 }
 
 try {
+  const provider = inspectProductionProviderConfiguration(process.env);
+  if (provider.code !== "PRODUCTION_PROVIDER_CONFIGURATION_READY") {
+    throw new WorkerStartupConfigurationError(provider.code, provider.keys);
+  }
   validateWorkerRuntimeConfiguration();
   repository = getControlPlaneRepository();
   const runtime = createProductionWorkerRuntime(repository);
@@ -42,11 +57,34 @@ try {
       await delay(backoffMs, shutdown.signal);
     }
   }
+} catch (error) {
+  const failure = startupFailure(error);
+  console.error(JSON.stringify(failure));
+  process.exitCode = 1;
 } finally {
   await Promise.allSettled([
     repository ? closeRepository(repository) : Promise.resolve(),
     observabilityRegistered ? shutdownObservability() : Promise.resolve(),
   ]);
+}
+
+function startupFailure(error: unknown): Readonly<{ code: string; missingEnvironment: readonly string[] }> {
+  if (error instanceof WorkerStartupConfigurationError) {
+    return { code: error.code, missingEnvironment: sortedUnique(error.missingEnvironment) };
+  }
+  const code = stableCode(error, "WORKER_STARTUP_FAILED");
+  const keysByCode: Readonly<Record<string, readonly string[]>> = {
+    DATABASE_URL_REQUIRED: ["DATABASE_URL"],
+    INVALID_PROVIDER_MODE: ["PAGE2WEBMCP_PROVIDER_MODE"],
+    INVALID_STORAGE_MODE: ["PAGE2WEBMCP_STORAGE_MODE"],
+    WORKER_POSTGRES_REQUIRED: ["PAGE2WEBMCP_STORAGE_MODE"],
+    WORKER_PROVIDER_MODE_REQUIRED: ["PAGE2WEBMCP_PROVIDER_MODE"],
+  };
+  return { code, missingEnvironment: sortedUnique(keysByCode[code] ?? []) };
+}
+
+function sortedUnique(values: readonly string[]): string[] {
+  return [...new Set(values)].sort((left, right) => left < right ? -1 : left > right ? 1 : 0);
 }
 
 function boundedInteger(value: string | undefined, fallback: number, minimum: number, maximum: number): number {
@@ -55,10 +93,10 @@ function boundedInteger(value: string | undefined, fallback: number, minimum: nu
   return Math.min(Math.max(parsed, minimum), maximum);
 }
 
-function stableCode(error: unknown): string {
+function stableCode(error: unknown, fallback = "WORKER_LOOP_FAILED"): string {
   return error instanceof Error && /^[A-Z0-9_]{1,64}$/.test(error.message)
     ? error.message
-    : "WORKER_LOOP_FAILED";
+    : fallback;
 }
 
 async function delay(milliseconds: number, signal: AbortSignal): Promise<void> {
