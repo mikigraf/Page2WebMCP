@@ -58,6 +58,7 @@ const CURRENT_MIGRATION_LEDGER = [
   "20260901071658_website_authentication_wait.sql",
   "20260901090842_website_authentication_cleanup_lease.sql",
   "20260901092107_website_authentication_cleanup_attempt_budget.sql",
+  "20260901094032_allow_waiting_authentication_failure.sql",
 ] as const;
 
 type Environment = Readonly<Record<string, string | undefined>>;

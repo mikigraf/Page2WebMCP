@@ -22,7 +22,7 @@ test("authentication cleanup budget migration persists an exhausted diagnostic s
   assert.doesNotMatch(sql, /\b(cookie|credential|bearer|password|otp|cdp_url|live_url|provider_session_id)\b/i);
 });
 
-test("authentication cleanup budget migration is the exact local readiness boundary", async () => {
+test("authentication cleanup budget migration remains in the forward readiness ledger", async () => {
   const { name, sql } = await migration();
   const version = name.slice(0, 14);
   assert.match(sql, /selected_release_readiness_topology_legacy_20260901090842/i);
@@ -30,5 +30,7 @@ test("authentication cleanup budget migration is the exact local readiness bound
   const readiness = await readFile(new URL("../../../scripts/check-release-readiness.ts", import.meta.url), "utf8");
   const lifecycle = await readFile(new URL("../../../scripts/local-supabase.mjs", import.meta.url), "utf8");
   assert.match(readiness, new RegExp(name.replaceAll(".", "\\.")));
-  assert.match(lifecycle, new RegExp(`REQUIRED_MIGRATION = "${version}"`));
+  const latest = lifecycle.match(/REQUIRED_MIGRATION = "(\d{14})"/)?.[1];
+  assert.ok(latest);
+  assert.ok(latest >= version);
 });

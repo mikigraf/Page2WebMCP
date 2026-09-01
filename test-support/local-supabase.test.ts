@@ -89,7 +89,7 @@ test("local status verifies the pinned CLI, parses machine env output, and never
     await mkdir(join(directory, "supabase/migrations"), { recursive: true });
     await writeFile(join(
       directory,
-      "supabase/migrations/20260901071658_website_authentication_wait.sql",
+      "supabase/migrations/20260901094032_allow_waiting_authentication_failure.sql",
     ), "-- fixture\n");
     await mkdir(bin);
     const fakePnpm = join(bin, "pnpm");
@@ -134,7 +134,7 @@ test("local lifecycle fails closed before stack commands when the executable ver
     await mkdir(join(directory, "supabase/migrations"), { recursive: true });
     await writeFile(join(
       directory,
-      "supabase/migrations/20260901071658_website_authentication_wait.sql",
+      "supabase/migrations/20260901094032_allow_waiting_authentication_failure.sql",
     ), "-- fixture\n");
     await mkdir(bin);
     const fakePnpm = join(bin, "pnpm");

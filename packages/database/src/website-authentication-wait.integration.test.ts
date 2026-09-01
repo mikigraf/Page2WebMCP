@@ -8,6 +8,7 @@ import {
   type ControlPlaneRepository,
   type RepositoryActor,
   type ResumeAnalysisAfterAuthenticationInput,
+  type TerminateAnalysisAuthenticationInput,
   type WaitAnalysisForAuthenticationInput,
 } from "./control-plane.ts";
 import { createPostgresRepository } from "./postgres.ts";
@@ -147,6 +148,25 @@ function resumeInput(
   };
 }
 
+function terminateInput(
+  source: Pick<Awaited<ReturnType<typeof runningWebsite>>, "runId" | "sourceSnapshotId" | "sourceIdentityHash">,
+  checkpointReference: string,
+  expiresAt: string,
+  suffix: string,
+): TerminateAnalysisAuthenticationInput {
+  return {
+    runId: source.runId,
+    checkpointReference,
+    sourceSnapshotId: source.sourceSnapshotId,
+    sourceIdentityHash: source.sourceIdentityHash,
+    targetOriginDigest: TARGET_ORIGIN_DIGEST,
+    expiresAt,
+    terminalState: "failed",
+    idempotencyKey: `authentication-terminate-${suffix}`,
+    inputHash: `authentication-terminate-${suffix}`,
+  };
+}
+
 test("Postgres website authentication wait and resume are four-record atomic and exactly claimed", {
   skip: !applicationConnectionString || !workerConnectionString || !adminConnectionString,
 }, async () => {
@@ -249,6 +269,158 @@ test("Postgres website authentication wait and resume are four-record atomic and
       targetOriginDigest: TARGET_ORIGIN_DIGEST,
       expiresAt: waitingInput.expiresAt,
     });
+  } finally {
+    if (projectId) await admin.query("delete from public.projects where id = $1", [projectId]);
+    await applicationRepository.close();
+    await workerRepository.close();
+    await admin.end();
+  }
+});
+
+test("Postgres authentication termination enforces tenant, role, and immutable checkpoint bindings", {
+  skip: !applicationConnectionString || !workerConnectionString || !adminConnectionString,
+}, async () => {
+  assert.notEqual(applicationConnectionString, workerConnectionString);
+  const applicationRepository = createPostgresRepository({
+    connectionString: applicationConnectionString!, maxConnections: 2,
+  });
+  const workerRepository = createPostgresRepository({ connectionString: workerConnectionString!, maxConnections: 2 });
+  const admin = new pg.Pool({ connectionString: adminConnectionString!, max: 1 });
+  let projectId: string | undefined;
+  try {
+    const source = await runningWebsite(applicationRepository, workerRepository, "terminal-denials");
+    projectId = source.projectId;
+    const checkpointReference = `urn:sha256:${"a".repeat(64)}`;
+    const waitingInput = waitInput(source, checkpointReference, "terminal-denials");
+    await workerRepository.waitAnalysisForAuthentication(
+      source.workerId, source.runId, waitingInput, source.claim.leaseGeneration,
+    );
+    const terminalInput = terminateInput(
+      source, checkpointReference, waitingInput.expiresAt, "terminal-denials",
+    );
+
+    await assert.rejects(
+      applicationRepository.terminateAnalysisAuthentication(viewer, terminalInput),
+      (error: unknown) => error instanceof RepositoryError && error.code === "FORBIDDEN",
+    );
+    await assert.rejects(
+      applicationRepository.terminateAnalysisAuthentication(outsider, terminalInput),
+      (error: unknown) => error instanceof RepositoryError && error.code === "NOT_FOUND",
+    );
+    await assert.rejects(
+      applicationRepository.terminateAnalysisAuthentication(editor, {
+        ...terminalInput,
+        sourceSnapshotId: "99999999-9999-4999-8999-999999999999",
+      }),
+      (error: unknown) => error instanceof RepositoryError && error.code === "INVALID_STATE",
+    );
+
+    const durable = await admin.query(
+      "select checkpoint.state, checkpoint.cleanup_status, job.status as job_status, " +
+      "task.status as task_status, workflow.status as workflow_status " +
+      "from private.website_authentication_checkpoints checkpoint " +
+      "join private.analysis_jobs job on job.analysis_run_id = checkpoint.analysis_run_id " +
+      "join private.workflow_tasks task on task.workflow_run_id = checkpoint.analysis_run_id " +
+      "and task.phase = 'analysis' " +
+      "join public.workflow_runs workflow on workflow.id = checkpoint.analysis_run_id " +
+      "where checkpoint.analysis_run_id = $1",
+      [source.runId],
+    );
+    assert.deepEqual(durable.rows[0], {
+      state: "waiting",
+      cleanup_status: null,
+      job_status: "waiting",
+      task_status: "waiting",
+      workflow_status: "waiting",
+    });
+  } finally {
+    if (projectId) await admin.query("delete from public.projects where id = $1", [projectId]);
+    await applicationRepository.close();
+    await workerRepository.close();
+    await admin.end();
+  }
+});
+
+test("Postgres authentication termination is atomic, replay-safe, and queues exact worker cleanup", {
+  skip: !applicationConnectionString || !workerConnectionString || !adminConnectionString,
+}, async () => {
+  assert.notEqual(applicationConnectionString, workerConnectionString);
+  const applicationRepository = createPostgresRepository({
+    connectionString: applicationConnectionString!, maxConnections: 2,
+  });
+  const workerRepository = createPostgresRepository({ connectionString: workerConnectionString!, maxConnections: 2 });
+  const admin = new pg.Pool({ connectionString: adminConnectionString!, max: 1 });
+  let projectId: string | undefined;
+  try {
+    const source = await runningWebsite(applicationRepository, workerRepository, "terminal-transition");
+    projectId = source.projectId;
+    const checkpointReference = `urn:sha256:${"b".repeat(64)}`;
+    const waitingInput = waitInput(source, checkpointReference, "terminal-transition");
+    await workerRepository.waitAnalysisForAuthentication(
+      source.workerId, source.runId, waitingInput, source.claim.leaseGeneration,
+    );
+    const terminalInput = terminateInput(
+      source, checkpointReference, waitingInput.expiresAt, "terminal-transition",
+    );
+
+    const terminal = await applicationRepository.terminateAnalysisAuthentication(editor, terminalInput);
+    assert.equal(terminal.state, "failed");
+    assert.equal(terminal.cleanupStatus, "pending");
+    assert.equal(terminal.cleanupAttempts, 0);
+    assert.deepEqual(await applicationRepository.terminateAnalysisAuthentication(editor, terminalInput), terminal);
+
+    const durable = await admin.query(
+      "select checkpoint.state, checkpoint.cleanup_status, checkpoint.cleanup_attempts, " +
+      "checkpoint.cleanup_idempotency_key, checkpoint.cleanup_available_at is not null as cleanup_available, " +
+      "job.status as job_status, analysis.status as analysis_status, analysis.error_code as analysis_error_code, " +
+      "task.status as task_status, task.error_code as task_error_code, " +
+      "workflow.status as workflow_status, workflow.error_code as workflow_error_code, project.status as project_status " +
+      "from private.website_authentication_checkpoints checkpoint " +
+      "join private.analysis_jobs job on job.analysis_run_id = checkpoint.analysis_run_id " +
+      "join public.analysis_runs analysis on analysis.id = checkpoint.analysis_run_id " +
+      "join private.workflow_tasks task on task.workflow_run_id = checkpoint.analysis_run_id " +
+      "and task.phase = 'analysis' " +
+      "join public.workflow_runs workflow on workflow.id = checkpoint.analysis_run_id " +
+      "join public.projects project on project.id = checkpoint.project_id " +
+      "where checkpoint.analysis_run_id = $1",
+      [source.runId],
+    );
+    assert.deepEqual(durable.rows[0], {
+      state: "failed",
+      cleanup_status: "pending",
+      cleanup_attempts: 0,
+      cleanup_idempotency_key: `website-auth-cleanup:${"b".repeat(64)}`,
+      cleanup_available: true,
+      job_status: "failed",
+      analysis_status: "failed",
+      analysis_error_code: "AUTHENTICATION_HANDOFF_FAILED",
+      task_status: "failed",
+      task_error_code: "AUTHENTICATION_HANDOFF_FAILED",
+      workflow_status: "failed",
+      workflow_error_code: "AUTHENTICATION_HANDOFF_FAILED",
+      project_status: "failed",
+    });
+
+    await assert.rejects(
+      applicationRepository.claimWebsiteAuthenticationCleanup("postgres-terminal-app-role", 60_000),
+      (error: unknown) => error instanceof RepositoryError && error.code === "FORBIDDEN",
+    );
+    const cleanup = await workerRepository.claimWebsiteAuthenticationCleanup(
+      "postgres-terminal-cleanup-worker", 60_000,
+    );
+    assert.ok(cleanup);
+    assert.equal(cleanup.analysisRunId, source.runId);
+    assert.equal(cleanup.organizationId, owner.organizationId);
+    assert.equal(cleanup.projectId, source.projectId);
+    assert.equal(cleanup.sourceSnapshotId, source.sourceSnapshotId);
+    assert.equal(cleanup.sourceIdentityHash, source.sourceIdentityHash);
+    assert.equal(cleanup.checkpointReference, checkpointReference);
+    assert.equal(cleanup.targetOriginDigest, TARGET_ORIGIN_DIGEST);
+    assert.equal(cleanup.terminalState, "failed");
+    assert.equal(cleanup.outcome, "failed");
+    assert.equal(cleanup.cleanupIdempotencyKey, `website-auth-cleanup:${"b".repeat(64)}`);
+    assert.equal(cleanup.attempts, 1);
+    assert.equal(cleanup.leaseOwner, "postgres-terminal-cleanup-worker");
   } finally {
     if (projectId) await admin.query("delete from public.projects where id = $1", [projectId]);
     await applicationRepository.close();
