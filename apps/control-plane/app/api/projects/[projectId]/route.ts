@@ -29,11 +29,11 @@ export async function GET(
       ? await repository.getAnalysisResult(actor, latestAnalysis.id)
       : undefined;
     const release = await recoverLatestPublishedRelease(repository, actor, project.id);
-    const latestProjectDraftPullRequest = project.sourceType === "github"
-      ? await repository.getLatestGitHubDraftPullRequestForProject(actor, project.id)
+    const githubWorkflow = project.sourceType === "github" && latestAnalysis
+      ? await repository.getLatestReviewedWorkflowForAnalysis(actor, project.id, latestAnalysis.id)
       : undefined;
-    const draftPullRequest = latestProjectDraftPullRequest?.analysisRunId === latestAnalysis?.id
-      ? latestProjectDraftPullRequest
+    const draftPullRequest = githubWorkflow
+      ? await repository.getLatestGitHubDraftPullRequest(actor, githubWorkflow.id)
       : undefined;
     return successResponse({
       project,
@@ -42,6 +42,12 @@ export async function GET(
       capabilities,
       analysisOutcome: analysisOutcome(latestAnalysisResult, capabilities.length),
       release,
+      ...(githubWorkflow ? { githubWorkflow: {
+        id: githubWorkflow.id,
+        status: githubWorkflow.status,
+        currentPhase: githubWorkflow.currentPhase,
+        ...(githubWorkflow.errorCode ? { errorCode: githubWorkflow.errorCode } : {}),
+      } } : {}),
       ...(draftPullRequest ? { draftPullRequest: gitHubDraftPullRequestProjection(draftPullRequest) } : {}),
       ...(project.sourceType === "website" ? {
         websiteUserHandoff: websiteUserHandoffProjection(project.id),

@@ -225,6 +225,10 @@ test("Postgres GitHub workflow exposes exact reviewed material only under its li
       inputHash: "postgres-github-binding-workflow",
     });
     assert.equal(workflow.reviewedAnalysisRunId, analysis.id);
+    assert.equal(
+      (await repository.getLatestReviewedWorkflowForAnalysis(actor, project.id, analysis.id))?.id,
+      workflow.id,
+    );
     const task = await repository.claimWorkflowTask("postgres-github-binding-worker");
     assert.ok(task);
     const directMaterialCounts = async (workerId?: string, leaseGeneration?: number) => {

@@ -437,6 +437,11 @@ export interface ControlPlaneRepository extends WorkflowRepository {
   completeAnalysis(workerId: string, runId: string, result: AnalysisResult, leaseGeneration?: number): Promise<AnalysisRunRecord>;
   failAnalysis(workerId: string, runId: string, code: string, retryable: boolean, leaseGeneration?: number): Promise<AnalysisRunRecord>;
   getAnalysisResult(actor: RepositoryActor, runId: string): Promise<AnalysisResult | undefined>;
+  getLatestReviewedWorkflowForAnalysis(
+    actor: RepositoryActor,
+    projectId: string,
+    analysisRunId: string,
+  ): Promise<WorkflowRunRecord | undefined>;
   getWorkflowExecutionMaterial(
     workerId: string,
     taskId: string,
@@ -1231,6 +1236,22 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
 
   async getWorkflowRun(actor: RepositoryActor, runId: string): Promise<WorkflowRunRecord> {
     return copy(this.#workflowRunForActor(actor, runId));
+  }
+
+  async getLatestReviewedWorkflowForAnalysis(
+    actor: RepositoryActor,
+    projectId: string,
+    analysisRunId: string,
+  ): Promise<WorkflowRunRecord | undefined> {
+    const project = this.#assertProject(actor, projectId);
+    if (project.sourceType !== "github") return undefined;
+    const run = [...this.#workflowRuns.values()]
+      .filter((item) => item.organizationId === actor.organizationId
+        && item.projectId === project.id
+        && item.reviewedAnalysisRunId === analysisRunId)
+      .sort((left, right) => compareCodePoints(right.createdAt, left.createdAt)
+        || compareCodePoints(right.id, left.id))[0];
+    return run ? copy(run) : undefined;
   }
 
   async listWorkflowTasks(actor: RepositoryActor, runId: string): Promise<WorkflowTaskRecord[]> {

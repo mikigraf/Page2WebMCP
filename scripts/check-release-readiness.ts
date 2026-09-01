@@ -342,6 +342,12 @@ async function localFacts() {
   const durableResultSurfaces = await readFile(new URL(
     "../supabase/migrations/20260901020000_durable_result_surfaces.sql", import.meta.url,
   ), "utf8");
+  const analysisSourceLock = await readFile(new URL(
+    "../supabase/migrations/20260901030000_analysis_source_lock.sql", import.meta.url,
+  ), "utf8");
+  const analysisSourceLockReadiness = await readFile(new URL(
+    "../supabase/migrations/20260901040000_analysis_source_lock_readiness.sql", import.meta.url,
+  ), "utf8");
   const selectedProviderContext = await readFile(new URL(
     "../supabase/migrations/20260901000000_selected_provider_probe_context.sql", import.meta.url,
   ), "utf8");
@@ -353,7 +359,9 @@ async function localFacts() {
     migrationsCurrent: migrations.includes("20260831211329_installed_execution_evidence.sql")
       && migrations.includes("20260901000000_selected_provider_probe_context.sql")
       && migrations.includes("20260901010000_single_installation_proof.sql")
-      && migrations.includes("20260901020000_durable_result_surfaces.sql"),
+      && migrations.includes("20260901020000_durable_result_surfaces.sql")
+      && migrations.includes("20260901030000_analysis_source_lock.sql")
+      && migrations.includes("20260901040000_analysis_source_lock_readiness.sql"),
     rlsVerified: /selected_native_installation_proof/i.test(singleInstallationProof)
       && /confirmed_mutation_effect_count\s*=\s*1/i.test(singleInstallationProof)
       && /grant execute[^;]+page2webmcp_maintenance/is.test(singleInstallationProof)
@@ -361,6 +369,10 @@ async function localFacts() {
       && /grant execute[^;]+page2webmcp_maintenance/is.test(selectedProviderContext)
       && /github_draft_pull_requests/i.test(durableResultSurfaces)
       && /force row level security/i.test(durableResultSurfaces)
+      && /security definer/i.test(analysisSourceLock)
+      && /grant execute[^;]+page2webmcp_app/is.test(analysisSourceLock)
+      && /selected_release_readiness_topology_legacy_20260901020000/i.test(analysisSourceLockReadiness)
+      && /page2webmcp_maintenance/is.test(analysisSourceLockReadiness)
       && /force row level security/i.test(task6),
   };
 }

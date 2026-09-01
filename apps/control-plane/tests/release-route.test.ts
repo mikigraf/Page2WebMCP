@@ -32,7 +32,13 @@ import {
   type InstalledVerificationReport,
   type ReleaseVerificationPort,
 } from "../src/release-verification.ts";
-import { authenticatedHeaders, editor, installTestRepository, owner } from "./auth-test-helpers.ts";
+import {
+  authenticatedHeaders,
+  editor,
+  hermeticReleaseVerificationPort,
+  installTestRepository,
+  owner,
+} from "./auth-test-helpers.ts";
 
 const HOSTED_ARTIFACT_PREFIX =
   "https://bimqgiedckdurqiywctl.supabase.co/storage/v1/object/public/page2webmcp-releases";
@@ -84,6 +90,19 @@ function exactInstalledReport(
     },
     csp: { hosted: "allowed" },
     ...overrides,
+  };
+}
+
+function liveVerificationPort(verifierOriginDigest: string): ReleaseVerificationPort {
+  return {
+    ...hermeticReleaseVerificationPort,
+    mode: "live",
+    readiness: async () => ({
+      protocolVersion: 1,
+      mode: "live",
+      webMcpImplementation: "native",
+      verifierOriginDigest,
+    }),
   };
 }
 
@@ -602,6 +621,7 @@ test("publication derives verification from persisted state and requires R1 revi
     },
     previousRelease: null,
     installed: false,
+    productionVerified: false,
     attestation: null,
   });
 
@@ -1083,6 +1103,7 @@ test("installed-target route records only an exact normal native WebMCP observat
   assert.equal(detail.status, 200, JSON.stringify(await detail.clone().json()));
   const recovered = (await detail.json()).release.installation;
   assert.equal(recovered.installed, true);
+  assert.equal(recovered.productionVerified, false);
   assert.deepEqual(recovered.attestation, {
     id: installation.id,
     status: "verified",
@@ -1099,6 +1120,54 @@ test("installed-target route records only an exact normal native WebMCP observat
     syntheticHarness: false,
     verifiedAt: installation.verifiedAt,
   });
+});
+
+test("production installation status requires the same live verifier for candidate and installed proof", async () => {
+  const repository = new InMemoryControlPlaneRepository();
+  installTestRepository(repository);
+  const { project, run } = await fixture(repository);
+  await approveTicket(repository, project.id);
+  const candidateVerifierDigest = "a".repeat(64);
+  setReleaseVerificationPortForTest(liveVerificationPort(candidateVerifierDigest));
+  const published = await publish(
+    request(project.id, run.id, "publish-for-live-proof-chain"),
+    { params: Promise.resolve({ projectId: project.id }) },
+  );
+  assert.equal(published.status, 201, JSON.stringify(await published.clone().json()));
+  const release = (await published.json()).release;
+
+  const install = async (idempotencyKey: string) => await verifyInstallation(new Request(
+    `https://control.example/api/projects/${project.id}/releases/${release.id}/installation`,
+    {
+      method: "POST",
+      headers: {
+        ...authenticatedHeaders(owner),
+        "content-type": "application/json",
+        "idempotency-key": idempotencyKey,
+      },
+      body: JSON.stringify({ pageUrl: "https://acme.example/account" }),
+    },
+  ), { params: Promise.resolve({ projectId: project.id, releaseId: release.id }) });
+  const recover = async () => {
+    const response = await projectDetail(new Request(
+      `https://control.example/api/projects/${project.id}`,
+      { headers: authenticatedHeaders(owner) },
+    ), { params: Promise.resolve({ projectId: project.id }) });
+    assert.equal(response.status, 200, JSON.stringify(await response.clone().json()));
+    return (await response.json()).release.installation;
+  };
+
+  setReleaseVerificationPortForTest(liveVerificationPort("b".repeat(64)));
+  assert.equal((await install("live-install-different-verifier")).status, 200);
+  const mismatched = await recover();
+  assert.equal(mismatched.installed, true);
+  assert.equal(mismatched.productionVerified, false);
+
+  setReleaseVerificationPortForTest(liveVerificationPort(candidateVerifierDigest));
+  assert.equal((await install("live-install-same-verifier")).status, 200);
+  const matched = await recover();
+  assert.equal(matched.installed, true);
+  assert.equal(matched.productionVerified, true);
 });
 
 test("an exact self-host verification can supersede pending hosted CSP evidence without overwriting unrelated evidence", async () => {

@@ -657,6 +657,25 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
     return this.#transaction({ kind: "app", actor }, (client) => this.#workflowRun(client, actor, runId));
   }
 
+  async getLatestReviewedWorkflowForAnalysis(
+    actor: RepositoryActor,
+    projectId: string,
+    analysisRunId: string,
+  ): Promise<WorkflowRunRecord | undefined> {
+    return this.#transaction({ kind: "app", actor }, async (client) => {
+      const project = await this.#project(client, actor, projectId);
+      if (project.sourceType !== "github") return undefined;
+      const result = await client.query(
+        "select id, organization_id, project_id, source_snapshot_id, analysis_run_id, reviewed_analysis_run_id, " +
+        "status, current_phase, input_hash, version, cancel_requested_at, cancelled_at, error_code, created_at, updated_at " +
+        "from public.workflow_runs where project_id = $1 and organization_id = $2 and reviewed_analysis_run_id = $3 " +
+        "order by created_at desc, id desc limit 1",
+        [project.id, actor.organizationId, analysisRunId],
+      );
+      return result.rows[0] ? mapWorkflowRun(result.rows[0]) : undefined;
+    });
+  }
+
   async listWorkflowTasks(actor: RepositoryActor, runId: string): Promise<WorkflowTaskRecord[]> {
     return this.#transaction({ kind: "app", actor }, async (client) => {
       await this.#workflowRun(client, actor, runId);

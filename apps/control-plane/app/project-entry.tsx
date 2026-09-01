@@ -2,6 +2,13 @@
 
 import { FormEvent, useEffect, useState } from "react";
 import type { CapabilityPlan } from "../../../packages/capability-ir/src/plan.ts";
+import {
+  analysisCompletion,
+  githubProjectRecovery,
+  releaseInstallationState,
+  type AnalysisDiagnosticView,
+  type GitHubProjectWorkflow,
+} from "../src/project-entry-state.ts";
 import { capabilityReviewPresentation } from "../src/workflow-presentation.ts";
 import {
   clearClientWorkflow,
@@ -29,10 +36,28 @@ type ApiFailure = { code?: string };
 type AnalysisStatus = {
   run: { status: "queued" | "running" | "succeeded" | "failed" | "cancelled"; errorCode?: string };
   capabilities: Capability[];
+  result?: {
+    diagnostics?: AnalysisDiagnosticView[];
+    release?: { contentHash: string };
+  };
+};
+type GitHubDraftPullRequest = {
+  repository: { owner: string; name: string };
+  number: number;
+  url: string;
+  branch: string;
+  baseCommitSha: string;
+  headCommitSha: string;
+  check: { externalId: string; status: "queued" | "in_progress" | "completed"; conclusion?: string };
+  phase: "publish" | "install_verify";
+  draft: true;
+  merged: false;
+  createdAt: string;
 };
 type GitHubWorkflowStatus = {
-  workflow: { status: "queued" | "running" | "waiting" | "succeeded" | "failed" | "cancelled"; errorCode?: string };
+  workflow: GitHubProjectWorkflow;
   outcome: "tested_patch_draft_pull_request_pending" | "tested_patch_draft_pull_request_check_preview_reconciled" | "github_workflow_terminal_without_installation";
+  draftPullRequest?: GitHubDraftPullRequest;
 };
 type ProjectSummary = {
   id: string;
@@ -46,6 +71,12 @@ type ProjectSource = {
   sourceUrl: string;
   sourceConfiguration: SourceConfiguration;
 };
+type WebsiteOwnershipState =
+  | { state: "pending"; method: "dns_txt"; targetOrigin: string; expiresAt: string;
+    instructions: { recordName: string; recordType: "TXT"; recordValue: string } }
+  | { state: "pending"; method: "well_known"; targetOrigin: string; expiresAt: string;
+    instructions: { url: string; content: string } }
+  | { state: "verified" | "expired" | "failed" | "missing"; targetOrigin: string; expiresAt?: string };
 type ReleaseResult = {
   id: string;
   url: string;
@@ -53,9 +84,32 @@ type ReleaseResult = {
     artifactUrl: string;
     downloadUrl: string;
     moduleScriptTag: string;
+    manifest: unknown;
+    integrity: string;
+    contentHash: string;
     targetOrigin: string;
     verificationPageUrl: string;
     localOnly: boolean;
+    compatibility: { moduleScripts: true; webMcp: "native-current-required" };
+    previousRelease: null | { id: string; contentHash: string; integrity: string; artifactUrl: string };
+    installed: boolean;
+    productionVerified: boolean;
+    attestation: null | {
+      id: string;
+      status: "pending_self_host" | "verified" | "failed";
+      delivery: "hosted" | "self_hosted";
+      pageUrl: string;
+      selfHostedUrl: string | null;
+      webMcpImplementation: string;
+      verifierMode: "hermetic" | "local_live" | "live";
+      registeredTools: string[];
+      executedContentHash: string | null;
+      normalPageLoad: boolean;
+      routeInterception: boolean;
+      injectedRegistration: boolean;
+      syntheticHarness: boolean;
+      verifiedAt: string | null;
+    };
     selfHost: { required: boolean; guidance: string };
   };
 };
@@ -85,8 +139,12 @@ export function ProjectEntry({ authState }: Readonly<{ authState?: "verified" | 
       ? "Email verified. Your personal organization is ready."
       : "");
   const [capabilities, setCapabilities] = useState<Capability[]>([]);
+  const [diagnostics, setDiagnostics] = useState<readonly AnalysisDiagnosticView[]>([]);
+  const [analysisNextStepReady, setAnalysisNextStepReady] = useState<boolean>();
   const [workflowRunId, setWorkflowRunId] = useState<string>();
   const [githubOutcome, setGitHubOutcome] = useState<GitHubWorkflowStatus["outcome"]>();
+  const [githubAction, setGitHubAction] = useState<ReturnType<typeof githubProjectRecovery>["action"]>();
+  const [githubDraftPullRequest, setGitHubDraftPullRequest] = useState<GitHubDraftPullRequest>();
   const [projectId, setProjectId] = useState<string>();
   const [analysisRunId, setAnalysisRunId] = useState<string>();
   const [releaseUrl, setReleaseUrl] = useState<string>();
@@ -100,6 +158,9 @@ export function ProjectEntry({ authState }: Readonly<{ authState?: "verified" | 
   const [nextProjectsCursor, setNextProjectsCursor] = useState<string>();
   const [recoveryMode, setRecoveryMode] = useState(authState === "recovery");
   const [busy, setBusy] = useState(false);
+  const [handoffBusy, setHandoffBusy] = useState(false);
+  const [websiteOwnership, setWebsiteOwnership] = useState<WebsiteOwnershipState>();
+  const [websiteHandoffError, setWebsiteHandoffError] = useState<string>();
 
   useEffect(() => {
     const storage = browserStorage();
@@ -123,22 +184,30 @@ export function ProjectEntry({ authState }: Readonly<{ authState?: "verified" | 
       setBusy(true);
       void waitForAnalysis(restored.analysisRunId, controller.signal)
         .then(async (completed) => {
-          setCapabilities(completed.capabilities);
+          applyCompletedAnalysis(completed, restored.sourceType);
           if (restored.sourceType === "github" && restored.workflowRunId) {
             const workflow = await waitForGitHubWorkflow(restored.workflowRunId, controller.signal);
-            setGitHubOutcome(workflow.outcome);
-            setMessage(workflow.outcome === "tested_patch_draft_pull_request_check_preview_reconciled"
-              ? "Tested patch and draft pull request reconciled"
-              : `GitHub workflow ${workflow.workflow.status}`);
-          } else setMessage(`Analysis complete for ${restored.sourceType}`);
+            const githubRecovery = githubProjectRecovery(workflow.workflow, workflow.draftPullRequest);
+            setWorkflowRunId(githubRecovery.workflowRunId);
+            setGitHubOutcome(githubRecovery.outcome);
+            setGitHubAction(githubRecovery.action);
+            setGitHubDraftPullRequest(workflow.draftPullRequest);
+            persistWorkflow(withWorkflowRunId(restored, githubRecovery.workflowRunId));
+            setMessage(gitHubWorkflowMessage(workflow));
+          }
         })
         .catch((error: unknown) => {
           if (controller.signal.aborted) return;
-          if (error instanceof AnalysisRunError && error.terminal) {
+          if (error instanceof GitHubWorkflowRunError && error.terminal) {
+            setWorkflowRunId(undefined);
+            setGitHubOutcome("github_workflow_terminal_without_installation");
+            setGitHubAction("retry");
+            persistWorkflow(withWorkflowRunId(restored, undefined));
+          } else if (error instanceof AnalysisRunError && error.terminal) {
             setAnalysisRunId(undefined);
             persistWorkflow({ ...restored, analysisRunId: undefined, releaseUrl: undefined });
           }
-          setMessage(`Analysis recovery failed: ${errorCode(error)}`);
+          setMessage(`${error instanceof GitHubWorkflowRunError ? "GitHub workflow" : "Analysis recovery"} failed: ${errorCode(error)}`);
         })
         .finally(() => {
           if (!controller.signal.aborted) setBusy(false);
@@ -192,8 +261,7 @@ export function ProjectEntry({ authState }: Readonly<{ authState?: "verified" | 
       if (analysisRunId) {
         try {
           const completed = await waitForAnalysis(analysisRunId);
-          setCapabilities(completed.capabilities);
-          setMessage(`Analysis complete for ${sourceType}`);
+          applyCompletedAnalysis(completed, sourceType);
         } catch (error) {
           if (error instanceof AnalysisRunError && error.terminal && projectId) {
             setAnalysisRunId(undefined);
@@ -351,6 +419,7 @@ export function ProjectEntry({ authState }: Readonly<{ authState?: "verified" | 
       }, ...current.filter((project) => project.id !== body.id)]);
       persistWorkflow({ sourceType, url, sourceConfiguration: activeSourceConfiguration(), projectId: body.id });
       setMessage(`Project ${body.id} created`);
+      if (sourceType === "website") await refreshWebsiteOwnership(body.id);
     } catch (error) {
       setMessage(`Project creation failed: ${errorCode(error)}`);
     } finally {
@@ -365,6 +434,8 @@ export function ProjectEntry({ authState }: Readonly<{ authState?: "verified" | 
       latestAnalysis?: { id: string; status: AnalysisStatus["run"]["status"] };
       capabilities?: Capability[];
       release?: ReleaseResult;
+      draftPullRequest?: GitHubDraftPullRequest;
+      githubWorkflow?: GitHubProjectWorkflow;
     } & ApiFailure>(`/api/projects/${encodeURIComponent(id)}`, { cache: "no-store", ...(signal ? { signal } : {}) });
     if (!response.ok || !body.project || !body.source) throw new Error(body.code ?? "PROJECT_LOAD_FAILED");
     const storage = browserStorage();
@@ -375,7 +446,12 @@ export function ProjectEntry({ authState }: Readonly<{ authState?: "verified" | 
       projectId: body.project.id,
       analysisRunId: body.latestAnalysis?.id,
     }, body.release);
-    const recovered = recovery.workflow;
+    const githubRecovery = body.source.sourceType === "github"
+      ? githubProjectRecovery(body.githubWorkflow, body.draftPullRequest)
+      : undefined;
+    const recovered = githubRecovery
+      ? withWorkflowRunId(recovery.workflow, githubRecovery.workflowRunId)
+      : recovery.workflow;
     applySource(body.source);
     setProjectId(body.project.id);
     setAnalysisRunId(body.latestAnalysis?.id);
@@ -383,8 +459,23 @@ export function ProjectEntry({ authState }: Readonly<{ authState?: "verified" | 
     setWorkflowRunId(recovered.workflowRunId);
     setReleaseUrl(body.release?.url);
     setRelease(recovery.release);
-    if (!recovered.workflowRunId) setGitHubOutcome(undefined);
+    setGitHubDraftPullRequest(body.source.sourceType === "github" ? body.draftPullRequest : undefined);
+    setGitHubOutcome(githubRecovery?.outcome);
+    setGitHubAction(githubRecovery?.action);
     persistWorkflow(recovered);
+    if (body.source.sourceType === "website") {
+      await refreshWebsiteOwnership(body.project.id, signal);
+    } else {
+      setWebsiteOwnership(undefined);
+      setWebsiteHandoffError(undefined);
+    }
+    if (body.latestAnalysis?.status === "succeeded") {
+      const completed = await analysisStatus(body.latestAnalysis.id, signal);
+      applyCompletedAnalysis(completed, body.source.sourceType);
+    } else {
+      setDiagnostics([]);
+      setAnalysisNextStepReady(undefined);
+    }
     return { ...body, project: body.project, source: body.source };
   }
 
@@ -392,7 +483,9 @@ export function ProjectEntry({ authState }: Readonly<{ authState?: "verified" | 
     setBusy(true);
     try {
       const body = await refreshProject(id);
-      setMessage(body.latestAnalysis ? `Resumed ${body.project.name}` : `Loaded ${body.project.name}`);
+      if (body.latestAnalysis?.status !== "succeeded") {
+        setMessage(body.latestAnalysis ? `Resumed ${body.project.name}` : `Loaded ${body.project.name}`);
+      }
     } catch (error) {
       setMessage(`Project load failed: ${errorCode(error)}`);
     } finally {
@@ -405,11 +498,17 @@ export function ProjectEntry({ authState }: Readonly<{ authState?: "verified" | 
       setMessage("Create this project before analysis");
       return;
     }
+    if (sourceType === "website" && websiteOwnership?.state !== "verified") {
+      setMessage("Verify ownership of this exact website source before analysis.");
+      return;
+    }
     setBusy(true);
     if (!analysisRunId) {
       setCapabilities([]);
       setWorkflowRunId(undefined);
       setGitHubOutcome(undefined);
+      setGitHubAction("create");
+      setGitHubDraftPullRequest(undefined);
       setReleaseUrl(undefined);
     }
     try {
@@ -428,8 +527,7 @@ export function ProjectEntry({ authState }: Readonly<{ authState?: "verified" | 
         persistWorkflow({ sourceType, url, sourceConfiguration: activeSourceConfiguration(), projectId, analysisRunId: runId });
       }
       const completed = await waitForAnalysis(runId);
-      setCapabilities(completed.capabilities);
-      setMessage(`Analysis complete for ${sourceType}`);
+      applyCompletedAnalysis(completed, sourceType);
     } catch (error) {
       if (error instanceof AnalysisRunError && error.terminal) {
         setAnalysisRunId(undefined);
@@ -453,22 +551,28 @@ export function ProjectEntry({ authState }: Readonly<{ authState?: "verified" | 
         }
       );
       if (!response.ok || !body.capability) throw new Error(body.code ?? "REVIEW_FAILED");
-      setCapabilities((current) => current.map((item) =>
-        item.id === capability.id ? body.capability! : item
-      ));
-      setMessage("");
+      setVerificationEligible(undefined);
+      if (analysisRunId) {
+        applyCompletedAnalysis(await analysisStatus(analysisRunId), sourceType);
+      } else {
+        setCapabilities((current) => current.map((item) =>
+          item.id === capability.id ? body.capability! : item
+        ));
+        setAnalysisNextStepReady(false);
+        setMessage("");
+      }
     } catch (error) {
       if (analysisRunId) {
         try {
           const refreshed = await analysisStatus(analysisRunId);
-          setCapabilities(refreshed.capabilities);
           const expectedStatus = action === "approve" ? "reviewed" : "blocked";
           if (refreshed.capabilities.some((item) =>
             item.id === capability.id && item.status === expectedStatus
           )) {
-            setMessage("");
+            applyCompletedAnalysis(refreshed, sourceType);
             return;
           }
+          setCapabilities(refreshed.capabilities);
         } catch {
           // Preserve the original stable failure when reconciliation is unavailable.
         }
@@ -498,12 +602,23 @@ export function ProjectEntry({ authState }: Readonly<{ authState?: "verified" | 
           runId = started.body.workflow.id;
           setWorkflowRunId(runId);
           setGitHubOutcome(started.body.outcome);
+          setGitHubAction("resume");
           persistWorkflow({ sourceType, url, sourceConfiguration: activeSourceConfiguration(), projectId, analysisRunId, workflowRunId: runId });
         }
         const completed = await waitForGitHubWorkflow(runId);
-        setGitHubOutcome(completed.outcome);
-        persistWorkflow({ sourceType, url, sourceConfiguration: activeSourceConfiguration(), projectId, analysisRunId, workflowRunId: runId });
-        setMessage("Tested patch and draft pull request/check/preview reconciled; no merge or installation was performed");
+        const githubRecovery = githubProjectRecovery(completed.workflow, completed.draftPullRequest);
+        setWorkflowRunId(githubRecovery.workflowRunId);
+        setGitHubOutcome(githubRecovery.outcome);
+        setGitHubAction(githubRecovery.action);
+        setGitHubDraftPullRequest(completed.draftPullRequest);
+        persistWorkflow(withWorkflowRunId({
+          sourceType,
+          url,
+          sourceConfiguration: activeSourceConfiguration(),
+          projectId,
+          analysisRunId,
+        }, githubRecovery.workflowRunId));
+        setMessage(gitHubWorkflowMessage(completed));
         return;
       }
       const published = await postIdempotent<{ release?: ReleaseResult } & ApiFailure>(
@@ -519,6 +634,12 @@ export function ProjectEntry({ authState }: Readonly<{ authState?: "verified" | 
       persistWorkflow({ sourceType, url, sourceConfiguration: activeSourceConfiguration(), projectId, analysisRunId, releaseUrl: published.body.release.url });
       setMessage("Immutable release published");
     } catch (error) {
+      if (sourceType === "github" && error instanceof GitHubWorkflowRunError && error.terminal) {
+        setWorkflowRunId(undefined);
+        setGitHubOutcome("github_workflow_terminal_without_installation");
+        setGitHubAction("retry");
+        persistWorkflow({ sourceType, url, sourceConfiguration: activeSourceConfiguration(), projectId, analysisRunId });
+      }
       setMessage(`${sourceType === "github" ? "GitHub workflow" : "Publication"} failed: ${errorCode(error)}`);
     } finally {
       setBusy(false);
@@ -565,11 +686,52 @@ export function ProjectEntry({ authState }: Readonly<{ authState?: "verified" | 
         `installation:${release.id}:${pageUrl}:${selfHostedUrl}`
       );
       if (!response.ok || !body.installation) throw new Error(body.code ?? "INSTALLATION_CHECK_FAILED");
+      await refreshProject(projectId);
       setMessage(body.installation.status === "verified"
         ? "Installed target verified without route interception"
         : `Installation state: ${body.installation.status}`);
     } catch (error) { setMessage(`Installed-target check failed: ${errorCode(error)}`); }
     finally { setBusy(false); }
+  }
+
+  async function refreshWebsiteOwnership(id: string, signal?: AbortSignal): Promise<void> {
+    try {
+      const { response, body } = await requestJson<{ ownership?: WebsiteOwnershipState } & ApiFailure>(
+        `/api/projects/${encodeURIComponent(id)}/website-ownership`,
+        { cache: "no-store", ...(signal ? { signal } : {}) },
+      );
+      if (!response.ok || !body.ownership) throw new Error(body.code ?? "WEBSITE_HANDOFF_UNAVAILABLE");
+      setWebsiteOwnership(body.ownership);
+      setWebsiteHandoffError(undefined);
+    } catch (error) {
+      if (signal?.aborted) return;
+      setWebsiteOwnership(undefined);
+      setWebsiteHandoffError(errorCode(error));
+    }
+  }
+
+  async function mutateWebsiteOwnership(action: "challenge" | "check") {
+    if (!projectId) return;
+    setHandoffBusy(true);
+    try {
+      const result = await postIdempotent<{ ownership?: WebsiteOwnershipState } & ApiFailure>(
+        `/api/projects/${encodeURIComponent(projectId)}/website-ownership`,
+        { action },
+        `website-ownership:${projectId}:${action}`,
+      );
+      if (!result.response.ok || !result.body.ownership) {
+        throw new Error(result.body.code ?? "WEBSITE_HANDOFF_UNAVAILABLE");
+      }
+      setWebsiteOwnership(result.body.ownership);
+      setWebsiteHandoffError(undefined);
+      setMessage(result.body.ownership.state === "verified"
+        ? "Website ownership verified for the exact active source."
+        : "Ownership challenge loaded. Complete the instruction below, then check ownership.");
+    } catch (error) {
+      setWebsiteHandoffError(errorCode(error));
+    } finally {
+      setHandoffBusy(false);
+    }
   }
 
   function selectSource(next: SourceType) {
@@ -607,12 +769,35 @@ export function ProjectEntry({ authState }: Readonly<{ authState?: "verified" | 
     setProjectId(undefined);
     setAnalysisRunId(undefined);
     setCapabilities([]);
+    setDiagnostics([]);
+    setAnalysisNextStepReady(undefined);
     setWorkflowRunId(undefined);
     setGitHubOutcome(undefined);
+    setGitHubAction(undefined);
+    setGitHubDraftPullRequest(undefined);
     setReleaseUrl(undefined);
     setRelease(undefined);
     setVerificationEligible(undefined);
+    setWebsiteOwnership(undefined);
+    setWebsiteHandoffError(undefined);
   }
+
+  function applyCompletedAnalysis(completed: AnalysisStatus, completedSourceType: SourceType) {
+    const completion = analysisCompletion(completedSourceType, completed);
+    setCapabilities(completed.capabilities);
+    setDiagnostics(completion.diagnostics);
+    setAnalysisNextStepReady(completion.nextStepReady);
+    setVerificationEligible(undefined);
+    setMessage(completion.summary);
+  }
+
+  const displayedInstallationState = release
+    ? releaseInstallationState({
+      installed: release.installation.installed,
+      productionVerified: release.installation.productionVerified,
+      ...(release.installation.attestation ? { attestation: release.installation.attestation } : {}),
+    })
+    : undefined;
 
   return <section aria-labelledby="project-entry-heading">
     <h2 id="project-entry-heading">Create a project</h2>
@@ -654,8 +839,42 @@ export function ProjectEntry({ authState }: Readonly<{ authState?: "verified" | 
       </fieldset>}
       <button type="submit" disabled={busy || !signedInRole}>Create project</button>
     </form>
-    <button type="button" onClick={analyze} disabled={busy || !projectId}>{analysisRunId ? "Resume analysis" : `Analyze ${sourceType}`}</button>
+    {sourceType === "website" && projectId && <section aria-labelledby="website-ownership-heading">
+      <h3 id="website-ownership-heading">Verify website ownership</h3>
+      <p>Ownership is bound to this exact active website source. Page2WebMCP will not start Browser Use discovery before the external proof is verified.</p>
+      {websiteOwnership?.state === "verified"
+        ? <p>Ownership verified for <code>{websiteOwnership.targetOrigin}</code>.</p>
+        : <button type="button" disabled={busy || handoffBusy}
+          onClick={() => mutateWebsiteOwnership("challenge")}>Create ownership challenge</button>}
+      {websiteOwnership?.state === "pending" && <>
+        <p>Challenge expires at {websiteOwnership.expiresAt}.</p>
+        {websiteOwnership.method === "dns_txt" ? <dl>
+          <dt>DNS record</dt><dd><code>{websiteOwnership.instructions.recordName}</code></dd>
+          <dt>Type</dt><dd>{websiteOwnership.instructions.recordType}</dd>
+          <dt>Value</dt><dd><code>{websiteOwnership.instructions.recordValue}</code></dd>
+        </dl> : <dl>
+          <dt>File URL</dt><dd><code>{websiteOwnership.instructions.url}</code></dd>
+          <dt>Exact file content</dt><dd><pre>{websiteOwnership.instructions.content}</pre></dd>
+        </dl>}
+        <button type="button" disabled={busy || handoffBusy}
+          onClick={() => mutateWebsiteOwnership("check")}>Check ownership</button>
+      </>}
+      {websiteOwnership && ["expired", "failed"].includes(websiteOwnership.state)
+        && <p>Ownership state: {websiteOwnership.state}. Create a fresh challenge.</p>}
+    </section>}
+    <p>Local-live processing uses durable local services and a real provider, but it is not production verification. Production requires a stored native installation attestation for the exact published hash.</p>
+    <button type="button" onClick={analyze}
+      disabled={busy || !projectId || sourceType === "website" && websiteOwnership?.state !== "verified"}>
+      {analysisRunId ? "Resume analysis" : `Analyze ${sourceType}`}
+    </button>
     {message && <p role="status">{message}</p>}
+    {websiteHandoffError && <p role="alert">Website handoff unavailable: <code>{websiteHandoffError}</code></p>}
+    {diagnostics.length > 0 && <section aria-labelledby="analysis-diagnostics-heading">
+      <h3 id="analysis-diagnostics-heading">Analysis diagnostics</h3>
+      <ul>{diagnostics.map((diagnostic) => <li key={`${diagnostic.code}:${diagnostic.operationKey}`}>
+        <code>{diagnostic.code}</code>: <code>{diagnostic.operationKey}</code> — {diagnostic.reason ?? "no additional reason"}
+      </li>)}</ul>
+    </section>}
     {capabilities.length > 0 && <ul aria-label="Capabilities">{capabilities.map((capability) => {
       const exact = capabilityReviewPresentation(capability);
       return <li key={capability.id}><details><summary>Exact reviewed capability <code>{capability.stableName}</code>: {capability.status}</summary>
@@ -674,13 +893,47 @@ export function ProjectEntry({ authState }: Readonly<{ authState?: "verified" | 
         <button type="button" disabled={busy} onClick={() => review(capability, "block")}>Block {capability.stableName}</button>
       </>}</li>;
     })}</ul>}
-    {sourceType !== "github" && <button type="button" onClick={verifyExactCandidate} disabled={busy || !analysisRunId}>Verify exact candidate</button>}
+    {sourceType !== "github" && <button type="button" onClick={verifyExactCandidate} disabled={busy || !analysisRunId || analysisNextStepReady !== true}>Verify exact candidate</button>}
     {verificationEligible === false && <p>Verification is not eligible; publish and install remain blocked.</p>}
-    <button type="button" onClick={publish} disabled={busy || !analysisRunId}>
-      {sourceType === "github" ? (workflowRunId ? "Resume tested patch workflow" : "Create tested patch and draft PR") : "Publish immutable release"}
+    <button type="button" onClick={publish} disabled={busy || !analysisRunId || analysisNextStepReady !== true
+      || (sourceType !== "github" && verificationEligible !== true)
+      || (sourceType === "github" && ["complete", "blocked"].includes(githubAction ?? "create"))}>
+      {sourceType === "github"
+        ? githubAction === "complete"
+          ? "Draft PR created"
+          : githubAction === "blocked"
+            ? "GitHub workflow state unavailable"
+          : workflowRunId
+            ? "Resume tested patch workflow"
+            : githubOutcome === "github_workflow_terminal_without_installation"
+              ? "Retry tested patch and draft PR"
+              : "Create tested patch and draft PR"
+        : "Publish immutable release"}
     </button>
     {releaseUrl && <a href={releaseUrl}>Download immutable release</a>}
     {release && <section aria-label="Installation">
+      <h3>Immutable release</h3>
+      {displayedInstallationState && <p>{displayedInstallationState.label}</p>}
+      <dl>
+        <dt>SHA-256</dt><dd><code>{release.installation.contentHash}</code></dd>
+        <dt>SRI</dt><dd><code>{release.installation.integrity}</code></dd>
+        <dt>Expected target origin</dt><dd><code>{release.installation.targetOrigin}</code></dd>
+        <dt>WebMCP compatibility</dt><dd>{release.installation.compatibility.webMcp}</dd>
+        <dt>Previous immutable release</dt><dd>{release.installation.previousRelease
+          ? <code>{release.installation.previousRelease.contentHash}</code>
+          : "none"}</dd>
+      </dl>
+      {release.installation.attestation && <details><summary>Installed-target attestation</summary><dl>
+        <dt>Status</dt><dd>{release.installation.attestation.status}</dd>
+        <dt>Verifier mode</dt><dd>{release.installation.attestation.verifierMode}</dd>
+        <dt>Delivery</dt><dd>{release.installation.attestation.delivery}</dd>
+        <dt>Verified page</dt><dd><code>{release.installation.attestation.pageUrl}</code></dd>
+        <dt>Executed SHA-256</dt><dd><code>{release.installation.attestation.executedContentHash ?? "not executed"}</code></dd>
+        <dt>Registered tools</dt><dd>{release.installation.attestation.registeredTools.join(", ") || "none"}</dd>
+        <dt>Verified at</dt><dd>{release.installation.attestation.verifiedAt ?? "not verified"}</dd>
+      </dl></details>}
+      <details><summary>Manifest</summary><pre>{JSON.stringify(release.installation.manifest, null, 2)}</pre></details>
+      <details><summary>Module script tag</summary><pre>{release.installation.moduleScriptTag}</pre></details>
       <button type="button" disabled={busy} onClick={copyTrustedLoaderScript}>Copy trusted-loader script</button>{" "}
       <a href={release.installation.downloadUrl}>Download exact artifact bytes</a>
       {release.installation.localOnly && <p>Local-only artifact: self-host these exact bytes before production installation.</p>}
@@ -689,9 +942,22 @@ export function ProjectEntry({ authState }: Readonly<{ authState?: "verified" | 
         onChange={(event) => setSelfHostedUrl(event.target.value)} /></label>
       <button type="button" disabled={busy} onClick={checkInstalledTarget}>Check installed target</button>
     </section>}
-    {githubOutcome === "tested_patch_draft_pull_request_pending" && <p>GitHub workflow pending; no draft pull request is claimed yet</p>}
-    {githubOutcome === "tested_patch_draft_pull_request_check_preview_reconciled" &&
-      <p>Tested patch, draft pull request, check, and preview reconciled. Nothing was merged or installed.</p>}
+    {githubDraftPullRequest && <section aria-labelledby="github-draft-heading">
+      <h3 id="github-draft-heading">Real GitHub draft pull request</h3>
+      <p><a href={githubDraftPullRequest.url} target="_blank" rel="noreferrer">
+        {githubDraftPullRequest.repository.owner}/{githubDraftPullRequest.repository.name} #{githubDraftPullRequest.number}
+      </a></p>
+      <dl>
+        <dt>Branch</dt><dd><code>{githubDraftPullRequest.branch}</code></dd>
+        <dt>Base commit</dt><dd><code>{githubDraftPullRequest.baseCommitSha}</code></dd>
+        <dt>Head commit</dt><dd><code>{githubDraftPullRequest.headCommitSha}</code></dd>
+        <dt>Check</dt><dd>{githubDraftPullRequest.check.status}{githubDraftPullRequest.check.conclusion
+          ? ` / ${githubDraftPullRequest.check.conclusion}` : ""}</dd>
+      </dl>
+      <p>This pull request is draft-only. Page2WebMCP never merged or installed it.</p>
+    </section>}
+    {githubOutcome === "tested_patch_draft_pull_request_pending" && !githubDraftPullRequest
+      && <p>GitHub workflow pending; no draft pull request is claimed yet.</p>}
   </section>;
 }
 
@@ -701,7 +967,16 @@ class AnalysisRunError extends Error {
   }
 }
 
-async function waitForAnalysis(runId: string, signal?: AbortSignal): Promise<AnalysisStatus> {
+class GitHubWorkflowRunError extends Error {
+  constructor(message: string, readonly terminal: boolean) {
+    super(message);
+  }
+}
+
+async function waitForAnalysis(
+  runId: string,
+  signal?: AbortSignal,
+): Promise<AnalysisStatus> {
   const deadline = Date.now() + ANALYSIS_POLL_DEADLINE_MS;
   let delayMs = 250;
   while (Date.now() < deadline) {
@@ -736,12 +1011,22 @@ async function waitForGitHubWorkflow(runId: string, signal?: AbortSignal): Promi
     if (!response.ok) throw new Error(body.code ?? "GITHUB_WORKFLOW_STATUS_FAILED");
     if (body.workflow.status === "succeeded") return body;
     if (body.workflow.status === "failed" || body.workflow.status === "cancelled") {
-      throw new AnalysisRunError(body.workflow.errorCode ?? "GITHUB_WORKFLOW_FAILED", true);
+      throw new GitHubWorkflowRunError(body.workflow.errorCode ?? "GITHUB_WORKFLOW_FAILED", true);
     }
     await abortableDelay(delayMs, signal);
     delayMs = Math.min(Math.round(delayMs * 1.5), 2_000);
   }
-  throw new AnalysisRunError("GITHUB_WORKFLOW_DEADLINE_EXCEEDED", false);
+  throw new GitHubWorkflowRunError("GITHUB_WORKFLOW_DEADLINE_EXCEEDED", false);
+}
+
+function gitHubWorkflowMessage(status: GitHubWorkflowStatus): string {
+  if (status.draftPullRequest) {
+    return `Draft pull request #${status.draftPullRequest.number} reconciled at the exact head commit; nothing was merged or installed.`;
+  }
+  if (status.workflow.status === "failed" || status.workflow.status === "cancelled") {
+    return `GitHub workflow ${status.workflow.status}; no draft pull request is claimed.`;
+  }
+  return "GitHub workflow has no persisted draft pull request identity yet; no pull request is claimed.";
 }
 
 async function postIdempotent<T extends ApiFailure>(url: string, body: unknown, operation: string) {
@@ -840,6 +1125,12 @@ function persistWorkflow(workflow: PersistedWorkflow): void {
   const storage = browserStorage();
   if (!storage) return;
   try { saveWorkflow(storage, workflow); } catch { /* Browser storage is an optional recovery aid. */ }
+}
+
+function withWorkflowRunId(workflow: PersistedWorkflow, workflowRunId: string | undefined): PersistedWorkflow {
+  const recovered = { ...workflow };
+  delete recovered.workflowRunId;
+  return workflowRunId ? { ...recovered, workflowRunId } : recovered;
 }
 
 function removePersistedWorkflow(): void {

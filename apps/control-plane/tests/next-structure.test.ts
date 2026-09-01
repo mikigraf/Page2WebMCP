@@ -13,6 +13,7 @@ test("control plane is a TypeScript Next App Router application with a durable a
 
 test("auth/project UI exposes actionable SSR states without trusting browser role storage", async () => {
   const entry = await readFile(new URL("../app/project-entry.tsx", import.meta.url), "utf8");
+  const entryState = await readFile(new URL("../src/project-entry-state.ts", import.meta.url), "utf8");
   const proxy = await readFile(new URL("../proxy.ts", import.meta.url), "utf8");
   assert.match(entry, /Create account/);
   assert.match(entry, /Recover password/);
@@ -29,12 +30,35 @@ test("auth/project UI exposes actionable SSR states without trusting browser rol
   assert.match(entry, /Input schema/);
   assert.match(entry, /Required scopes/);
   assert.match(entry, /Verify exact candidate/);
+  assert.match(entry, /analysisNextStepReady !== true/);
+  assert.match(entry, /Analysis diagnostics/);
+  assert.match(entryState, /without a publishable/);
   assert.match(entry, /Copy trusted-loader script/);
   assert.match(entry, /Check installed target/);
   assert.match(entry, /release\.installation\.verificationPageUrl/);
   assert.doesNotMatch(entry, /const pageUrl = new URL\(url\)\.origin/);
   assert.match(entry, /Local-only artifact/);
   assert.match(entry, /Self-hosted artifact URL/);
+  assert.match(entry, /SHA-256/);
+  assert.match(entry, /release\.installation\.integrity/);
+  assert.match(entry, /Previous immutable release/);
+  assert.match(entry, /stored native installation attestation/);
+  assert.match(entry, /Installed-target attestation/);
+  assert.match(entry, /displayedInstallationState\.label/);
+  assert.match(entry, /Create ownership challenge/);
+  assert.match(entry, /Check ownership/);
+  assert.match(entry, /\/website-ownership/);
+  assert.doesNotMatch(entry, /Open secure browser handoff/);
+  assert.doesNotMatch(entry, /I&amp;apos;ve finished signing in|I&apos;ve finished signing in/);
+  assert.doesNotMatch(entry, /\/website-authentication/);
+  assert.doesNotMatch(entry, /cdpReference|cdpUrl|secretReference/);
+  assert.match(entry, /Real GitHub draft pull request/);
+  assert.match(entry, /githubDraftPullRequest\.headCommitSha/);
+  assert.match(entry, /draftPullRequest\?: GitHubDraftPullRequest/);
+  assert.match(entry, /setGitHubDraftPullRequest\(body\.source\.sourceType === "github" \? body\.draftPullRequest : undefined\)/);
+  assert.match(entry, /githubProjectRecovery\(body\.githubWorkflow/);
+  assert.match(entry, /Draft PR created/);
+  assert.match(entry, /no pull request is claimed/);
   assert.match(entry, /nothing was merged or installed/i);
   assert.match(entry, /\/api\/workflow-runs\//);
   assert.doesNotMatch(entry, /sourceType === "github"\}>Publish immutable release/);

@@ -683,6 +683,18 @@ test("GitHub workflow binds the exact reviewed analysis and exposes lease-scoped
     idempotencyKey: "workflow-reviewed", inputHash: "workflow-reviewed",
   });
   assert.equal(run.reviewedAnalysisRunId, analysis.id);
+  assert.equal(
+    (await repository.getLatestReviewedWorkflowForAnalysis(ownerA, project.id, analysis.id))?.id,
+    run.id,
+  );
+  assert.equal(
+    await repository.getLatestReviewedWorkflowForAnalysis(
+      ownerA,
+      project.id,
+      "00000000-0000-4000-8000-000000000000",
+    ),
+    undefined,
+  );
   const task = await repository.claimWorkflowTask("github-material-worker");
   assert.ok(task);
   const material = await repository.getWorkflowExecutionMaterial(

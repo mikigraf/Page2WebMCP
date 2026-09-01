@@ -5,6 +5,7 @@ import {
   RepositoryError,
   type GitHubDraftPullRequestRecord,
 } from "../../../packages/database/src/control-plane.ts";
+import type { WorkflowRunRecord } from "../../../packages/database/src/workflow.ts";
 import { normalizeProjectInput } from "../src/projects.ts";
 import { GET as listProjects } from "../app/api/projects/route.ts";
 import { GET as projectDetail } from "../app/api/projects/[projectId]/route.ts";
@@ -172,10 +173,31 @@ test("GitHub project detail recovers the latest durable draft PR without browser
     outputReference: `urn:sha256:${"3".repeat(64)}`,
     createdAt: "2026-08-31T12:00:00.000Z",
   };
-  repository.getLatestGitHubDraftPullRequestForProject = async (actor, projectId) => {
+  const githubWorkflow: WorkflowRunRecord = {
+    id: draftPullRequest.workflowRunId,
+    organizationId: owner.organizationId,
+    projectId: project.id,
+    sourceSnapshotId: draftPullRequest.sourceSnapshotId,
+    reviewedAnalysisRunId: analysis.id,
+    status: "succeeded",
+    currentPhase: "install_verify",
+    inputHash: "4".repeat(64),
+    version: 12,
+    createdAt: "2026-08-31T11:58:00.000Z",
+    updatedAt: "2026-08-31T12:00:00.000Z",
+  };
+  repository.getLatestGitHubDraftPullRequestForProject = async () => {
+    throw new Error("PROJECT_WIDE_PR_LOOKUP_MUST_NOT_SPLICE_WORKFLOWS");
+  };
+  repository.getLatestGitHubDraftPullRequest = async (actor, workflowRunId) => {
+    assert.equal(actor.organizationId, owner.organizationId);
+    assert.equal(workflowRunId, githubWorkflow.id);
+    return draftPullRequest;
+  };
+  repository.getLatestReviewedWorkflowForAnalysis = async (actor, projectId, analysisRunId) => {
     assert.equal(actor.organizationId, owner.organizationId);
     assert.equal(projectId, project.id);
-    return draftPullRequest;
+    return analysisRunId === analysis.id ? githubWorkflow : undefined;
   };
 
   const detail = await projectDetail(
@@ -199,6 +221,11 @@ test("GitHub project detail recovers the latest durable draft PR without browser
     merged: false,
     createdAt: "2026-08-31T12:00:00.000Z",
   });
+  assert.deepEqual(body.githubWorkflow, {
+    id: githubWorkflow.id,
+    status: "succeeded",
+    currentPhase: "install_verify",
+  });
 
   repository.getLatestAnalysis = async () => ({
     ...analysis,
@@ -213,7 +240,9 @@ test("GitHub project detail recovers the latest durable draft PR without browser
     { params: Promise.resolve({ projectId: project.id }) },
   );
   assert.equal(newerAnalysisDetail.status, 200);
-  assert.equal((await newerAnalysisDetail.json()).draftPullRequest, undefined);
+  const newerAnalysisBody = await newerAnalysisDetail.json();
+  assert.equal(newerAnalysisBody.draftPullRequest, undefined);
+  assert.equal(newerAnalysisBody.githubWorkflow, undefined);
 });
 
 test("project detail returns OpenAPI verification context as the authoritative source after refresh", async () => {

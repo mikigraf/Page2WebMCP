@@ -193,6 +193,7 @@ export type ReleaseInstallationGuide = Readonly<{
   selfHost: { required: boolean; guidance: string };
   previousRelease: null | { id: string; contentHash: string; integrity: string; artifactUrl: string };
   installed: boolean;
+  productionVerified: boolean;
   attestation: null | Readonly<{
     id: string;
     status: ReleaseInstallationRecord["status"];
@@ -273,6 +274,10 @@ export function buildReleaseInstallationGuide(
   const persistedAttestation = installation
     ? releaseInstallationProjection(release, installation)
     : null;
+  const productionVerified = identity.localOnly === false
+    && persistedAttestation?.status === "verified"
+    && persistedAttestation.webMcpImplementation === "native"
+    && verifierChainMatches(verification, installation);
   return {
     artifactUrl: identity.artifactUrl,
     downloadUrl: identity.downloadUrl,
@@ -299,8 +304,23 @@ export function buildReleaseInstallationGuide(
     } : null,
     installed: persistedAttestation?.status === "verified"
       && persistedAttestation.webMcpImplementation === "native",
+    productionVerified,
     attestation: persistedAttestation,
   };
+}
+
+function verifierChainMatches(
+  candidate: VerificationRecord,
+  installation: ReleaseInstallationRecord | undefined,
+): boolean {
+  const candidateIdentity = candidate.verifierIdentity;
+  const installationIdentity = installation?.verifierIdentity;
+  return candidate.verificationMode === "live"
+    && candidateIdentity?.mode === "live"
+    && installationIdentity?.mode === "live"
+    && candidateIdentity.protocolVersion === installationIdentity.protocolVersion
+    && candidateIdentity.webMcpImplementation === installationIdentity.webMcpImplementation
+    && candidateIdentity.verifierOriginDigest === installationIdentity.verifierOriginDigest;
 }
 
 function releaseInstallationProjection(
