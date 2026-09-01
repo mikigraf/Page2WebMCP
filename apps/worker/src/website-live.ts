@@ -196,6 +196,12 @@ function canonicalJson(value: unknown): string {
   return JSON.stringify(value);
 }
 
+function checkpointIdempotencyDigest(payload: Record<string, unknown>): string {
+  const checkpointIdentity = { ...payload };
+  delete checkpointIdentity.outcome;
+  return createHash("sha256").update(canonicalJson(checkpointIdentity), "utf8").digest("hex");
+}
+
 function same(value: unknown, expected: unknown): boolean {
   return canonicalJson(value) === canonicalJson(expected);
 }
@@ -584,7 +590,7 @@ export function createConfiguredWebsiteAnalysisAdapter(
     });
     const checkpointEnvelope = (operation: string, payload: Record<string, unknown>) => ({
       gatewayProtocolVersion: WEBSITE_LIVE_GATEWAY_PROTOCOL_VERSION,
-      idempotencyKey: `website:${source.id}:authentication:${operation}:${createHash("sha256").update(canonicalJson(payload), "utf8").digest("hex")}`,
+      idempotencyKey: `website:${source.id}:authentication:${operation}:${checkpointIdempotencyDigest(payload)}`,
       ownership: ownershipIdentity,
       ...payload,
     });
@@ -1063,7 +1069,12 @@ export function createConfiguredWebsiteAnalysisAdapter(
       if (primaryError === undefined && cleanupErrors.length > 0) throw new Error("WEBSITE_EGRESS_POLICY_CLEANUP_FAILED");
     }
   };
-  configuredAdapter.reconcileAuthenticationCheckpoint = async (source, waiting, reconcileSignal) => {
+  configuredAdapter.reconcileAuthenticationCheckpoint = async (
+    source,
+    waiting,
+    reconcileSignal,
+    outcome: "failed" | "cancelled" = "failed",
+  ) => {
     if (!source.id || !source.organizationId || !source.projectId) {
       throw new Error("WEBSITE_SOURCE_OWNERSHIP_REQUIRED");
     }
@@ -1079,11 +1090,11 @@ export function createConfiguredWebsiteAnalysisAdapter(
       sourceIdentityHash: waiting.sourceIdentityHash,
       targetOriginDigest: waiting.targetOriginDigest,
       expiresAt: waiting.expiresAt,
-      outcome: "failed",
+      outcome,
     };
     const request = {
       gatewayProtocolVersion: WEBSITE_LIVE_GATEWAY_PROTOCOL_VERSION,
-      idempotencyKey: `website:${source.id}:authentication:checkpoint-reconcile:${createHash("sha256").update(canonicalJson(payload), "utf8").digest("hex")}`,
+      idempotencyKey: `website:${source.id}:authentication:checkpoint-reconcile:${checkpointIdempotencyDigest(payload)}`,
       ownership: ownershipIdentity,
       ...payload,
     };

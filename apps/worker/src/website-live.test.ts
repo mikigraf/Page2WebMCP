@@ -847,6 +847,72 @@ test("website TTL secrets stay exact and authenticated sites return only a durab
   }, new AbortController().signal), /^Error: WEBSITE_CONTROL_RESPONSE_INVALID$/);
 });
 
+test("checkpoint terminal retries keep one gateway idempotency key across changed outcomes", async () => {
+  const harness = controlHarness({ requiresAuthentication: true });
+  const adapter = createConfiguredWebsiteAnalysisAdapter(environment(), {
+    controlTransport: harness.transport, clock: () => now, ...networkControls(harness.expiresAt),
+  });
+  const source = {
+    id: "analysis-run-terminal-retry", organizationId: "organization-1", projectId: "project-1",
+    sourceType: "website" as const, sourceUrl: "https://widgets.example/app",
+    sourceConfiguration: { kind: "website" as const }, sourceSnapshotId: "snapshot-terminal-retry", leaseGeneration: 1,
+  };
+  const waiting = await adapter(source, new AbortController().signal);
+  if (waiting.disposition !== "waiting_for_authentication") throw new Error("WAITING_OUTCOME_REQUIRED");
+  const resumedSource = {
+    ...source,
+    leaseGeneration: 2,
+    authenticationCheckpoint: {
+      checkpointReference: waiting.checkpointReference,
+      authenticationEvidenceReference: `urn:sha256:${"b".repeat(64)}`,
+      sourceSnapshotId: waiting.sourceSnapshotId,
+      sourceIdentityHash: waiting.sourceIdentityHash,
+      targetOriginDigest: waiting.targetOriginDigest,
+      expiresAt: waiting.expiresAt,
+    },
+  };
+
+  await adapter(resumedSource, new AbortController().signal);
+  await assert.rejects(
+    adapter(resumedSource, new AbortController().signal),
+    /^Error: WEBSITE_CONTROL_RESPONSE_INVALID$/,
+  );
+
+  for (const path of [
+    WEBSITE_LIVE_CONTROL_PATHS.authenticationCheckpointFinalize,
+    WEBSITE_LIVE_CONTROL_PATHS.authenticationCheckpointReconcile,
+  ]) {
+    const calls = harness.calls.filter(({ url }) => url.endsWith(path));
+    assert.deepEqual(calls.map(({ body }) => body.outcome), ["completed", "failed"]);
+    assert.equal(calls.length, 2);
+    assert.equal(calls[0]!.body.idempotencyKey, calls[1]!.body.idempotencyKey);
+  }
+});
+
+test("runtime checkpoint reconciliation forwards its terminal outcome under the stable gateway key", async () => {
+  const harness = controlHarness({ requiresAuthentication: true });
+  const adapter = createConfiguredWebsiteAnalysisAdapter(environment(), {
+    controlTransport: harness.transport, clock: () => now, ...networkControls(harness.expiresAt),
+  });
+  const source = {
+    id: "analysis-run-runtime-reconcile", organizationId: "organization-1", projectId: "project-1",
+    sourceType: "website" as const, sourceUrl: "https://widgets.example/app",
+    sourceConfiguration: { kind: "website" as const }, sourceSnapshotId: "snapshot-runtime-reconcile", leaseGeneration: 1,
+  };
+  const waiting = await adapter(source, new AbortController().signal);
+  if (waiting.disposition !== "waiting_for_authentication") throw new Error("WAITING_OUTCOME_REQUIRED");
+  assert.ok(adapter.reconcileAuthenticationCheckpoint);
+
+  await adapter.reconcileAuthenticationCheckpoint(source, waiting, new AbortController().signal, "failed");
+  await adapter.reconcileAuthenticationCheckpoint(source, waiting, new AbortController().signal, "cancelled");
+
+  const calls = harness.calls.filter(({ url }) =>
+    url.endsWith(WEBSITE_LIVE_CONTROL_PATHS.authenticationCheckpointReconcile));
+  assert.deepEqual(calls.map(({ body }) => body.outcome), ["failed", "cancelled"]);
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0]!.body.idempotencyKey, calls[1]!.body.idempotencyKey);
+});
+
 test("website live resume rejects a CDP reference outside the content-addressed suspension attestation", async () => {
   const harness = controlHarness({ requiresAuthentication: true, swappedResumeCdpReference: true });
   const adapter = createConfiguredWebsiteAnalysisAdapter(environment(), {
