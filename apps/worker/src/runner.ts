@@ -63,7 +63,8 @@ export async function processNextAnalysis(
     const analyze = options.analyze ?? testAnalysisAdapter;
     const outcome = await withDeadline(
       (signal) => analyze ? analyze(run, signal) : Promise.reject(new Error("ANALYZER_NOT_CONFIGURED")),
-      deadlineMs
+      deadlineMs,
+      isAuthenticationWait,
     );
     heartbeatController.abort();
     await heartbeat;
@@ -85,7 +86,6 @@ export async function processNextAnalysis(
             targetOriginDigest: outcome.targetOriginDigest,
           }), "utf8").digest("hex"),
         }, run.leaseGeneration);
-        await recordAnalysisOutcome(run.id, "success", run.sourceType, "WAITING_FOR_AUTHENTICATION", startedAt, run.attempts);
         return undefined;
       } catch (error) {
         try {
@@ -163,20 +163,38 @@ function boundedDuration(value: number | undefined, fallback: number, minimum: n
   return Math.min(Math.max(Math.floor(value), minimum), maximum);
 }
 
-async function withDeadline<T>(operation: (signal: AbortSignal) => Promise<T>, deadlineMs: number): Promise<T> {
+async function withDeadline<T>(
+  operation: (signal: AbortSignal) => Promise<T>,
+  deadlineMs: number,
+  acceptAfterAbort: (value: T) => boolean = () => false,
+): Promise<T> {
   const controller = new AbortController();
+  const deadlineError = new Error("ANALYSIS_DEADLINE_EXCEEDED");
   let timeout: ReturnType<typeof setTimeout> | undefined;
+  const operationSettlement = Promise.resolve().then(() => operation(controller.signal)).then(
+    (value) => ({ kind: "value" as const, value }),
+    (error: unknown) => ({ kind: "error" as const, error }),
+  );
   try {
-    return await Promise.race([
-      Promise.resolve().then(() => operation(controller.signal)),
-      new Promise<T>((_, reject) => {
+    const first = await Promise.race([
+      operationSettlement,
+      new Promise<{ kind: "deadline" }>((resolve) => {
         timeout = setTimeout(() => {
-          const error = new Error("ANALYSIS_DEADLINE_EXCEEDED");
-          controller.abort(error);
-          reject(error);
+          controller.abort(deadlineError);
+          resolve({ kind: "deadline" });
         }, deadlineMs);
-      })
+      }),
     ]);
+    if (first.kind === "value") return first.value;
+    if (first.kind === "error") throw first.error;
+
+    // Abort initiates provider reconciliation. Keep the lease alive until that
+    // path settles so the runner cannot transition the durable job underneath
+    // cleanup. A suspension attested during the boundary race is still safe to
+    // commit; ordinary work remains bounded by the original deadline.
+    const afterAbort = await operationSettlement;
+    if (afterAbort.kind === "value" && acceptAfterAbort(afterAbort.value)) return afterAbort.value;
+    throw deadlineError;
   } finally {
     if (timeout) clearTimeout(timeout);
   }

@@ -111,6 +111,52 @@ test("analysis deadline aborts work and returns the durable job to the bounded r
   assert.equal(completed?.errorCode, "ANALYSIS_DEADLINE_EXCEEDED");
 });
 
+test("analysis deadline awaits aborted cleanup and preserves an attested authentication suspension", async () => {
+  const repository = new InMemoryControlPlaneRepository(() => new Date("2026-09-01T12:00:00.000Z"));
+  const { project, run } = await enqueue(repository, "website", "https://widgets.example/");
+  let observeAbort!: () => void;
+  const abortObserved = new Promise<void>((resolve) => { observeAbort = resolve; });
+  let releaseCleanup!: () => void;
+  const cleanupReleased = new Promise<void>((resolve) => { releaseCleanup = resolve; });
+  let cleanupFinished = false;
+  let processingSettled = false;
+
+  const processing = processNextAnalysis(repository, {
+    workerId: "deadline-authentication-worker",
+    deadlineMs: 10,
+    heartbeatMs: 10,
+    analyze: async (source, signal) => new Promise((resolve) => {
+      signal.addEventListener("abort", async () => {
+        observeAbort();
+        await cleanupReleased;
+        cleanupFinished = true;
+        resolve({
+          disposition: "waiting_for_authentication" as const,
+          capabilities: [] as [], diagnostics: [] as [], evidence: [] as [],
+          checkpointReference: `urn:sha256:${"d".repeat(64)}`,
+          sourceSnapshotId: source.sourceSnapshotId,
+          sourceIdentityHash: computeSourceIdentityHash("website", "https://widgets.example/", { kind: "website" }),
+          targetOriginDigest: createHash("sha256").update("https://widgets.example").digest("hex"),
+          expiresAt: "2026-09-01T12:09:00.000Z",
+        });
+      }, { once: true });
+    }),
+  });
+  void processing.finally(() => { processingSettled = true; });
+
+  await abortObserved;
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const settledBeforeCleanup = processingSettled;
+  releaseCleanup();
+  const result = await processing;
+
+  assert.equal(settledBeforeCleanup, false);
+  assert.equal(cleanupFinished, true);
+  assert.equal(result, undefined);
+  assert.equal((await repository.getLatestAnalysis(owner, project.id))?.status, "waiting");
+  assert.equal((await repository.getWebsiteAuthenticationWait(owner, run.id))?.state, "waiting");
+});
+
 test("worker retries only the stable transient website control classification", async () => {
   for (const [code, status] of [
     ["WEBSITE_CONTROL_RETRYABLE", "queued"],
@@ -219,6 +265,37 @@ test("worker atomically waits without completing or failing and a fresh worker r
   assert.equal(completed?.status, "succeeded");
   assert.equal(completes, 1);
   assert.equal(failures, 0);
+});
+
+test("durable authentication suspension does not emit a successful analysis completion", async () => {
+  const repository = new InMemoryControlPlaneRepository(() => new Date("2026-09-01T12:00:00.000Z"));
+  const { project, run } = await enqueue(repository, "website", "https://widgets.example/");
+  const emitted: Array<Record<string, unknown>> = [];
+  const originalInfo = console.info;
+  console.info = (value?: unknown) => {
+    if (typeof value !== "string") return;
+    try { emitted.push(JSON.parse(value) as Record<string, unknown>); } catch { /* unrelated output */ }
+  };
+  try {
+    await processNextAnalysis(repository, {
+      workerId: "authentication-observation-worker",
+      analyze: async (source) => ({
+        disposition: "waiting_for_authentication" as const,
+        capabilities: [] as [], diagnostics: [] as [], evidence: [] as [],
+        checkpointReference: `urn:sha256:${"e".repeat(64)}`,
+        sourceSnapshotId: source.sourceSnapshotId,
+        sourceIdentityHash: computeSourceIdentityHash("website", "https://widgets.example/", { kind: "website" }),
+        targetOriginDigest: createHash("sha256").update("https://widgets.example").digest("hex"),
+        expiresAt: "2026-09-01T12:09:00.000Z",
+      }),
+    });
+  } finally {
+    console.info = originalInfo;
+  }
+
+  assert.equal((await repository.getLatestAnalysis(owner, project.id))?.status, "waiting");
+  assert.equal((await repository.getWebsiteAuthenticationWait(owner, run.id))?.state, "waiting");
+  assert.deepEqual(emitted.filter((record) => record.event === "analysis_completed" && record.request_id === run.id), []);
 });
 
 test("worker reconciles an externally created checkpoint when the database wait commit fails", async () => {
