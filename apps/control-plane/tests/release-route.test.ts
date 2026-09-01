@@ -869,7 +869,7 @@ test("project recovery omits an intentionally preserved legacy release identity 
 });
 
 test("release guides preserve local-only and the previous persisted Storage URL", async () => {
-  let instant = Date.parse("2026-08-31T10:00:00.000Z");
+  let instant = Date.now();
   const repository = new InMemoryControlPlaneRepository(() => new Date(instant++));
   installTestRepository(repository);
   const { project, run } = await fixture(repository);
