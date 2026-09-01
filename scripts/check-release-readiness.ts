@@ -330,8 +330,8 @@ function inspectControls(environment: Environment, mode: Exclude<ReadinessMode, 
 }> {
   const invalid = new Set<string>();
   if (environment.PAGE2WEBMCP_STORAGE_MODE !== "postgres") invalid.add("PAGE2WEBMCP_STORAGE_MODE");
-  if (!exactDatabaseUrl(environment.DATABASE_URL, mode)) invalid.add("DATABASE_URL");
-  if (!exactDatabaseUrl(environment.PAGE2WEBMCP_MAINTENANCE_DATABASE_URL, mode)) {
+  if (!exactDatabaseUrl(environment.DATABASE_URL, mode, "application")) invalid.add("DATABASE_URL");
+  if (!exactDatabaseUrl(environment.PAGE2WEBMCP_MAINTENANCE_DATABASE_URL, mode, "maintenance")) {
     invalid.add("PAGE2WEBMCP_MAINTENANCE_DATABASE_URL");
   }
   if (!boundedSecret(environment.PAGE2WEBMCP_RELEASE_VERIFIER_TOKEN)) {
@@ -439,6 +439,7 @@ function exactLocalControlOrigin(value: string | undefined): value is string {
 function exactDatabaseUrl(
   value: string | undefined,
   mode: Exclude<ReadinessMode, "hermetic">,
+  purpose: "application" | "maintenance",
 ): value is string {
   if (!value || value.length < 32 || value.length > 4_096 || value.trim() !== value || /[\r\n]/.test(value)) {
     return false;
@@ -447,10 +448,18 @@ function exactDatabaseUrl(
     const parsed = new URL(value);
     const loopback = parsed.hostname === "127.0.0.1" || parsed.hostname === "[::1]";
     const canonicalLocal = loopback && parsed.port === "58322";
+    const expectedLocalIdentity = purpose === "application"
+      ? { login: "page2webmcp_app_local", role: "page2webmcp_app" }
+      : { login: "page2webmcp_maintenance_local", role: "page2webmcp_maintenance" };
+    const canonicalLocalRole = parsed.username === expectedLocalIdentity.login
+      && parsed.searchParams.size === 1
+      && parsed.searchParams.get("options") === `-c role=${expectedLocalIdentity.role}`;
     return (parsed.protocol === "postgresql:" || parsed.protocol === "postgres:")
       && parsed.username.length > 0 && parsed.password.length > 0
-      && parsed.pathname.length > 1 && !parsed.hash && !parsed.search
-      && (mode === "local-live" ? canonicalLocal : !loopback);
+      && parsed.pathname.length > 1 && !parsed.hash
+      && (mode === "local-live"
+        ? canonicalLocal && canonicalLocalRole
+        : !loopback && !parsed.search);
   } catch { return false; }
 }
 

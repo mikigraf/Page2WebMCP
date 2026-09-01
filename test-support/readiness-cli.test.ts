@@ -49,10 +49,10 @@ function completeEnvironment(mode: "live" | "local-live" = "live") {
     PAGE2WEBMCP_READINESS_RELEASE_HASH: selectedHash,
     DATABASE_URL: mode === "live"
       ? "postgresql://app:secret@database.example/page2webmcp"
-      : "postgresql://app:secret@127.0.0.1:58322/page2webmcp",
+      : "postgresql://page2webmcp_app_local:secret@127.0.0.1:58322/postgres?options=-c+role%3Dpage2webmcp_app",
     PAGE2WEBMCP_MAINTENANCE_DATABASE_URL: mode === "live"
       ? "postgresql://readiness:secret@database.example/page2webmcp"
-      : "postgresql://readiness:secret@127.0.0.1:58322/page2webmcp",
+      : "postgresql://page2webmcp_maintenance_local:secret@127.0.0.1:58322/postgres?options=-c+role%3Dpage2webmcp_maintenance",
     PAGE2WEBMCP_RELEASE_VERIFIER_TOKEN: "v".repeat(32),
     ...(mode === "live" ? {
       PAGE2WEBMCP_RELEASE_VERIFIER_ORIGIN: "https://verifier.example",
@@ -215,8 +215,10 @@ test("local-live databases require exact IP-literal loopback port 58322", async 
   }
 
   const ipv6 = completeEnvironment("local-live");
-  ipv6.DATABASE_URL = "postgresql://app:secret@[::1]:58322/page2webmcp";
-  ipv6.PAGE2WEBMCP_MAINTENANCE_DATABASE_URL = "postgresql://readiness:secret@[::1]:58322/page2webmcp";
+  ipv6.DATABASE_URL =
+    "postgresql://page2webmcp_app_local:secret@[::1]:58322/postgres?options=-c+role%3Dpage2webmcp_app";
+  ipv6.PAGE2WEBMCP_MAINTENANCE_DATABASE_URL =
+    "postgresql://page2webmcp_maintenance_local:secret@[::1]:58322/postgres?options=-c+role%3Dpage2webmcp_maintenance";
   ipv6.PAGE2WEBMCP_READINESS_RELEASE_HASH = "A".repeat(64);
   assert.equal((await runReadinessCli(["--local-live"], ipv6, dependencies([], true))).output.code,
     "LIVE_INSTALLATION_EVIDENCE_REQUIRED");
