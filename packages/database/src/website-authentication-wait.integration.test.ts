@@ -12,11 +12,10 @@ import {
 } from "./control-plane.ts";
 import { createPostgresRepository } from "./postgres.ts";
 
-const connectionString = process.env.PAGE2WEBMCP_TEST_DATABASE_URL;
 const explicitApplicationConnectionString = process.env.PAGE2WEBMCP_TEST_APP_DATABASE_URL;
 const explicitWorkerConnectionString = process.env.PAGE2WEBMCP_TEST_WORKER_DATABASE_URL;
-const applicationConnectionString = explicitApplicationConnectionString ?? connectionString;
-const workerConnectionString = explicitWorkerConnectionString ?? connectionString;
+const applicationConnectionString = explicitApplicationConnectionString;
+const workerConnectionString = explicitWorkerConnectionString;
 const adminConnectionString = process.env.PAGE2WEBMCP_TEST_ADMIN_DATABASE_URL;
 const owner: RepositoryActor = {
   id: "11111111-1111-1111-1111-111111111111",
