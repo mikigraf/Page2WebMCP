@@ -31,6 +31,31 @@ const HASH = /^[0-9a-f]{64}$/;
 const MAX_ARTIFACT_BYTES = 65_536;
 const ARTIFACT_TIMEOUT_MS = 10_000;
 const PROVIDER_PROBE_TIMEOUT_MS = 10_000;
+const CURRENT_MIGRATION_LEDGER = [
+  "20260826000000_page2webmcp.sql",
+  "20260829074144_durable_control_plane.sql",
+  "20260829090000_harden_control_plane.sql",
+  "20260829092023_bounded_retention_cleanup.sql",
+  "20260829094207_preserve_analysis_source_candidates.sql",
+  "20260829100000_capability_plan_authorization.sql",
+  "20260830094622_trusted_release_installations.sql",
+  "20260830120000_phased_workflow_substrate.sql",
+  "20260830160000_supabase_auth_identity.sql",
+  "20260830180000_github_workflow_binding.sql",
+  "20260830190000_workflow_event_observability.sql",
+  "20260831090000_source_configuration.sql",
+  "20260831100000_release_artifact_storage.sql",
+  "20260831110000_release_artifact_identity.sql",
+  "20260831111000_openapi_test_page_no_query.sql",
+  "20260831120000_live_readiness_attestation.sql",
+  "20260831211329_installed_execution_evidence.sql",
+  "20260901000000_selected_provider_probe_context.sql",
+  "20260901010000_single_installation_proof.sql",
+  "20260901020000_durable_result_surfaces.sql",
+  "20260901030000_analysis_source_lock.sql",
+  "20260901040000_analysis_source_lock_readiness.sql",
+  "20260901060852_alternate_canonical_local_supabase_topology.sql",
+] as const;
 
 type Environment = Readonly<Record<string, string | undefined>>;
 type Output = Readonly<{
@@ -356,12 +381,7 @@ async function localFacts() {
   ), "utf8");
   return {
     versionDrift: checkPackageVersionDrift(packageJson),
-    migrationsCurrent: migrations.includes("20260831211329_installed_execution_evidence.sql")
-      && migrations.includes("20260901000000_selected_provider_probe_context.sql")
-      && migrations.includes("20260901010000_single_installation_proof.sql")
-      && migrations.includes("20260901020000_durable_result_surfaces.sql")
-      && migrations.includes("20260901030000_analysis_source_lock.sql")
-      && migrations.includes("20260901040000_analysis_source_lock_readiness.sql"),
+    migrationsCurrent: sourceMigrationLedgerCurrent(migrations),
     rlsVerified: /selected_native_installation_proof/i.test(singleInstallationProof)
       && /confirmed_mutation_effect_count\s*=\s*1/i.test(singleInstallationProof)
       && /grant execute[^;]+page2webmcp_maintenance/is.test(singleInstallationProof)
@@ -375,6 +395,12 @@ async function localFacts() {
       && /page2webmcp_maintenance/is.test(analysisSourceLockReadiness)
       && /force row level security/i.test(task6),
   };
+}
+
+export function sourceMigrationLedgerCurrent(migrations: readonly string[]): boolean {
+  const ledger = migrations.filter((name) => /^\d{14}_[a-z0-9_]+\.sql$/.test(name)).sort();
+  return ledger.length === CURRENT_MIGRATION_LEDGER.length
+    && ledger.every((name, index) => name === CURRENT_MIGRATION_LEDGER[index]);
 }
 
 function boundedSecret(value: string | undefined): value is string {
@@ -416,10 +442,11 @@ function exactDatabaseUrl(
   try {
     const parsed = new URL(value);
     const loopback = parsed.hostname === "127.0.0.1" || parsed.hostname === "[::1]";
+    const canonicalLocal = loopback && parsed.port === "58322";
     return (parsed.protocol === "postgresql:" || parsed.protocol === "postgres:")
       && parsed.username.length > 0 && parsed.password.length > 0
       && parsed.pathname.length > 1 && !parsed.hash && !parsed.search
-      && (mode === "local-live" ? loopback : !loopback);
+      && (mode === "local-live" ? canonicalLocal : !loopback);
   } catch { return false; }
 }
 

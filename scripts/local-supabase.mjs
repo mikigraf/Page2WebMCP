@@ -3,7 +3,7 @@ import { readdir } from "node:fs/promises";
 import { resolve } from "node:path";
 import { bootstrapLocalRuntimeRoles, validateOwnerDatabaseUrl } from "./local-runtime-roles.mjs";
 
-const REQUIRED_MIGRATION = "20260830190000";
+const REQUIRED_MIGRATION = "20260901060852";
 const PINNED_SUPABASE_VERSION = "2.116.0";
 const MAX_COMMAND_OUTPUT_BYTES = 65_536;
 const commands = {

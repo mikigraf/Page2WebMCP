@@ -62,13 +62,35 @@ test("runtime role helper is import-only and local-supabase remains the executab
   }
 });
 
+test("local lifecycle rejects an old-only migration ledger before constructing the CLI", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "page2webmcp-local-old-ledger-"));
+  try {
+    await mkdir(join(directory, "supabase/migrations"), { recursive: true });
+    await writeFile(
+      join(directory, "supabase/migrations/20260830190000_workflow_event_observability.sql"),
+      "-- old-only fixture\n",
+    );
+    const result = await run("scripts/local-supabase.mjs", ["status"], directory, {
+      PATH: "/usr/bin:/bin",
+    });
+    assert.equal(result.code, 2);
+    assert.equal(result.stdout, "");
+    assert.equal(result.stderr, "LOCAL_MIGRATION_LEDGER_INCOMPLETE\n");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("local status verifies the pinned CLI, parses machine env output, and never prints status credentials", async () => {
   const directory = await mkdtemp(join(tmpdir(), "page2webmcp-local-status-"));
   const bin = join(directory, "bin");
   const log = join(directory, "pnpm-arguments.log");
   try {
     await mkdir(join(directory, "supabase/migrations"), { recursive: true });
-    await writeFile(join(directory, "supabase/migrations/20260830190000_workflow_event_observability.sql"), "-- fixture\n");
+    await writeFile(join(
+      directory,
+      "supabase/migrations/20260901060852_alternate_canonical_local_supabase_topology.sql",
+    ), "-- fixture\n");
     await mkdir(bin);
     const fakePnpm = join(bin, "pnpm");
     await writeFile(fakePnpm, `#!/bin/sh
@@ -110,7 +132,10 @@ test("local lifecycle fails closed before stack commands when the executable ver
   const log = join(directory, "pnpm-arguments.log");
   try {
     await mkdir(join(directory, "supabase/migrations"), { recursive: true });
-    await writeFile(join(directory, "supabase/migrations/20260830190000_workflow_event_observability.sql"), "-- fixture\n");
+    await writeFile(join(
+      directory,
+      "supabase/migrations/20260901060852_alternate_canonical_local_supabase_topology.sql",
+    ), "-- fixture\n");
     await mkdir(bin);
     const fakePnpm = join(bin, "pnpm");
     await writeFile(fakePnpm, `#!/bin/sh

@@ -1,12 +1,14 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
+import { readdir } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import test from "node:test";
 import {
   parseReadinessMode,
   runReadinessCli,
+  sourceMigrationLedgerCurrent,
   type ReadinessCliDependencies,
 } from "../scripts/check-release-readiness.ts";
 
@@ -192,6 +194,56 @@ test("missing live controls are sorted names only, never values", async () => {
     assert.equal(output.liveSuccess, false);
     return true;
   });
+});
+
+test("local-live databases require exact IP-literal loopback port 58322", async () => {
+  const invalid = [
+    "postgresql://app:secret@127.0.0.1:54322/page2webmcp",
+    ...[58320, 58321, 58323, 58324, 58325, 58326, 58327, 58328, 58329]
+      .map((port) => `postgresql://app:secret@127.0.0.1:${port}/page2webmcp`),
+    "postgresql://app:secret@localhost:58322/page2webmcp",
+    "postgresql://app:secret@127.0.0.2:58322/page2webmcp",
+  ];
+  for (const key of ["DATABASE_URL", "PAGE2WEBMCP_MAINTENANCE_DATABASE_URL"] as const) {
+    for (const value of invalid) {
+      const environment = { ...completeEnvironment("local-live"), [key]: value };
+      assert.deepEqual(await runReadinessCli(["--local-live"], environment, dependencies([], true)), {
+        output: { status: "skipped", code: "LIVE_CONTROLS_REQUIRED", liveSuccess: false, missingKeys: [key] },
+        exitCode: 2,
+      });
+    }
+  }
+
+  const ipv6 = completeEnvironment("local-live");
+  ipv6.DATABASE_URL = "postgresql://app:secret@[::1]:58322/page2webmcp";
+  ipv6.PAGE2WEBMCP_MAINTENANCE_DATABASE_URL = "postgresql://readiness:secret@[::1]:58322/page2webmcp";
+  ipv6.PAGE2WEBMCP_READINESS_RELEASE_HASH = "A".repeat(64);
+  assert.equal((await runReadinessCli(["--local-live"], ipv6, dependencies([], true))).output.code,
+    "LIVE_INSTALLATION_EVIDENCE_REQUIRED");
+
+  const live = completeEnvironment();
+  live.DATABASE_URL = "postgresql://app:secret@database.example:6432/page2webmcp";
+  live.PAGE2WEBMCP_MAINTENANCE_DATABASE_URL =
+    "postgresql://readiness:secret@database.example:6432/page2webmcp";
+  live.PAGE2WEBMCP_READINESS_RELEASE_HASH = "A".repeat(64);
+  assert.equal((await runReadinessCli(["--live"], live, dependencies([]))).output.code,
+    "LIVE_INSTALLATION_EVIDENCE_REQUIRED");
+});
+
+test("source readiness requires the complete migration ledger through the alternate topology", async () => {
+  const migrations = await readdir(new URL("../supabase/migrations/", import.meta.url));
+  assert.equal(sourceMigrationLedgerCurrent(migrations), true);
+  assert.equal(sourceMigrationLedgerCurrent(
+    migrations.filter((name) => name !== "20260901060852_alternate_canonical_local_supabase_topology.sql"),
+  ), false);
+  assert.equal(sourceMigrationLedgerCurrent([
+    "20260831211329_installed_execution_evidence.sql",
+    "20260901000000_selected_provider_probe_context.sql",
+    "20260901010000_single_installation_proof.sql",
+    "20260901020000_durable_result_surfaces.sql",
+    "20260901030000_analysis_source_lock.sql",
+    "20260901040000_analysis_source_lock_readiness.sql",
+  ]), false);
 });
 
 test("a provider constructor failure never emits the inspection success code", async () => {
