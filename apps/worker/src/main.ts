@@ -60,6 +60,7 @@ export async function runProductionWorker(
       throw error;
     }
     (dependencies.validateConfiguration ?? validateWorkerRuntimeConfiguration)(environment);
+    if (provider.startupProbe) await provider.startupProbe(signal);
     repository = (dependencies.getRepository ?? getControlPlaneRepository)();
     const runtime = (dependencies.createRuntime ?? createProductionWorkerRuntimeFromProvider)(repository, provider);
     await (dependencies.registerObservability ?? registerObservability)();

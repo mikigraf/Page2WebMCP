@@ -28,6 +28,7 @@ import {
   type ClaimedAnalysisRunRecord,
   type ControlPlaneRepository,
   type CreateProjectRequest,
+  type EnqueueAnalysisRequest,
   type AuthenticatedIdentity,
   type IdempotentRequest,
   type GitHubDraftPullRequestRecord,
@@ -47,6 +48,7 @@ import {
   type VerificationRequest,
   type WorkflowExecutionMaterial,
 } from "./control-plane.ts";
+import { computeSourceIdentityHash } from "./source-identity.ts";
 import {
   WORKFLOW_DEFAULT_ACTIVE_TASK_QUOTA,
   WORKFLOW_LEASE_MS,
@@ -291,7 +293,7 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
         "insert into public.source_snapshots " +
         "(organization_id, project_id, project_source_id, source_identity_hash, is_fixture) values ($1, $2, $3, $4, false)",
         [actor.organizationId, id, source.rows[0].id,
-          stableHash(sourceIdentityMaterial(input.sourceType, input.url, sourceConfiguration))]
+          computeSourceIdentityHash(input.sourceType, input.url, sourceConfiguration)]
       );
       await this.#audit(client, actor, "project.created", id);
       return mapProject(result.rows[0]);
@@ -365,7 +367,27 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
     });
   }
 
-  async enqueueAnalysis(actor: RepositoryActor, input: IdempotentRequest): Promise<AnalysisRunRecord> {
+  async getAnalysisReplay(actor: RepositoryActor, input: IdempotentRequest): Promise<AnalysisRunRecord | undefined> {
+    if (actor.role === "viewer") throw new RepositoryError("FORBIDDEN");
+    return this.#transaction({ kind: "app", actor }, async (client) => {
+      const project = await this.#project(client, actor, input.projectId);
+      const existing = await client.query(
+        "select input_hash, result_id from private.idempotency_keys " +
+        "where organization_id = $1 and actor_id = $2 and operation = 'analysis' and idempotency_key = $3 " +
+        "and expires_at > now() limit 1",
+        [actor.organizationId, actor.id, input.idempotencyKey],
+      );
+      if (!existing.rows[0]) return undefined;
+      if (String(existing.rows[0].input_hash) !== input.inputHash) {
+        throw new RepositoryError("IDEMPOTENCY_CONFLICT");
+      }
+      const replay = await this.#analysis(client, actor, String(existing.rows[0].result_id));
+      if (replay.projectId !== project.id) throw new RepositoryError("INVALID_STATE");
+      return replay;
+    });
+  }
+
+  async enqueueAnalysis(actor: RepositoryActor, input: EnqueueAnalysisRequest): Promise<AnalysisRunRecord> {
     if (actor.role === "viewer") throw new RepositoryError("FORBIDDEN");
     return this.#transaction({ kind: "app", actor }, async (client) => {
       const project = await this.#project(client, actor, input.projectId);
@@ -377,28 +399,33 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
         return replay;
       }
       const result = await client.query(
+        "with selected_source as (" +
+        "select * from private.lock_active_analysis_source($2, $1, $3, $4, $5)), " +
+        "inserted_run as (" +
         "insert into public.analysis_runs " +
         "(id, organization_id, project_id, requested_by, status, attempts) " +
-        "values ($1, $2, $3, $4, 'queued', 0) " +
-        "returning id, organization_id, project_id, requested_by, status, attempts, error_code, created_at, updated_at",
-        [runId, actor.organizationId, project.id, actor.id]
+        "select $6, $2, $1, $7, 'queued', 0 from selected_source " +
+        "returning id, organization_id, project_id, requested_by, status, attempts, error_code, created_at, updated_at) " +
+        "select inserted_run.*, selected_source.source_snapshot_id, selected_source.project_source_id, " +
+        "selected_source.source_identity_hash, selected_source.source_type, selected_source.source_url, " +
+        "selected_source.source_configuration from inserted_run cross join selected_source",
+        [project.id, actor.organizationId,
+          input.expectedSource?.projectSourceId ?? null,
+          input.expectedSource?.sourceSnapshotId ?? null,
+          input.expectedSource?.sourceIdentityHash ?? null,
+          runId, actor.id]
       );
-      const snapshot = await client.query(
-        "select snapshot.id, source.source_type, source.source_url, source.source_configuration from public.source_snapshots snapshot " +
-        "join public.project_sources source on source.id = snapshot.project_source_id " +
-        "where source.project_id = $1 and source.organization_id = $2 and source.active " +
-        "order by snapshot.created_at desc, snapshot.id limit 1",
-        [project.id, actor.organizationId]
-      );
-      if (!snapshot.rows[0]) throw new RepositoryError("INVALID_STATE");
+      if (!result.rows[0]) {
+        throw new RepositoryError(input.expectedSource ? "SOURCE_SNAPSHOT_STALE" : "INVALID_STATE");
+      }
       const sourceConfiguration = parsePersistedSourceConfiguration(
-        snapshot.rows[0].source_type as SourceType,
-        snapshot.rows[0].source_configuration as SourceConfiguration,
+        result.rows[0].source_type as SourceType,
+        result.rows[0].source_configuration as SourceConfiguration,
       );
       await client.query(
         "insert into private.analysis_jobs (analysis_run_id, organization_id, source_type, source_url, source_configuration) " +
         "values ($1, $2, $3, $4, $5::jsonb)",
-        [runId, actor.organizationId, snapshot.rows[0].source_type, snapshot.rows[0].source_url,
+        [runId, actor.organizationId, result.rows[0].source_type, result.rows[0].source_url,
           JSON.stringify(sourceConfiguration)]
       );
       const workflowInputHash = stableHash(input.inputHash);
@@ -406,7 +433,7 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
         "insert into public.workflow_runs " +
         "(id, organization_id, project_id, source_snapshot_id, analysis_run_id, status, current_phase, input_hash) " +
         "values ($1, $2, $3, $4, $1, 'queued', 'analysis', $5)",
-        [runId, actor.organizationId, project.id, snapshot.rows[0].id, workflowInputHash]
+        [runId, actor.organizationId, project.id, result.rows[0].source_snapshot_id, workflowInputHash]
       );
       const task = await client.query(
         "insert into private.workflow_tasks " +
@@ -2843,12 +2870,6 @@ function workflowTaskEventPayload(input: WorkflowTaskEventInput): WorkflowTaskEv
 function workflowTaskIdempotencyKey(runId: string, phase: WorkflowTaskRecord["phase"], inputHash: string): string {
   const normalizedHash = stableHash(inputHash);
   return `wft_${stableHash(`${runId.length}:${runId}:${phase.length}:${phase}:${normalizedHash}`)}`;
-}
-
-function sourceIdentityMaterial(sourceType: string, sourceUrl: string, sourceConfiguration: SourceConfiguration): string {
-  const configuration = canonicalJson(sourceConfiguration);
-  return `${Buffer.byteLength(sourceType)}:${sourceType}:${Buffer.byteLength(sourceUrl)}:${sourceUrl}:`
-    + `${Buffer.byteLength(configuration)}:${configuration}`;
 }
 
 function assertWorkflowWorkerId(workerId: string): void {

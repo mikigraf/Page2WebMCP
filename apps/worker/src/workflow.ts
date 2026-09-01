@@ -19,7 +19,6 @@ import {
   type WebsiteProviderControls,
 } from "../../../packages/providers/src/website.ts";
 import {
-  awaitWebsiteAuthentication,
   withBrowserUseCloudV4Session,
   type BrowserUseCloudV4Controls,
   type WebsiteAuthControls,
@@ -50,7 +49,8 @@ export type OpenApiAnalysisConfiguration = Readonly<{
 
 export type AnalysisSource = Pick<ClaimedAnalysisRunRecord, "sourceType" | "sourceUrl">
   & Partial<Pick<ClaimedAnalysisRunRecord,
-    "id" | "organizationId" | "projectId" | "sourceConfiguration" | "leaseGeneration">>;
+    "id" | "organizationId" | "projectId" | "sourceConfiguration" | "leaseGeneration">>
+  & Readonly<{ sourceIdentityHash?: string }>;
 export type AnalysisAdapter = (source: AnalysisSource, signal: AbortSignal) => Promise<AnalysisResult>;
 
 export type GitHubAnalysisConfiguration = Readonly<{
@@ -73,6 +73,16 @@ export type WebsiteAnalysisConfiguration = Readonly<{
   clock?: () => Date;
   provider: Omit<WebsiteProviderControls, "signal">;
   ownership: Readonly<{
+    attestations: {
+      consume(input: Readonly<{
+        organizationId: string;
+        projectId: string;
+        runId: string;
+        sourceIdentityHash: string;
+        sourceUrl: string;
+        targetOrigin: string;
+      }>): Promise<Readonly<{ bound: true; challengeDigest: string }>>;
+    };
     challenges: {
       load(input: Readonly<{
         organizationId: string;
@@ -254,7 +264,8 @@ function assertWebsiteControls(configuration: WebsiteAnalysisConfiguration): voi
   if (!configuration?.provider?.resolver || typeof configuration.provider.resolver.resolve !== "function"
     || typeof configuration.provider.resolver.resolveTxt !== "function" || !configuration.provider.transport
     || typeof configuration.provider.transport.request !== "function" || !configuration.provider.hostedScriptOrigin
-    || !configuration.ownership?.challenges || typeof configuration.ownership.challenges.load !== "function"
+    || !configuration.ownership?.attestations || typeof configuration.ownership.attestations.consume !== "function"
+    || !configuration.ownership.challenges || typeof configuration.ownership.challenges.load !== "function"
     || !configuration.ownership.replayStore || typeof configuration.ownership.replayStore.consume !== "function"
     || !configuration.browser?.controls || !configuration.browser.proxyPolicyReference || !configuration.browser.expiresAt
     || !configuration.explorer || typeof configuration.explorer.observe !== "function"
@@ -304,16 +315,32 @@ export function createWebsiteAnalysisAdapter(configuration: WebsiteAnalysisConfi
   return async (source, signal) => {
     if (source.sourceType !== "website") throw new Error("SOURCE_TYPE_UNSUPPORTED");
     if (!source.organizationId || !source.projectId || !source.id) throw new Error("WEBSITE_SOURCE_OWNERSHIP_REQUIRED");
+    if (!source.sourceIdentityHash || !/^[0-9a-f]{64}$/.test(source.sourceIdentityHash)) {
+      throw new Error("WEBSITE_SOURCE_ATTESTATION_REQUIRED");
+    }
     const organizationId = source.organizationId;
     const projectId = source.projectId;
     const runId = source.id;
     const preflight = await preflightWebsiteSource(source.sourceUrl, { ...configuration.provider, signal });
+    const attestation = await configuration.ownership.attestations.consume({
+      organizationId,
+      projectId,
+      runId,
+      sourceIdentityHash: source.sourceIdentityHash,
+      sourceUrl: source.sourceUrl,
+      targetOrigin: preflight.targetOrigin,
+    });
+    if (attestation?.bound !== true || !/^[0-9a-f]{64}$/.test(attestation.challengeDigest)) {
+      throw new Error("WEBSITE_SOURCE_ATTESTATION_REQUIRED");
+    }
     const ownershipChallenge = await configuration.ownership.challenges.load({
       organizationId,
       projectId,
       runId,
       targetOrigin: preflight.targetOrigin,
     });
+    if (createHash("sha256").update(ownershipChallenge.token, "utf8").digest("hex")
+      !== attestation.challengeDigest) throw new Error("WEBSITE_SOURCE_ATTESTATION_MISMATCH");
     if (ownershipChallenge.targetOrigin !== preflight.targetOrigin) throw new Error("OWNERSHIP_ORIGIN_MISMATCH");
     const ownership = await verifyWebsiteOwnership(ownershipChallenge, {
       ...configuration.provider,
@@ -343,30 +370,12 @@ export function createWebsiteAnalysisAdapter(configuration: WebsiteAnalysisConfi
       if (!first || !first.observations || typeof first.requiresAuthentication !== "boolean") {
         throw new Error("WEBSITE_EXPLORER_RESPONSE_INVALID");
       }
-      let authEvidence: Awaited<ReturnType<typeof awaitWebsiteAuthentication>> | undefined;
-      let second: Awaited<ReturnType<WebsiteAnalysisConfiguration["explorer"]["observe"]>> | undefined;
       if (first.requiresAuthentication) {
-        if (!configuration.authentication?.store) throw new Error("AUTH_HANDOFF_CONTROLS_REQUIRED");
-        authEvidence = await awaitWebsiteAuthentication({
-          organizationId,
-          projectId,
-          runId,
-          targetOrigin: preflight.targetOrigin,
-          liveReference: session.liveReference,
-          expiresAt: session.expiresAt,
-        }, { store: configuration.authentication.store, clock: configuration.clock, signal: sessionSignal });
-        second = await configuration.explorer.observe({
-          phase: "authenticated",
-          targetOrigin: preflight.targetOrigin,
-          sourceUrl: preflight.finalUrl,
-          cdpReference: session.cdpReference,
-          firewall,
-          signal: sessionSignal,
-        });
-        if (!second || !second.observations || typeof second.requiresAuthentication !== "boolean") {
-          throw new Error("WEBSITE_EXPLORER_RESPONSE_INVALID");
-        }
-        if (second.requiresAuthentication) throw new Error("AUTH_STATE_UNVERIFIED");
+        // The current analysis job is monolithic and cannot release its worker
+        // lease/browser session at a durable human boundary. Fail closed until
+        // authentication is a checkpointed workflow phase; never expose a
+        // short-lived URL that the control plane cannot safely resume.
+        throw new Error("WEBSITE_DURABLE_AUTHENTICATION_HANDOFF_REQUIRED");
       }
       const evidence = await captureWebsiteEvidence({
         organizationId,
@@ -374,7 +383,7 @@ export function createWebsiteAnalysisAdapter(configuration: WebsiteAnalysisConfi
         runId,
         targetOrigin: preflight.targetOrigin,
         provider: { apiVersion: session.apiVersion, model: session.model, policyDigest: session.policyDigest },
-        observations: mergedObservations(first.observations, second?.observations),
+        observations: mergedObservations(first.observations),
       }, configuration.evidenceStore);
       const proposed = proposeWebsiteCapabilityPlans(evidence);
       const release = proposed.plans.length > 0 ? compileWebMcpRelease([...proposed.plans]) : undefined;
@@ -389,7 +398,6 @@ export function createWebsiteAnalysisAdapter(configuration: WebsiteAnalysisConfi
         diagnostics,
         evidence: [
           { source: ownership.source, content: ownership.content, reference: ownership.reference },
-          ...(authEvidence ? [{ source: authEvidence.source, content: authEvidence.content, reference: authEvidence.reference }] : []),
           evidence,
           { source: "source" as const, content: preflightContent, reference: preflightReference },
         ],

@@ -18,9 +18,11 @@ import { setReleaseArtifactStoreForTest } from "../src/artifact-storage.ts";
 import { setAuthServiceForTest } from "../src/auth.ts";
 import { createFixtureAuthService, fixtureSessionId } from "../src/auth-fixture.ts";
 import { setReleaseVerificationPortForTest } from "../src/release-verification.ts";
+import { setWebsiteUserHandoffPortForTest } from "../src/website-user-handoff.ts";
 import {
   hermeticReleaseArtifactStore,
   hermeticReleaseVerificationPort,
+  hermeticWebsiteUserHandoffPort,
 } from "./auth-test-helpers.ts";
 
 const appConnectionString = process.env.PAGE2WEBMCP_TEST_APP_DATABASE_URL;
@@ -59,6 +61,7 @@ test("PostgreSQL route lifecycle is completed by a separately launched durable w
   setAuthServiceForTest(createFixtureAuthService());
   setReleaseArtifactStoreForTest(hermeticReleaseArtifactStore);
   setReleaseVerificationPortForTest(hermeticReleaseVerificationPort);
+  setWebsiteUserHandoffPortForTest(hermeticWebsiteUserHandoffPort);
 
   try {
     const loginResponse = await login(jsonRequest("/api/auth/login", {
@@ -191,6 +194,7 @@ test("PostgreSQL route lifecycle is completed by a separately launched durable w
     setAuthServiceForTest(undefined);
     setReleaseArtifactStoreForTest(undefined);
     setReleaseVerificationPortForTest(undefined);
+    setWebsiteUserHandoffPortForTest(undefined);
     await repository.close();
     await admin.end();
   }

@@ -16,6 +16,7 @@ import {
   type RepositoryActor,
   type VerificationRequest,
 } from "./control-plane.ts";
+import { computeSourceIdentityHash } from "./source-identity.ts";
 
 function passedVerificationChecks() {
   return RELEASE_VERIFICATION_CHECK_NAMES.map((name) => ({ name, status: "passed" as const }));
@@ -322,6 +323,219 @@ test("Postgres dedicated analysis claims leave other source types queued", {
     await repository.failAnalysis("postgres-website-only-worker", website!.id, "EXPECTED_TEST_CLEANUP", false,
       website!.leaseGeneration);
   } finally {
+    await repository.close();
+  }
+});
+
+test("Postgres analysis enqueue atomically pins the attested source and preserves accepted replay", {
+  skip: !connectionString || !adminConnectionString,
+}, async () => {
+  const repository = createPostgresRepository({ connectionString: connectionString!, maxConnections: 2 });
+  const admin = new pg.Pool({ connectionString: adminConnectionString!, max: 1 });
+  let adminTransaction = false;
+  const actor: RepositoryActor = {
+    id: "11111111-1111-1111-1111-111111111111",
+    organizationId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+    role: "owner",
+  };
+  try {
+    const project = await repository.createProject(actor, {
+      name: "Postgres source-pinned website",
+      sourceType: "website",
+      url: "https://postgres-source-pinned.example/app",
+      sourceConfiguration: { kind: "website" },
+      idempotencyKey: "postgres-source-pinned-project",
+      inputHash: "postgres-source-pinned-project",
+    });
+    const [source] = await repository.listProjectSources(actor, project.id);
+    const [snapshot] = await repository.listSourceSnapshots(actor, project.id);
+    const request = {
+      projectId: project.id,
+      idempotencyKey: "postgres-source-pinned-analysis",
+      inputHash: "postgres-source-pinned-analysis",
+    };
+    assert.equal(await repository.getAnalysisReplay(actor, request), undefined);
+    await assert.rejects(repository.enqueueAnalysis(actor, {
+      ...request,
+      expectedSource: {
+        projectSourceId: source!.id,
+        sourceSnapshotId: snapshot!.id,
+        sourceIdentityHash: "0".repeat(64),
+      },
+    }), (error: unknown) => error instanceof RepositoryError && error.code === "SOURCE_SNAPSHOT_STALE");
+    assert.equal(await repository.getLatestAnalysis(actor, project.id), undefined);
+
+    const replacementUrl = "https://postgres-source-pinned.example/changed";
+    const replacementConfiguration = { kind: "website" } as const;
+    await admin.query("begin");
+    adminTransaction = true;
+    await admin.query("update public.project_sources set active = false where id = $1", [source!.id]);
+    const replacement = await admin.query(
+      "insert into public.project_sources " +
+      "(organization_id, project_id, source_type, source_url, source_configuration, version, active) " +
+      "values ($1, $2, 'website', $3, $4::jsonb, 2, true) returning id",
+      [actor.organizationId, project.id, replacementUrl, JSON.stringify(replacementConfiguration)],
+    );
+    await admin.query(
+      "insert into public.source_snapshots " +
+      "(organization_id, project_id, project_source_id, source_identity_hash, is_fixture) " +
+      "values ($1, $2, $3, $4, false)",
+      [actor.organizationId, project.id, replacement.rows[0].id,
+        computeSourceIdentityHash("website", replacementUrl, replacementConfiguration)],
+    );
+    const racingEnqueue = repository.enqueueAnalysis(actor, {
+      ...request,
+      expectedSource: {
+        projectSourceId: source!.id,
+        sourceSnapshotId: snapshot!.id,
+        sourceIdentityHash: snapshot!.sourceIdentityHash,
+      },
+    }).then(
+      (value) => ({ state: "resolved" as const, value }),
+      (error: unknown) => ({ state: "rejected" as const, error }),
+    );
+    assert.deepEqual(await Promise.race([
+      racingEnqueue,
+      delay(50).then(() => ({ state: "blocked" as const })),
+    ]), { state: "blocked" }, "enqueue must serialize behind an in-flight active-source replacement");
+    await admin.query("commit");
+    adminTransaction = false;
+    const raceOutcome = await racingEnqueue;
+    assert.equal(raceOutcome.state, "rejected");
+    if (raceOutcome.state === "rejected") {
+      assert.ok(raceOutcome.error instanceof RepositoryError);
+      assert.equal(raceOutcome.error.code, "SOURCE_SNAPSHOT_STALE");
+    }
+    assert.equal(await repository.getLatestAnalysis(actor, project.id), undefined);
+
+    const activeSource = (await repository.listProjectSources(actor, project.id)).find(({ active }) => active)!;
+    const activeSnapshot = (await repository.listSourceSnapshots(actor, project.id))
+      .find(({ projectSourceId }) => projectSourceId === activeSource.id)!;
+    const accepted = await repository.enqueueAnalysis(actor, {
+      ...request,
+      expectedSource: {
+        projectSourceId: activeSource.id,
+        sourceSnapshotId: activeSnapshot.id,
+        sourceIdentityHash: activeSnapshot.sourceIdentityHash,
+      },
+    });
+    assert.equal((await repository.getAnalysisReplay(actor, request))?.id, accepted.id);
+    await assert.rejects(repository.getAnalysisReplay(actor, {
+      ...request,
+      inputHash: "different-input",
+    }), (error: unknown) => error instanceof RepositoryError && error.code === "IDEMPOTENCY_CONFLICT");
+    await repository.cancelWorkflow(actor, {
+      runId: accepted.id,
+      idempotencyKey: "postgres-source-pinned-cleanup",
+      inputHash: "postgres-source-pinned-cleanup",
+    });
+  } finally {
+    if (adminTransaction) await admin.query("rollback");
+    await admin.end();
+    await repository.close();
+  }
+});
+
+test("Postgres source replacement cannot commit after analysis locks an attested source", {
+  skip: !connectionString || !adminConnectionString,
+}, async () => {
+  const repository = createPostgresRepository({ connectionString: connectionString!, maxConnections: 2 });
+  const admin = new pg.Pool({ connectionString: adminConnectionString!, max: 3 });
+  const queueLock = await admin.connect();
+  const replacement = await admin.connect();
+  let queueLockTransaction = false;
+  let replacementTransaction = false;
+  const actor: RepositoryActor = {
+    id: "11111111-1111-1111-1111-111111111111",
+    organizationId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+    role: "owner",
+  };
+  try {
+    const project = await repository.createProject(actor, {
+      name: "Postgres commit-ordered source",
+      sourceType: "website",
+      url: "https://postgres-commit-ordered.example/app",
+      sourceConfiguration: { kind: "website" },
+      idempotencyKey: "postgres-commit-ordered-project",
+      inputHash: "postgres-commit-ordered-project",
+    });
+    const [source] = await repository.listProjectSources(actor, project.id);
+    const [snapshot] = await repository.listSourceSnapshots(actor, project.id);
+
+    await queueLock.query("begin");
+    queueLockTransaction = true;
+    await queueLock.query("lock table private.analysis_jobs in access exclusive mode");
+    const enqueue = repository.enqueueAnalysis(actor, {
+      projectId: project.id,
+      idempotencyKey: "postgres-commit-ordered-analysis",
+      inputHash: "postgres-commit-ordered-analysis",
+      expectedSource: {
+        projectSourceId: source!.id,
+        sourceSnapshotId: snapshot!.id,
+        sourceIdentityHash: snapshot!.sourceIdentityHash,
+      },
+    });
+
+    let enqueueReachedQueueWrite = false;
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const waiting = await admin.query(
+        "select 1 from pg_stat_activity " +
+        "where query like 'insert into private.analysis_jobs%' and wait_event_type = 'Lock' limit 1",
+      );
+      if (waiting.rows[0]) {
+        enqueueReachedQueueWrite = true;
+        break;
+      }
+      await delay(10);
+    }
+    assert.equal(enqueueReachedQueueWrite, true, "enqueue did not reach its post-source-lock queue write");
+
+    const replacementUrl = "https://postgres-commit-ordered.example/replaced";
+    const replacementConfiguration = { kind: "website" } as const;
+    const replace = (async () => {
+      await replacement.query("begin");
+      replacementTransaction = true;
+      await replacement.query("update public.project_sources set active = false where id = $1", [source!.id]);
+      const inserted = await replacement.query(
+        "insert into public.project_sources " +
+        "(organization_id, project_id, source_type, source_url, source_configuration, version, active) " +
+        "values ($1, $2, 'website', $3, $4::jsonb, 2, true) returning id",
+        [actor.organizationId, project.id, replacementUrl, JSON.stringify(replacementConfiguration)],
+      );
+      await replacement.query(
+        "insert into public.source_snapshots " +
+        "(organization_id, project_id, project_source_id, source_identity_hash, is_fixture) " +
+        "values ($1, $2, $3, $4, false)",
+        [actor.organizationId, project.id, inserted.rows[0].id,
+          computeSourceIdentityHash("website", replacementUrl, replacementConfiguration)],
+      );
+      await replacement.query("commit");
+      replacementTransaction = false;
+      return "replaced" as const;
+    })();
+    assert.equal(await Promise.race([replace, delay(50).then(() => "blocked" as const)]), "blocked");
+
+    await queueLock.query("commit");
+    queueLockTransaction = false;
+    const accepted = await enqueue;
+    assert.equal(await replace, "replaced");
+    const claimed = await repository.claimAnalysis("postgres-commit-ordered-worker", 60_000, ["website"]);
+    assert.equal(claimed?.id, accepted.id);
+    assert.equal(claimed?.sourceUrl, "https://postgres-commit-ordered.example/app");
+    assert.deepEqual(claimed?.sourceConfiguration, { kind: "website" });
+    await repository.failAnalysis(
+      "postgres-commit-ordered-worker",
+      accepted.id,
+      "EXPECTED_TEST_CLEANUP",
+      false,
+      claimed!.leaseGeneration,
+    );
+  } finally {
+    if (replacementTransaction) await replacement.query("rollback");
+    if (queueLockTransaction) await queueLock.query("rollback");
+    replacement.release();
+    queueLock.release();
+    await admin.end();
     await repository.close();
   }
 });

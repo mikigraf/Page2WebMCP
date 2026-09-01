@@ -216,6 +216,49 @@ test("analysis enqueue is idempotent and leased jobs recover after expiry", asyn
   assert.equal(recovered?.attempts, 2);
 });
 
+test("analysis enqueue atomically pins the expected source and exposes only accepted idempotency replays", async () => {
+  const repository = new InMemoryControlPlaneRepository();
+  const project = await repository.createProject(owner, {
+    name: "Source-pinned website",
+    sourceType: "website",
+    url: "https://source-pinned.example/app",
+    sourceConfiguration: { kind: "website" },
+    idempotencyKey: "source-pinned-project",
+    inputHash: "source-pinned-project",
+  });
+  const [source] = await repository.listProjectSources(owner, project.id);
+  const [snapshot] = await repository.listSourceSnapshots(owner, project.id);
+  const request = {
+    projectId: project.id,
+    idempotencyKey: "source-pinned-analysis",
+    inputHash: "source-pinned-analysis",
+  };
+  assert.equal(await repository.getAnalysisReplay(owner, request), undefined);
+  await assert.rejects(repository.enqueueAnalysis(owner, {
+    ...request,
+    expectedSource: {
+      projectSourceId: source!.id,
+      sourceSnapshotId: snapshot!.id,
+      sourceIdentityHash: "0".repeat(64),
+    },
+  }), (error: unknown) => error instanceof RepositoryError && error.code === "SOURCE_SNAPSHOT_STALE");
+  assert.equal(await repository.getLatestAnalysis(owner, project.id), undefined);
+
+  const accepted = await repository.enqueueAnalysis(owner, {
+    ...request,
+    expectedSource: {
+      projectSourceId: source!.id,
+      sourceSnapshotId: snapshot!.id,
+      sourceIdentityHash: snapshot!.sourceIdentityHash,
+    },
+  });
+  assert.equal((await repository.getAnalysisReplay(owner, request))?.id, accepted.id);
+  await assert.rejects(repository.getAnalysisReplay(owner, {
+    ...request,
+    inputHash: "different-input",
+  }), (error: unknown) => error instanceof RepositoryError && error.code === "IDEMPOTENCY_CONFLICT");
+});
+
 test("analysis completion persists only the exact source-compatible provider provenance tuple", async () => {
   const repository = new InMemoryControlPlaneRepository();
   const project = await repository.createProject(owner, {

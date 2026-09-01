@@ -289,7 +289,8 @@ function mapError(error: unknown): ApiError {
       LEASE_LOST: 409,
       MEMBERSHIP_REQUIRED: 403,
       INVALID_CURSOR: 400,
-      SESSION_REVOKED: 401
+      SESSION_REVOKED: 401,
+      SOURCE_SNAPSHOT_STALE: 409
     };
     return new ApiError(error.code, statusByCode[error.code] ?? 500, false, error.details);
   }

@@ -196,7 +196,22 @@ function websiteConfiguration(events: string[], observe: (phase: "public" | "aut
     hostedScriptOrigin: "https://scripts.page2webmcp.example",
     provider: { hostedScriptOrigin: "https://scripts.page2webmcp.example", resolver, transport, timeoutMs: 1_000 },
     ownership: {
-      challenges: { load: async () => ({ method: "dns_txt" as const, targetOrigin: websiteOrigin, token: ownershipToken, expiresAt: ownershipExpiry }) },
+      attestations: { consume: async (input: {
+        organizationId: string; projectId: string; runId: string; sourceIdentityHash: string;
+        sourceUrl: string; targetOrigin: string;
+      }) => {
+        assert.equal(input.targetOrigin, websiteOrigin);
+        return {
+          bound: true as const,
+          challengeDigest: createHash("sha256").update(ownershipToken, "utf8").digest("hex"),
+        };
+      } },
+      challenges: { load: async (input: {
+        organizationId: string; projectId: string; runId: string; targetOrigin: string;
+      }) => {
+        assert.equal(input.targetOrigin, websiteOrigin);
+        return { method: "dns_txt" as const, targetOrigin: websiteOrigin, token: ownershipToken, expiresAt: ownershipExpiry };
+      } },
       replayStore: { consume: async () => true },
     },
     browser: {
@@ -236,10 +251,24 @@ function websiteConfiguration(events: string[], observe: (phase: "public" | "aut
 
 test("website worker runs hermetic preflight/ownership/browser/evidence proposal and compiles exact plans", async () => {
   const events: string[] = [];
-  const adapter = createWebsiteAnalysisAdapter(websiteConfiguration(events, async () => ({ observations: websiteObservations(), requiresAuthentication: false })));
+  let attestationInput: unknown;
+  let challengeInput: unknown;
+  const configuration = websiteConfiguration(events, async () => ({ observations: websiteObservations(), requiresAuthentication: false }));
+  const consume = configuration.ownership.attestations.consume;
+  configuration.ownership.attestations.consume = async (input) => {
+    attestationInput = input;
+    return consume(input);
+  };
+  const challenge = configuration.ownership.challenges.load;
+  configuration.ownership.challenges.load = async (input) => {
+    challengeInput = input;
+    return challenge(input);
+  };
+  const adapter = createWebsiteAnalysisAdapter(configuration);
   const result = await adapter({
     sourceType: "website", sourceUrl: `${websiteOrigin}/`,
     organizationId: "org-1", projectId: "project-1", id: "run-1",
+    sourceConfiguration: { kind: "website" }, sourceIdentityHash: "f".repeat(64),
   }, new AbortController().signal);
   assert.deepEqual(result.capabilities.map(({ plan }) => [plan.tool.name, plan.request.adapter]), [["list_widgets", "json_api"]]);
   assert.ok(result.release);
@@ -249,30 +278,44 @@ test("website worker runs hermetic preflight/ownership/browser/evidence proposal
   assert.deepEqual(result.diagnostics, []);
   assert.equal(JSON.stringify(result).includes(ownershipToken), false);
   assert.equal(JSON.stringify(result).includes("live.invalid"), false);
+  assert.deepEqual(attestationInput, {
+    organizationId: "org-1",
+    projectId: "project-1",
+    runId: "run-1",
+    sourceIdentityHash: "f".repeat(64),
+    sourceUrl: `${websiteOrigin}/`,
+    targetOrigin: websiteOrigin,
+  });
+  assert.deepEqual(challengeInput, {
+    organizationId: "org-1",
+    projectId: "project-1",
+    runId: "run-1",
+    targetOrigin: websiteOrigin,
+  });
   assert.deepEqual(events, ["stop:completed", "reconcile", "release"]);
 });
 
-test("website worker performs durable auth resume once and cleans provider state after explorer failure", async () => {
+test("website worker fails closed at authentication until a durable human wait phase exists", async () => {
   const events: string[] = [];
   const phases: string[] = [];
   const adapter = createWebsiteAnalysisAdapter(websiteConfiguration(events, async (phase) => {
     phases.push(phase);
-    if (phase === "public") return { observations: { ...websiteObservations(), network: [] }, requiresAuthentication: true };
-    return { observations: { ...websiteObservations(), network: websiteObservations().network.map((item) => ({ ...item, authentication: "same_origin_cookie" as const })) }, requiresAuthentication: false };
+    return { observations: { ...websiteObservations(), network: [] }, requiresAuthentication: true };
   }));
-  const result = await adapter({
+  await assert.rejects(adapter({
     sourceType: "website", sourceUrl: `${websiteOrigin}/`,
     organizationId: "org-1", projectId: "project-1", id: "run-auth",
-  }, new AbortController().signal);
-  assert.deepEqual(phases, ["public", "authenticated"]);
-  assert.equal(result.capabilities[0]!.plan.authentication.mode, "same_origin_cookie");
-  assert.deepEqual(events, ["auth:completed", "stop:completed", "reconcile", "release"]);
+    sourceConfiguration: { kind: "website" }, sourceIdentityHash: "f".repeat(64),
+  }, new AbortController().signal), /WEBSITE_DURABLE_AUTHENTICATION_HANDOFF_REQUIRED/);
+  assert.deepEqual(phases, ["public"]);
+  assert.deepEqual(events, ["stop:failed", "reconcile", "release"]);
 
   const failedEvents: string[] = [];
   const failed = createWebsiteAnalysisAdapter(websiteConfiguration(failedEvents, async () => { throw new Error("EXPLORER_CRASHED"); }));
   await assert.rejects(failed({
     sourceType: "website", sourceUrl: `${websiteOrigin}/`,
     organizationId: "org-1", projectId: "project-1", id: "run-failed",
+    sourceConfiguration: { kind: "website" }, sourceIdentityHash: "f".repeat(64),
   }, new AbortController().signal), /EXPLORER_CRASHED/);
   assert.deepEqual(failedEvents, ["stop:failed", "reconcile", "release"]);
 });
@@ -282,6 +325,27 @@ test("website worker construction and source ownership fail closed without every
   const adapter = createWebsiteAnalysisAdapter(websiteConfiguration([], async () => ({ observations: websiteObservations(), requiresAuthentication: false })));
   await assert.rejects(adapter({ sourceType: "openapi", sourceUrl: `${websiteOrigin}/` }, new AbortController().signal), /SOURCE_TYPE_UNSUPPORTED/);
   await assert.rejects(adapter({ sourceType: "website", sourceUrl: `${websiteOrigin}/` }, new AbortController().signal), /WEBSITE_SOURCE_OWNERSHIP_REQUIRED/);
+});
+
+test("website worker binds the additive source attestation to the unchanged per-run challenge", async () => {
+  const configuration = websiteConfiguration([], async () => ({
+    observations: websiteObservations(),
+    requiresAuthentication: false,
+  }));
+  configuration.ownership.attestations.consume = async () => ({
+    bound: true,
+    challengeDigest: "0".repeat(64),
+  });
+  const adapter = createWebsiteAnalysisAdapter(configuration);
+  await assert.rejects(adapter({
+    sourceType: "website",
+    sourceUrl: `${websiteOrigin}/`,
+    organizationId: "org-1",
+    projectId: "project-1",
+    id: "run-mismatched-attestation",
+    sourceConfiguration: { kind: "website" },
+    sourceIdentityHash: "f".repeat(64),
+  }, new AbortController().signal), /WEBSITE_SOURCE_ATTESTATION_MISMATCH/);
 });
 
 test("website worker locally expires a stalled explorer and still reconciles the browser", async () => {
@@ -298,6 +362,7 @@ test("website worker locally expires a stalled explorer and still reconciles the
   await assert.rejects(adapter({
     sourceType: "website", sourceUrl: `${websiteOrigin}/`,
     organizationId: "org-1", projectId: "project-1", id: "run-expired-explorer",
+    sourceConfiguration: { kind: "website" }, sourceIdentityHash: "f".repeat(64),
   }, new AbortController().signal), /BROWSER_SESSION_EXPIRED/);
   assert.equal(observationCompleted, false);
   assert.deepEqual(events, ["stop:cancelled", "reconcile", "release"]);

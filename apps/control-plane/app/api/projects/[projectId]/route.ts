@@ -2,6 +2,7 @@ import { z } from "zod";
 import { getControlPlaneRepository } from "../../../../../../packages/database/src/factory.ts";
 import { ApiError, createRequestId, errorResponse, requireActor, successResponse } from "../../../../src/api.ts";
 import { recoverLatestPublishedRelease } from "../../../../src/releases.ts";
+import { websiteUserHandoffProjection } from "../../../../src/website-user-handoff-api.ts";
 import { analysisOutcome } from "../../../../src/analysis-outcome.ts";
 import { gitHubDraftPullRequestProjection } from "../../../../src/github-result.ts";
 
@@ -42,6 +43,9 @@ export async function GET(
       analysisOutcome: analysisOutcome(latestAnalysisResult, capabilities.length),
       release,
       ...(draftPullRequest ? { draftPullRequest: gitHubDraftPullRequestProjection(draftPullRequest) } : {}),
+      ...(project.sourceType === "website" ? {
+        websiteUserHandoff: websiteUserHandoffProjection(project.id),
+      } : {}),
     }, requestId);
   } catch (error) {
     return errorResponse(error, requestId, request);

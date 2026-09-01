@@ -31,6 +31,7 @@ import {
   type WorkflowTaskCompletion,
   type WorkflowTaskRecord,
 } from "./workflow.ts";
+import { computeSourceIdentityHash } from "./source-identity.ts";
 
 export type RepositoryRole = "owner" | "editor" | "viewer";
 export type RepositoryActor = { id: string; organizationId: string; role: RepositoryRole };
@@ -362,6 +363,14 @@ export type AuditEventRecord = {
 
 export type ReviewInput = { action: "approve" | "block" | "reject"; expectedVersion: number };
 export type IdempotencyInput = { idempotencyKey: string; inputHash: string };
+export type ExpectedAnalysisSource = Readonly<{
+  projectSourceId: string;
+  sourceSnapshotId: string;
+  sourceIdentityHash: string;
+}>;
+export type EnqueueAnalysisRequest = IdempotentRequest & Readonly<{
+  expectedSource?: ExpectedAnalysisSource;
+}>;
 export type CreateProjectRequest = {
   name: string;
   sourceType: SourceType;
@@ -397,6 +406,7 @@ export type RepositoryErrorCode =
   | "MEMBERSHIP_REQUIRED"
   | "INVALID_CURSOR"
   | "SESSION_REVOKED"
+  | "SOURCE_SNAPSHOT_STALE"
   | "OPENAPI_VERIFICATION_CONTEXT_REQUIRED";
 
 export class RepositoryError extends Error {
@@ -415,7 +425,8 @@ export interface ControlPlaneRepository extends WorkflowRepository {
   getProject(actor: RepositoryActor, id: string): Promise<ProjectRecord>;
   getActiveProjectSource(actor: RepositoryActor, projectId: string): Promise<ProjectSourceRecord>;
   getLatestAnalysis(actor: RepositoryActor, projectId: string): Promise<AnalysisRunRecord | undefined>;
-  enqueueAnalysis(actor: RepositoryActor, input: IdempotentRequest): Promise<AnalysisRunRecord>;
+  getAnalysisReplay(actor: RepositoryActor, input: IdempotentRequest): Promise<AnalysisRunRecord | undefined>;
+  enqueueAnalysis(actor: RepositoryActor, input: EnqueueAnalysisRequest): Promise<AnalysisRunRecord>;
   getAnalysis(actor: RepositoryActor, id: string): Promise<AnalysisRunRecord>;
   claimAnalysis(
     workerId: string,
@@ -1031,7 +1042,7 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
       organizationId: project.organizationId,
       projectId: project.id,
       projectSourceId: projectSource.id,
-      sourceIdentityHash: stableHash(sourceIdentityMaterial(project.sourceType, project.url, sourceConfiguration)),
+      sourceIdentityHash: computeSourceIdentityHash(project.sourceType, project.url, sourceConfiguration),
       isFixture: false,
       createdAt: project.createdAt,
     };
@@ -1086,7 +1097,22 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
     return run ? copy(run) : undefined;
   }
 
-  async enqueueAnalysis(actor: RepositoryActor, input: IdempotentRequest): Promise<AnalysisRunRecord> {
+  async getAnalysisReplay(actor: RepositoryActor, input: IdempotentRequest): Promise<AnalysisRunRecord | undefined> {
+    if (actor.role === "viewer") throw new RepositoryError("FORBIDDEN");
+    const project = this.#assertProject(actor, input.projectId);
+    const previous = this.#idempotentReplay(
+      this.#idempotencyId("analysis", actor, input.idempotencyKey),
+      input.inputHash,
+    );
+    if (!previous) return undefined;
+    const run = this.#runs.get(previous.resultId);
+    if (!run || run.organizationId !== actor.organizationId || run.projectId !== project.id) {
+      throw new RepositoryError("INVALID_STATE");
+    }
+    return copy(run);
+  }
+
+  async enqueueAnalysis(actor: RepositoryActor, input: EnqueueAnalysisRequest): Promise<AnalysisRunRecord> {
     if (actor.role === "viewer") throw new RepositoryError("FORBIDDEN");
     const project = this.#assertProject(actor, input.projectId);
     const idempotencyId = this.#idempotencyId("analysis", actor, input.idempotencyKey);
@@ -1097,6 +1123,15 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
         throw new RepositoryError("INVALID_STATE");
       }
       return copy(run);
+    }
+    const source = [...this.#projectSources.values()].find((candidate) =>
+      candidate.projectId === project.id && candidate.organizationId === actor.organizationId && candidate.active);
+    const snapshot = this.#activeSourceSnapshot(project.id);
+    if (!source || snapshot.projectSourceId !== source.id) throw new RepositoryError("INVALID_STATE");
+    if (input.expectedSource && (input.expectedSource.projectSourceId !== source.id
+      || input.expectedSource.sourceSnapshotId !== snapshot.id
+      || input.expectedSource.sourceIdentityHash !== snapshot.sourceIdentityHash)) {
+      throw new RepositoryError("SOURCE_SNAPSHOT_STALE");
     }
     if ([...this.#runs.values()].some((run) => run.projectId === project.id && (run.status === "queued" || run.status === "running"))) {
       throw new RepositoryError("INVALID_STATE");
@@ -1114,8 +1149,6 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
     };
     this.#runs.set(run.id, run);
     this.#analysisAvailableAt.set(run.id, now);
-    const source = [...this.#projectSources.values()].find((candidate) => candidate.projectId === project.id && candidate.active);
-    if (!source) throw new RepositoryError("INVALID_STATE");
     this.#analysisSources.set(run.id, {
       sourceType: source.sourceType,
       sourceUrl: source.sourceUrl,
@@ -1124,7 +1157,7 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
     this.#createWorkflowRun({
       id: run.id,
       project,
-      sourceSnapshotId: this.#activeSourceSnapshot(project.id).id,
+      sourceSnapshotId: snapshot.id,
       inputHash: input.inputHash,
       phase: "analysis",
       analysisRunId: run.id,
@@ -2800,12 +2833,6 @@ function normalizeWorkflowTaskEvent(input: WorkflowTaskEventInput): WorkflowEven
 function workflowTaskIdempotencyKey(runId: string, phase: WorkflowTaskRecord["phase"], inputHash: string): string {
   const normalizedHash = stableHash(inputHash);
   return `wft_${stableHash(`${runId.length}:${runId}:${phase.length}:${phase}:${normalizedHash}`)}`;
-}
-
-function sourceIdentityMaterial(sourceType: string, sourceUrl: string, sourceConfiguration: SourceConfiguration): string {
-  const configuration = canonicalJson(sourceConfiguration);
-  return `${Buffer.byteLength(sourceType)}:${sourceType}:${Buffer.byteLength(sourceUrl)}:${sourceUrl}:`
-    + `${Buffer.byteLength(configuration)}:${configuration}`;
 }
 
 function assertIdempotencyKey(value: string): void {

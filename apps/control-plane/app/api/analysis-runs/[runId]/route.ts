@@ -8,6 +8,7 @@ import {
   successResponse
 } from "../../../../src/api.ts";
 import { analysisOutcome } from "../../../../src/analysis-outcome.ts";
+import { websiteUserHandoffProjection } from "../../../../src/website-user-handoff-api.ts";
 
 const RunIdSchema = z.string().uuid();
 
@@ -23,6 +24,7 @@ export async function GET(
     const parsed = RunIdSchema.safeParse(rawRunId);
     if (!parsed.success) throw new ApiError("NOT_FOUND", 404);
     const run = await repository.getAnalysis(actor, parsed.data);
+    const project = await repository.getProject(actor, run.projectId);
     const result = run.status === "succeeded"
       ? await repository.getAnalysisResult(actor, run.id)
       : undefined;
@@ -35,6 +37,9 @@ export async function GET(
       result,
       capabilities,
       analysisOutcome: analysisOutcome(result, capabilities.length),
+      ...(project.sourceType === "website" ? {
+        websiteUserHandoff: websiteUserHandoffProjection(project.id),
+      } : {}),
     }, requestId);
   } catch (error) {
     return errorResponse(error, requestId, request);

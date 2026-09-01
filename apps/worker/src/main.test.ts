@@ -46,6 +46,7 @@ test("actual provider construction precedes repository creation and the exact in
       fixture: false as const,
     },
     analyze: async () => ({ capabilities: [], diagnostics: [], evidence: [] }),
+    startupProbe: async () => { order.push("startup-probe"); },
     probe: async () => undefined,
   };
   await runProductionWorker({ PAGE2WEBMCP_PROVIDER_MODE: "openapi" }, {
@@ -67,9 +68,36 @@ test("actual provider construction precedes repository creation and the exact in
     closeRepository: async () => { order.push("repository-close"); },
   });
   assert.deepEqual(order, [
-    "provider", "configuration", "repository", "runtime", "observability",
+    "provider", "configuration", "startup-probe", "repository", "runtime", "observability",
     "repository-close", "observability-close",
   ]);
+});
+
+test("website control protocol support fails startup before a repository can lease work", async () => {
+  let repositoryOpened = false;
+  const provider = {
+    analysisSourceTypes: ["website"] as const,
+    provenance: {
+      mode: "website" as const,
+      adapter: "browser-use-v4" as const,
+      adapterVersion: 4 as const,
+      fixture: false as const,
+    },
+    analyze: async () => ({ capabilities: [], diagnostics: [], evidence: [] }),
+    startupProbe: async () => { throw new Error("WEBSITE_HANDOFF_PROTOCOL_UNSUPPORTED"); },
+    probe: async () => undefined,
+  };
+  await assert.rejects(runProductionWorker({ PAGE2WEBMCP_PROVIDER_MODE: "website" }, {
+    constructProvider: () => provider,
+    validateConfiguration: () => undefined,
+    getRepository: () => {
+      repositoryOpened = true;
+      return new InMemoryControlPlaneRepository();
+    },
+    registerObservability: async () => undefined,
+    shutdownObservability: async () => undefined,
+  }), /WEBSITE_HANDOFF_PROTOCOL_UNSUPPORTED/);
+  assert.equal(repositoryOpened, false);
 });
 
 test("website controls fail startup with sorted operator key names before repository construction", async () => {

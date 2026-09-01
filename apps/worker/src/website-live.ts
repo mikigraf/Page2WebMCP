@@ -16,6 +16,7 @@ import {
 } from "./node-network.ts";
 import { createWebsiteAnalysisAdapter, type AnalysisAdapter } from "./workflow.ts";
 import type { SelectedProviderProbeContext } from "../../../packages/operations/src/readiness.ts";
+import { computeSourceIdentityHash } from "../../../packages/database/src/source-identity.ts";
 
 type RuntimeEnvironment = Readonly<Record<string, string | undefined>>;
 
@@ -44,6 +45,7 @@ export const WEBSITE_LIVE_CONTROL_PATHS = Object.freeze({
   observe: "/v1/website-observations/observe",
   ownershipChallenge: "/v1/website-ownership/challenges/load",
   ownershipReplay: "/v1/website-ownership/replays/consume",
+  sourceAttestationConsume: "/v1/website-ownership/source-attestations/consume",
   policyApply: "/v1/website-egress-policies/apply",
   policyIssue: "/v1/website-egress-policies/issue",
   policyRevoke: "/v1/website-egress-policies/revoke",
@@ -363,12 +365,72 @@ export async function probeConfiguredWebsiteControls(
     || !(input.signal instanceof AbortSignal)) throw new Error("WEBSITE_PROVIDER_PROBE_FAILED");
   const transport = dependencies?.controlTransport ?? createNodePinnedJsonTransport();
   const network = configuredNetwork(dependencies?.resolver, dependencies?.transport);
+  const fanout = linkedSignal(input.signal);
+  const operations = [
+    async () => {
+      await preflightWebsiteSource(input.context.sourceUrl, {
+        ...network,
+        hostedScriptOrigin: new URL(environment.PAGE2WEBMCP_PUBLIC_ORIGIN).origin,
+        maxBytes: MAX_CONTROL_BYTES,
+        maxRedirects: 0,
+        timeoutMs: CONTROL_TIMEOUT_MS,
+        signal: fanout.signal,
+      });
+    },
+    () => probeWebsiteControlServices(environment, transport, input.selectedReleaseHash, fanout.signal),
+  ].map(async (operation) => {
+    try { await operation(); }
+    catch (error) { fanout.abort(error); throw error; }
+  });
+  try {
+    const settled = await Promise.allSettled(operations);
+    const protocolFailure = settled.find((result) => result.status === "rejected"
+      && result.reason instanceof Error && result.reason.message === "WEBSITE_HANDOFF_PROTOCOL_UNSUPPORTED");
+    if (protocolFailure) throw new Error("WEBSITE_HANDOFF_PROTOCOL_UNSUPPORTED");
+    if (settled.some((result) => result.status === "rejected")) throw new Error("WEBSITE_PROVIDER_PROBE_FAILED");
+  } catch (error) {
+    if (error instanceof Error && error.message === "WEBSITE_HANDOFF_PROTOCOL_UNSUPPORTED") throw error;
+    throw new Error("WEBSITE_PROVIDER_PROBE_FAILED");
+  }
+  finally {
+    fanout.abort(new Error("WEBSITE_CONTROL_ABORTED"));
+    fanout.close();
+  }
+}
+
+/**
+ * Authenticates every configured website control before the worker opens its
+ * repository or can claim a job. This deliberately excludes target preflight,
+ * which remains bound to an immutable selected source/release context.
+ */
+export async function probeConfiguredWebsiteControlStartup(
+  environmentValue: RuntimeEnvironment,
+  dependencies: Pick<WebsiteLiveDependencies, "controlTransport">,
+  signal: AbortSignal,
+): Promise<void> {
+  const environment = configuredEnvironment(environmentValue);
+  if (!(signal instanceof AbortSignal) || signal.aborted) throw new Error("WEBSITE_PROVIDER_PROBE_FAILED");
+  const transport = dependencies?.controlTransport ?? createNodePinnedJsonTransport();
+  await probeWebsiteControlServices(
+    environment,
+    transport,
+    randomBytes(32).toString("hex"),
+    signal,
+  );
+}
+
+async function probeWebsiteControlServices(
+  environment: WebsiteLiveEnvironment,
+  transport: NodePinnedJsonTransport,
+  selectedReleaseHash: string,
+  signal: AbortSignal,
+): Promise<void> {
   const nonce = randomBytes(32).toString("hex");
   const commonHeaders = {
     accept: "application/json",
     "x-page2webmcp-gateway-version": String(WEBSITE_LIVE_GATEWAY_PROTOCOL_VERSION),
     "x-page2webmcp-readiness-nonce": nonce,
-    "x-page2webmcp-release-hash": input.selectedReleaseHash,
+    "x-page2webmcp-release-hash": selectedReleaseHash,
   } as const;
   const bearer = (token: string) => ({ authorization: `Bearer ${token}` });
   const kmsKeyIdDigest = createHash("sha256")
@@ -393,55 +455,58 @@ export async function probeConfiguredWebsiteControls(
     ["evidence-store", environment.PAGE2WEBMCP_EVIDENCE_STORE_ORIGIN,
       bearer(environment.PAGE2WEBMCP_EVIDENCE_STORE_TOKEN), {}],
     ["ownership-store", environment.PAGE2WEBMCP_OWNERSHIP_STORE_ORIGIN,
-      bearer(environment.PAGE2WEBMCP_OWNERSHIP_STORE_TOKEN), {}],
+      bearer(environment.PAGE2WEBMCP_OWNERSHIP_STORE_TOKEN), { sourceAttestationProtocolVersion: 1 }],
     ["ttl-secret-store", environment.PAGE2WEBMCP_SECRET_STORE_ORIGIN,
       { ...bearer(environment.PAGE2WEBMCP_SECRET_STORE_TOKEN), "x-page2webmcp-kms-key-id-digest": kmsKeyIdDigest },
       { kmsKeyIdDigest }],
   ] as const;
-  const fanout = linkedSignal(input.signal);
-  const operations = [
-    async () => {
-      await preflightWebsiteSource(input.context.sourceUrl, {
-        ...network,
-        hostedScriptOrigin: new URL(environment.PAGE2WEBMCP_PUBLIC_ORIGIN).origin,
-        maxBytes: MAX_CONTROL_BYTES,
-        maxRedirects: 0,
-        timeoutMs: CONTROL_TIMEOUT_MS,
-        signal: fanout.signal,
+  const fanout = linkedSignal(signal);
+  const operations = probes.map(async ([control, origin, authorization, expectedExtra]) => {
+    const url = `${origin}${WEBSITE_LIVE_READINESS_PATH}`;
+    const lifecycle = linkedSignal(fanout.signal);
+    try {
+      const response = await transport.request({
+        url,
+        method: "GET",
+        headers: { ...commonHeaders, ...authorization, "x-page2webmcp-control": control },
+        signal: lifecycle.signal,
       });
-    },
-    ...probes.map(([control, origin, authorization, expectedExtra]) => async () => {
-      const url = `${origin}${WEBSITE_LIVE_READINESS_PATH}`;
-      const lifecycle = linkedSignal(fanout.signal);
-      try {
-        const response = await transport.request({
-          url,
-          method: "GET",
-          headers: { ...commonHeaders, ...authorization, "x-page2webmcp-control": control },
-          signal: lifecycle.signal,
-        });
-        if (response.url !== url || response.status !== 200
-          || response.headers["content-type"]?.split(";", 1)[0]?.trim().toLowerCase() !== "application/json"
-          || !same(asRecord(boundedJson(response)), {
-            gatewayProtocolVersion: WEBSITE_LIVE_GATEWAY_PROTOCOL_VERSION,
-            status: "ready",
-            readOnly: true,
-            control,
-            selectedReleaseHash: input.selectedReleaseHash,
-            nonce,
-            ...expectedExtra,
-          })) throw new Error("WEBSITE_PROVIDER_PROBE_FAILED");
-      } finally { lifecycle.close(); }
-    }),
-  ].map(async (operation) => {
-    try { await operation(); }
-    catch (error) { fanout.abort(error); throw error; }
+      const actual = response.url === url && response.status === 200
+        && response.headers["content-type"]?.split(";", 1)[0]?.trim().toLowerCase() === "application/json"
+        ? asRecord(boundedJson(response))
+        : undefined;
+      const expected = {
+        gatewayProtocolVersion: WEBSITE_LIVE_GATEWAY_PROTOCOL_VERSION,
+        status: "ready",
+        readOnly: true,
+        control,
+        selectedReleaseHash,
+        nonce,
+        ...expectedExtra,
+      };
+      if (!same(actual, expected)) {
+        if (control === "ownership-store" && actual && same(actual, {
+          gatewayProtocolVersion: WEBSITE_LIVE_GATEWAY_PROTOCOL_VERSION,
+          status: "ready",
+          readOnly: true,
+          control,
+          selectedReleaseHash,
+          nonce,
+        })) throw new Error("WEBSITE_HANDOFF_PROTOCOL_UNSUPPORTED");
+        throw new Error("WEBSITE_PROVIDER_PROBE_FAILED");
+      }
+    } catch (error) {
+      fanout.abort(error);
+      throw error;
+    } finally { lifecycle.close(); }
   });
   try {
     const settled = await Promise.allSettled(operations);
+    const protocolFailure = settled.find((result) => result.status === "rejected"
+      && result.reason instanceof Error && result.reason.message === "WEBSITE_HANDOFF_PROTOCOL_UNSUPPORTED");
+    if (protocolFailure) throw new Error("WEBSITE_HANDOFF_PROTOCOL_UNSUPPORTED");
     if (settled.some((result) => result.status === "rejected")) throw new Error("WEBSITE_PROVIDER_PROBE_FAILED");
-  } catch { throw new Error("WEBSITE_PROVIDER_PROBE_FAILED"); }
-  finally {
+  } finally {
     fanout.abort(new Error("WEBSITE_CONTROL_ABORTED"));
     fanout.close();
   }
@@ -562,6 +627,23 @@ export function createConfiguredWebsiteAnalysisAdapter(
         clock,
         provider: { hostedScriptOrigin, ...network },
         ownership: {
+          attestations: {
+            consume: async (input) => {
+              const result = await stateful(
+                ownership,
+                WEBSITE_LIVE_CONTROL_PATHS.sourceAttestationConsume,
+                "source-attestation-consume",
+                input,
+                signal,
+              );
+              const challengeDigest = result.response.challengeDigest;
+              if (typeof challengeDigest !== "string" || !/^[0-9a-f]{64}$/.test(challengeDigest)
+                || !same(result.response, { ...result.request, bound: true, challengeDigest })) {
+                throw new Error("WEBSITE_SOURCE_ATTESTATION_REQUIRED");
+              }
+              return { bound: true, challengeDigest };
+            },
+          },
           challenges: {
             load: async (input) => {
               const result = await stateful(ownership, WEBSITE_LIVE_CONTROL_PATHS.ownershipChallenge, "ownership-load", input, signal);
@@ -717,7 +799,14 @@ export function createConfiguredWebsiteAnalysisAdapter(
           },
         },
       });
-      return await adapter(source, signal);
+      return await adapter({
+        ...source,
+        sourceIdentityHash: computeSourceIdentityHash(
+          source.sourceType,
+          source.sourceUrl,
+          source.sourceConfiguration,
+        ),
+      }, signal);
     } catch (error) {
       primaryError = error;
       throw error;

@@ -10,6 +10,7 @@ import { createConfiguredGitHubWorkflow, githubConfigurationInvalidKeys } from "
 import { createConfiguredOpenApiProductionAdapter } from "./openapi-live.ts";
 import {
   createConfiguredWebsiteAnalysisAdapter,
+  probeConfiguredWebsiteControlStartup,
   probeConfiguredWebsiteControls,
   websiteMissingControls,
 } from "./website-live.ts";
@@ -41,6 +42,7 @@ export type ProductionProvider = Readonly<{
     context: SelectedProviderProbeContext;
     signal: AbortSignal;
   }>): Promise<void>;
+  startupProbe?(signal: AbortSignal): Promise<void>;
   github?: ReturnType<typeof createConfiguredGitHubWorkflow>;
 }>;
 
@@ -149,6 +151,7 @@ export function createProductionProvider(
       analyze: stampProviderProvenance(createConfiguredWebsiteAnalysisAdapter(environment, dependencies), provenance),
       analysisSourceTypes: ["website"],
       provenance,
+      startupProbe: (signal) => probeConfiguredWebsiteControlStartup(environment, {}, signal),
       probe: (input) => probeConfiguredWebsiteControls(environment, {}, input),
     };
   }

@@ -13,6 +13,10 @@ import {
   type ReleaseVerificationPort,
 } from "../src/release-verification.ts";
 import {
+  setWebsiteUserHandoffPortForTest,
+  type WebsiteUserHandoffPort,
+} from "../src/website-user-handoff.ts";
+import {
   authenticate,
   createFixtureAuthService,
   fixtureSessionId,
@@ -83,6 +87,12 @@ export const hermeticReleaseArtifactStore: ReleaseArtifactStore = {
   },
 };
 
+export const hermeticWebsiteUserHandoffPort: WebsiteUserHandoffPort = {
+  ownershipStatus: async (binding) => ({ state: "verified", targetOrigin: binding.targetOrigin }),
+  issueOwnershipChallenge: async (binding) => ({ state: "verified", targetOrigin: binding.targetOrigin }),
+  checkOwnership: async (binding) => ({ state: "verified", targetOrigin: binding.targetOrigin }),
+};
+
 setAuthServiceForTest(createFixtureAuthService());
 
 export function installTestRepository(repository = new InMemoryControlPlaneRepository()): InMemoryControlPlaneRepository {
@@ -93,6 +103,7 @@ export function installTestRepository(repository = new InMemoryControlPlaneRepos
   setAuthServiceForTest(createFixtureAuthService());
   setReleaseVerificationPortForTest(hermeticReleaseVerificationPort);
   setReleaseArtifactStoreForTest(hermeticReleaseArtifactStore);
+  setWebsiteUserHandoffPortForTest(hermeticWebsiteUserHandoffPort);
   return repository;
 }
 
