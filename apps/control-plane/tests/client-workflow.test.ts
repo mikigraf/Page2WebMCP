@@ -5,8 +5,21 @@ import {
   completeOperation,
   loadWorkflow,
   operationKey,
+  recoverableAnalysisRunId,
+  reconcileProjectRecovery,
+  reconcileProjectWorkflow,
   saveWorkflow
 } from "../src/client-workflow.ts";
+
+test("terminal analysis recovery clears stale run identity so the next action starts a fresh run", () => {
+  for (const status of ["queued", "running", "waiting", "succeeded"] as const) {
+    assert.equal(recoverableAnalysisRunId({ id: "analysis-1", status }), "analysis-1");
+  }
+  for (const status of ["failed", "cancelled"] as const) {
+    assert.equal(recoverableAnalysisRunId({ id: "analysis-1", status }), undefined);
+  }
+  assert.equal(recoverableAnalysisRunId(undefined), undefined);
+});
 
 test("operation keys survive ambiguous retries and rotate only for a different request", () => {
   const storage = new MemoryStorage();
@@ -29,17 +42,126 @@ test("operation keys survive ambiguous retries and rotate only for a different r
 test("workflow state round-trips across reload and invalid state fails closed", () => {
   const storage = new MemoryStorage();
   const workflow = {
-    sourceType: "website" as const,
-    url: "https://acme.example",
+    sourceType: "openapi" as const,
+    url: "https://api.acme.example/openapi.json",
+    sourceConfiguration: {
+      kind: "openapi" as const,
+      targetOrigin: "https://app.acme.example",
+      testPageUrl: "https://app.acme.example/checkout",
+      environment: "staging" as const
+    },
     projectId: "project-1",
-    analysisRunId: "run-1"
+    analysisRunId: "run-1",
+    workflowRunId: "workflow-1"
   };
-  saveWorkflow(storage, workflow);
+  saveWorkflow(storage, workflow as never);
   assert.deepEqual(loadWorkflow(storage), workflow);
 
   storage.setItem("page2webmcp.workflow.v1", JSON.stringify({ sourceType: "unknown", url: "https://acme.example" }));
   assert.equal(loadWorkflow(storage), undefined);
   assert.equal(storage.getItem("page2webmcp.workflow.v1"), null);
+});
+
+test("OpenAPI recovery state keeps bounded verification context and fails closed when it is malformed", () => {
+  const storage = new MemoryStorage();
+  saveWorkflow(storage, {
+    sourceType: "openapi",
+    url: "https://api.acme.example/openapi.json",
+    sourceConfiguration: {
+      kind: "openapi",
+      targetOrigin: "https://app.acme.example",
+      testPageUrl: "https://app.acme.example/checkout",
+      environment: "production"
+    }
+  } as never);
+  assert.deepEqual(loadWorkflow(storage)?.sourceConfiguration, {
+    kind: "openapi",
+    targetOrigin: "https://app.acme.example",
+    testPageUrl: "https://app.acme.example/checkout",
+    environment: "production"
+  });
+
+  storage.setItem("page2webmcp.workflow.v1", JSON.stringify({
+    sourceType: "openapi",
+    url: "https://api.acme.example/openapi.json",
+    sourceConfiguration: { kind: "openapi", targetOrigin: "not-a-url", testPageUrl: "https://app.acme.example/", environment: "test" }
+  }));
+  assert.equal(loadWorkflow(storage), undefined);
+  assert.equal(storage.getItem("page2webmcp.workflow.v1"), null);
+
+  storage.setItem("page2webmcp.workflow.v1", JSON.stringify({
+    sourceType: "openapi",
+    url: "https://api.acme.example/openapi.json",
+    sourceConfiguration: {
+      kind: "openapi",
+      targetOrigin: "https://app.acme.example",
+      testPageUrl: "https://app.acme.example/checkout?session=secret",
+      environment: "test"
+    }
+  }));
+  assert.equal(loadWorkflow(storage), undefined);
+  assert.equal(storage.getItem("page2webmcp.workflow.v1"), null);
+});
+
+test("authoritative refresh derives release recovery from the server on reload and a new tab", () => {
+  const current = {
+    sourceType: "openapi" as const,
+    url: "https://api.acme.example/openapi.json",
+    sourceConfiguration: {
+      kind: "openapi" as const,
+      targetOrigin: "https://app.acme.example",
+      testPageUrl: "https://app.acme.example/checkout",
+      environment: "staging" as const
+    },
+    projectId: "project-1",
+    analysisRunId: "analysis-1",
+    workflowRunId: "workflow-1",
+    releaseUrl: "https://stale.example/release.js"
+  };
+  const authoritative = {
+    sourceType: current.sourceType,
+    url: current.url,
+    sourceConfiguration: current.sourceConfiguration,
+    projectId: current.projectId,
+    analysisRunId: current.analysisRunId,
+    releaseUrl: "https://storage.example/exact-release.js"
+  };
+  assert.deepEqual(reconcileProjectWorkflow(current, authoritative), {
+    ...current,
+    releaseUrl: authoritative.releaseUrl
+  });
+  assert.deepEqual(reconcileProjectWorkflow(undefined, authoritative), authoritative);
+
+  const exactRelease = {
+    id: "release-1",
+    url: authoritative.releaseUrl,
+    installation: { verificationPageUrl: "https://app.acme.example/checkout" }
+  };
+  const newTab = reconcileProjectRecovery(undefined, {
+    sourceType: authoritative.sourceType,
+    url: authoritative.url,
+    sourceConfiguration: authoritative.sourceConfiguration,
+    projectId: authoritative.projectId,
+    analysisRunId: authoritative.analysisRunId,
+  }, exactRelease);
+  assert.strictEqual(newTab.release, exactRelease);
+  assert.equal(newTab.workflow.releaseUrl, exactRelease.url);
+
+  assert.deepEqual(reconcileProjectWorkflow(current, { ...authoritative, projectId: "project-2" }), {
+    ...authoritative,
+    projectId: "project-2"
+  });
+  assert.deepEqual(reconcileProjectWorkflow(current, { ...authoritative, analysisRunId: "analysis-2" }), {
+    ...authoritative,
+    analysisRunId: "analysis-2"
+  });
+  assert.deepEqual(reconcileProjectWorkflow(current, {
+    ...authoritative,
+    sourceConfiguration: { ...authoritative.sourceConfiguration, environment: "production" }
+  }), {
+    ...authoritative,
+    sourceConfiguration: { ...authoritative.sourceConfiguration, environment: "production" }
+  });
 });
 
 test("clearing a workflow removes persisted workflow and pending operation keys only", () => {

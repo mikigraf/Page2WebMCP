@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { acmeCapabilityPlans } from "../../../apps/acme-support/src/capability-plans.ts";
 import {
   createObservability,
   createRequestId,
@@ -247,7 +248,8 @@ test("structured logs retain request correlation without unsafe properties", asy
 
 test("compiled WebMCP artifacts exclude observability implementation markers", async () => {
   const { compileWebMcpRelease } = await import("../../compiler/src/compiler.ts");
-  const release = compileWebMcpRelease([{ name: "find_order", description: "Find an order", readOnly: true }], "https://acme.example");
+  const release = compileWebMcpRelease(acmeCapabilityPlans("https://acme.example")
+    .filter((plan) => plan.tool.name === "find_order"));
   assert.doesNotMatch(release.code, /langfuse|posthog|observability/i);
 });
 

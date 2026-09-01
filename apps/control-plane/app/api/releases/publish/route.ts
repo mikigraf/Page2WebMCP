@@ -2,13 +2,13 @@ import { z } from "zod";
 import { getControlPlaneRepository } from "../../../../../../packages/database/src/factory.ts";
 import {
   ApiError,
-  assertSameOrigin,
   createRequestId,
   errorResponse,
   parseJsonBody,
-  requireActor,
+  requireMutationActor,
   successResponse
 } from "../../../../src/api.ts";
+import { releaseArtifactStore } from "../../../../src/artifact-storage.ts";
 import { publishPersistedRelease } from "../../../../src/releases.ts";
 import { recordLifecycle, recordLifecycleFailure } from "../../../../src/telemetry.ts";
 
@@ -23,28 +23,31 @@ export async function POST(request: Request) {
   const requestId = createRequestId();
   const startedAt = Date.now();
   try {
-    assertSameOrigin(request);
-    const actor = requireActor(request);
+    const repository = getControlPlaneRepository();
+    const actor = await requireMutationActor(request, repository);
     const input = await parseJsonBody(request, PublishInputSchema);
     const idempotencyKey = request.headers.get("idempotency-key") ?? "";
     if (!IDEMPOTENCY_KEY.test(idempotencyKey)) throw new ApiError("IDEMPOTENCY_KEY_REQUIRED", 400);
     const release = await publishPersistedRelease(
-      getControlPlaneRepository(),
+      repository,
       actor,
       input.projectId,
       input.analysisRunId,
-      idempotencyKey
+      idempotencyKey,
+      request.signal,
+      releaseArtifactStore(),
     );
     await recordLifecycle({
       event: "release_published",
       operation: "publish",
       outcome: "success",
       requestId,
-      properties: { release_result: "published", duration_ms: Date.now() - startedAt }
+      properties: { actor_id: actor.id, organization_id: actor.organizationId,
+        release_result: "published", duration_ms: Date.now() - startedAt }
     });
     return successResponse({ release }, requestId, 201);
   } catch (error) {
-    const response = errorResponse(error, requestId);
+    const response = errorResponse(error, requestId, request);
     await recordLifecycleFailure({ event: "release_published", operation: "publish", requestId, startedAt }, error, response.status);
     return response;
   }

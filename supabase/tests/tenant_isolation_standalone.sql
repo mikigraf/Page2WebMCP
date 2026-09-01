@@ -46,6 +46,7 @@ begin
     'public.capability_reviews'::regclass,
     'public.verification_runs'::regclass,
     'public.releases'::regclass,
+    'public.github_draft_pull_requests'::regclass,
     'public.audit_events'::regclass,
     'private.analysis_jobs'::regclass,
     'private.idempotency_keys'::regclass,
@@ -68,10 +69,26 @@ begin
   end if;
 
   if has_table_privilege('page2webmcp_worker', 'public.projects', 'select')
-    or has_table_privilege('page2webmcp_worker', 'public.projects', 'update')
-    or has_table_privilege('page2webmcp_worker', 'public.analysis_evidence', 'select')
-    or has_table_privilege('page2webmcp_worker', 'public.capabilities', 'select') then
+    or has_table_privilege('page2webmcp_worker', 'public.projects', 'update') then
     raise exception 'worker role has unused public-table privileges';
+  end if;
+
+  if not has_table_privilege('page2webmcp_app', 'public.github_draft_pull_requests', 'select')
+    or has_table_privilege('page2webmcp_app', 'public.github_draft_pull_requests', 'insert')
+    or has_table_privilege('page2webmcp_app', 'public.github_draft_pull_requests', 'update')
+    or has_table_privilege('page2webmcp_app', 'public.github_draft_pull_requests', 'delete')
+    or not has_table_privilege('page2webmcp_worker', 'public.github_draft_pull_requests', 'select')
+    or not has_table_privilege('page2webmcp_worker', 'public.github_draft_pull_requests', 'insert')
+    or has_table_privilege('page2webmcp_worker', 'public.github_draft_pull_requests', 'update')
+    or has_table_privilege('page2webmcp_worker', 'public.github_draft_pull_requests', 'delete') then
+    raise exception 'GitHub result table grants exceed append-only worker and read-only app requirements';
+  end if;
+
+  if not has_table_privilege('page2webmcp_worker', 'public.project_sources', 'select')
+    or not has_table_privilege('page2webmcp_worker', 'public.source_snapshots', 'select')
+    or not has_table_privilege('page2webmcp_worker', 'public.analysis_evidence', 'select')
+    or not has_table_privilege('page2webmcp_worker', 'public.capabilities', 'select') then
+    raise exception 'worker cannot read exact reviewed workflow execution material';
   end if;
 
   if has_column_privilege('page2webmcp_worker', 'private.analysis_jobs', 'source_type', 'update')
@@ -112,7 +129,8 @@ begin
   if has_table_privilege('authenticated', 'public.projects', 'insert')
     or has_table_privilege('authenticated', 'public.projects', 'update')
     or has_table_privilege('authenticated', 'public.analysis_runs', 'insert')
-    or has_table_privilege('authenticated', 'public.capability_reviews', 'insert') then
+    or has_table_privilege('authenticated', 'public.capability_reviews', 'insert')
+    or has_table_privilege('authenticated', 'public.github_draft_pull_requests', 'select') then
     raise exception 'the public Data API can bypass server lifecycle invariants';
   end if;
 end
@@ -253,8 +271,12 @@ begin
     when unique_violation then null;
   end;
 
-  insert into private.analysis_jobs (analysis_run_id, organization_id, source_type, source_url) values
-    (active_run_id, 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'website', 'https://acme.example');
+  insert into private.analysis_jobs (
+    analysis_run_id, organization_id, source_type, source_url, source_configuration
+  ) values (
+    active_run_id, 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'website',
+    'https://acme.example', '{"kind":"website"}'::jsonb
+  );
   if (select status from public.projects where id = 'aaaaaaaa-0000-0000-0000-000000000001') <> 'analyzing' then
     raise exception 'queue/public lifecycle state did not synchronize';
   end if;

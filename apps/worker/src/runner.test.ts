@@ -1,6 +1,16 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
-import { InMemoryControlPlaneRepository, type AnalysisResult, type RepositoryActor } from "../../../packages/database/src/control-plane.ts";
+import { compileWebMcpRelease } from "../../../packages/compiler/src/compiler.ts";
+import { acmeCapabilityEvidence, acmeCapabilityPlans } from "../../acme-support/src/capability-plans.ts";
+import {
+  InMemoryControlPlaneRepository,
+  type AnalysisResult,
+  type ClaimedAnalysisRunRecord,
+  type RepositoryActor,
+} from "../../../packages/database/src/control-plane.ts";
+import { computeSourceIdentityHash } from "../../../packages/database/src/source-identity.ts";
+import { websiteSuspensionProjectionFixture } from "../../../test-support/website-suspension-evidence.ts";
 import { processNextAnalysis } from "./runner.ts";
 
 const owner: RepositoryActor = {
@@ -29,25 +39,38 @@ async function enqueue(
   return { project, run };
 }
 
-test("worker canonicalizes the configured GitHub fixture URL before binding the job", async () => {
-  const previous = process.env.PAGE2WEBMCP_FIXTURE_GITHUB_URL;
-  process.env.PAGE2WEBMCP_FIXTURE_GITHUB_URL = "https://github.com/acme/support/";
+function fixtureAnalysisResult(): AnalysisResult {
+  const plans = acmeCapabilityPlans("https://acme.example").slice(0, 1);
+  const release = compileWebMcpRelease(plans);
+  return {
+    capabilities: plans.map((plan) => ({ plan, status: "proposed" })),
+    diagnostics: [],
+    evidence: acmeCapabilityEvidence().filter(({ reference }) =>
+      plans.some((plan) => plan.evidence.some((item) => item.reference === reference))),
+    release
+  };
+}
+
+test("worker fails closed when no analysis adapter is configured", async () => {
   const repository = new InMemoryControlPlaneRepository();
-  try {
-    const { run } = await enqueue(repository, "github", "https://github.com/acme/support");
-    const completed = await processNextAnalysis(repository, { workerId: "github-worker" });
-    assert.equal(completed?.id, run.id);
-    assert.equal(completed?.status, "succeeded");
-  } finally {
-    if (previous === undefined) delete process.env.PAGE2WEBMCP_FIXTURE_GITHUB_URL;
-    else process.env.PAGE2WEBMCP_FIXTURE_GITHUB_URL = previous;
-  }
+  const { run } = await enqueue(repository, "github", "https://code.widgets.example/team/repository");
+  const completed = await processNextAnalysis(repository, { workerId: "unconfigured-worker" });
+  assert.equal(completed?.id, run.id);
+  assert.equal(completed?.status, "failed");
+  assert.equal(completed?.errorCode, "ANALYZER_NOT_CONFIGURED");
 });
 
-test("worker rejects a persisted source outside the fixed fixture without retrying", async () => {
+test("worker binds the persisted source to the explicit analysis adapter", async () => {
   const repository = new InMemoryControlPlaneRepository();
   const { run } = await enqueue(repository, "website", "https://unexpected.example/");
-  const completed = await processNextAnalysis(repository, { workerId: "scope-worker" });
+  const completed = await processNextAnalysis(repository, {
+    workerId: "scope-worker",
+    analyze: async (source) => {
+      assert.equal(source.sourceType, "website");
+      assert.equal(source.sourceUrl, "https://unexpected.example/");
+      throw new Error("SOURCE_SCOPE_MISMATCH");
+    },
+  });
   assert.equal(completed?.id, run.id);
   assert.equal(completed?.status, "failed");
   assert.equal(completed?.attempts, 1);
@@ -60,7 +83,8 @@ test("worker processing never needs member-scoped repository reads", async () =>
   repository.getProject = async () => { throw new Error("APP_CONTEXT_FORBIDDEN"); };
   repository.getAnalysis = async () => { throw new Error("APP_CONTEXT_FORBIDDEN"); };
 
-  const completed = await processNextAnalysis(repository, { workerId: "worker-only" });
+  const result = fixtureAnalysisResult();
+  const completed = await processNextAnalysis(repository, { workerId: "worker-only", analyze: async () => result });
 
   assert.equal(completed?.id, run.id);
   assert.equal(completed?.status, "succeeded");
@@ -88,6 +112,76 @@ test("analysis deadline aborts work and returns the durable job to the bounded r
   assert.equal(completed?.errorCode, "ANALYSIS_DEADLINE_EXCEEDED");
 });
 
+test("analysis deadline awaits aborted cleanup and preserves an attested authentication suspension", async () => {
+  const repository = new InMemoryControlPlaneRepository(() => new Date("2026-09-01T12:00:00.000Z"));
+  const { project, run } = await enqueue(repository, "website", "https://widgets.example/");
+  let observeAbort!: () => void;
+  const abortObserved = new Promise<void>((resolve) => { observeAbort = resolve; });
+  let releaseCleanup!: () => void;
+  const cleanupReleased = new Promise<void>((resolve) => { releaseCleanup = resolve; });
+  let cleanupFinished = false;
+  let processingSettled = false;
+
+  const processing = processNextAnalysis(repository, {
+    workerId: "deadline-authentication-worker",
+    deadlineMs: 10,
+    heartbeatMs: 10,
+    analyze: async (source, signal) => new Promise((resolve) => {
+      signal.addEventListener("abort", async () => {
+        observeAbort();
+        await cleanupReleased;
+        cleanupFinished = true;
+        resolve({
+          disposition: "waiting_for_authentication" as const,
+          capabilities: [] as [], diagnostics: [] as [], evidence: [] as [],
+          checkpointReference: `urn:sha256:${"d".repeat(64)}`,
+          sourceSnapshotId: source.sourceSnapshotId,
+          sourceIdentityHash: computeSourceIdentityHash("website", "https://widgets.example/", { kind: "website" }),
+          targetOriginDigest: createHash("sha256").update("https://widgets.example").digest("hex"),
+          expiresAt: "2026-09-01T12:09:00.000Z",
+          suspensionEvidence: websiteSuspensionProjectionFixture({
+            checkpointReference: `urn:sha256:${"d".repeat(64)}`, sourceSnapshotId: source.sourceSnapshotId,
+            sourceIdentityHash: computeSourceIdentityHash("website", "https://widgets.example/", { kind: "website" }),
+            targetOriginDigest: createHash("sha256").update("https://widgets.example").digest("hex"),
+            expiresAt: "2026-09-01T12:09:00.000Z",
+          }),
+        });
+      }, { once: true });
+    }),
+  });
+  void processing.finally(() => { processingSettled = true; });
+
+  await abortObserved;
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const settledBeforeCleanup = processingSettled;
+  releaseCleanup();
+  const result = await processing;
+
+  assert.equal(settledBeforeCleanup, false);
+  assert.equal(cleanupFinished, true);
+  assert.equal(result, undefined);
+  assert.equal((await repository.getLatestAnalysis(owner, project.id))?.status, "waiting");
+  assert.equal((await repository.getWebsiteAuthenticationWait(owner, run.id))?.state, "waiting");
+});
+
+test("worker retries only the stable transient website control classification", async () => {
+  for (const [code, status] of [
+    ["WEBSITE_CONTROL_RETRYABLE", "queued"],
+    ["WEBSITE_CONTROL_REJECTED", "failed"],
+    ["WEBSITE_CONTROL_RESPONSE_INVALID", "failed"],
+  ] as const) {
+    const repository = new InMemoryControlPlaneRepository();
+    const { run } = await enqueue(repository, "website", "https://acme.example/");
+    const completed = await processNextAnalysis(repository, {
+      workerId: `classification-${code.toLowerCase()}`,
+      analyze: async () => { throw new Error(code); },
+    });
+    assert.equal(completed?.id, run.id);
+    assert.equal(completed?.status, status);
+    assert.equal(completed?.errorCode, code);
+  }
+});
+
 test("heartbeats are serialized and stop before completion", async () => {
   const repository = new InMemoryControlPlaneRepository();
   await enqueue(repository, "website", "https://acme.example/");
@@ -109,11 +203,7 @@ test("heartbeats are serialized and stop before completion", async () => {
       active -= 1;
     }
   };
-  const result: AnalysisResult = {
-    capabilities: [],
-    evidence: [],
-    release: { code: "export {};", contentHash: "ignored", allowedOrigin: "https://acme.example" }
-  };
+  const result = fixtureAnalysisResult();
   const completed = await processNextAnalysis(repository, {
     workerId: "heartbeat-worker",
     heartbeatMs: 10,
@@ -126,4 +216,241 @@ test("heartbeats are serialized and stop before completion", async () => {
   assert.ok(calls >= 2);
   assert.equal(maximumActive, 1);
   assert.equal(active, 0);
+});
+
+test("worker atomically waits without completing or failing and a fresh worker resumes the claimed checkpoint", async () => {
+  const repository = new InMemoryControlPlaneRepository(() => new Date("2026-09-01T12:00:00.000Z"));
+  const { project, run } = await enqueue(repository, "website", "https://widgets.example/");
+  const sourceIdentityHash = computeSourceIdentityHash("website", "https://widgets.example/", { kind: "website" });
+  let completes = 0;
+  let checkpoints = 0;
+  let cleanupCompletions = 0;
+  let persistedCleanupResources: unknown;
+  let failures = 0;
+  const checkpoint = repository.checkpointWebsiteAuthenticationResult.bind(repository);
+  const complete = repository.completeCheckpointedWebsiteAuthenticationAnalysis.bind(repository);
+  const fail = repository.failAnalysis.bind(repository);
+  repository.checkpointWebsiteAuthenticationResult = async (...args) => {
+    checkpoints += 1;
+    return checkpoint(...args);
+  };
+  repository.completeCheckpointedWebsiteAuthenticationAnalysis = async (...args) => {
+    completes += 1;
+    persistedCleanupResources = args[4];
+    return complete(...args);
+  };
+  repository.failAnalysis = async (...args) => { failures += 1; return fail(...args); };
+
+  const waitingResult = await processNextAnalysis(repository, {
+    workerId: "authentication-public-worker",
+    analyze: async (source) => ({
+      disposition: "waiting_for_authentication" as const,
+      capabilities: [] as [],
+      diagnostics: [] as [],
+      evidence: [] as [],
+      checkpointReference: `urn:sha256:${"a".repeat(64)}`,
+      sourceSnapshotId: source.sourceSnapshotId!,
+      sourceIdentityHash,
+      targetOriginDigest: createHash("sha256").update("https://widgets.example").digest("hex"),
+      expiresAt: "2026-09-01T12:09:00.000Z",
+      suspensionEvidence: websiteSuspensionProjectionFixture({
+        checkpointReference: `urn:sha256:${"a".repeat(64)}`, sourceSnapshotId: source.sourceSnapshotId!,
+        sourceIdentityHash, targetOriginDigest: createHash("sha256").update("https://widgets.example").digest("hex"),
+        expiresAt: "2026-09-01T12:09:00.000Z",
+      }),
+    }),
+  });
+  assert.equal(waitingResult, undefined);
+  const waiting = await repository.getWebsiteAuthenticationWait(owner, run.id);
+  assert.equal(waiting?.state, "waiting");
+  assert.equal(completes, 0);
+  assert.equal(failures, 0);
+  assert.equal((await repository.getLatestAnalysis(owner, project.id))?.status, "waiting");
+  assert.equal(await repository.claimAnalysis("must-not-claim-human-wait", 60_000, ["website"]), undefined);
+
+  await repository.resumeAnalysisAfterAuthentication(owner, {
+    runId: run.id,
+    checkpointReference: `urn:sha256:${"a".repeat(64)}`,
+    authenticationEvidenceReference: `urn:sha256:${"b".repeat(64)}`,
+    sourceSnapshotId: waiting!.sourceSnapshotId,
+    sourceIdentityHash,
+    targetOriginDigest: createHash("sha256").update("https://widgets.example").digest("hex"),
+    idempotencyKey: "resume-authentication-runner-test",
+    inputHash: "c".repeat(64),
+  });
+  const resumedAdapter = Object.assign(async (source: ClaimedAnalysisRunRecord) => {
+    assert.equal(source.authenticationCheckpoint?.checkpointReference, `urn:sha256:${"a".repeat(64)}`);
+    assert.equal(source.authenticationCheckpoint?.authenticationEvidenceReference, `urn:sha256:${"b".repeat(64)}`);
+    return fixtureAnalysisResult();
+  }, {
+    finalizeAuthenticationCheckpoint: async (source: ClaimedAnalysisRunRecord) => {
+      cleanupCompletions += 1;
+      assert.ok(source.authenticationCheckpoint?.liveReceiptEvidence);
+      const terminalDisposition = {
+        authentication_handoff_checkpoint: "destroyed",
+        browser_lease: "released",
+        browser_session: "destroyed",
+        cdp_observation_lease: "released",
+        egress_policy_proxy: "revoked",
+        evidence_lease: "retained_immutable",
+        ttl_secrets: "destroyed",
+      } as const;
+      return source.authenticationCheckpoint.liveReceiptEvidence.cleanupResources.map((resource) => ({
+        ...resource,
+        disposition: terminalDisposition[resource.resource],
+        timestamp: "2026-09-01T12:01:00.000Z",
+      }));
+    },
+  });
+  const completed = await processNextAnalysis(repository, {
+    workerId: "authentication-resume-fresh-worker",
+    analyze: resumedAdapter,
+  });
+  assert.equal(completed?.status, "succeeded");
+  assert.equal(checkpoints, 1);
+  assert.equal(completes, 1);
+  assert.equal(cleanupCompletions, 1);
+  assert.equal(Array.isArray(persistedCleanupResources) && persistedCleanupResources.length, 7);
+  assert.ok((persistedCleanupResources as Array<{ disposition: string }>).every(
+    ({ disposition }) => disposition !== "pending" && disposition !== "failed",
+  ));
+  assert.equal(failures, 0);
+});
+
+test("a lost authentication result-checkpoint response resumes after lease expiry without re-analysis", async () => {
+  let now = new Date("2026-09-01T12:00:00.000Z");
+  const repository = new InMemoryControlPlaneRepository(() => now);
+  const { run } = await enqueue(repository, "website", "https://widgets.example/");
+  const sourceIdentityHash = computeSourceIdentityHash("website", "https://widgets.example/", { kind: "website" });
+  const first = await repository.claimAnalysis("authentication-public", 60_000, ["website"]);
+  assert.ok(first);
+  const checkpointReference = `urn:sha256:${"d".repeat(64)}`;
+  const targetOriginDigest = createHash("sha256").update("https://widgets.example").digest("hex");
+  await repository.waitAnalysisForAuthentication("authentication-public", run.id, {
+    checkpointReference, sourceSnapshotId: first.sourceSnapshotId, sourceIdentityHash, targetOriginDigest,
+    expiresAt: "2026-09-01T12:09:00.000Z",
+    suspensionEvidence: {
+      ...websiteSuspensionProjectionFixture({ checkpointReference, sourceSnapshotId: first.sourceSnapshotId,
+        sourceIdentityHash, targetOriginDigest, expiresAt: "2026-09-01T12:09:00.000Z" }),
+      suspendedWorkerIdentityDigest: createHash("sha256").update("authentication-public").digest("hex"),
+      suspendedLeaseGeneration: first.leaseGeneration,
+    },
+    idempotencyKey: "result-response-loss-wait", inputHash: "result-response-loss-wait",
+  }, first.leaseGeneration);
+  await repository.resumeAnalysisAfterAuthentication(owner, {
+    runId: run.id, checkpointReference, authenticationEvidenceReference: `urn:sha256:${"e".repeat(64)}`,
+    sourceSnapshotId: first.sourceSnapshotId, sourceIdentityHash, targetOriginDigest,
+    idempotencyKey: "result-response-loss-resume", inputHash: "result-response-loss-resume",
+  });
+
+  const originalCheckpoint = repository.checkpointWebsiteAuthenticationResult.bind(repository);
+  let analysisCalls = 0;
+  let cleanupCalls = 0;
+  repository.checkpointWebsiteAuthenticationResult = async (...args) => {
+    await originalCheckpoint(...args);
+    throw new Error("DATABASE_RESULT_CHECKPOINT_RESPONSE_LOST");
+  };
+  const adapter = Object.assign(async () => {
+    analysisCalls += 1;
+    return fixtureAnalysisResult();
+  }, { finalizeAuthenticationCheckpoint: async () => { cleanupCalls += 1; } });
+  await assert.rejects(processNextAnalysis(repository, {
+    workerId: "authentication-result-worker-b", leaseMs: 1_000, analyze: adapter,
+  }), /DATABASE_RESULT_CHECKPOINT_RESPONSE_LOST/);
+  assert.equal(analysisCalls, 1);
+  assert.equal(cleanupCalls, 0);
+  assert.equal((await repository.getAnalysis(owner, run.id)).status, "running");
+
+  repository.checkpointWebsiteAuthenticationResult = originalCheckpoint;
+  now = new Date("2026-09-01T12:00:01.001Z");
+  const completed = await processNextAnalysis(repository, {
+    workerId: "authentication-result-worker-c",
+    analyze: Object.assign(async () => {
+      analysisCalls += 1;
+      throw new Error("RESULT_CHECKPOINT_MUST_SKIP_ANALYSIS");
+    }, { finalizeAuthenticationCheckpoint: async () => { cleanupCalls += 1; } }),
+  });
+  assert.equal(completed?.status, "succeeded");
+  assert.equal(analysisCalls, 1);
+  assert.equal(cleanupCalls, 1);
+});
+
+test("durable authentication suspension does not emit a successful analysis completion", async () => {
+  const repository = new InMemoryControlPlaneRepository(() => new Date("2026-09-01T12:00:00.000Z"));
+  const { project, run } = await enqueue(repository, "website", "https://widgets.example/");
+  const emitted: Array<Record<string, unknown>> = [];
+  const originalInfo = console.info;
+  console.info = (value?: unknown) => {
+    if (typeof value !== "string") return;
+    try { emitted.push(JSON.parse(value) as Record<string, unknown>); } catch { /* unrelated output */ }
+  };
+  try {
+    await processNextAnalysis(repository, {
+      workerId: "authentication-observation-worker",
+      analyze: async (source) => ({
+        disposition: "waiting_for_authentication" as const,
+        capabilities: [] as [], diagnostics: [] as [], evidence: [] as [],
+        checkpointReference: `urn:sha256:${"e".repeat(64)}`,
+        sourceSnapshotId: source.sourceSnapshotId,
+        sourceIdentityHash: computeSourceIdentityHash("website", "https://widgets.example/", { kind: "website" }),
+        targetOriginDigest: createHash("sha256").update("https://widgets.example").digest("hex"),
+        expiresAt: "2026-09-01T12:09:00.000Z",
+        suspensionEvidence: websiteSuspensionProjectionFixture({
+          checkpointReference: `urn:sha256:${"e".repeat(64)}`, sourceSnapshotId: source.sourceSnapshotId,
+          sourceIdentityHash: computeSourceIdentityHash("website", "https://widgets.example/", { kind: "website" }),
+          targetOriginDigest: createHash("sha256").update("https://widgets.example").digest("hex"),
+          expiresAt: "2026-09-01T12:09:00.000Z",
+        }),
+      }),
+    });
+  } finally {
+    console.info = originalInfo;
+  }
+
+  assert.equal((await repository.getLatestAnalysis(owner, project.id))?.status, "waiting");
+  assert.equal((await repository.getWebsiteAuthenticationWait(owner, run.id))?.state, "waiting");
+  assert.deepEqual(emitted.filter((record) => record.event === "analysis_completed" && record.request_id === run.id), []);
+});
+
+test("worker reconciles an externally created checkpoint when the database wait commit fails", async () => {
+  const repository = new InMemoryControlPlaneRepository(() => new Date("2026-09-01T12:00:00.000Z"));
+  await enqueue(repository, "website", "https://widgets.example/");
+  const originalWait = repository.waitAnalysisForAuthentication.bind(repository);
+  let reconciliations = 0;
+  let simulateAmbiguousCommit = false;
+  repository.waitAnalysisForAuthentication = async (...args) => {
+    if (simulateAmbiguousCommit) await originalWait(...args);
+    throw new Error("DATABASE_WAIT_COMMIT_FAILED");
+  };
+  const analyze = Object.assign(async (source: ClaimedAnalysisRunRecord) => ({
+    disposition: "waiting_for_authentication" as const,
+    capabilities: [] as [], diagnostics: [] as [], evidence: [] as [],
+    checkpointReference: `urn:sha256:${"c".repeat(64)}`,
+    sourceSnapshotId: source.sourceSnapshotId,
+    sourceIdentityHash: computeSourceIdentityHash("website", "https://widgets.example/", { kind: "website" }),
+    targetOriginDigest: createHash("sha256").update("https://widgets.example").digest("hex"),
+    expiresAt: "2026-09-01T12:09:00.000Z",
+    suspensionEvidence: websiteSuspensionProjectionFixture({
+      checkpointReference: `urn:sha256:${"c".repeat(64)}`, sourceSnapshotId: source.sourceSnapshotId,
+      sourceIdentityHash: computeSourceIdentityHash("website", "https://widgets.example/", { kind: "website" }),
+      targetOriginDigest: createHash("sha256").update("https://widgets.example").digest("hex"),
+      expiresAt: "2026-09-01T12:09:00.000Z",
+    }),
+  }), {
+    reconcileAuthenticationCheckpoint: async () => { reconciliations += 1; },
+  });
+  const failed = await processNextAnalysis(repository, { workerId: "wait-commit-failure", analyze });
+  assert.equal(failed?.status, "failed");
+  assert.equal(failed?.errorCode, "DATABASE_WAIT_COMMIT_FAILED");
+  assert.equal(reconciliations, 1);
+
+  const second = new InMemoryControlPlaneRepository(() => new Date("2026-09-01T12:00:00.000Z"));
+  const { project, run } = await enqueue(second, "website", "https://widgets.example/");
+  const secondWait = second.waitAnalysisForAuthentication.bind(second);
+  second.waitAnalysisForAuthentication = async (...args) => { await secondWait(...args); throw new Error("DATABASE_RESPONSE_LOST"); };
+  simulateAmbiguousCommit = true;
+  await assert.rejects(processNextAnalysis(second, { workerId: "wait-ambiguous", analyze }), /LEASE_LOST/);
+  assert.equal((await second.getLatestAnalysis(owner, project.id))?.status, "waiting");
+  assert.equal((await second.getWebsiteAuthenticationWait(owner, run.id))?.state, "waiting");
+  assert.equal(reconciliations, 2);
 });

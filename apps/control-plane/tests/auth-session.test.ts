@@ -2,10 +2,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   authenticate,
+  createFixtureAuthService,
   issueSession,
   sessionFromRequest,
   verifySessionToken
-} from "../src/auth.ts";
+} from "../src/auth-fixture.ts";
+import { createConfiguredSupabaseAuthService } from "../src/auth.ts";
 
 const clock = new Date("2026-08-29T12:00:00.000Z");
 const secret = "test-session-secret-that-is-long-enough";
@@ -19,16 +21,54 @@ test("fixture authentication returns a stable actor rather than a caller-control
   assert.equal(authenticate("owner@example.test", "wrong"), undefined);
 });
 
-test("production authentication uses only deployment-managed credentials", () => {
-  const environment = {
+test("production auth has no fixture-credential fallback", () => {
+  assert.throws(() => createConfiguredSupabaseAuthService({
     NODE_ENV: "production",
-    PAGE2WEBMCP_OWNER_PASSWORD: "deployment-owner-password-with-32-bytes",
-    PAGE2WEBMCP_EDITOR_PASSWORD: "deployment-editor-password-with-32-bytes"
+    PAGE2WEBMCP_OWNER_PASSWORD: "fixture-password"
+  }), /SUPABASE_CONFIGURATION_REQUIRED/);
+});
+
+test("production Auth permits HTTP only for the explicit canonical IP-literal local stack", () => {
+  const base = {
+    NODE_ENV: "production",
+    NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: "sb_publishable_local-browser-safe-key"
   };
-  assert.equal(authenticate("owner@example.test", "fixture-password", environment), undefined);
-  assert.equal(authenticate("owner@example.test", "deployment-owner-password-with-32-bytes", environment)?.role, "owner");
-  assert.equal(authenticate("editor@example.test", "deployment-editor-password-with-32-bytes", environment)?.role, "editor");
-  assert.equal(authenticate("owner@example.test", "fixture-invalid-password", { NODE_ENV: "production" }), undefined);
+  assert.throws(() => createConfiguredSupabaseAuthService({
+    ...base,
+    PAGE2WEBMCP_TEST_MODE: "true",
+    NEXT_PUBLIC_SUPABASE_URL: "http://127.0.0.1:58321"
+  }), /^AuthError: SUPABASE_CONFIGURATION_REQUIRED$/);
+  for (const url of ["http://127.0.0.1:58321", "http://[::1]:58321"]) {
+    assert.doesNotThrow(() => createConfiguredSupabaseAuthService({
+      ...base,
+      PAGE2WEBMCP_LOCAL_STACK: "true",
+      NEXT_PUBLIC_SUPABASE_URL: url
+    }));
+  }
+  for (const url of [
+    "http://localhost:58321",
+    "http://127.0.0.2:58321",
+    "http://127.0.0.1:54321",
+    "http://127.0.0.1:58322",
+    "http://[::1]:58322",
+    "http://127.0.0.1:58321/auth/v1",
+    "http://127.0.0.1:58321?unsafe=true",
+    "http://user@127.0.0.1:58321"
+  ]) assert.throws(() => createConfiguredSupabaseAuthService({
+    ...base,
+    PAGE2WEBMCP_LOCAL_STACK: "true",
+    NEXT_PUBLIC_SUPABASE_URL: url
+  }), /^AuthError: SUPABASE_CONFIGURATION_REQUIRED$/);
+});
+
+test("the explicit hermetic fixture still returns a server-verifiable session identifier", async () => {
+  const service = createFixtureAuthService({ now: clock });
+  const actor = authenticate("owner@example.test", "fixture-password")!;
+  const token = issueSession(actor, { now: clock, ttlSeconds: 60 });
+  const identity = await service.identity(new Request("https://control.example/api/projects", {
+    headers: { cookie: `page2webmcp_fixture_session=${token}` }
+  }));
+  assert.match(identity?.sessionId ?? "", /^[0-9a-f-]{36}$/);
 });
 
 test("signed sessions reject tampering and expiration", () => {
@@ -51,7 +91,7 @@ test("request authentication ignores the legacy plaintext role cookie", () => {
   assert.ok(actor);
   const token = issueSession(actor, { secret, now: clock, ttlSeconds: 60 });
   const signed = new Request("https://control.example/api/projects", {
-    headers: { cookie: `page2webmcp_session=${token}` }
+    headers: { cookie: `page2webmcp_fixture_session=${token}` }
   });
   assert.deepEqual(sessionFromRequest(signed, { secret, now: clock }), actor);
 });

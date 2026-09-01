@@ -1,14 +1,18 @@
-import { randomUUID } from "node:crypto";
-import { AcmeSupport } from "../../acme-support/src/app.ts";
-import { compileWebMcpRelease } from "../../../packages/compiler/src/compiler.ts";
+import { createHash, randomUUID } from "node:crypto";
 import type {
   AnalysisResult,
   AnalysisRunRecord,
   ClaimedAnalysisRunRecord,
   ControlPlaneRepository,
+  SourceType,
 } from "../../../packages/database/src/control-plane.ts";
 import { getObservability } from "../../../packages/observability/src/server.ts";
-import { runFixtureSourceHardening, runFixtureWorkflow } from "./workflow.ts";
+import {
+  bindWebsiteSuspensionToWorker,
+  type AnalysisAdapter,
+  type AnalysisAdapterOutcome,
+  type WebsiteAuthenticationWaitingOutcome,
+} from "./workflow.ts";
 
 const LEASE_MS = 60_000;
 const HEARTBEAT_MS = 15_000;
@@ -19,8 +23,21 @@ export type ProcessAnalysisOptions = {
   leaseMs?: number;
   deadlineMs?: number;
   heartbeatMs?: number;
-  analyze?: (source: ClaimedAnalysisRunRecord, signal: AbortSignal) => Promise<AnalysisResult>;
+  sourceTypes?: readonly SourceType[];
+  analyze?: RunnerAnalysisAdapter;
 };
+
+type RunnerAnalysisAdapter = ((source: ClaimedAnalysisRunRecord, signal: AbortSignal) => Promise<AnalysisAdapterOutcome>) & {
+  finalizeAuthenticationCheckpoint?: AnalysisAdapter["finalizeAuthenticationCheckpoint"];
+  reconcileAuthenticationCheckpoint?: AnalysisAdapter["reconcileAuthenticationCheckpoint"];
+};
+
+let testAnalysisAdapter: RunnerAnalysisAdapter | undefined;
+
+export function setAnalysisAdapterForTest(adapter: AnalysisAdapter | undefined): void {
+  if (process.env.NODE_ENV === "production") throw new Error("TEST_ADAPTER_FORBIDDEN");
+  testAnalysisAdapter = adapter;
+}
 
 /** Claims and processes at most one durable analysis job. */
 export async function processNextAnalysis(
@@ -36,33 +53,106 @@ export async function processNextAnalysis(
     10,
     Math.max(10, Math.floor(leaseMs / 2))
   );
-  const run = await repository.claimAnalysis(workerId, leaseMs);
+  const run = await repository.claimAnalysis(workerId, leaseMs, options.sourceTypes);
   if (!run) return undefined;
   const startedAt = Date.now();
 
   let heartbeatFailure: unknown;
   const heartbeatController = new AbortController();
-  const heartbeat = maintainLease(repository, workerId, run.id, leaseMs, heartbeatMs, heartbeatController.signal, (error) => {
+  const heartbeat = maintainLease(
+    repository, workerId, run.id, run.leaseGeneration, leaseMs, heartbeatMs, heartbeatController.signal, (error) => {
     if (stableFailureCode(error) === "LEASE_LOST") heartbeatFailure = error;
-  });
+    },
+  );
+  let durableAuthenticationCheckpointAttempted = false;
 
   try {
-    const result = await withDeadline(
-      (signal) => options.analyze ? options.analyze(run, signal) : Promise.resolve(buildResult(run)),
-      deadlineMs
+    const analyze = options.analyze ?? testAnalysisAdapter;
+    const persistedResultCheckpoint = run.authenticationCheckpoint?.resultCheckpoint;
+    const outcome = persistedResultCheckpoint ? undefined : await withDeadline(
+      (signal) => analyze ? analyze(run, signal) : Promise.reject(new Error("ANALYZER_NOT_CONFIGURED")),
+      deadlineMs,
+      isAuthenticationWait,
     );
-    heartbeatController.abort();
-    await heartbeat;
     if (heartbeatFailure) throw heartbeatFailure;
-    const completed = await repository.completeAnalysis(workerId, run.id, result);
+    if (isAuthenticationWait(outcome)) {
+      heartbeatController.abort();
+      await heartbeat;
+      if (heartbeatFailure) throw heartbeatFailure;
+      try {
+        if (!outcome.suspensionEvidence) throw new Error("WEBSITE_SUSPENSION_EVIDENCE_REQUIRED");
+        const suspensionEvidence = bindWebsiteSuspensionToWorker(
+          outcome.suspensionEvidence,
+          workerId,
+          run.leaseGeneration,
+        );
+        await repository.waitAnalysisForAuthentication(workerId, run.id, {
+          checkpointReference: outcome.checkpointReference,
+          sourceSnapshotId: outcome.sourceSnapshotId,
+          sourceIdentityHash: outcome.sourceIdentityHash,
+          targetOriginDigest: outcome.targetOriginDigest,
+          expiresAt: outcome.expiresAt,
+          suspensionEvidence,
+          idempotencyKey: `website-auth-wait:${outcome.checkpointReference.slice("urn:sha256:".length)}`,
+          inputHash: createHash("sha256").update(JSON.stringify({
+            checkpointReference: outcome.checkpointReference,
+            expiresAt: outcome.expiresAt,
+            sourceIdentityHash: outcome.sourceIdentityHash,
+            sourceSnapshotId: outcome.sourceSnapshotId,
+            targetOriginDigest: outcome.targetOriginDigest,
+            suspensionEvidence,
+          }), "utf8").digest("hex"),
+        }, run.leaseGeneration);
+        return undefined;
+      } catch (error) {
+        try {
+          await analyze?.reconcileAuthenticationCheckpoint?.(run, outcome, new AbortController().signal);
+        } catch {
+          throw new Error("WEBSITE_AUTHENTICATION_RECONCILE_FAILED");
+        }
+        throw error;
+      }
+    }
+    let completed: AnalysisRunRecord;
+    if (run.authenticationCheckpoint) {
+      if (!analyze?.finalizeAuthenticationCheckpoint) {
+        throw new Error("WEBSITE_AUTHENTICATION_FINALIZE_NOT_CONFIGURED");
+      }
+      durableAuthenticationCheckpointAttempted = true;
+      const resultCheckpoint = persistedResultCheckpoint ?? await repository.checkpointWebsiteAuthenticationResult(
+        workerId, run.id, completedResult(outcome), run.leaseGeneration,
+      );
+      const remainingDeadlineMs = Math.max(10, deadlineMs - (Date.now() - startedAt));
+      const cleanupResources = await withDeadline(
+        (signal) => analyze.finalizeAuthenticationCheckpoint!(run, signal),
+        remainingDeadlineMs,
+      );
+      heartbeatController.abort();
+      await heartbeat;
+      if (heartbeatFailure) throw heartbeatFailure;
+      completed = await repository.completeCheckpointedWebsiteAuthenticationAnalysis(
+        workerId, run.id, resultCheckpoint.resultHash, run.leaseGeneration, cleanupResources ?? [],
+      );
+    } else {
+      heartbeatController.abort();
+      await heartbeat;
+      if (heartbeatFailure) throw heartbeatFailure;
+      completed = await repository.completeAnalysis(workerId, run.id, completedResult(outcome), run.leaseGeneration);
+    }
     await recordAnalysisOutcome(run.id, "success", run.sourceType, undefined, startedAt, run.attempts);
     return completed;
   } catch (error) {
     heartbeatController.abort();
     await heartbeat;
     const code = stableFailureCode(error);
+    if (durableAuthenticationCheckpointAttempted) {
+      await recordAnalysisOutcome(run.id, "failure", run.sourceType, code, startedAt, run.attempts);
+      throw error;
+    }
     try {
-      const failed = await repository.failAnalysis(workerId, run.id, code, isRetryableFailure(code));
+      const failed = await repository.failAnalysis(
+        workerId, run.id, code, isRetryableFailure(code), run.leaseGeneration,
+      );
       await recordAnalysisOutcome(run.id, "failure", run.sourceType, code, startedAt, run.attempts);
       return failed;
     } catch (transitionError) {
@@ -77,43 +167,14 @@ export async function processNextAnalysis(
 
 }
 
-function buildResult(source: ClaimedAnalysisRunRecord): AnalysisResult {
-  assertFixtureScope(source);
+function isAuthenticationWait(value: AnalysisAdapterOutcome | undefined): value is WebsiteAuthenticationWaitingOutcome {
+  return Boolean(value && typeof value === "object"
+    && "disposition" in value && value.disposition === "waiting_for_authentication");
+}
 
-  if (source.sourceType === "github") {
-    const draftPullRequest = runFixtureSourceHardening();
-    const origin = fixtureOrigin();
-    const release = compileWebMcpRelease([], origin);
-    return {
-      capabilities: [],
-      evidence: [{ source: "source", draft: true, changedFiles: draftPullRequest.files?.length ?? 0 }],
-      release: {
-        code: release.code,
-        contentHash: release.contentHash,
-        allowedOrigin: release.allowedOrigin,
-        manifest: release.manifest
-      },
-      draftPullRequest
-    };
-  }
-
-  const origin = new URL(source.sourceUrl).origin;
-  const workflow = runFixtureWorkflow(new AcmeSupport(), origin);
-  const capabilities = workflow.capabilities.map((capability) => ({
-    stableName: capability.identity.name,
-    riskTier: capability.safety.riskTier,
-    status: capability.status === "blocked" ? "blocked" as const : "proposed" as const
-  }));
-  return {
-    capabilities,
-    evidence: workflow.evidence,
-    release: {
-      code: workflow.release.code,
-      contentHash: workflow.release.contentHash,
-      allowedOrigin: workflow.release.allowedOrigin,
-      manifest: workflow.release.manifest
-    }
-  };
+function completedResult(value: AnalysisAdapterOutcome | undefined): AnalysisResult {
+  if (!value) throw new Error("WEBSITE_AUTHENTICATION_RESULT_CHECKPOINT_INVALID");
+  return value as AnalysisResult;
 }
 
 async function recordAnalysisOutcome(
@@ -143,39 +204,43 @@ async function recordAnalysisOutcome(
   }
 }
 
-function assertFixtureScope(source: ClaimedAnalysisRunRecord): void {
-  const expectedOrigin = fixtureOrigin();
-  if (source.sourceType === "website" && source.sourceUrl === `${expectedOrigin}/`) return;
-  if (source.sourceType === "openapi" && source.sourceUrl === `${expectedOrigin}/openapi.json`) return;
-  const expectedRepository = process.env.PAGE2WEBMCP_FIXTURE_GITHUB_URL ?? "https://github.com/acme/support";
-  if (source.sourceType === "github" && canonicalUrl(source.sourceUrl) === canonicalUrl(expectedRepository)) return;
-  throw new Error("SOURCE_SCOPE_MISMATCH");
-}
-
-function fixtureOrigin(): string {
-  const configured = process.env.PAGE2WEBMCP_FIXTURE_APP_URL ?? "https://acme.example";
-  return new URL(configured).origin;
-}
-
 function boundedDuration(value: number | undefined, fallback: number, minimum: number, maximum: number): number {
   if (value === undefined || !Number.isFinite(value)) return fallback;
   return Math.min(Math.max(Math.floor(value), minimum), maximum);
 }
 
-async function withDeadline<T>(operation: (signal: AbortSignal) => Promise<T>, deadlineMs: number): Promise<T> {
+async function withDeadline<T>(
+  operation: (signal: AbortSignal) => Promise<T>,
+  deadlineMs: number,
+  acceptAfterAbort: (value: T) => boolean = () => false,
+): Promise<T> {
   const controller = new AbortController();
+  const deadlineError = new Error("ANALYSIS_DEADLINE_EXCEEDED");
   let timeout: ReturnType<typeof setTimeout> | undefined;
+  const operationSettlement = Promise.resolve().then(() => operation(controller.signal)).then(
+    (value) => ({ kind: "value" as const, value }),
+    (error: unknown) => ({ kind: "error" as const, error }),
+  );
   try {
-    return await Promise.race([
-      Promise.resolve().then(() => operation(controller.signal)),
-      new Promise<T>((_, reject) => {
+    const first = await Promise.race([
+      operationSettlement,
+      new Promise<{ kind: "deadline" }>((resolve) => {
         timeout = setTimeout(() => {
-          const error = new Error("ANALYSIS_DEADLINE_EXCEEDED");
-          controller.abort(error);
-          reject(error);
+          controller.abort(deadlineError);
+          resolve({ kind: "deadline" });
         }, deadlineMs);
-      })
+      }),
     ]);
+    if (first.kind === "value") return first.value;
+    if (first.kind === "error") throw first.error;
+
+    // Abort initiates provider reconciliation. Keep the lease alive until that
+    // path settles so the runner cannot transition the durable job underneath
+    // cleanup. A suspension attested during the boundary race is still safe to
+    // commit; ordinary work remains bounded by the original deadline.
+    const afterAbort = await operationSettlement;
+    if (afterAbort.kind === "value" && acceptAfterAbort(afterAbort.value)) return afterAbort.value;
+    throw deadlineError;
   } finally {
     if (timeout) clearTimeout(timeout);
   }
@@ -185,6 +250,7 @@ async function maintainLease(
   repository: ControlPlaneRepository,
   workerId: string,
   runId: string,
+  leaseGeneration: number,
   leaseMs: number,
   heartbeatMs: number,
   signal: AbortSignal,
@@ -194,7 +260,7 @@ async function maintainLease(
     await abortableDelay(heartbeatMs, signal);
     if (signal.aborted) return;
     try {
-      await repository.heartbeatAnalysis(workerId, runId, leaseMs);
+      await repository.heartbeatAnalysis(workerId, runId, leaseMs, leaseGeneration);
     } catch (error) {
       onFailure(error);
       if (stableFailureCode(error) === "LEASE_LOST") return;
@@ -216,15 +282,12 @@ async function abortableDelay(milliseconds: number, signal: AbortSignal): Promis
   });
 }
 
-function canonicalUrl(value: string): string {
-  return new URL(value).toString().replace(/\/$/, "");
-}
-
 function stableFailureCode(error: unknown): string {
   if (error instanceof Error && /^[A-Z0-9_]{1,64}$/.test(error.message)) return error.message;
   return "ANALYSIS_FAILED";
 }
 
 function isRetryableFailure(code: string): boolean {
-  return code === "ANALYSIS_DEADLINE_EXCEEDED" || code === "ANALYSIS_FAILED";
+  return code === "ANALYSIS_DEADLINE_EXCEEDED" || code === "ANALYSIS_FAILED"
+    || code === "WEBSITE_CONTROL_RETRYABLE";
 }

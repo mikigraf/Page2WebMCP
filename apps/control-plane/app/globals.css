@@ -1,0 +1,8 @@
+:root { color-scheme: light; font-family: system-ui, sans-serif; }
+body { max-width: 68rem; margin: 2rem auto; padding: 0 1rem; }
+form, fieldset { display: grid; gap: .75rem; }
+fieldset { margin: 0; }
+label { display: grid; gap: .25rem; }
+input, select, button { font: inherit; }
+button { width: fit-content; }
+#source-guidance, #openapi-guidance { margin: 0; color: #4b5563; }

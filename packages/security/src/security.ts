@@ -31,20 +31,55 @@ function parseIpv6(hostname: string): number[] | undefined {
   return [...left, ...Array(omitted).fill("0"), ...right].map((part) => Number.parseInt(part, 16));
 }
 
+const BLOCKED_GLOBAL_IPV6_PREFIXES: readonly Readonly<{ parts: readonly number[]; length: number }>[] = [
+  { parts: [0x2001, 0x0000], length: 32 }, // TEREDO
+  { parts: [0x2001, 0x0002, 0x0000], length: 48 }, // benchmarking
+  { parts: [0x2001, 0x0010], length: 28 }, // deprecated ORCHID
+  { parts: [0x2001, 0x0020], length: 28 }, // ORCHIDv2
+  { parts: [0x2001, 0x0030], length: 28 }, // Drone Remote ID protocol entity tags
+  { parts: [0x2001, 0x0db8], length: 32 }, // documentation
+  { parts: [0x2002], length: 16 }, // 6to4 transition addressing
+  { parts: [0x3fff, 0x0000], length: 20 }, // documentation
+];
+
+function matchesIpv6Prefix(parts: readonly number[], prefix: Readonly<{ parts: readonly number[]; length: number }>): boolean {
+  const completeParts = Math.floor(prefix.length / 16);
+  for (let index = 0; index < completeParts; index += 1) {
+    if (parts[index] !== prefix.parts[index]) return false;
+  }
+  const remainingBits = prefix.length % 16;
+  if (remainingBits === 0) return true;
+  const mask = (0xffff << (16 - remainingBits)) & 0xffff;
+  return (parts[completeParts]! & mask) === (prefix.parts[completeParts]! & mask);
+}
+
 function isBlockedIpv6(hostname: string): boolean {
   const parts = parseIpv6(hostname);
   if (!parts) return false;
   if (parts.every((part) => part === 0) || parts.slice(0, 7).every((part) => part === 0) && parts[7] === 1) return true;
   if ((parts[0] & 0xfe00) === 0xfc00 || (parts[0] & 0xffc0) === 0xfe80 || (parts[0] & 0xff00) === 0xff00) return true;
+  // Permit only ordinary global-unicast space and exclude transition/documentation ranges.
   if (parts.slice(0, 5).every((part) => part === 0) && parts[5] === 0xffff || parts.slice(0, 6).every((part) => part === 0)) {
     return isBlockedIpv4(`${parts[6] >>> 8}.${parts[6] & 0xff}.${parts[7] >>> 8}.${parts[7] & 0xff}`);
   }
-  return false;
+  return (parts[0] & 0xe000) !== 0x2000
+    || BLOCKED_GLOBAL_IPV6_PREFIXES.some((prefix) => matchesIpv6Prefix(parts, prefix));
 }
 
 function isPrivateOrReservedHost(hostname: string): boolean {
   const host = hostname.toLowerCase().replace(/\.+$/, "");
   return host === "localhost" || host.endsWith(".localhost") || isBlockedIpv4(host) || isBlockedIpv6(host);
+}
+
+export function validateResolvedAddress(value: string): { ok: boolean; code?: string } {
+  const normalized = value.toLowerCase().replace(/^\[|\]$/g, "");
+  const ipv4 = normalized.split(".");
+  const validIpv4 = ipv4.length === 4
+    && ipv4.every((part) => /^(?:0|[1-9]\d{0,2})$/.test(part) && Number(part) <= 255);
+  const validIpv6 = normalized.includes(":") && parseIpv6(normalized) !== undefined;
+  if (!validIpv4 && !validIpv6) return { ok: false, code: "INVALID_RESOLVED_ADDRESS" };
+  if (isPrivateOrReservedHost(normalized)) return { ok: false, code: "PRIVATE_NETWORK_BLOCKED" };
+  return { ok: true };
 }
 
 export function validateTargetUrl(value: string): { ok: boolean; code?: string } {
@@ -68,12 +103,21 @@ export function validateRedirectChain(targets: string[]): { ok: boolean; code?: 
 export function createDiscoveryFirewall(origins: string[]) {
   const allowed = new Set(origins);
   return {
-    decide(request: { method: string; url: string }): { allow: boolean; code?: string } {
+    decide(request: {
+      method: string;
+      url: string;
+      kind?: "document" | "subresource" | "download" | "upload" | "tool";
+      tool?: string;
+      pageText?: string;
+    }): { allow: boolean; code?: string } {
       const target = validateTargetUrl(request.url);
       if (!target.ok) return { allow: false, code: target.code };
       let origin: string;
       try { origin = new URL(request.url).origin; } catch { return { allow: false, code: "INVALID_URL" }; }
       if (!allowed.has(origin)) return { allow: false, code: "ORIGIN_BLOCKED" };
+      if (request.kind === "download") return { allow: false, code: "DOWNLOAD_BLOCKED" };
+      if (request.kind === "upload") return { allow: false, code: "UPLOAD_BLOCKED" };
+      if (request.kind === "tool") return { allow: false, code: "TOOL_BLOCKED" };
       if (!["GET", "HEAD"].includes(request.method)) return { allow: false, code: "MUTATION_BLOCKED" };
       return { allow: true };
     }

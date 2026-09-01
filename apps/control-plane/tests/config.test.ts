@@ -1,17 +1,45 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { validateRuntimeConfiguration, validateWorkerRuntimeConfiguration } from "../src/config.ts";
+import {
+  validateRuntimeConfiguration as validateRuntimeConfigurationWithoutBuildIdentity,
+  validateWorkerRuntimeConfiguration as validateWorkerRuntimeConfigurationWithoutBuildIdentity,
+} from "../src/config.ts";
+import { buildDeploymentIdentity } from "../src/deployment-identity.ts";
 
 const production = {
   NODE_ENV: "production",
   PAGE2WEBMCP_SESSION_SECRET: "a-production-session-secret-with-32-bytes",
-  PAGE2WEBMCP_OWNER_PASSWORD: "a-production-owner-password-with-32-bytes",
-  PAGE2WEBMCP_EDITOR_PASSWORD: "a-production-editor-password-with-32-bytes",
+  NEXT_PUBLIC_SUPABASE_URL: "https://auth.example",
+  NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: "sb_publishable_safe-public-key-value",
   PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN: "https://control.example",
+  PAGE2WEBMCP_GIT_COMMIT_SHA: "c".repeat(40),
+  PAGE2WEBMCP_APPLICATION_RELEASE_ID: "control-plane-test-1",
+  PAGE2WEBMCP_SUPABASE_URL: "https://bimqgiedckdurqiywctl.supabase.co",
+  PAGE2WEBMCP_SUPABASE_SECRET_KEY: "sb_secret_test-only-artifact-storage-key",
+  PAGE2WEBMCP_PUBLIC_ORIGIN: "https://bimqgiedckdurqiywctl.supabase.co/storage/v1/object/public/page2webmcp-releases",
   PAGE2WEBMCP_STORAGE_MODE: "postgres",
-  DATABASE_URL: "postgresql://database.example/page2webmcp",
-  PAGE2WEBMCP_FIXTURE_APP_URL: "https://acme.example",
-  PAGE2WEBMCP_FIXTURE_GITHUB_URL: "https://github.com/acme/support"
+  DATABASE_URL: "postgresql://database.example/page2webmcp"
+};
+
+const embeddedIdentity = buildDeploymentIdentity({
+  gitCommitSha: production.PAGE2WEBMCP_GIT_COMMIT_SHA,
+  applicationReleaseId: production.PAGE2WEBMCP_APPLICATION_RELEASE_ID,
+  controlPlaneOrigin: production.PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN,
+  sourceTreeSha256: "a".repeat(64),
+});
+const deploymentIdentity = { loadBuildIdentity: () => embeddedIdentity };
+const validateRuntimeConfiguration = (environment: Record<string, string | undefined>) =>
+  validateRuntimeConfigurationWithoutBuildIdentity(environment, deploymentIdentity);
+const validateWorkerRuntimeConfiguration = (environment: Record<string, string | undefined>) =>
+  validateWorkerRuntimeConfigurationWithoutBuildIdentity(environment, deploymentIdentity);
+
+const localProduction = {
+  ...production,
+  PAGE2WEBMCP_LOCAL_STACK: "true",
+  NEXT_PUBLIC_SUPABASE_URL: "http://127.0.0.1:58321",
+  PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN: "http://127.0.0.1:3100",
+  PAGE2WEBMCP_SUPABASE_URL: "http://127.0.0.1:58321",
+  PAGE2WEBMCP_PUBLIC_ORIGIN: "http://127.0.0.1:58321/storage/v1/object/public/page2webmcp-releases"
 };
 
 test("production configuration requires a strong session secret and durable database", () => {
@@ -24,6 +52,14 @@ test("production configuration requires a strong session secret and durable data
     /DATABASE_URL_REQUIRED/
   );
   assert.doesNotThrow(() => validateRuntimeConfiguration(production));
+  assert.throws(
+    () => validateRuntimeConfiguration({ ...production, PAGE2WEBMCP_GIT_COMMIT_SHA: "" }),
+    /DEPLOYMENT_IDENTITY_CONFIGURATION_REQUIRED/,
+  );
+  assert.throws(
+    () => validateRuntimeConfiguration({ ...production, PAGE2WEBMCP_APPLICATION_RELEASE_ID: "" }),
+    /DEPLOYMENT_IDENTITY_CONFIGURATION_REQUIRED/,
+  );
 });
 
 test("production memory storage is restricted to an explicit ephemeral-test override", () => {
@@ -46,21 +82,33 @@ test("production memory storage is restricted to an explicit ephemeral-test over
   }), /EPHEMERAL_STORAGE_FORBIDDEN/);
 });
 
-test("production never accepts the committed fixture passwords or one shared credential", () => {
+test("production requires public Supabase configuration and rejects browser-exposed secret keys", () => {
+  const serviceRoleJwt = [
+    Buffer.from(JSON.stringify({ alg: "HS256", typ: "JWT" })).toString("base64url"),
+    Buffer.from(JSON.stringify({ role: "service_role", ref: "project" })).toString("base64url"),
+    "unsafe-signature-value"
+  ].join(".");
   assert.throws(
-    () => validateRuntimeConfiguration({ ...production, PAGE2WEBMCP_OWNER_PASSWORD: "" }),
-    /AUTH_CREDENTIALS_REQUIRED/
+    () => validateRuntimeConfiguration({ ...production, NEXT_PUBLIC_SUPABASE_URL: "" }),
+    /SUPABASE_CONFIGURATION_REQUIRED/
   );
   assert.throws(
     () => validateRuntimeConfiguration({
       ...production,
-      PAGE2WEBMCP_EDITOR_PASSWORD: production.PAGE2WEBMCP_OWNER_PASSWORD
+      NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: "sb_secret_this-must-never-enter-browser-code"
     }),
-    /AUTH_CREDENTIALS_MUST_DIFFER/
+    /SUPABASE_CONFIGURATION_REQUIRED/
+  );
+  assert.throws(
+    () => validateRuntimeConfiguration({
+      ...production,
+      NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: serviceRoleJwt
+    }),
+    /SUPABASE_CONFIGURATION_REQUIRED/
   );
 });
 
-test("production requires an exact HTTPS public origin for CSRF validation", () => {
+test("production permits HTTP Auth and control origins only for the explicit IP-literal local stack", () => {
   assert.throws(
     () => validateRuntimeConfiguration({ ...production, PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN: "" }),
     /INVALID_CONTROL_PLANE_PUBLIC_ORIGIN/
@@ -79,26 +127,80 @@ test("production requires an exact HTTPS public origin for CSRF validation", () 
     }),
     /INVALID_CONTROL_PLANE_PUBLIC_ORIGIN/
   );
-  assert.doesNotThrow(() => validateRuntimeConfiguration({
+  assert.throws(() => validateRuntimeConfiguration({
     ...production,
     PAGE2WEBMCP_TEST_MODE: "true",
+    NEXT_PUBLIC_SUPABASE_URL: "http://127.0.0.1:58321",
     PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN: "http://127.0.0.1:3100"
+  }), /SUPABASE_CONFIGURATION_REQUIRED|INVALID_CONTROL_PLANE_PUBLIC_ORIGIN/);
+  assert.doesNotThrow(() => validateRuntimeConfiguration(localProduction));
+  assert.doesNotThrow(() => validateRuntimeConfiguration({
+    ...localProduction,
+    NEXT_PUBLIC_SUPABASE_URL: "http://[::1]:58321",
+    PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN: "http://[::1]:3100"
   }));
+  for (const overrides of [
+    { PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN: "http://localhost:3100" },
+    { PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN: "http://127.0.0.2:3100" },
+    { PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN: "http://127.0.0.1:3101" },
+    { PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN: "http://[::1]:3101" },
+    { PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN: "http://127.0.0.1:3100/path" },
+    { PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN: "http://user@127.0.0.1:3100" },
+    { NEXT_PUBLIC_SUPABASE_URL: "http://localhost:58321" },
+    { NEXT_PUBLIC_SUPABASE_URL: "http://127.0.0.2:58321" },
+    { NEXT_PUBLIC_SUPABASE_URL: "http://127.0.0.1:54321" },
+    { NEXT_PUBLIC_SUPABASE_URL: "http://127.0.0.1:58322" },
+    { NEXT_PUBLIC_SUPABASE_URL: "http://[::1]:58322" },
+    { NEXT_PUBLIC_SUPABASE_URL: "http://127.0.0.1:58321/auth/v1" },
+    { NEXT_PUBLIC_SUPABASE_URL: "http://127.0.0.1:58321?unsafe=true" }
+  ]) assert.throws(
+    () => validateRuntimeConfiguration({ ...localProduction, ...overrides }),
+    /SUPABASE_CONFIGURATION_REQUIRED|INVALID_CONTROL_PLANE_PUBLIC_ORIGIN/
+  );
 });
 
-test("fixture source configuration remains exact and HTTPS", () => {
-  assert.throws(
-    () => validateRuntimeConfiguration({ ...production, PAGE2WEBMCP_PROVIDER_MODE: "live" }),
-    /LIVE_PROVIDER_UNSUPPORTED/
-  );
-  assert.throws(
-    () => validateRuntimeConfiguration({ ...production, PAGE2WEBMCP_FIXTURE_APP_URL: "http://localhost:3200" }),
-    /INVALID_FIXTURE_APP_URL/
-  );
-  assert.throws(
-    () => validateRuntimeConfiguration({ ...production, PAGE2WEBMCP_FIXTURE_GITHUB_URL: "https://gitlab.example/acme/support" }),
-    /INVALID_FIXTURE_GITHUB_URL/
-  );
+test("production requires this app's exact hosted Supabase Storage artifact topology", () => {
+  for (const overrides of [
+    { PAGE2WEBMCP_SUPABASE_URL: "" },
+    { PAGE2WEBMCP_SUPABASE_SECRET_KEY: "" },
+    { PAGE2WEBMCP_PUBLIC_ORIGIN: "" },
+    { PAGE2WEBMCP_SUPABASE_URL: "https://different-project.supabase.co" },
+    { PAGE2WEBMCP_SUPABASE_URL: "https://bimqgiedckdurqiywctl.supabase.co/" },
+    { PAGE2WEBMCP_PUBLIC_ORIGIN: "https://bimqgiedckdurqiywctl.supabase.co/storage/v1/object/public/other" },
+    { PAGE2WEBMCP_PUBLIC_ORIGIN: "https://bimqgiedckdurqiywctl.supabase.co/storage/v1/object/public/page2webmcp-releases/" },
+  ]) {
+    assert.throws(
+      () => validateRuntimeConfiguration({ ...production, ...overrides }),
+      /^Error: RELEASE_ARTIFACT_CONFIGURATION_REQUIRED$/,
+    );
+  }
+});
+
+test("production rejects artifact Storage secret aliases without rejecting browser Auth configuration", () => {
+  for (const overrides of [
+    { NEXT_PUBLIC_PAGE2WEBMCP_SUPABASE_URL: production.PAGE2WEBMCP_SUPABASE_URL },
+    { NEXT_PUBLIC_SUPABASE_SERVICE_ROLE_KEY: production.PAGE2WEBMCP_SUPABASE_SECRET_KEY },
+    { PAGE2WEBMCP_SUPABASE_SERVICE_ROLE_KEY: production.PAGE2WEBMCP_SUPABASE_SECRET_KEY },
+    { SUPABASE_SECRET_KEY: production.PAGE2WEBMCP_SUPABASE_SECRET_KEY },
+  ]) {
+    assert.throws(
+      () => validateRuntimeConfiguration({ ...production, ...overrides }),
+      /^Error: RELEASE_ARTIFACT_SECRET_EXPOSURE_BLOCKED$/,
+    );
+  }
+  assert.doesNotThrow(() => validateRuntimeConfiguration(production));
+});
+
+test("shared configuration recognizes only exact untrimmed provider mode spellings", () => {
+  for (const mode of ["local", "openapi", "website", "github"]) {
+    assert.doesNotThrow(() => validateRuntimeConfiguration({ ...production, PAGE2WEBMCP_PROVIDER_MODE: mode }));
+  }
+  for (const mode of ["", "live", "OpenAPI", " openapi", "openapi "]) {
+    assert.throws(
+      () => validateRuntimeConfiguration({ ...production, PAGE2WEBMCP_PROVIDER_MODE: mode }),
+      /^Error: INVALID_PROVIDER_MODE$/,
+    );
+  }
 });
 
 test("the standalone worker fails before polling without durable storage", () => {
@@ -115,13 +217,44 @@ test("the standalone worker fails before polling without durable storage", () =>
       PAGE2WEBMCP_PROVIDER_MODE: "live",
       DATABASE_URL: "postgresql:\/\/database.example\/page2webmcp"
     }),
-    /LIVE_PROVIDER_UNSUPPORTED/
+    /INVALID_PROVIDER_MODE/
   );
-  assert.doesNotThrow(() => validateWorkerRuntimeConfiguration({
+  assert.throws(() => validateWorkerRuntimeConfiguration({
     PAGE2WEBMCP_STORAGE_MODE: "postgres",
     PAGE2WEBMCP_PROVIDER_MODE: "local",
+    DATABASE_URL: "postgresql://database.example/page2webmcp"
+  }), /^Error: WORKER_PROVIDER_MODE_REQUIRED$/);
+  assert.throws(() => validateWorkerRuntimeConfiguration({
+    PAGE2WEBMCP_STORAGE_MODE: "postgres",
+    DATABASE_URL: "postgresql://database.example/page2webmcp"
+  }), /^Error: WORKER_PROVIDER_MODE_REQUIRED$/);
+  assert.doesNotThrow(() => validateWorkerRuntimeConfiguration({
+    PAGE2WEBMCP_STORAGE_MODE: "postgres",
+    PAGE2WEBMCP_PROVIDER_MODE: "openapi",
     DATABASE_URL: "postgresql://database.example/page2webmcp",
-    PAGE2WEBMCP_FIXTURE_APP_URL: "https://acme.example",
-    PAGE2WEBMCP_FIXTURE_GITHUB_URL: "https://github.com/acme/support"
+    PAGE2WEBMCP_GIT_COMMIT_SHA: production.PAGE2WEBMCP_GIT_COMMIT_SHA,
+    PAGE2WEBMCP_APPLICATION_RELEASE_ID: production.PAGE2WEBMCP_APPLICATION_RELEASE_ID,
+    PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN: production.PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN,
   }));
+  assert.doesNotThrow(() => validateWorkerRuntimeConfiguration({
+    PAGE2WEBMCP_STORAGE_MODE: "postgres",
+    PAGE2WEBMCP_PROVIDER_MODE: "website",
+    DATABASE_URL: "postgresql://database.example/page2webmcp",
+    PAGE2WEBMCP_GIT_COMMIT_SHA: production.PAGE2WEBMCP_GIT_COMMIT_SHA,
+    PAGE2WEBMCP_APPLICATION_RELEASE_ID: production.PAGE2WEBMCP_APPLICATION_RELEASE_ID,
+    PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN: production.PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN,
+  }));
+  assert.doesNotThrow(() => validateWorkerRuntimeConfiguration({
+    PAGE2WEBMCP_STORAGE_MODE: "postgres",
+    PAGE2WEBMCP_PROVIDER_MODE: "github",
+    DATABASE_URL: "postgresql://database.example/page2webmcp",
+    PAGE2WEBMCP_GIT_COMMIT_SHA: production.PAGE2WEBMCP_GIT_COMMIT_SHA,
+    PAGE2WEBMCP_APPLICATION_RELEASE_ID: production.PAGE2WEBMCP_APPLICATION_RELEASE_ID,
+    PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN: production.PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN,
+  }));
+  assert.throws(() => validateWorkerRuntimeConfiguration({
+    PAGE2WEBMCP_STORAGE_MODE: "postgres",
+    PAGE2WEBMCP_PROVIDER_MODE: "openapi",
+    DATABASE_URL: "postgresql://database.example/page2webmcp",
+  }), /DEPLOYMENT_IDENTITY_CONFIGURATION_REQUIRED$/);
 });

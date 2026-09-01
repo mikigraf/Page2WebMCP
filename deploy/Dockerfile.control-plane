@@ -1,0 +1,38 @@
+ARG NODE_BASE_IMAGE
+FROM ${NODE_BASE_IMAGE} AS build
+
+ARG NODE_BASE_IMAGE
+ARG PAGE2WEBMCP_GIT_COMMIT_SHA
+ARG PAGE2WEBMCP_APPLICATION_RELEASE_ID
+ARG PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN
+WORKDIR /workspace
+COPY .dist/deployment-source.tar /tmp/page2webmcp-deployment-source.tar
+RUN tar --extract --file=/tmp/page2webmcp-deployment-source.tar --directory=/workspace
+COPY .dist/deployment-identity.json ./.dist/deployment-identity.json
+COPY deploy/Dockerfile.control-plane /tmp/page2webmcp-context.Dockerfile
+RUN PAGE2WEBMCP_DEPLOYMENT_DOCKERFILE=deploy/Dockerfile.control-plane \
+    node scripts/generate-deployment-identity.mjs --verify-build-context \
+    && rm /tmp/page2webmcp-deployment-source.tar /tmp/page2webmcp-context.Dockerfile
+RUN corepack enable && corepack prepare pnpm@10.14.0 --activate
+RUN pnpm install --frozen-lockfile
+
+ENV PAGE2WEBMCP_PRODUCTION_LIVE_BUILD=true \
+    PAGE2WEBMCP_GIT_COMMIT_SHA=${PAGE2WEBMCP_GIT_COMMIT_SHA} \
+    PAGE2WEBMCP_APPLICATION_RELEASE_ID=${PAGE2WEBMCP_APPLICATION_RELEASE_ID} \
+    PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN=${PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN}
+RUN pnpm --filter @page2webmcp/control-plane build
+
+ARG NODE_BASE_IMAGE
+FROM ${NODE_BASE_IMAGE} AS runtime
+
+ENV NODE_ENV=production \
+    PORT=3000 \
+    HOSTNAME=0.0.0.0
+WORKDIR /app
+COPY --from=build --chown=node:node /workspace/apps/control-plane/.next/standalone ./
+COPY --from=build --chown=node:node /workspace/apps/control-plane/.next/static ./apps/control-plane/.next/static
+COPY --from=build --chown=node:node /workspace/.dist/deployment-identity.json ./.dist/deployment-identity.json
+
+USER node
+EXPOSE 3000
+CMD ["node", "apps/control-plane/server.js"]

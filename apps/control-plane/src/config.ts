@@ -1,29 +1,43 @@
+import { unsafeSupabaseBrowserKey } from "./supabase-config.ts";
+import { validateReleaseArtifactStorageConfiguration } from "./artifact-storage.ts";
+import {
+  configuredDeploymentIdentity,
+  type DeploymentIdentityDependencies,
+} from "./deployment-identity.ts";
+
 type RuntimeEnvironment = Record<string, string | undefined>;
 
-export function validateRuntimeConfiguration(environment: RuntimeEnvironment = process.env): void {
+export function validateRuntimeConfiguration(
+  environment: RuntimeEnvironment = process.env,
+  dependencies: DeploymentIdentityDependencies = {},
+): void {
   if (environment.NODE_ENV !== "production") return;
   if ((environment.PAGE2WEBMCP_SESSION_SECRET?.length ?? 0) < 32) throw new Error("SESSION_SECRET_REQUIRED");
-  const ownerPassword = environment.PAGE2WEBMCP_OWNER_PASSWORD ?? "";
-  const editorPassword = environment.PAGE2WEBMCP_EDITOR_PASSWORD ?? "";
-  if (ownerPassword.length < 32 || editorPassword.length < 32) throw new Error("AUTH_CREDENTIALS_REQUIRED");
-  if (ownerPassword === editorPassword) throw new Error("AUTH_CREDENTIALS_MUST_DIFFER");
+  validateReleaseArtifactStorageConfiguration(environment);
+  validateSupabaseConfiguration(environment);
   const publicOrigin = exactUrl(environment.PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN ?? "");
-  const permitsHttp = environment.PAGE2WEBMCP_TEST_MODE === "true";
   if (!publicOrigin
-    || publicOrigin.origin !== publicOrigin.toString().replace(/\/$/, "")
-    || (publicOrigin.protocol !== "https:" && !(permitsHttp && publicOrigin.protocol === "http:"))) {
+    || !exactOrigin(publicOrigin)
+    || (publicOrigin.protocol !== "https:" && !localStackHttpOrigin(publicOrigin, environment, "3100"))) {
     throw new Error("INVALID_CONTROL_PLANE_PUBLIC_ORIGIN");
   }
+  if (environment.PAGE2WEBMCP_LOCAL_STACK !== "true") configuredDeploymentIdentity(environment, dependencies);
   validateSharedRuntimeConfiguration(environment, true);
 }
 
-export function validateWorkerRuntimeConfiguration(environment: RuntimeEnvironment = process.env): void {
+export function validateWorkerRuntimeConfiguration(
+  environment: RuntimeEnvironment = process.env,
+  dependencies: DeploymentIdentityDependencies = {},
+): void {
   validateSharedRuntimeConfiguration(environment, false);
+  if (environment.PAGE2WEBMCP_LOCAL_STACK !== "true") configuredDeploymentIdentity(environment, dependencies);
 }
 
 function validateSharedRuntimeConfiguration(environment: RuntimeEnvironment, allowTestMemory: boolean): void {
-  if (environment.PAGE2WEBMCP_PROVIDER_MODE && environment.PAGE2WEBMCP_PROVIDER_MODE !== "local") {
-    throw new Error("LIVE_PROVIDER_UNSUPPORTED");
+  const providerMode = environment.PAGE2WEBMCP_PROVIDER_MODE;
+  if (providerMode !== undefined
+    && !["local", "openapi", "website", "github"].includes(providerMode)) {
+    throw new Error("INVALID_PROVIDER_MODE");
   }
   const storageMode = environment.PAGE2WEBMCP_STORAGE_MODE ?? "postgres";
   if (storageMode === "memory") {
@@ -37,15 +51,41 @@ function validateSharedRuntimeConfiguration(environment: RuntimeEnvironment, all
   } else {
     throw new Error("INVALID_STORAGE_MODE");
   }
+  if (!allowTestMemory && (providerMode === undefined || providerMode === "local")) {
+    throw new Error("WORKER_PROVIDER_MODE_REQUIRED");
+  }
 
-  const fixtureApp = exactUrl(environment.PAGE2WEBMCP_FIXTURE_APP_URL ?? "https://acme.example");
-  if (!fixtureApp || fixtureApp.protocol !== "https:" || fixtureApp.origin !== fixtureApp.toString().replace(/\/$/, "")) {
-    throw new Error("INVALID_FIXTURE_APP_URL");
+}
+
+function validateSupabaseConfiguration(environment: RuntimeEnvironment): void {
+  const url = exactUrl(environment.NEXT_PUBLIC_SUPABASE_URL ?? "");
+  const key = environment.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY
+    ?? environment.NEXT_PUBLIC_SUPABASE_ANON_KEY
+    ?? "";
+  if (!url || !exactOrigin(url)
+    || (url.protocol !== "https:" && !localStackHttpOrigin(url, environment, "58321"))
+    || key.length < 20 || unsafeSupabaseBrowserKey(key)) {
+    throw new Error("SUPABASE_CONFIGURATION_REQUIRED");
   }
-  const fixtureGithub = exactUrl(environment.PAGE2WEBMCP_FIXTURE_GITHUB_URL ?? "https://github.com/acme/support");
-  if (!fixtureGithub || fixtureGithub.protocol !== "https:" || fixtureGithub.hostname !== "github.com") {
-    throw new Error("INVALID_FIXTURE_GITHUB_URL");
+  for (const [name, value] of Object.entries(environment)) {
+    if (name.startsWith("NEXT_PUBLIC_") && name.includes("SUPABASE")
+      && /(?:KEY|TOKEN|SECRET)$/.test(name) && value
+      && unsafeSupabaseBrowserKey(value)) {
+      throw new Error("SUPABASE_SECRET_EXPOSURE_BLOCKED");
+    }
   }
+}
+
+function exactOrigin(url: URL): boolean {
+  return !url.username && !url.password && !url.search && !url.hash && url.pathname === "/";
+}
+
+function localStackHttpOrigin(url: URL, environment: RuntimeEnvironment, expectedPort: string): boolean {
+  return environment.PAGE2WEBMCP_LOCAL_STACK === "true"
+    && url.protocol === "http:"
+    && ["127.0.0.1", "[::1]"].includes(url.hostname)
+    && url.port === expectedPort
+    && exactOrigin(url);
 }
 
 function exactUrl(value: string): URL | undefined {

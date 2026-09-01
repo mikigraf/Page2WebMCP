@@ -9,8 +9,11 @@ exception
 end
 $$;
 
-alter role page2webmcp_app nologin noinherit nosuperuser nocreatedb nocreaterole noreplication nobypassrls;
-alter role page2webmcp_worker nologin noinherit nosuperuser nocreatedb nocreaterole noreplication nobypassrls;
+-- Supabase's tenant postgres role may restate only attributes that do not
+-- require true superuser authority. The next migration asserts every safe
+-- attribute after all three application roles exist.
+alter role page2webmcp_app nologin noinherit nocreatedb nocreaterole;
+alter role page2webmcp_worker nologin noinherit nocreatedb nocreaterole;
 
 -- Make every redundant tenant identifier relationally consistent. These keys
 -- let PostgreSQL reject cross-tenant references even for privileged migrations.

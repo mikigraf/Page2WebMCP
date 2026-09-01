@@ -1,0 +1,14 @@
+.git
+.page2webmcp
+.env*
+!.env.example
+node_modules
+**/node_modules
+**/.next
+.dist/*
+!.dist/deployment-identity.json
+!.dist/deployment-source.tar
+playwright-report
+test-results
+.superpowers
+docs/superpowers/.DS_Store

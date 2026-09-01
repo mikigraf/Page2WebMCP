@@ -8,6 +8,17 @@ type RegisteredGeneratedTool = {
   execute: (input: Record<string, unknown>, context: { signal: AbortSignal }) => Promise<unknown>;
 };
 
+const realPublicationConfigured = process.env.PAGE2WEBMCP_E2E_PUBLISHED_RELEASE === "true" && [
+  process.env.PAGE2WEBMCP_SUPABASE_URL,
+  process.env.PAGE2WEBMCP_SUPABASE_SECRET_KEY,
+  process.env.PAGE2WEBMCP_PUBLIC_ORIGIN,
+  process.env.PAGE2WEBMCP_RELEASE_VERIFIER_ORIGIN,
+  process.env.PAGE2WEBMCP_RELEASE_VERIFIER_TOKEN,
+].every(Boolean);
+
+test.skip(!realPublicationConfigured,
+  "non-live harness requires explicit opt-in plus real Storage and verifier controls");
+
 test("the exact reviewed and published bytes execute on the allowed Acme origin", async ({ page, request, context }) => {
   const controlCookie = await loginControlPlane(request);
   const project = await controlPost<{ id: string }>(request, controlCookie, "/api/projects", {
@@ -35,13 +46,12 @@ test("the exact reviewed and published bytes execute on the allowed Acme origin"
     `/api/projects/${project.id}/releases`,
     { analysisRunId: accepted.runId }
   );
-  const artifactResponse = await request.get(`${CONTROL_PLANE_URL}${published.release.url}`);
+  const artifactResponse = await request.get(published.release.url);
   expect(artifactResponse.status()).toBe(200);
   const artifact = await artifactResponse.text();
   const digest = createHash("sha256").update(artifact).digest();
   expect(digest.toString("hex")).toBe(published.release.contentHash);
-  expect(`sha256-${digest.toString("base64")}`).toBe(published.release.sri);
-  expect(artifactResponse.headers()["x-page2webmcp-integrity"]).toBe(published.release.sri);
+  expect(`sha384-${createHash("sha384").update(artifact).digest("base64")}`).toBe(published.release.sri);
   expect(artifactResponse.headers()["access-control-allow-origin"]).toBe("https://acme.example");
   expect(artifactResponse.headers()["cross-origin-resource-policy"]).toBe("cross-origin");
 

@@ -13,7 +13,3 @@ export class LocalArtifactStore {
   publish(content: string, contentHash: string) { const id = createHash("sha256").update(contentHash).digest("hex"); const item = { id, content, contentHash }; this.#items.set(id, item); return item; }
   get(id: string) { const item = this.#items.get(id); if (!item) throw new ProviderError("ARTIFACT_NOT_FOUND"); return item; }
 }
-export class LocalSourceControlProvider {
-  #counter = 0;
-  openDraftPullRequest(input: { title: string; files: string[] }) { return { number: ++this.#counter, title: input.title, files: input.files, draft: true, checks: "passed" as const }; }
-}

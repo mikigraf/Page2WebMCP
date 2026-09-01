@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { z } from "zod";
-import { authenticate, issueSession } from "../src/auth.ts";
 import {
   ApiError,
   assertSameOrigin,
@@ -10,6 +9,7 @@ import {
   parseJsonBody,
   requireActor
 } from "../src/api.ts";
+import { installTestRepository } from "./auth-test-helpers.ts";
 
 test("API body parsing is strict and bounded", async () => {
   const schema = z.object({ value: z.string() }).strict();
@@ -60,20 +60,18 @@ test("API body parsing cancels an undeclared oversized stream before buffering i
   assert.ok(pulls < 100);
 });
 
-test("authenticated mutation rejects forged cookies and cross-site origins", () => {
+test("authenticated mutation rejects forged cookies and cross-site origins", async () => {
+  installTestRepository();
   const forged = new Request("https://control.example/api/projects", {
     method: "POST",
     headers: { cookie: "page2webmcp_role=owner", origin: "https://control.example" }
   });
-  assert.throws(() => requireActor(forged), (error: unknown) => error instanceof ApiError && error.code === "AUTH_REQUIRED");
+  await assert.rejects(requireActor(forged), (error: unknown) =>
+    error instanceof ApiError && error.code === "AUTH_REQUIRED");
 
-  const actor = authenticate("owner@example.test", "fixture-password");
-  assert.ok(actor);
-  const token = issueSession(actor);
   const crossSite = new Request("https://control.example/api/projects", {
     method: "POST",
     headers: {
-      cookie: `page2webmcp_session=${token}`,
       origin: "https://attacker.example",
       "sec-fetch-site": "cross-site"
     }

@@ -1,24 +1,22 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { GET, POST } from "../app/api/projects/route.ts";
-import { authenticate, issueSession } from "../src/auth.ts";
 import { InMemoryControlPlaneRepository } from "../../../packages/database/src/control-plane.ts";
-import { setControlPlaneRepositoryForTest } from "../../../packages/database/src/factory.ts";
+import { authenticatedHeaders, installTestRepository, owner } from "./auth-test-helpers.ts";
 
-const owner = authenticate("owner@example.test", "fixture-password")!;
-const session = issueSession(owner);
+const authHeaders = authenticatedHeaders(owner);
 
 function request(
   method: "GET" | "POST",
   body?: unknown,
-  cookie = `page2webmcp_session=${session}`,
+  cookie = authHeaders.cookie,
   idempotencyKey = "project-request"
 ): Request {
   return new Request("https://control.example/api/projects", {
     method,
     headers: {
+      ...authHeaders,
       cookie,
-      origin: "https://control.example",
       "content-type": "application/json",
       ...(method === "POST" && idempotencyKey ? { "idempotency-key": idempotencyKey } : {})
     },
@@ -27,7 +25,7 @@ function request(
 }
 
 test("projects require a signed session and legacy role cookies are rejected", async () => {
-  setControlPlaneRepositoryForTest(new InMemoryControlPlaneRepository());
+  installTestRepository(new InMemoryControlPlaneRepository());
   const anonymous = await GET(request("GET", undefined, ""));
   assert.equal(anonymous.status, 401);
   const forged = await POST(request("POST", {
@@ -38,7 +36,7 @@ test("projects require a signed session and legacy role cookies are rejected", a
 });
 
 test("project entry persists scoped fixture sources with opaque IDs", async () => {
-  setControlPlaneRepositoryForTest(new InMemoryControlPlaneRepository());
+  installTestRepository(new InMemoryControlPlaneRepository());
   const website = await POST(request("POST", { sourceType: "website", url: "https://acme.example" }, undefined, "website-project"));
   assert.equal(website.status, 201);
   const websiteBody = await website.json();
@@ -48,7 +46,13 @@ test("project entry persists scoped fixture sources with opaque IDs", async () =
 
   assert.equal((await POST(request("POST", {
     sourceType: "openapi",
-    url: "https://acme.example/openapi.json"
+    url: "https://acme.example/openapi.json",
+    sourceConfiguration: {
+      kind: "openapi",
+      targetOrigin: "https://acme.example",
+      testPageUrl: "https://acme.example/checkout",
+      environment: "test"
+    }
   }, undefined, "openapi-project"))).status, 201);
   assert.equal((await POST(request("POST", {
     sourceType: "github",
@@ -59,15 +63,59 @@ test("project entry persists scoped fixture sources with opaque IDs", async () =
   assert.equal((await list.json()).projects.length, 3);
 });
 
-test("project entry fails closed for private, mismatched, and unsupported live sources", async () => {
-  setControlPlaneRepositoryForTest(new InMemoryControlPlaneRepository());
+test("OpenAPI project creation requires a same-origin HTTPS verification context", async () => {
+  const repository = installTestRepository(new InMemoryControlPlaneRepository());
+  const missing = await POST(request("POST", {
+    sourceType: "openapi",
+    url: "https://api.acme.example/openapi.json"
+  }, undefined, "openapi-context-missing"));
+  assert.equal(missing.status, 400);
+  assert.equal((await missing.json()).code, "OPENAPI_VERIFICATION_CONTEXT_REQUIRED");
+
+  const mismatched = await POST(request("POST", {
+    sourceType: "openapi",
+    url: "https://api.acme.example/openapi.json",
+    sourceConfiguration: {
+      kind: "openapi",
+      targetOrigin: "https://acme.example",
+      testPageUrl: "https://other.example/checkout",
+      environment: "preview"
+    }
+  }, undefined, "openapi-context-invalid"));
+  assert.equal(mismatched.status, 400);
+  assert.equal((await mismatched.json()).code, "OPENAPI_VERIFICATION_CONTEXT_REQUIRED");
+
+  const queryBearingPage = await POST(request("POST", {
+    sourceType: "openapi",
+    url: "https://api.acme.example/openapi.json",
+    sourceConfiguration: {
+      kind: "openapi",
+      targetOrigin: "https://acme.example",
+      testPageUrl: "https://acme.example/checkout?session=tenant-a",
+      environment: "test"
+    }
+  }, undefined, "openapi-context-query"));
+  assert.equal(queryBearingPage.status, 400);
+  assert.equal((await queryBearingPage.json()).code, "OPENAPI_VERIFICATION_CONTEXT_REQUIRED");
+  assert.equal((await repository.listProjects(owner)).length, 0);
+
+  const strictWebsite = await POST(request("POST", {
+    sourceType: "website",
+    url: "https://acme.example",
+    sourceConfiguration: { kind: "github" }
+  }, undefined, "website-context-invalid"));
+  assert.equal(strictWebsite.status, 400);
+});
+
+test("project entry fails closed for private and invalid source shapes while accepting arbitrary public sources", async () => {
+  installTestRepository(new InMemoryControlPlaneRepository());
   const privateTarget = await POST(request("POST", { sourceType: "website", url: "https://127.0.0.1" }));
   assert.equal(privateTarget.status, 400);
   assert.equal((await privateTarget.json()).code, "PRIVATE_NETWORK_BLOCKED");
 
   const arbitraryPublic = await POST(request("POST", { sourceType: "website", url: "https://other.example" }));
-  assert.equal(arbitraryPublic.status, 400);
-  assert.equal((await arbitraryPublic.json()).code, "FIXTURE_SOURCE_REQUIRED");
+  assert.equal(arbitraryPublic.status, 201);
+  assert.equal((await arbitraryPublic.json()).url, "https://other.example/");
 
   const wrongGithub = await POST(request("POST", { sourceType: "github", url: "https://acme.example" }));
   assert.equal(wrongGithub.status, 400);
@@ -75,7 +123,7 @@ test("project entry fails closed for private, mismatched, and unsupported live s
 });
 
 test("project creation requires a valid idempotency key and replays only identical input", async () => {
-  setControlPlaneRepositoryForTest(new InMemoryControlPlaneRepository());
+  installTestRepository(new InMemoryControlPlaneRepository());
   const input = { sourceType: "website", url: "https://acme.example" };
   const missing = await POST(request("POST", input, undefined, ""));
   assert.equal(missing.status, 400);
@@ -88,7 +136,8 @@ test("project creation requires a valid idempotency key and replays only identic
 
   const conflict = await POST(request("POST", {
     sourceType: "openapi",
-    url: "https://acme.example/openapi.json"
+    url: "https://acme.example/openapi.json",
+    sourceConfiguration: { kind: "openapi", targetOrigin: "https://acme.example", testPageUrl: "https://acme.example/", environment: "test" }
   }, undefined, "same-project-key"));
   assert.equal(conflict.status, 409);
   assert.equal((await conflict.json()).code, "IDEMPOTENCY_CONFLICT");

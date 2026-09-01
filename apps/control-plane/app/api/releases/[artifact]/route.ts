@@ -18,9 +18,10 @@ export async function GET(
     const release = await getControlPlaneRepository().getReleaseArtifact(contentHash);
     const bytes = Buffer.from(release.code);
     const digest = createHash("sha256").update(bytes).digest();
+    const integrity = createHash("sha384").update(bytes).digest("base64");
     if (digest.toString("hex") !== contentHash
       || release.contentHash !== contentHash
-      || release.sri !== `sha256-${digest.toString("base64")}`) {
+      || release.sri !== `sha384-${integrity}`) {
       throw new ApiError("ARTIFACT_INTEGRITY_FAILED", 500);
     }
     const etag = `"${release.contentHash}"`;
@@ -31,12 +32,16 @@ export async function GET(
       "cross-origin-resource-policy": "cross-origin",
       etag,
       "x-content-type-options": "nosniff",
+      "x-page2webmcp-content-hash": release.contentHash,
       "x-page2webmcp-integrity": release.sri,
       "x-request-id": requestId
     });
+    if (new URL(request.url).searchParams.get("download") === "1") {
+      headers.set("content-disposition", `attachment; filename="page2webmcp-${release.contentHash}.js"`);
+    }
     if (request.headers.get("if-none-match") === etag) return new Response(null, { status: 304, headers });
     return new Response(release.code, { status: 200, headers });
   } catch (error) {
-    return errorResponse(error, requestId);
+    return errorResponse(error, requestId, request);
   }
 }

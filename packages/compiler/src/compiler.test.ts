@@ -1,6 +1,26 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { compileWebMcpRelease, type CompilableCapability } from "./compiler.ts";
+import { acmeCapabilityPlans } from "../../../apps/acme-support/src/capability-plans.ts";
+import type { CapabilityPlan } from "../../capability-ir/src/plan.ts";
+import { compileOpenApi } from "../../openapi/src/compile.ts";
+import { compileWebMcpRelease } from "./compiler.ts";
+
+const REGISTRY = Symbol.for("page2webmcp.release.registry.v1");
+let harnessFetch: typeof fetch = async () => { throw new Error("fetch harness is not configured"); };
+type ConfirmationRequest = {
+  toolName: string;
+  input: Record<string, unknown>;
+  idempotencyKey: string;
+  signal: AbortSignal;
+};
+type ConfirmationHook = (request: ConfirmationRequest) => boolean | Promise<boolean>;
+let harnessConfirm: ConfirmationHook | undefined;
+
+const capturedHarnessFetch: typeof fetch = (input, init) => harnessFetch(input, init);
+const capturedHarnessConfirmation = (request: ConfirmationRequest) => {
+  if (!harnessConfirm) throw new Error("confirmation harness is not configured");
+  return harnessConfirm(request);
+};
 
 type GeneratedTool = {
   name: string;
@@ -9,72 +29,39 @@ type GeneratedTool = {
 };
 
 type GeneratedArtifact = {
-  releaseManifest: { allowedOrigin: string; tools: Array<{ name: string }> };
+  autoRegistration: Promise<{ supported: boolean; reason?: string; alreadyRegistered?: boolean }>;
+  releaseManifest: { targetOrigin: string; plans: CapabilityPlan[] };
   registerPage2WebMCPTools: (bridge?: {
-    confirm?: (request: { toolName: string; input: Record<string, unknown>; idempotencyKey: string; signal: AbortSignal }) => boolean | Promise<boolean>;
+    confirm?: ConfirmationHook;
     onDiagnostic?: (event: { phase: "registration" | "execution"; code: string }) => void;
   }) => Promise<{ supported: boolean; reason?: string; alreadyRegistered?: boolean }>;
   unregisterPage2WebMCPTools: () => void;
 };
 
-const capabilities: CompilableCapability[] = [
-  {
-    name: "find_order",
-    description: "Find an order",
-    readOnly: true,
-    inputSchema: {
-      type: "object",
-      properties: { query: { type: "string", minLength: 1, maxLength: 120 } },
-      required: ["query"],
-      additionalProperties: false,
-    },
-    requestPlan: { method: "GET", path: "/api/orders", query: { q: "query" } },
-    outputSchema: {
-      type: "array",
-      items: {
-        type: "object",
-        properties: { id: { type: "string" }, email: { type: "string" }, shipmentStatus: { type: "string" } },
-        required: ["id", "email", "shipmentStatus"],
-        additionalProperties: false,
-      },
-    },
-  },
-  {
-    name: "create_support_ticket",
-    description: "Create a ticket",
-    readOnly: false,
-    requiresConfirmation: true,
-    inputSchema: {
-      type: "object",
-      properties: {
-        orderId: { type: "string", minLength: 1 },
-        title: { type: "string", minLength: 3, maxLength: 120 },
-        priority: { type: "string", enum: ["low", "medium", "high"] },
-      },
-      required: ["orderId", "title", "priority"],
-      additionalProperties: false,
-    },
-    requestPlan: { method: "POST", path: "/api/tickets", body: ["orderId", "title", "priority"] },
-    outputSchema: {
-      type: "object",
-      properties: {
-        ticketId: { type: "string" }, status: { type: "string", enum: ["open"] },
-        priority: { type: "string", enum: ["low", "medium", "high"] }, createdAt: { type: "string" },
-      },
-      required: ["ticketId", "status", "priority", "createdAt"],
-      additionalProperties: false,
-    },
-  },
-];
+const capabilities = acmeCapabilityPlans("https://acme.example")
+  .filter((plan) => plan.tool.name !== "get_order_status");
 
 async function loadArtifact(
   origin: string,
-  selectedCapabilities: CompilableCapability[] = capabilities,
+  selectedCapabilities: CapabilityPlan[] = capabilities,
   harness: { deadlineMs?: number; afterRegister?: (tool: GeneratedTool, signal: AbortSignal) => Promise<void> } = {},
 ): Promise<{ artifact: GeneratedArtifact; tools: GeneratedTool[]; registeredSignals: AbortSignal[] }> {
   const tools: GeneratedTool[] = [];
   const registeredSignals: AbortSignal[] = [];
-  Object.defineProperty(globalThis, "window", { configurable: true, value: { location: { origin } } });
+  harnessFetch = async () => { throw new Error("fetch harness is not configured"); };
+  harnessConfirm = undefined;
+  delete (globalThis as Record<symbol, unknown>)[REGISTRY];
+  const windowEvents = new EventTarget();
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    value: Object.assign(windowEvents, { location: { origin } }),
+  });
+  Object.defineProperty(globalThis, "fetch", { configurable: true, writable: true, value: capturedHarnessFetch });
+  Object.defineProperty(globalThis, "__page2webmcpConfirmSupportTicket", {
+    configurable: true,
+    writable: true,
+    value: capturedHarnessConfirmation,
+  });
   Object.defineProperty(globalThis, "document", { configurable: true, value: { modelContext: {
     registerTool: async (tool: GeneratedTool, options: { signal: AbortSignal }) => {
       tools.push(tool);
@@ -85,8 +72,8 @@ async function loadArtifact(
       }, { once: true });
       await harness.afterRegister?.(tool, options.signal);
     },
-  } } });
-  const release = compileWebMcpRelease(selectedCapabilities, "https://acme.example");
+  }, querySelector: () => null } });
+  const release = compileWebMcpRelease(selectedCapabilities);
   const code = harness.deadlineMs === undefined
     ? release.code
     : release.code.replace("const EXECUTION_DEADLINE_MS = 15000;", `const EXECUTION_DEADLINE_MS = ${harness.deadlineMs};`);
@@ -95,45 +82,104 @@ async function loadArtifact(
 }
 
 async function registerWithFetch(artifact: GeneratedArtifact, fetchImpl: typeof fetch, bridge: Parameters<GeneratedArtifact["registerPage2WebMCPTools"]>[0] = {}) {
-  const originalFetch = globalThis.fetch;
-  globalThis.fetch = fetchImpl;
-  try {
-    return await artifact.registerPage2WebMCPTools(bridge);
-  } finally {
-    globalThis.fetch = originalFetch;
-  }
+  harnessFetch = fetchImpl;
+  harnessConfirm = bridge.confirm;
+  return artifact.registerPage2WebMCPTools(bridge);
 }
 
-test("compiler emits a browser artifact with accurate content metadata and no arbitrary execute callback", () => {
-  const release = compileWebMcpRelease(capabilities, "https://acme.example");
-  assert.match(release.code, /document\.modelContext\.registerTool/);
-  assert.match(release.code, /credentials: "same-origin"/);
-  assert.match(release.code, /EXECUTION_DEADLINE_MS = 15000/);
-  assert.doesNotMatch(release.code, /testOverrides|bridge\.fetch|deadlineMs:/);
-  assert.doesNotMatch(release.code, /registerPage2WebMCPTools\(execute\)/);
-  assert.doesNotMatch(release.code, /navigator\.modelContext/);
+function findOrderTool(tools: GeneratedTool[]): GeneratedTool {
+  return tools.find(({ name }) => name === "find_order")!;
+}
+
+test("compiler emits an executable browser artifact with accurate content metadata", async () => {
+  const release = compileWebMcpRelease(capabilities);
   assert.match(release.contentHash, /^[a-f0-9]{64}$/);
-  assert.match(release.integrity, /^sha256-[A-Za-z0-9+/]+=*$/);
+  assert.match(release.integrity, /^sha384-[A-Za-z0-9+/]+=*$/);
+  const { artifact, tools } = await loadArtifact("https://acme.example");
+  assert.deepEqual(await artifact.autoRegistration, { supported: true });
+  assert.equal(tools.length, capabilities.length);
 });
 
 test("compiler preserves the untrusted-content classification in its manifest and browser registration", async () => {
-  const classified = [{ ...capabilities[0]!, untrustedContent: true }];
-  const release = compileWebMcpRelease(classified, "https://acme.example");
-  assert.equal(release.manifest.tools[0]?.untrustedContent, true);
+  const classified = [{ ...capabilities[0]!, annotations: { ...capabilities[0]!.annotations, untrusted: true } }];
+  const release = compileWebMcpRelease(classified);
+  assert.equal(release.manifest.plans[0]?.annotations.untrusted, true);
   const { artifact, tools } = await loadArtifact("https://acme.example", classified);
   await registerWithFetch(artifact, async () => Response.json([]));
   assert.equal(tools[0]?.annotations?.untrustedContentHint, true);
 });
 
-test("vetted get_order_status metadata cannot be downgraded by a caller", () => {
-  const release = compileWebMcpRelease([{
-    name: "get_order_status",
-    description: "get order status",
-    readOnly: true,
-    untrustedContent: false
-  }], "https://acme.example");
-  assert.equal(release.manifest.tools[0]?.untrustedContent, true);
-  assert.match(release.code, /"untrustedContent":true/);
+test("generated JSON adapter serializes reviewed headers, optional query values, and form bodies exactly", async () => {
+  const evidenceReference = `urn:sha256:${"d".repeat(64)}`;
+  const compiled = compileOpenApi({ openapi: "3.1.0", paths: {
+    "/widgets/{id}": { get: {
+      parameters: [
+        { in: "path", name: "id", required: true, schema: { type: "string", maxLength: 20 } },
+        { in: "query", name: "locale", schema: { type: "string", maxLength: 5 } },
+        { in: "header", name: "X-Trace", required: true, schema: { type: "string", maxLength: 20 } },
+      ],
+      responses: { "200": { description: "ok", content: { "application/json": { schema: { type: "boolean" } } } } },
+    } },
+    "/widgets": { post: {
+      "x-page2webmcp": { reviewed: true, effect: "mutation", riskTier: "R1", reversible: true },
+      requestBody: { required: true, content: { "application/x-www-form-urlencoded": { schema: {
+        type: "object", required: ["name"], properties: { name: { type: "string", maxLength: 20 } },
+      } } } },
+      responses: { "201": { description: "ok", content: { "application/json": { schema: { type: "boolean" } } } } },
+    } },
+  } }, {
+    targetOrigin: "https://widgets.example",
+    testPageUrl: "https://widgets.example/review",
+    environment: "test",
+    evidenceReference,
+  });
+  const executablePlans = compiled.plans.map((plan) => plan.effects.kind === "mutation" ? {
+    ...plan,
+    effects: {
+      ...plan.effects,
+      sourceNativeConfirmation: {
+        reviewed: true as const,
+        globalName: "__page2webmcpConfirmSupportTicket",
+        evidenceReference,
+      },
+    },
+  } : plan);
+  const loaded = await loadArtifact("https://widgets.example", executablePlans);
+  const requests: Array<{ url: string; init?: RequestInit }> = [];
+  await registerWithFetch(loaded.artifact, async (input, init) => {
+    requests.push({ url: String(input), init });
+    return Response.json(true, { status: init?.method === "POST" ? 201 : 200 });
+  }, { confirm: () => true });
+  const platform = {
+    Headers: globalThis.Headers,
+    URL: globalThis.URL,
+    URLSearchParams: globalThis.URLSearchParams,
+    TextEncoder: globalThis.TextEncoder,
+    TextDecoder: globalThis.TextDecoder,
+  };
+  const replaced = class { constructor() { throw new Error("PAGE_REPLACEMENT_CALLED"); } };
+  try {
+    for (const name of Object.keys(platform)) Object.defineProperty(globalThis, name, { configurable: true, writable: true, value: replaced });
+    const read = loaded.tools.find(({ name }) => name.startsWith("get_operation_"))!;
+    await read.execute({ path_id: "a/b", header_x_trace: "trace-1" }, { signal: new AbortController().signal });
+    const mutation = loaded.tools.find(({ name }) => name.startsWith("post_operation_"))!;
+    await mutation.execute({ body_name: "blue widget" }, { signal: new AbortController().signal });
+  } finally {
+    for (const [name, constructor] of Object.entries(platform)) {
+      Object.defineProperty(globalThis, name, { configurable: true, writable: true, value: constructor });
+    }
+  }
+  assert.equal(requests[0]!.url, "https://widgets.example/widgets/a%2Fb");
+  assert.equal(new Headers(requests[0]!.init?.headers).get("x-trace"), "trace-1");
+  assert.equal(requests[1]!.init?.body, "name=blue+widget");
+  assert.match(new Headers(requests[1]!.init?.headers).get("content-type") ?? "", /^application\/x-www-form-urlencoded/);
+});
+
+test("compiler applies no fixture-name metadata fallback", () => {
+  const fixturePlan = acmeCapabilityPlans("https://acme.example")
+    .find((plan) => plan.tool.name === "get_order_status")!;
+  const release = compileWebMcpRelease([{ ...fixturePlan, annotations: { ...fixturePlan.annotations, untrusted: false } }]);
+  assert.equal(release.manifest.plans[0]?.annotations.untrusted, false);
 });
 
 test("generated runtime enforces allowedOrigin before registration and immediately before execution", async () => {
@@ -145,7 +191,7 @@ test("generated runtime enforces allowedOrigin before registration and immediate
   await registerWithFetch(right.artifact, async () => Response.json([]));
   Object.defineProperty(globalThis, "window", { configurable: true, value: { location: { origin: "https://evil.example" } } });
   await assert.rejects(
-    right.tools[0]!.execute({ query: "ORD-4812" }, { signal: new AbortController().signal }),
+    findOrderTool(right.tools).execute({ query: "ORD-4812" }, { signal: new AbortController().signal }),
     { name: "Page2WebMCPError", code: "ORIGIN_MISMATCH" },
   );
 });
@@ -163,12 +209,8 @@ test("generated runtime rejects malformed input and additional properties before
 
 test("get_order_status enforces the endpoint's 64-character identifier boundary before fetch", async () => {
   let calls = 0;
-  const { artifact, tools } = await loadArtifact("https://acme.example", [{
-    name: "get_order_status",
-    description: "get order status",
-    readOnly: true,
-    untrustedContent: true
-  }]);
+  const { artifact, tools } = await loadArtifact("https://acme.example", acmeCapabilityPlans("https://acme.example")
+    .filter((plan) => plan.tool.name === "get_order_status"));
   await registerWithFetch(artifact, async () => {
     calls += 1;
     return Response.json({ orderId: "x".repeat(64), shipmentStatus: "unknown", customerNotes: "", untrustedContent: true });
@@ -216,22 +258,24 @@ test("generated runtime returns null-prototype object projections", async () => 
   await registerWithFetch(artifact, async () => Response.json([
     { id: "ORD-4812", email: "customer@example.test", shipmentStatus: "delayed" },
   ]));
-  const result = await tools[0]!.execute({ query: "ORD-4812" }, { signal: new AbortController().signal }) as Array<Record<string, unknown>>;
+  const result = await findOrderTool(tools).execute({ query: "ORD-4812" }, { signal: new AbortController().signal }) as Array<Record<string, unknown>>;
   assert.equal(Object.getPrototypeOf(result[0]!), null);
 });
 
 test("generated runtime returns typed safe errors for HTTP failures and oversized bodies", async () => {
   const http = await loadArtifact("https://acme.example");
   await registerWithFetch(http.artifact, async () => new Response("upstream secret", { status: 502 }));
-  await assert.rejects(http.tools[0]!.execute({ query: "ORD-4812" }, { signal: new AbortController().signal }), (error: unknown) => {
-    assert.equal((error as { code: string }).code, "HTTP_ERROR");
+  await assert.rejects(findOrderTool(http.tools).execute({ query: "ORD-4812" }, { signal: new AbortController().signal }), (error: unknown) => {
+    assert.equal((error as { code: string }).code, "TARGET_ERROR");
     assert.doesNotMatch(String((error as Error).message), /upstream secret/);
     return true;
   });
 
   const large = await loadArtifact("https://acme.example");
-  await registerWithFetch(large.artifact, async () => new Response("x".repeat(65_537)));
-  await assert.rejects(large.tools[0]!.execute({ query: "ORD-4812" }, { signal: new AbortController().signal }), { code: "RESPONSE_TOO_LARGE" });
+  await registerWithFetch(large.artifact, async () => new Response("x".repeat(65_537), {
+    headers: { "content-type": "application/json" },
+  }));
+  await assert.rejects(findOrderTool(large.tools).execute({ query: "ORD-4812" }, { signal: new AbortController().signal }), { code: "RESPONSE_TOO_LARGE" });
 });
 
 test("generated safe GET retries one retryable response and no more", async () => {
@@ -243,7 +287,7 @@ test("generated safe GET retries one retryable response and no more", async () =
       ? new Response("temporarily unavailable", { status: 503 })
       : Response.json([{ id: "ORD-4812", email: "customer@example.test", shipmentStatus: "delayed" }]);
   });
-  const result = await recovered.tools[0]!.execute({ query: "ORD-4812" }, { signal: new AbortController().signal }) as Array<Record<string, unknown>>;
+  const result = await findOrderTool(recovered.tools).execute({ query: "ORD-4812" }, { signal: new AbortController().signal }) as Array<Record<string, unknown>>;
   assert.equal(result[0]!.id, "ORD-4812");
   assert.equal(recoveredCalls, 2);
 
@@ -253,7 +297,7 @@ test("generated safe GET retries one retryable response and no more", async () =
     boundedCalls += 1;
     return boundedCalls < 3 ? new Response("still unavailable", { status: 429 }) : Response.json([]);
   });
-  await assert.rejects(bounded.tools[0]!.execute({ query: "ORD-4812" }, { signal: new AbortController().signal }), { code: "HTTP_ERROR" });
+  await assert.rejects(findOrderTool(bounded.tools).execute({ query: "ORD-4812" }, { signal: new AbortController().signal }), { code: "RATE_LIMITED" });
   assert.equal(boundedCalls, 2);
 });
 
@@ -262,23 +306,20 @@ test("generated requests do not retry authentication or other non-retryable 4xx 
     const generated = await loadArtifact("https://acme.example");
     let calls = 0;
     await registerWithFetch(generated.artifact, async () => { calls += 1; return new Response("rejected", { status }); });
-    await assert.rejects(generated.tools[0]!.execute({ query: "ORD-4812" }, { signal: new AbortController().signal }), { code: "HTTP_ERROR" });
+    await assert.rejects(findOrderTool(generated.tools).execute({ query: "ORD-4812" }, { signal: new AbortController().signal }), {
+      code: status === 401 ? "AUTHENTICATION_REQUIRED" : status === 403 ? "FORBIDDEN" : status === 409 ? "STALE_TARGET" : "VALIDATION_FAILED",
+    });
     assert.equal(calls, 1);
   }
 });
 
-test("generated final POST recovers a dropped response with the same idempotency and confirmation evidence", async () => {
+test("generated final POST recovers a dropped response with the same idempotency key", async () => {
   const generated = await loadArtifact("https://acme.example");
   let confirmCalls = 0;
-  let evidenceCalls = 0;
   let ticketCalls = 0;
   const mutationHeaders: Headers[] = [];
   const committedTicket = { ticketId: "TCK-committed", status: "open", priority: "high", createdAt: "2026-08-29T00:00:00.000Z" };
-  await registerWithFetch(generated.artifact, async (request, init) => {
-    if (String(request).endsWith("/api/confirmations")) {
-      evidenceCalls += 1;
-      return Response.json({ evidence: "proof-once" }, { status: 201 });
-    }
+  await registerWithFetch(generated.artifact, async (_request, init) => {
     ticketCalls += 1;
     mutationHeaders.push(new Headers(init?.headers));
     if (ticketCalls === 1) {
@@ -293,15 +334,14 @@ test("generated final POST recovers a dropped response with the same idempotency
     { signal: new AbortController().signal },
   ) as { ticketId: string }).ticketId, "TCK-committed");
   assert.equal(confirmCalls, 1);
-  assert.equal(evidenceCalls, 1);
   assert.equal(ticketCalls, 2);
   assert.equal(mutationHeaders[0]!.get("idempotency-key"), mutationHeaders[1]!.get("idempotency-key"));
-  assert.equal(mutationHeaders[0]!.get("x-page2webmcp-confirmation"), "proof-once");
-  assert.equal(mutationHeaders[1]!.get("x-page2webmcp-confirmation"), "proof-once");
 });
 
 test("generated mutation reuses its pending key across a timed-out execute and a separate invocation", async () => {
-  const generated = await loadArtifact("https://acme.example", capabilities, { deadlineMs: 15 });
+  // Leave enough headroom for WebCrypto's async digest under parallel test load;
+  // the deliberately unresolved first fetch still deterministically reaches the deadline.
+  const generated = await loadArtifact("https://acme.example", capabilities, { deadlineMs: 100 });
   const mutationKeys: string[] = [];
   let confirmationCalls = 0;
   let mutationCalls = 0;
@@ -311,11 +351,7 @@ test("generated mutation reuses its pending key across a timed-out execute and a
     priority: "high",
     createdAt: "2026-08-29T00:00:00.000Z"
   };
-  await registerWithFetch(generated.artifact, async (request, init) => {
-    if (String(request).endsWith("/api/confirmations")) {
-      confirmationCalls += 1;
-      return Response.json({ evidence: `proof-${confirmationCalls}` }, { status: 201 });
-    }
+  await registerWithFetch(generated.artifact, async (_request, init) => {
     mutationCalls += 1;
     mutationKeys.push(new Headers(init?.headers).get("idempotency-key") ?? "");
     if (mutationCalls === 1) {
@@ -324,7 +360,7 @@ test("generated mutation reuses its pending key across a timed-out execute and a
       });
     }
     return Response.json(committedTicket, { status: 201 });
-  }, { confirm: async () => true });
+  }, { confirm: async () => { confirmationCalls += 1; return true; } });
   const tool = generated.tools.find(({ name }) => name === "create_support_ticket")!;
   const input = { orderId: "ORD-4812", title: "Recover after timeout", priority: "high" };
 
@@ -340,13 +376,8 @@ test("generated mutation reuses its pending key across a timed-out execute and a
 
 test("generated final POST does not retry an idempotency conflict", async () => {
   const generated = await loadArtifact("https://acme.example");
-  let evidenceCalls = 0;
   let ticketCalls = 0;
-  await registerWithFetch(generated.artifact, async (request) => {
-    if (String(request).endsWith("/api/confirmations")) {
-      evidenceCalls += 1;
-      return Response.json({ evidence: "proof-once" }, { status: 201 });
-    }
+  await registerWithFetch(generated.artifact, async () => {
     ticketCalls += 1;
     return new Response("conflict", { status: 409 });
   }, { confirm: async () => true });
@@ -354,8 +385,7 @@ test("generated final POST does not retry an idempotency conflict", async () => 
   await assert.rejects(tool.execute(
     { orderId: "ORD-4812", title: "Conflicting ticket", priority: "high" },
     { signal: new AbortController().signal },
-  ), { code: "HTTP_ERROR" });
-  assert.equal(evidenceCalls, 1);
+  ), { code: "STALE_TARGET" });
   assert.equal(ticketCalls, 1);
 });
 
@@ -369,7 +399,7 @@ test("generated retry remains inside the original total execution deadline", asy
       init?.signal?.addEventListener("abort", () => reject(init.signal!.reason), { once: true });
     });
   });
-  await assert.rejects(generated.tools[0]!.execute(
+  await assert.rejects(findOrderTool(generated.tools).execute(
     { query: "ORD-4812" },
     { signal: new AbortController().signal },
   ), { code: "DEADLINE_EXCEEDED" });
@@ -379,12 +409,12 @@ test("generated retry remains inside the original total execution deadline", asy
 test("generated runtime applies a deadline and honors caller cancellation", async () => {
   const timeout = await loadArtifact("https://acme.example", capabilities, { deadlineMs: 5 });
   await registerWithFetch(timeout.artifact, async (_input, init) => new Promise<Response>((_resolve, reject) => init?.signal?.addEventListener("abort", () => reject(init.signal!.reason), { once: true })));
-  await assert.rejects(timeout.tools[0]!.execute({ query: "ORD-4812" }, { signal: new AbortController().signal }), { code: "DEADLINE_EXCEEDED" });
+  await assert.rejects(findOrderTool(timeout.tools).execute({ query: "ORD-4812" }, { signal: new AbortController().signal }), { code: "DEADLINE_EXCEEDED" });
 
   const cancelled = await loadArtifact("https://acme.example");
   await registerWithFetch(cancelled.artifact, async (_input, init) => new Promise<Response>((_resolve, reject) => init?.signal?.addEventListener("abort", () => reject(init.signal!.reason), { once: true })));
   const caller = new AbortController();
-  const pending = cancelled.tools[0]!.execute({ query: "ORD-4812" }, { signal: caller.signal });
+  const pending = findOrderTool(cancelled.tools).execute({ query: "ORD-4812" }, { signal: caller.signal });
   caller.abort();
   await assert.rejects(pending, { code: "ABORTED" });
 });
@@ -395,8 +425,8 @@ test("generated deadline includes response body consumption", async () => {
       start(controller) {
         init?.signal?.addEventListener("abort", () => controller.error(new Error("aborted")), { once: true });
       },
-    })));
-  const execution = delayedBody.tools[0]!.execute({ query: "ORD-4812" }, { signal: new AbortController().signal });
+    }), { headers: { "content-type": "application/json" } }));
+  const execution = findOrderTool(delayedBody.tools).execute({ query: "ORD-4812" }, { signal: new AbortController().signal });
   await assert.rejects(
     Promise.race([execution, new Promise((resolve) => setTimeout(() => resolve("STALLED"), 50))]),
     { code: "DEADLINE_EXCEEDED" },
@@ -435,8 +465,8 @@ test("generated response reader cancels a stream immediately after the 64 KiB ca
       if (pulls === 100) controller.close();
     },
     cancel() { cancelled = true; },
-  })));
-  await assert.rejects(large.tools[0]!.execute({ query: "ORD-4812" }, { signal: new AbortController().signal }), { code: "RESPONSE_TOO_LARGE" });
+  }), { headers: { "content-type": "application/json" } }));
+  await assert.rejects(findOrderTool(large.tools).execute({ query: "ORD-4812" }, { signal: new AbortController().signal }), { code: "RESPONSE_TOO_LARGE" });
   assert.equal(cancelled, true);
   assert.ok(pulls < 100);
 });
@@ -468,7 +498,11 @@ test("concurrent registration shares one generation and unregister during regist
   assert.equal(concurrent.tools.length, 1);
   concurrent.artifact.unregisterPage2WebMCPTools();
   releaseFirst();
-  await Promise.all([first, second]);
+  const cancelled = await Promise.all([first, second]);
+  assert.deepEqual(cancelled, [
+    { supported: false, reason: "REGISTRATION_CANCELLED" },
+    { supported: false, reason: "REGISTRATION_CANCELLED" },
+  ]);
   assert.equal(concurrent.tools.length, 0);
 
   await registerWithFetch(concurrent.artifact, async () => Response.json([]));
@@ -481,7 +515,6 @@ test("generated mutation fails closed without confirmation and sends bound evide
   const fakeFetch: typeof fetch = async (input, init) => {
     const url = String(input);
     requests.push({ url, init });
-    if (url.endsWith("/api/confirmations")) return Response.json({ evidence: "proof-once" }, { status: 201 });
     return Response.json({ ticketId: "TCK-safe", status: "open", priority: "high", createdAt: "2026-08-29T00:00:00.000Z" }, { status: 201 });
   };
 
@@ -489,7 +522,7 @@ test("generated mutation fails closed without confirmation and sends bound evide
   await registerWithFetch(missing.artifact, fakeFetch);
   const missingTool = missing.tools.find(({ name }) => name === "create_support_ticket")!;
   const input = { orderId: "ORD-4812", title: "Damaged parcel", priority: "high" };
-  await assert.rejects(missingTool.execute(input, { signal: new AbortController().signal }), { code: "CONFIRMATION_REQUIRED" });
+  await assert.rejects(missingTool.execute(input, { signal: new AbortController().signal }), { code: "CONFIRMATION_FAILED" });
 
   const declined = await loadArtifact("https://acme.example");
   await registerWithFetch(declined.artifact, fakeFetch, { confirm: async () => false });
@@ -504,26 +537,24 @@ test("generated mutation fails closed without confirmation and sends bound evide
   const ticket = await approvedTool.execute(input, { signal: new AbortController().signal });
   assert.equal((ticket as { ticketId: string }).ticketId, "TCK-safe");
   assert.deepEqual({ ...(confirmationRequest as { input: Record<string, unknown> }).input }, input);
-  assert.equal(requests.length, 2);
-  const mutationHeaders = new Headers(requests[1]!.init?.headers);
-  assert.equal(mutationHeaders.get("x-page2webmcp-confirmation"), "proof-once");
+  assert.equal(requests.length, 1);
+  const mutationHeaders = new Headers(requests[0]!.init?.headers);
+  assert.equal(mutationHeaders.get("x-page2webmcp-confirmation"), null);
   assert.match(mutationHeaders.get("idempotency-key") ?? "", /^[0-9a-f-]{36}$/);
 });
 
 test("host confirmation bridge cannot replace fetch execution semantics", async () => {
-  const originalFetch = globalThis.fetch;
   let platformCalls = 0;
   let injectedCalls = 0;
-  globalThis.fetch = async () => { platformCalls += 1; return Response.json([]); };
-  try {
-    const { artifact, tools } = await loadArtifact("https://acme.example");
-    await artifact.registerPage2WebMCPTools({ fetch: async () => { injectedCalls += 1; return Response.json([]); } } as unknown as Parameters<GeneratedArtifact["registerPage2WebMCPTools"]>[0]);
-    await tools[0]!.execute({ query: "ORD-4812" }, { signal: new AbortController().signal });
-    assert.equal(platformCalls, 1);
-    assert.equal(injectedCalls, 0);
-  } finally {
-    globalThis.fetch = originalFetch;
-  }
+  const { artifact, tools } = await loadArtifact("https://acme.example");
+  await registerWithFetch(
+    artifact,
+    async () => { platformCalls += 1; return Response.json([]); },
+    { fetch: async () => { injectedCalls += 1; return Response.json([]); } } as unknown as Parameters<GeneratedArtifact["registerPage2WebMCPTools"]>[0],
+  );
+  await findOrderTool(tools).execute({ query: "ORD-4812" }, { signal: new AbortController().signal });
+  assert.equal(platformCalls, 1);
+  assert.equal(injectedCalls, 0);
 });
 
 test("generated diagnostics expose only stable phase and code", async () => {
@@ -559,26 +590,38 @@ test("all concurrent registration callers receive typed safe failures", async ()
 });
 
 test("compiler rejects unsafe request plans", () => {
-  assert.throws(() => compileWebMcpRelease([{ ...capabilities[0]!, requestPlan: { method: "GET", path: "https://evil.example/orders" } }], "https://acme.example"), /unsafe request path/i);
-  assert.throws(() => compileWebMcpRelease([{ ...capabilities[0]!, requestPlan: { method: "DELETE", path: "/api/orders" } as unknown as CompilableCapability["requestPlan"] }], "https://acme.example"), /unsupported request method/i);
-  assert.throws(() => compileWebMcpRelease([{ name: "lookup", description: "Generic lookup", readOnly: true }], "https://acme.example"), /vetted request plan/i);
+  const read = capabilities.find((plan) => plan.tool.name === "find_order")!;
+  const mutation = capabilities.find((plan) => plan.tool.name === "create_support_ticket")!;
+  if (read.request.adapter !== "json_api" || mutation.request.adapter !== "json_api") {
+    throw new Error("expected JSON fixture adapters");
+  }
+  const readRequest = read.request;
+  const mutationRequest = mutation.request;
   assert.throws(() => compileWebMcpRelease([{
-    name: "get_mutation",
-    description: "Mutation disguised as a GET",
-    readOnly: false,
-    requiresConfirmation: true,
-    inputSchema: { type: "object", properties: {}, required: [], additionalProperties: false },
-    requestPlan: { method: "GET", path: "/api/mutate" },
-    outputSchema: { type: "boolean" },
-  }], "https://acme.example"), /mutation must use POST/i);
+    ...read,
+    request: { ...readRequest, pathTemplate: "https://evil.example/orders" },
+  }]), /unsafe request path/i);
+  assert.throws(() => compileWebMcpRelease([{
+    ...read,
+    request: { ...readRequest, method: "DELETE" },
+  } as unknown as CapabilityPlan]), /invalid option|GET|POST/i);
+  assert.throws(() => compileWebMcpRelease([{
+    name: "lookup",
+    description: "Generic lookup",
+    readOnly: true,
+  } as unknown as CapabilityPlan]), /invalid input|expected/i);
+  assert.throws(() => compileWebMcpRelease([{
+    ...mutation,
+    request: { ...mutationRequest, method: "GET" },
+  }]), /mutation capability must use POST/i);
 
   const inheritedProperties = Object.create({ constructor: { type: "string" } }) as Record<string, { type: "string" }>;
   assert.throws(() => compileWebMcpRelease([{
-    name: "prototype_schema",
-    description: "Schema with an inherited field",
-    readOnly: true,
-    inputSchema: { type: "object", properties: inheritedProperties, required: ["constructor"], additionalProperties: false },
-    requestPlan: { method: "GET", path: "/api/lookup" },
-    outputSchema: { type: "boolean" },
-  }], "https://acme.example"), /invalid required fields/i);
+    ...read,
+    schemas: {
+      ...read.schemas,
+      input: { type: "object", properties: inheritedProperties, required: ["constructor"], additionalProperties: false },
+    },
+    request: { ...readRequest, query: {} },
+  }]), /unknown property/i);
 });

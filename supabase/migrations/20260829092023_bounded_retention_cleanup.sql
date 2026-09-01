@@ -12,7 +12,36 @@ end
 $$;
 
 alter role page2webmcp_maintenance
-  nologin noinherit nosuperuser nocreatedb nocreaterole noreplication nobypassrls;
+  nologin noinherit nocreatedb nocreaterole;
+
+-- A tenant migration role cannot safely rewrite SUPERUSER, REPLICATION, or
+-- BYPASSRLS on an existing role. Prove their safe catalog state instead, and
+-- also fail if any expected application role is missing.
+do $$
+begin
+  if exists (
+    select 1
+    from (values
+      ('page2webmcp_app'),
+      ('page2webmcp_worker'),
+      ('page2webmcp_maintenance')
+    ) as expected_role(rolname)
+    left join pg_catalog.pg_roles as role_state
+      on role_state.rolname = expected_role.rolname
+    where role_state.oid is null
+      or role_state.rolcanlogin
+      or role_state.rolinherit
+      or role_state.rolsuper
+      or role_state.rolcreatedb
+      or role_state.rolcreaterole
+      or role_state.rolreplication
+      or role_state.rolbypassrls
+  ) then
+    raise exception 'page2webmcp application role posture is unsafe'
+      using errcode = '42501';
+  end if;
+end
+$$;
 
 -- One call can delete at most max_rows rows in total. The budget is split
 -- across the four retention classes so a continuously busy class cannot

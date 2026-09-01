@@ -1,6 +1,6 @@
 import { AcmeSupport } from "../apps/acme-support/src/app";
 import { transitionCapability } from "../packages/capability-ir/src/status.ts";
-import { runFixtureWorkflow } from "../apps/worker/src/workflow.ts";
+import { runFixtureWorkflow } from "./fixture-workflow.ts";
 
 export async function runAutonomousDemo() {
   const app = new AcmeSupport({

@@ -2,11 +2,10 @@ import { z } from "zod";
 import { getControlPlaneRepository } from "../../../../../../../packages/database/src/factory.ts";
 import {
   ApiError,
-  assertSameOrigin,
   createRequestId,
   errorResponse,
   parseJsonBody,
-  requireActor,
+  requireMutationActor,
   successResponse
 } from "../../../../../src/api.ts";
 import { recordLifecycle, recordLifecycleFailure } from "../../../../../src/telemetry.ts";
@@ -24,22 +23,23 @@ export async function POST(
   const requestId = createRequestId();
   const startedAt = Date.now();
   try {
-    assertSameOrigin(request);
-    const actor = requireActor(request);
+    const repository = getControlPlaneRepository();
+    const actor = await requireMutationActor(request, repository);
     const input = await parseJsonBody(request, ReviewInputSchema);
     const { capabilityId: rawCapabilityId } = await context.params;
     const capabilityId = CapabilityIdSchema.safeParse(rawCapabilityId);
     if (!capabilityId.success) throw new ApiError("NOT_FOUND", 404);
-    const capability = await getControlPlaneRepository().reviewCapability(actor, capabilityId.data, input);
+    const capability = await repository.reviewCapability(actor, capabilityId.data, input);
     await recordLifecycle({
       event: "capability_reviewed",
       outcome: "success",
       requestId,
-      properties: { review_action: input.action, risk_tier: capability.riskTier, duration_ms: Date.now() - startedAt }
+      properties: { actor_id: actor.id, organization_id: actor.organizationId,
+        review_action: input.action, risk_tier: capability.riskTier, duration_ms: Date.now() - startedAt }
     });
     return successResponse({ capability }, requestId);
   } catch (error) {
-    const response = errorResponse(error, requestId);
+    const response = errorResponse(error, requestId, request);
     await recordLifecycleFailure({ event: "capability_reviewed", requestId, startedAt }, error, response.status);
     return response;
   }

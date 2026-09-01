@@ -5,7 +5,8 @@ export const PRODUCT_EVENTS = [
   "analysis_completed",
   "capability_reviewed",
   "release_verified",
-  "release_published"
+  "release_published",
+  "installation_verified"
 ] as const;
 
 export const TRACE_OPERATIONS = ["analysis", "verify", "publish"] as const;
@@ -47,10 +48,12 @@ export type ObservabilityOptions = {
 const MAX_VENDOR_TIMEOUT_MS = 250;
 const SUCCESS_SAMPLE_PERCENT = 20;
 const SAFE_PROPERTY_RULES: Record<string, (value: unknown) => string | number | boolean | undefined> = {
+  actor_id: safeUuid,
   code: safeCode,
   attempts: safeAttempts,
   environment: safeLabel,
   http_status: safeStatus,
+  organization_id: safeUuid,
   outcome: safeOutcome,
   release: safeLabel,
   release_result: safeLabel,
@@ -154,6 +157,13 @@ function safeLabel(value: unknown): string | undefined {
 
 function safeRequestId(value: unknown): string | undefined {
   return typeof value === "string" && /^[a-z0-9-]{1,80}$/i.test(value) && !isSensitive(value) ? value : undefined;
+}
+
+function safeUuid(value: unknown): string | undefined {
+  return typeof value === "string"
+    && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)
+    ? value.toLowerCase()
+    : undefined;
 }
 
 function safeStatus(value: unknown): number | undefined {

@@ -9,6 +9,14 @@ task_initdb="$task_pg_bindir/initdb"
 task_pg_ctl="$task_pg_bindir/pg_ctl"
 task_psql="$task_pg_bindir/psql"
 
+run_typescript_test() {
+  if [[ "${PAGE2WEBMCP_NATIVE_TYPESCRIPT_TESTS:-false}" == "true" ]]; then
+    "${PAGE2WEBMCP_NODE_BINARY:-node}" --experimental-transform-types --test "$@"
+  else
+    pnpm exec tsx --test "$@"
+  fi
+}
+
 cleanup() {
   "$task_pg_ctl" -D "$task_data_dir" -m immediate stop >/dev/null 2>&1 || true
   rm -rf "$task_tmp_dir"
@@ -18,8 +26,16 @@ trap cleanup EXIT
 "$task_initdb" -D "$task_data_dir" --auth=trust --no-locale >/dev/null
 "$task_pg_ctl" -D "$task_data_dir" -o "-k $task_tmp_dir -p $task_port" -w start >/dev/null
 
-"$task_psql" -h "$task_tmp_dir" -p "$task_port" -d postgres -v ON_ERROR_STOP=1 -c "create schema auth; create table auth.users (id uuid primary key, email text not null); create function auth.uid() returns uuid language sql stable as 'select nullif(current_setting(''request.jwt.claim.sub'', true), '''')::uuid'; create role anon nologin; create role authenticated nologin;"
+"$task_psql" -h "$task_tmp_dir" -p "$task_port" -d postgres -v ON_ERROR_STOP=1 -c "create schema extensions; create extension if not exists pgcrypto with schema extensions; create schema auth; create table auth.users (id uuid primary key, email text not null, email_confirmed_at timestamptz); create table auth.sessions (id uuid primary key, user_id uuid not null references auth.users(id), not_after timestamptz); create function auth.uid() returns uuid language sql stable as 'select nullif(current_setting(''request.jwt.claim.sub'', true), '''')::uuid'; create schema storage; create table storage.buckets (id text primary key, name text not null, public boolean default false, file_size_limit bigint default null, allowed_mime_types text[] default null); create role anon nologin; create role authenticated nologin; create role service_role nologin;"
 for migration in supabase/migrations/*.sql; do
+  if [[ "$(basename "$migration")" == "20260901010000_single_installation_proof.sql" ]]; then
+    "$task_psql" -h "$task_tmp_dir" -p "$task_port" -d postgres -v ON_ERROR_STOP=1 \
+      -f supabase/tests/single_installation_proof_upgrade_before.sql
+  fi
+  if [[ "$(basename "$migration")" == "20260901120000_live_verifier_attestation_v2.sql" ]]; then
+    "$task_psql" -h "$task_tmp_dir" -p "$task_port" -d postgres -v ON_ERROR_STOP=1 \
+      -f supabase/tests/live_verifier_attestation_v2_upgrade_before.sql
+  fi
   "$task_psql" -h "$task_tmp_dir" -p "$task_port" -d postgres -v ON_ERROR_STOP=1 -f "$migration"
   if [[ "$(basename "$migration")" == "20260826000000_page2webmcp.sql" ]]; then
     "$task_psql" -h "$task_tmp_dir" -p "$task_port" -d postgres -v ON_ERROR_STOP=1 -f supabase/seed.sql
@@ -87,7 +103,50 @@ for migration in supabase/migrations/*.sql; do
           repeat('2', 64), repeat('a', 64), 'legacy published candidate',
           'https://acme.example', '{}', 'sha256-legacy', 'published');"
   fi
+  if [[ "$(basename "$migration")" == "20260831120000_live_readiness_attestation.sql" ]]; then
+    "$task_psql" -h "$task_tmp_dir" -p "$task_port" -d postgres -v ON_ERROR_STOP=1 -c \
+      "insert into public.release_installations
+         (id, organization_id, project_id, release_id, actor_id, page_url,
+          artifact_url, target_origin, artifact_content_hash, integrity, expected_tools,
+          status, delivery, csp_status, webmcp_implementation, attestation,
+          idempotency_key, input_hash, verified_at,
+          download_url, local_only, verification_mode, verifier_protocol_version,
+          verifier_origin_digest, verifier_webmcp_implementation,
+          observed_artifact_url, observed_download_url, observed_local_only,
+          observed_integrity, observed_target_origin, registered_tools,
+          executed_artifact_url, served_content_hash, executed_content_hash,
+          normal_page_load, route_interception, injected_registration,
+          synthetic_harness, duplicate_load_harmless)
+       values
+         ('aaaaaaaa-0000-0000-0000-0000000000e5', 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+          'aaaaaaaa-0000-0000-0000-0000000000fa', 'aaaaaaaa-0000-0000-0000-0000000000f7',
+          '11111111-1111-1111-1111-111111111111', 'https://acme.example/',
+          'https://bimqgiedckdurqiywctl.supabase.co/storage/v1/object/public/page2webmcp-releases/' || repeat('a', 64) || '.js',
+          'https://acme.example', repeat('a', 64), 'sha384-AAAA', '[\"read_widget\"]',
+          'verified', 'hosted', 'allowed', 'native', '{}',
+          'legacy-registration-only', repeat('e', 64), now(),
+          'https://bimqgiedckdurqiywctl.supabase.co/storage/v1/object/public/page2webmcp-releases/' || repeat('a', 64) || '.js?download=page2webmcp-' || repeat('a', 64) || '.js',
+          false, 'live', 1, repeat('d', 64), 'native',
+          'https://bimqgiedckdurqiywctl.supabase.co/storage/v1/object/public/page2webmcp-releases/' || repeat('a', 64) || '.js',
+          'https://bimqgiedckdurqiywctl.supabase.co/storage/v1/object/public/page2webmcp-releases/' || repeat('a', 64) || '.js?download=page2webmcp-' || repeat('a', 64) || '.js',
+          false, 'sha384-AAAA', 'https://acme.example', '[\"read_widget\"]',
+          'https://bimqgiedckdurqiywctl.supabase.co/storage/v1/object/public/page2webmcp-releases/' || repeat('a', 64) || '.js',
+          repeat('a', 64), repeat('a', 64), true, false, false, false, true);"
+  fi
+  if [[ "$(basename "$migration")" == "20260901010000_single_installation_proof.sql" ]]; then
+    "$task_psql" -h "$task_tmp_dir" -p "$task_port" -d postgres -v ON_ERROR_STOP=1 \
+      -f supabase/tests/single_installation_proof_upgrade_after.sql
+  fi
+  if [[ "$(basename "$migration")" == "20260901120000_live_verifier_attestation_v2.sql" ]]; then
+    "$task_psql" -h "$task_tmp_dir" -p "$task_port" -d postgres -v ON_ERROR_STOP=1 \
+      -f supabase/tests/live_verifier_attestation_v2_upgrade_after.sql
+  fi
 done
+
+if [[ "${PAGE2WEBMCP_MIGRATION_ONLY:-false}" == "true" ]]; then
+  echo "Standalone PostgreSQL migration upgrade tests passed."
+  exit 0
+fi
 "$task_psql" -h "$task_tmp_dir" -p "$task_port" -d postgres -v ON_ERROR_STOP=1 -c \
   "do \$\$
    begin
@@ -127,10 +186,14 @@ done
        select 1
        from public.verification_runs
        where id = 'aaaaaaaa-0000-0000-0000-0000000000f8'
-         and eligible
+         and not eligible
          and candidate_code = 'legacy published candidate'
+         and verifier_protocol_version is null
+         and verifier_origin_digest is null
+         and verifier_webmcp_implementation is null
+         and 'MIGRATION_NATIVE_REVERIFY_REQUIRED' = any(failures)
      ) then
-       raise exception 'legacy published verification was not reconstructed from immutable release bytes';
+       raise exception 'legacy published verification was not reconstructed and invalidated for native reverification';
      end if;
      if not exists (
        select 1
@@ -144,6 +207,37 @@ done
      end if;
    end
    \$\$;
+   do \$\$
+   declare registration_only_rejected boolean := false;
+   begin
+     if not exists (
+       select 1
+       from public.release_installations
+       where id = 'aaaaaaaa-0000-0000-0000-0000000000e5'
+         and status = 'failed'
+         and verified_at is null
+         and authenticated_read_tool_name is null
+         and confirmed_mutation_effect_count is null
+         and final_state_verified is null
+     ) then
+       raise exception 'legacy registration-only installation did not fail closed for native execution reverification';
+     end if;
+     begin
+       update public.release_installations
+       set status = 'verified', verified_at = now()
+       where id = 'aaaaaaaa-0000-0000-0000-0000000000e5';
+     exception when check_violation then
+       registration_only_rejected := true;
+     end;
+     if not registration_only_rejected then
+       raise exception 'verified registration-only installation bypassed execution evidence constraint';
+     end if;
+     if exists (select 1 from private.selected_native_installation_proof(repeat('a', 64))) then
+       raise exception 'registration-only installation remained eligible for live readiness';
+     end if;
+   end
+   \$\$;
+   delete from public.release_installations where id = 'aaaaaaaa-0000-0000-0000-0000000000e5';
    delete from public.releases where id = 'aaaaaaaa-0000-0000-0000-0000000000f7';
    delete from public.projects where id in (
      'aaaaaaaa-0000-0000-0000-0000000000ff',
@@ -158,16 +252,18 @@ done
    grant page2webmcp_app, page2webmcp_worker to page2webmcp_test_runtime;
    grant page2webmcp_app to page2webmcp_test_app;
    grant page2webmcp_worker to page2webmcp_test_worker;"
+"$task_psql" -h "$task_tmp_dir" -p "$task_port" -d postgres -v ON_ERROR_STOP=1 -f supabase/tests/auth_identity_standalone.sql
 "$task_psql" -h "$task_tmp_dir" -p "$task_port" -d postgres -v ON_ERROR_STOP=1 -f supabase/tests/tenant_isolation_standalone.sql
 "$task_psql" -h "$task_tmp_dir" -p "$task_port" -d postgres -v ON_ERROR_STOP=1 -f supabase/tests/retention_standalone.sql
 
 PAGE2WEBMCP_TEST_DATABASE_URL="postgresql://page2webmcp_test_runtime@127.0.0.1:$task_port/postgres?host=$task_tmp_dir" \
 PAGE2WEBMCP_TEST_ADMIN_DATABASE_URL="postgresql://127.0.0.1:$task_port/postgres?host=$task_tmp_dir" \
-  pnpm exec tsx --test packages/database/src/postgres.integration.test.ts
+  run_typescript_test packages/database/src/postgres.integration.test.ts
 
 NODE_ENV=test \
 PAGE2WEBMCP_TEST_APP_DATABASE_URL="postgresql://page2webmcp_test_app@127.0.0.1:$task_port/postgres?host=$task_tmp_dir" \
 PAGE2WEBMCP_TEST_WORKER_DATABASE_URL="postgresql://page2webmcp_test_worker@127.0.0.1:$task_port/postgres?host=$task_tmp_dir" \
-  pnpm exec tsx --test apps/control-plane/tests/postgres-topology.integration.test.ts
+PAGE2WEBMCP_TEST_ADMIN_DATABASE_URL="postgresql://127.0.0.1:$task_port/postgres?host=$task_tmp_dir" \
+  run_typescript_test apps/control-plane/tests/postgres-topology.integration.test.ts
 
 echo "Standalone PostgreSQL RLS and production-topology integration tests passed."

@@ -3,6 +3,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import pg from "pg";
 import { GET as getAnalysis } from "../app/api/analysis-runs/[runId]/route.ts";
 import { POST as login } from "../app/api/auth/login/route.ts";
 import { POST as reviewCapability } from "../app/api/capabilities/[capabilityId]/review/route.ts";
@@ -12,11 +13,27 @@ import { POST as createProject } from "../app/api/projects/route.ts";
 import { GET as getArtifact } from "../app/api/releases/[artifact]/route.ts";
 import { setControlPlaneRepositoryForTest } from "../../../packages/database/src/factory.ts";
 import { createPostgresRepository } from "../../../packages/database/src/postgres.ts";
+import { issueCsrfChallenge } from "../src/api.ts";
+import { setReleaseArtifactStoreForTest } from "../src/artifact-storage.ts";
+import { setAuthServiceForTest } from "../src/auth.ts";
+import { createFixtureAuthService, fixtureSessionId } from "../src/auth-fixture.ts";
+import { setReleaseVerificationPortForTest } from "../src/release-verification.ts";
+import { setWebsiteUserHandoffPortForTest } from "../src/website-user-handoff.ts";
+import {
+  hermeticReleaseArtifactStore,
+  hermeticReleaseVerificationPort,
+  hermeticWebsiteUserHandoffPort,
+} from "./auth-test-helpers.ts";
 
 const appConnectionString = process.env.PAGE2WEBMCP_TEST_APP_DATABASE_URL;
 const workerConnectionString = process.env.PAGE2WEBMCP_TEST_WORKER_DATABASE_URL;
+const adminConnectionString = process.env.PAGE2WEBMCP_TEST_ADMIN_DATABASE_URL;
+const trustedTsxCli = process.env.PAGE2WEBMCP_TEST_TSX_CLI;
+const nativeTypeScript = process.env.PAGE2WEBMCP_NATIVE_TYPESCRIPT_TESTS === "true";
 const controlOrigin = "https://control.example";
 const workspaceRoot = fileURLToPath(new URL("../../../", import.meta.url));
+const csrfSecret = "postgres-topology-test-csrf-secret-32-bytes";
+process.env.PAGE2WEBMCP_SESSION_SECRET = csrfSecret;
 
 type CapabilityResponse = {
   id: string;
@@ -31,15 +48,20 @@ type AnalysisResponse = {
 };
 
 test("PostgreSQL route lifecycle is completed by a separately launched durable worker", {
-  skip: !appConnectionString || !workerConnectionString,
+  skip: !appConnectionString || !workerConnectionString || !adminConnectionString,
   timeout: 30_000
 }, async () => {
-  if (!appConnectionString || !workerConnectionString) return;
+  if (!appConnectionString || !workerConnectionString || !adminConnectionString) return;
 
   const repository = createPostgresRepository({ connectionString: appConnectionString, maxConnections: 3 });
+  const admin = new pg.Pool({ connectionString: adminConnectionString, max: 1 });
   let worker: ChildProcess | undefined;
   let workerOutput = () => "";
   setControlPlaneRepositoryForTest(repository);
+  setAuthServiceForTest(createFixtureAuthService());
+  setReleaseArtifactStoreForTest(hermeticReleaseArtifactStore);
+  setReleaseVerificationPortForTest(hermeticReleaseVerificationPort);
+  setWebsiteUserHandoffPortForTest(hermeticWebsiteUserHandoffPort);
 
   try {
     const loginResponse = await login(jsonRequest("/api/auth/login", {
@@ -48,13 +70,20 @@ test("PostgreSQL route lifecycle is completed by a separately launched durable w
     }));
     await assertResponseStatus(loginResponse, 200);
     const cookie = loginResponse.headers.get("set-cookie")?.split(";", 1)[0];
-    assert.match(cookie ?? "", /^page2webmcp_session=/);
+    assert.match(cookie ?? "", /^page2webmcp_fixture_session=/);
     assert.ok(cookie);
+    const fixtureToken = cookie.split("=", 2)[1]!;
+    const sessionId = fixtureSessionId(fixtureToken);
+    assert.ok(sessionId);
+    await admin.query(
+      "insert into auth.sessions (id, user_id, not_after) values ($1, $2, now() + interval '1 hour')",
+      [sessionId, "11111111-1111-1111-1111-111111111111"]
+    );
 
     const suffix = randomUUID();
     const projectResponse = await createProject(jsonRequest("/api/projects", {
       sourceType: "website",
-      url: "https://acme.example"
+      url: "https://widgets.example"
     }, cookie, `topology-project-${suffix}`));
     await assertResponseStatus(projectResponse, 201);
     const project = await projectResponse.json() as { id: string; status: string };
@@ -67,14 +96,17 @@ test("PostgreSQL route lifecycle is completed by a separately launched durable w
     const accepted = await analyzeResponse.json() as { runId: string; status: string };
     assert.equal(accepted.status, "queued", "PostgreSQL work must not execute inside the request process");
 
-    worker = spawn(process.execPath, ["--import", "tsx", "apps/worker/src/main.ts"], {
+    const fixtureWorker = "apps/control-plane/tests/fixtures/postgres-worker.ts";
+    worker = spawn(process.execPath, nativeTypeScript
+      ? ["--experimental-transform-types", fixtureWorker]
+      : trustedTsxCli
+        ? [trustedTsxCli, fixtureWorker]
+        : ["--import", "tsx", fixtureWorker], {
       cwd: workspaceRoot,
       env: {
         ...process.env,
         DATABASE_URL: workerConnectionString,
         NODE_ENV: "test",
-        PAGE2WEBMCP_FIXTURE_APP_URL: "https://acme.example",
-        PAGE2WEBMCP_FIXTURE_GITHUB_URL: "https://github.com/acme/support",
         PAGE2WEBMCP_OBSERVABILITY_ENABLED: "false",
         PAGE2WEBMCP_PROVIDER_MODE: "local",
         PAGE2WEBMCP_STORAGE_MODE: "postgres",
@@ -101,8 +133,8 @@ test("PostgreSQL route lifecycle is completed by a separately launched durable w
     await assertResponseStatus(deniedPublish, 409);
     assert.equal((await deniedPublish.json() as { code: string }).code, "REVIEW_REQUIRED");
 
-    const ticket = completed.capabilities.find((capability) => capability.stableName === "create_support_ticket");
-    assert.ok(ticket, "worker result must persist the R1 support-ticket capability");
+    const ticket = completed.capabilities.find((capability) => capability.stableName === "create_widget");
+    assert.ok(ticket, "worker result must persist the generic R1 fixture capability");
     const reviewedResponse = await reviewCapability(
       jsonRequest(`/api/capabilities/${ticket.id}/review`, {
         action: "approve",
@@ -130,37 +162,57 @@ test("PostgreSQL route lifecycle is completed by a separately launched durable w
         sri: string;
         status: string;
         url: string;
+        artifactUrl: string;
+        downloadUrl: string;
+        localOnly: boolean;
       };
     };
     assert.equal(published.release.analysisRunId, accepted.runId);
     assert.equal(published.release.status, "published");
-    assert.equal(published.release.allowedOrigin, "https://acme.example");
+    assert.equal(published.release.allowedOrigin, "https://widgets.example");
+    assert.equal(published.release.url, published.release.artifactUrl);
+    assert.equal(published.release.localOnly, false);
+    assert.equal(published.release.downloadUrl,
+      `${published.release.artifactUrl}?download=page2webmcp-${published.release.contentHash}.js`);
 
     const artifactResponse = await getArtifact(
-      new Request(`${controlOrigin}${published.release.url}`),
+      new Request(`${controlOrigin}/api/releases/${published.release.contentHash}.js`),
       { params: Promise.resolve({ artifact: `${published.release.contentHash}.js` }) }
     );
     await assertResponseStatus(artifactResponse, 200);
     const artifact = await artifactResponse.text();
     const digest = createHash("sha256").update(Buffer.from(artifact)).digest();
+    const integrity = createHash("sha384").update(Buffer.from(artifact)).digest("base64");
     assert.equal(digest.toString("hex"), published.release.contentHash);
-    assert.equal(`sha256-${digest.toString("base64")}`, published.release.sri);
+    assert.equal(`sha384-${integrity}`, published.release.sri);
     assert.equal(artifactResponse.headers.get("x-page2webmcp-integrity"), published.release.sri);
-    assert.equal(artifactResponse.headers.get("access-control-allow-origin"), "https://acme.example");
+    assert.equal(artifactResponse.headers.get("access-control-allow-origin"), "https://widgets.example");
     assert.match(artifact, /registerPage2WebMCPTools/);
   } finally {
     if (worker) await terminateWorker(worker);
     setControlPlaneRepositoryForTest(undefined);
+    setAuthServiceForTest(undefined);
+    setReleaseArtifactStoreForTest(undefined);
+    setReleaseVerificationPortForTest(undefined);
+    setWebsiteUserHandoffPortForTest(undefined);
     await repository.close();
+    await admin.end();
   }
 });
 
 function jsonRequest(path: string, body: unknown, cookie?: string, idempotencyKey?: string): Request {
+  const fixtureToken = cookie?.split("=", 2)[1];
+  const challenge = issueCsrfChallenge(new Request(`${controlOrigin}/api/auth/csrf`), {
+    secret: csrfSecret,
+    ...(fixtureToken ? { sessionId: fixtureSessionId(fixtureToken) } : {})
+  });
   const headers = new Headers({
     "content-type": "application/json",
-    origin: controlOrigin
+    origin: controlOrigin,
+    "sec-fetch-site": "same-origin",
+    "x-csrf-token": challenge.token
   });
-  if (cookie) headers.set("cookie", cookie);
+  headers.set("cookie", [cookie, challenge.cookie.split(";", 1)[0]].filter(Boolean).join("; "));
   if (idempotencyKey) headers.set("idempotency-key", idempotencyKey);
   return new Request(`${controlOrigin}${path}`, {
     method: "POST",
