@@ -122,3 +122,17 @@ all exit 0; no output
 - Task 13 changes no database schema. It consumes the already accepted Task 12 wait/resume contract and does not replay or reset a Supabase stack.
 - Verification was the focused Task 13 behavior suite plus full typecheck and source/static checks, not the exhaustive repository suite.
 - Production correctness still depends on the configured gateway actually honoring protocol v1 ownership, durable checkpoint storage, secret-reference resolution, and exact-once termination. Startup attestation and every runtime response fail closed when those bindings are absent or inconsistent.
+
+## Post-review hardening addendum
+
+Subsequent review fixes were committed without changing the Task 13 architecture:
+
+- `5b6ec17`: binds website claims to immutable source snapshots.
+- `29e35f5`: preserves a valid authentication suspension when the outer analysis deadline fires.
+- `5f39a3a`: requires the resumed CDP reference to match the content-addressed suspension attestation.
+- `fdaf37d`: prevents duplicate local cleanup when the gateway owns termination.
+- `bc91dfe`: stabilizes cleanup identity across changed terminal observations.
+- `1b4308a`: reconciles terminal checkpoints through the durable cleanup queue.
+- `84c517d`: permits and constrains the exact waiting-to-failed database transition.
+
+The user-facing gateway capability is additive: website startup now also requires `authenticationUserHandoffProtocolVersion: 1`. The full repository suite after these fixes passed with 701 passes, 20 environment-gated skips, and no failures.

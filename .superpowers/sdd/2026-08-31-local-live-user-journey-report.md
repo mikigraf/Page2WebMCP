@@ -1,191 +1,121 @@
 # Page2WebMCP local-live user journey implementation report
 
 Date: 2026-09-01
+
 Branch: `codex/url-to-script`
+
 Worktree: `.worktrees/url-to-script`
 Push performed: no
 
-## User-level outcome
+## Outcome
 
-The full product acceptance journey was **not** achieved in this environment. A real user cannot yet complete the locked URL-to-installed-script production journey here because:
-
-- The fixed Docker Supabase ports are occupied by an unrelated local project, so the required persistent Docker local-live OpenAPI journey could not run.
-- The selected hosted Supabase project has no applied Page2WebMCP migrations or public release bucket, and no hosted database or Storage service credentials were available.
-- No non-Acme artifact was published, installed, or natively attested.
-- Website ownership is durable and exact-source-bound, but authenticated website exploration intentionally fails closed with `WEBSITE_DURABLE_AUTHENTICATION_HANDOFF_REQUIRED`; a durable human authentication pause/resume is not implemented.
-- Browser Use and GitHub App controls were not supplied, so neither real external provider journey ran.
+The locked implementation and durable website authentication handoff are in the worktree, but the full user-level live acceptance journey was **not genuinely completed**. No command or database row reported `liveSuccess:true`.
 
 Production live success genuinely achieved: **No**.
-Observed `liveSuccess:true`: **No**.
-Current truthful value: **`false`**.
 
-No artifact, pull request, credential, installation attestation, hash, or `liveSuccess` value was fabricated.
+Truthful readiness value: **`liveSuccess:false`**.
 
-## Implemented product-lock behavior
+The remaining blockers are external, not converted into test doubles:
 
-- The UI offers independent Website URL, OpenAPI URL, and GitHub repository paths.
-- OpenAPI persists `sourceUrl`, `targetOrigin`, same-origin `testPageUrl`, and `environment` per project and uses bounded DNS plus pinned HTTPS fetching.
-- Website analysis requires externally verified ownership for the exact immutable active source. The Browser Use v4 runtime requires the real egress, KMS/TTL secret, lease, evidence, CDP, ownership, and authentication controls before repository construction or leasing.
-- GitHub uses the real selected-repository App factory, immutable commit evidence, a bounded sandbox, idempotent draft-PR side effects, and never merges or fabricates a PR.
-- The worker recognizes `PAGE2WEBMCP_PROVIDER_MODE=openapi|website|github` and constructs exactly one adapter. `local` remains an explicitly rejected production-worker mode.
-- Release publication is bound to exact candidate bytes and the selected Page2WebMCP public Storage prefix. Hosted and download identities share one content-addressed `<sha256>.js` object.
-- Installation state is recovered from the latest exact durable attempt. “Production verified” additionally requires matching candidate and installation live verifier identities and native execution evidence.
-- GitHub UI recovery binds the latest reviewed workflow to a PR from that exact workflow. Active work resumes, terminal work without a completed install-verification PR can retry, and completion requires a succeeded workflow plus `install_verify` PR evidence with a completed successful check.
-- Readiness accepts exactly one of `--hermetic`, `--local-live`, or `--live`. Hermetic and local-live can never return live success. Live ignores the local verifier origin and requires the exact selected hosted hash plus native installed-target proof.
-- The final readiness topology contains the exact 22-migration ledger, including the app-only source-lock definer and its grant posture.
+- no real native local verifier origin/token or target install page was supplied;
+- no Browser Use v4 gateway, ownership, egress, KMS/TTL secret-store, evidence, CDP, lease, or authentication credentials were supplied;
+- no GitHub App/repository binding/sandbox credentials were supplied;
+- no hosted Supabase server secret or hosted runtime database login URLs were available for artifact upload/application startup; and
+- the hosted project contains no release or native installation attestation.
 
-## Verification that ran
+## Implemented behavior
 
-- Docker Node `24.20.0` full test suite: **655 tests; 643 passed, 12 environment-gated skips, 0 failed**.
-- Coverage gates passed: **87.41% lines, 79.73% branches, 85.16% functions**.
-- Golden evaluation: **3/3 passed**.
-- Full lint, source-security policy, TypeScript typecheck, production build, and `git diff --check`: passed.
-- Production dependency audit: **no known vulnerabilities**.
-- PostgreSQL `17.6` replayed all **22 migrations** in lexical order; repository integration passed **11/11**, and separate app/worker topology passed **1/1**. Both two-connection source commit-order races passed.
-- The PostgreSQL TypeScript harness used the working local Node `22.14.0` native type-strip runner because the Homebrew Node 24 executable hung on this host. All application, build, coverage, and focused contract gates ran under Docker Node 24.
-- Conditional E2E contracts: **1 passed, 2 skipped** with exact missing-control diagnostics.
-- Playwright discovered **16 browser journeys across 7 files**. Browser execution is not claimed because the required isolated Chromium runtime and live services were unavailable.
-- Independent final review found no remaining Critical or Important issue beyond the explicitly unachieved authenticated-website journey.
-- Supabase CLI version: **2.116.0** through `pnpm exec`.
+- The UI preserves three independent source paths: OpenAPI, Website, and GitHub.
+- OpenAPI stores the exact `sourceUrl`, `targetOrigin`, `testPageUrl`, and `environment` per project and uses bounded DNS/pinned HTTPS fetching.
+- Website uses the existing Browser Use v4 factory and fails startup closed before repository construction unless every real control is valid. Recording, persistent profile/workspace/memory, uploads, and downloads are not enabled.
+- Website authentication can now suspend without retaining a worker lease, expose only a safe gateway portal to an authorized owner/editor, recover the exact checkpoint from PostgreSQL after restart/reload, resume once on deterministic evidence, and queue durable cleanup for cancellation/failure/expiry.
+- GitHub uses the selected-repository App factory, immutable commit evidence, bounded sandbox, and idempotent draft-PR-only side effect. No merge or fabricated PR path exists.
+- One worker process constructs exactly one `openapi`, `website`, or `github` adapter. Missing selected-provider controls are startup failures.
+- Publication uploads exact candidate bytes to the configured public Supabase Storage bucket at `<sha256>.js`; hosted and download reads must hash to the same bytes.
+- Readiness accepts exactly one of `--hermetic`, `--local-live`, or `--live`. Hermetic/local-live can never produce live success, and live requires an exact native installation proof for the selected hash.
 
-Readiness commands returned:
+## Migrations and Supabase state
 
-- `--hermetic`: `HERMETIC_READINESS_PASSED`, `liveSuccess:false`, exit 0.
-- `--local-live` without controls: `LIVE_CONTROLS_REQUIRED`, `liveSuccess:false`, exit 2.
-- `--live` without controls: `LIVE_CONTROLS_REQUIRED`, `liveSuccess:false`, exit 2.
+Supabase CLI is pinned and verified through `pnpm exec` at **2.116.0**.
 
-## Docker Supabase and local-live result
+The alternate local Docker stack is running without touching the unrelated stacks:
 
-The exact Page2WebMCP local stack requires ports `54321` and `54322`. An unrelated stack named `next-supabase-saas-kit-turbo` currently owns both ports. It was not stopped, modified, or reused. A prior exact `local:up` attempt also encountered Docker writable-store capacity pressure.
+- API/Auth/Storage: `127.0.0.1:58321`
+- PostgreSQL: `127.0.0.1:58322`
+- Studio: `127.0.0.1:58323`
+- Inbucket: `127.0.0.1:58324`
+- SMTP/POP3: `58325`/`58326`
+- Analytics: `58327`
+- Pooler: `58329`
 
-Therefore these are **not** claimed:
+All **27** committed migrations were cleanly replayed locally. The local ledger is exact from `20260826000000` through `20260901094032`. Split-role PostgreSQL authentication tests passed 8/8, including wait, exact resume, replay, terminal failure/expiry, tenant denial, and restart-safe cleanup.
 
-- Docker Supabase startup/reset for this worktree.
-- Local Auth signup through the running Page2WebMCP control plane.
-- Process-restart persistence through that exact topology.
-- A non-Acme OpenAPI release in Docker Storage.
-- Local-live installed-target verification.
+The same **27** migrations were applied to Supabase project `bimqgiedckdurqiywctl` (`Page2WebMCP`, `eu-west-2`, PostgreSQL 17.6). Hosted verification found:
 
-The isolated PostgreSQL result proves migrations, RLS, source locking, leases, and separate app/worker topology. It is not relabeled as the full Docker Supabase journey.
+- exact migration range `20260826000000`–`20260901094032`;
+- public `page2webmcp-releases` bucket, 65,536-byte limit, JavaScript MIME allowlist;
+- forced RLS intact on the application tables checked;
+- bounded app/worker/maintenance roles remain NOLOGIN/non-superuser/non-bypass;
+- zero Supabase security advisories and zero performance advisories; and
+- zero projects, releases, installations, and hosted Storage objects.
 
-The conditional Docker OpenAPI E2E reported these missing inputs:
+## Verification run
 
-- `PAGE2WEBMCP_E2E_CONTROL_URL`
-- `PAGE2WEBMCP_E2E_INSTALL_PAGE_URL`
-- `PAGE2WEBMCP_E2E_LOCAL_LIVE`
-- `PAGE2WEBMCP_E2E_PROCESS_CONTROL`
-- `PAGE2WEBMCP_E2E_SOURCE_URL`
-- `PAGE2WEBMCP_LOCAL_RELEASE_VERIFIER_ORIGIN`
-- `PAGE2WEBMCP_LOCAL_STACK`
-- `PAGE2WEBMCP_OPENAPI_TARGET_ORIGIN`
-- `PAGE2WEBMCP_OPENAPI_TEST_PAGE_URL`
-- `PAGE2WEBMCP_PROVIDER_MODE`
-- `PAGE2WEBMCP_RELEASE_VERIFIER_TOKEN`
-- `PAGE2WEBMCP_STORAGE_MODE`
+- Docker Node `24.20.0` full suite: **721 total; 701 passed; 20 environment-gated skips; 0 failed**.
+- Focused website authentication/API/UI/worker suite: **54/54 passed**.
+- Release-route regression suite: **27/27 passed**.
+- Readiness/local-Supabase suite after accepting the exact generated NOINHERIT login URLs: **28/28 passed**.
+- Production build passed for Acme fixture, control plane, and worker; the new authentication route appears in the Next route manifest.
+- TypeScript, focused ESLint, source lint, source-security policy, and `git diff --check` passed.
+- Conditional E2E: **1 passed, 2 skipped**. The real local-live OpenAPI and production-live cases skipped with explicit missing-control names.
+- Independent final review found no remaining Critical or Important implementation issue.
 
-## Source-path evidence
+Observed readiness results:
 
-### OpenAPI
+```json
+{"status":"passed","code":"HERMETIC_READINESS_PASSED","liveSuccess":false}
+{"status":"skipped","code":"LIVE_CONTROLS_REQUIRED","liveSuccess":false,"missingKeys":["PAGE2WEBMCP_LOCAL_RELEASE_VERIFIER_ORIGIN","PAGE2WEBMCP_RELEASE_VERIFIER_TOKEN"]}
+{"status":"skipped","code":"LIVE_CONTROLS_REQUIRED","liveSuccess":false,"missingKeys":["DATABASE_URL","PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN","PAGE2WEBMCP_MAINTENANCE_DATABASE_URL","PAGE2WEBMCP_RELEASE_VERIFIER_ORIGIN","PAGE2WEBMCP_RELEASE_VERIFIER_TOKEN"]}
+```
 
-The independent source path and verification context are implemented and covered by generic non-Acme contract tests. With `PAGE2WEBMCP_PROVIDER_MODE=openapi`, the real adapter constructed, then startup stopped before a claim with:
+The local-live result used the actual generated app and maintenance login URLs and the running alternate-port stack; it stopped only on the two absent verifier controls.
 
-- code: `DATABASE_URL_REQUIRED`
-- missing: `DATABASE_URL`
+## Artifact evidence
 
-The full persistent local-live user journey did not run for the Docker reasons above.
+One content-addressed, non-Acme-origin bundle remains in local Docker Storage:
 
-### Website
+- target origin: `https://widgets.example`
+- tool: `listwidgets_4f17b177`
+- public URL: `http://127.0.0.1:58321/storage/v1/object/public/page2webmcp-releases/9442bf29ae310e3580435c925bdf1d5937c911a9b16dcf46de5e1e18046db24b.js`
+- SHA-256: `9442bf29ae310e3580435c925bdf1d5937c911a9b16dcf46de5e1e18046db24b`
+- SRI: `sha384-utcjOJ/PWSd2EhW7gZq3Ug9jXVdD12HM7wyhRNm59ThOewF26pu1fw98liFqSmZI`
+- bytes: 47,890
+- served and named-download SHA-256: identical
+- locality: `localOnly:true`; never eligible for `--live`
 
-The ownership UI/API, exact source attestation, atomic enqueue/source lock, real Browser Use v4 control factory, exact allowlists, and cleanup behavior are implemented. Missing controls fail before repository construction with `WEBSITE_LIVE_CONFIGURATION_REQUIRED` and these exact operator-only names:
+The last clean migration reset left local database project/release/installation counts at zero while the immutable Storage object remained. Therefore this object is byte/hash evidence, **not** claimed as the completed persistent local-live OpenAPI user journey.
 
-- `PAGE2WEBMCP_AUTH_HANDOFF_ORIGIN`
-- `PAGE2WEBMCP_AUTH_HANDOFF_TOKEN`
-- `PAGE2WEBMCP_BROWSER_LEASE_STORE_ORIGIN`
-- `PAGE2WEBMCP_BROWSER_LEASE_STORE_TOKEN`
-- `PAGE2WEBMCP_BROWSER_USE_API_KEY`
-- `PAGE2WEBMCP_BROWSER_USE_API_ORIGIN`
-- `PAGE2WEBMCP_CDP_OBSERVER_ORIGIN`
-- `PAGE2WEBMCP_CDP_OBSERVER_TOKEN`
-- `PAGE2WEBMCP_EGRESS_POLICY_ORIGIN`
-- `PAGE2WEBMCP_EGRESS_POLICY_TOKEN`
-- `PAGE2WEBMCP_EGRESS_PROXY_ORIGIN`
-- `PAGE2WEBMCP_EGRESS_PROXY_TOKEN`
-- `PAGE2WEBMCP_EVIDENCE_STORE_ORIGIN`
-- `PAGE2WEBMCP_EVIDENCE_STORE_TOKEN`
-- `PAGE2WEBMCP_OWNERSHIP_STORE_ORIGIN`
-- `PAGE2WEBMCP_OWNERSHIP_STORE_TOKEN`
-- `PAGE2WEBMCP_PUBLIC_ORIGIN`
-- `PAGE2WEBMCP_SECRET_STORE_KMS_KEY_ID`
-- `PAGE2WEBMCP_SECRET_STORE_ORIGIN`
-- `PAGE2WEBMCP_SECRET_STORE_TOKEN`
+The hosted bucket currently has zero objects. A request for the local hash at the hosted prefix failed, so no hosted artifact URL, hosted SHA/SRI, or hosted download identity is claimed.
 
-No recording, persistent profile, workspace, model memory, upload, or download fallback is enabled. Public/unauthenticated exploration is covered by deterministic provider contracts. Authenticated targets are **not end-to-end**: even with controls, the worker returns `WEBSITE_DURABLE_AUTHENTICATION_HANDOFF_REQUIRED` before credential entry because the required durable human wait/resume phase is absent. The removed UI/API handoff does not pretend otherwise.
+## Missing provider credentials
 
-### GitHub
+Website startup returned `WEBSITE_LIVE_CONFIGURATION_REQUIRED` with these exact missing names:
 
-With `PAGE2WEBMCP_PROVIDER_MODE=github`, startup failed before repository access with `GITHUB_LIVE_CONFIGURATION_REQUIRED` and:
+`PAGE2WEBMCP_AUTH_HANDOFF_ORIGIN`, `PAGE2WEBMCP_AUTH_HANDOFF_TOKEN`, `PAGE2WEBMCP_BROWSER_LEASE_STORE_ORIGIN`, `PAGE2WEBMCP_BROWSER_LEASE_STORE_TOKEN`, `PAGE2WEBMCP_BROWSER_USE_API_KEY`, `PAGE2WEBMCP_BROWSER_USE_API_ORIGIN`, `PAGE2WEBMCP_CDP_OBSERVER_ORIGIN`, `PAGE2WEBMCP_CDP_OBSERVER_TOKEN`, `PAGE2WEBMCP_EGRESS_POLICY_ORIGIN`, `PAGE2WEBMCP_EGRESS_POLICY_TOKEN`, `PAGE2WEBMCP_EGRESS_PROXY_ORIGIN`, `PAGE2WEBMCP_EGRESS_PROXY_TOKEN`, `PAGE2WEBMCP_EVIDENCE_STORE_ORIGIN`, `PAGE2WEBMCP_EVIDENCE_STORE_TOKEN`, `PAGE2WEBMCP_OWNERSHIP_STORE_ORIGIN`, `PAGE2WEBMCP_OWNERSHIP_STORE_TOKEN`, `PAGE2WEBMCP_PUBLIC_ORIGIN`, `PAGE2WEBMCP_SECRET_STORE_KMS_KEY_ID`, `PAGE2WEBMCP_SECRET_STORE_ORIGIN`, `PAGE2WEBMCP_SECRET_STORE_TOKEN`.
 
-- `PAGE2WEBMCP_GITHUB_APP_ID`
-- `PAGE2WEBMCP_GITHUB_PRIVATE_KEY_BASE64`
-- `PAGE2WEBMCP_GITHUB_REPOSITORY_BINDINGS`
-- `PAGE2WEBMCP_GITHUB_SANDBOX_ORIGIN`
-- `PAGE2WEBMCP_GITHUB_SANDBOX_TOKEN`
+GitHub startup returned `GITHUB_LIVE_CONFIGURATION_REQUIRED` with:
 
-No GitHub branch, check, preview, or draft PR was created. No merge path exists.
+`PAGE2WEBMCP_GITHUB_APP_ID`, `PAGE2WEBMCP_GITHUB_PRIVATE_KEY_BASE64`, `PAGE2WEBMCP_GITHUB_REPOSITORY_BINDINGS`, `PAGE2WEBMCP_GITHUB_SANDBOX_ORIGIN`, `PAGE2WEBMCP_GITHUB_SANDBOX_TOKEN`.
 
-## Artifact Storage and hashes
+The OpenAPI provider itself constructed successfully with no provider-specific secret. Completing local-live still requires a real loopback native verifier and target/source/install URLs. Completing production live additionally requires hosted application/maintenance database logins, hosted Storage server credentials for upload, an HTTPS verifier, a selected hosted release hash, and native installation attestation.
 
-Selected hosted topology:
+## Final acceptance status
 
-- Supabase project: `bimqgiedckdurqiywctl` (`Page2WebMCP`)
-- API origin: `https://bimqgiedckdurqiywctl.supabase.co`
-- bucket: `page2webmcp-releases`
-- public prefix: `https://bimqgiedckdurqiywctl.supabase.co/storage/v1/object/public/page2webmcp-releases`
-- object key: `<sha256>.js`
-
-A read-only project check found the project active and healthy, but its migration list was empty and `storage.buckets` had no `page2webmcp-releases` row. `PAGE2WEBMCP_SUPABASE_SECRET_KEY`, hosted database credentials, and live runtime controls were unavailable. No partial hosted mutation was attempted.
-
-Consequently:
-
-- published non-Acme SHA-256: **not produced**
-- published non-Acme SRI: **not produced**
-- hosted artifact URL: **not produced**
-- hosted/download byte comparison: **not runnable**
-- native installed release hash: **not produced**
-
-## Readiness missing controls
-
-The direct empty-environment local-live probe named:
-
-- `DATABASE_URL`
-- `PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN`
-- `PAGE2WEBMCP_LOCAL_RELEASE_VERIFIER_ORIGIN`
-- `PAGE2WEBMCP_LOCAL_STACK`
-- `PAGE2WEBMCP_MAINTENANCE_DATABASE_URL`
-- `PAGE2WEBMCP_PROVIDER_MODE`
-- `PAGE2WEBMCP_PUBLIC_ORIGIN`
-- `PAGE2WEBMCP_RELEASE_VERIFIER_TOKEN`
-- `PAGE2WEBMCP_STORAGE_MODE`
-
-The direct empty-environment live probe named:
-
-- `DATABASE_URL`
-- `PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN`
-- `PAGE2WEBMCP_MAINTENANCE_DATABASE_URL`
-- `PAGE2WEBMCP_PROVIDER_MODE`
-- `PAGE2WEBMCP_PUBLIC_ORIGIN`
-- `PAGE2WEBMCP_RELEASE_VERIFIER_ORIGIN`
-- `PAGE2WEBMCP_RELEASE_VERIFIER_TOKEN`
-- `PAGE2WEBMCP_STORAGE_MODE`
-
-After those controls are supplied, production also requires `PAGE2WEBMCP_READINESS_RELEASE_HASH` and the exact native installation proof for that hash. The conditional live E2E additionally requires `PAGE2WEBMCP_E2E_LIVE_INSTALLATION`. Hosted Storage requires `PAGE2WEBMCP_SUPABASE_URL=https://bimqgiedckdurqiywctl.supabase.co` and a real server-only `PAGE2WEBMCP_SUPABASE_SECRET_KEY`.
-
-## Remaining operator/product work
-
-1. Implement the durable website human-authentication wait/resume state before claiming authenticated websites work end to end.
-2. Free the fixed Page2WebMCP local ports without destroying or reusing the unrelated Supabase project, then run `local:up`, `local:reset`, and the conditional Docker OpenAPI journey.
-3. Provide hosted database/Storage credentials for `bimqgiedckdurqiywctl`, apply all 22 migrations, and create the public `page2webmcp-releases` bucket through supported Supabase tooling.
-4. Publish exact non-Acme candidate bytes, record SHA-256/SRI, and prove hosted/download byte identity.
-5. Provide real Browser Use or GitHub App controls for the selected external journey.
-6. Install the exact hosted hash on a normal HTTPS target and obtain native WebMCP authenticated-read plus confirmed-reversible-mutation evidence.
-7. Run `--live` with that exact hash. Only that evidence may produce `LIVE_READINESS_PASSED` and `liveSuccess:true`.
+- Authentication handoff implementation: **yes**, with deterministic and real-PostgreSQL restart/replay coverage.
+- Authentication handoff exercised by a human against real Browser Use/gateway controls: **no**.
+- Migrations applied locally: **yes, 27/27**.
+- Migrations applied to `bimqgiedckdurqiywctl`: **yes, 27/27**.
+- Persistent Docker local-live OpenAPI user journey after the final reset: **no**.
+- Hosted non-Acme artifact published: **no**.
+- Native installed-target proof: **no**.
+- Production `liveSuccess:true`: **no**.
