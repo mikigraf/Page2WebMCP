@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
 import { GET as projectDetail } from "../app/api/projects/[projectId]/route.ts";
 import {
@@ -293,7 +294,7 @@ test("accepted website analysis idempotency replay does not depend on a later ow
   assert.equal(ownershipCalls, 1);
 });
 
-test("website run projections expose ownership only until authentication has a durable wait phase", async () => {
+test("website run projections expose only exact durable authentication wait and terminal phases", async () => {
   const repository = installTestRepository();
   const project = await websiteProject(repository);
   const run = await repository.enqueueAnalysis(owner, {
@@ -323,4 +324,72 @@ test("website run projections expose ownership only until authentication has a d
   ), runContext(run.id));
   assert.equal(analysis.status, 200);
   assert.deepEqual((await analysis.json()).websiteUserHandoff, projected.websiteUserHandoff);
+
+  const snapshot = (await repository.listSourceSnapshots(owner, project.id))[0];
+  assert.ok(snapshot);
+  const claim = await repository.claimAnalysis("website-authentication-projection-worker", 60_000, ["website"]);
+  assert.equal(claim?.id, run.id);
+  const expiresAt = new Date(Date.now() + 5 * 60_000).toISOString();
+  await repository.waitAnalysisForAuthentication("website-authentication-projection-worker", run.id, {
+    checkpointReference: `urn:sha256:${"c".repeat(64)}`,
+    sourceSnapshotId: claim!.sourceSnapshotId,
+    sourceIdentityHash: snapshot.sourceIdentityHash,
+    targetOriginDigest: createHash("sha256").update("https://widgets.example", "utf8").digest("hex"),
+    expiresAt,
+    idempotencyKey: "website-authentication-projection-wait",
+    inputHash: "website-authentication-projection-wait",
+  }, claim!.leaseGeneration);
+
+  const waitingWorkflow = await workflowStatus(new Request(
+    `https://control.example/api/workflow-runs/${run.id}`,
+    { headers: { cookie: headers.cookie } },
+  ), runContext(run.id));
+  assert.equal(waitingWorkflow.status, 200);
+  const waitingProjection = (await waitingWorkflow.json()).websiteUserHandoff;
+  assert.deepEqual(waitingProjection, {
+    ownership: {
+      endpoint: `/api/projects/${project.id}/website-ownership`,
+      requiredBeforeAnalysis: true,
+    },
+    authentication: {
+      endpoint: `/api/workflow-runs/${run.id}/website-authentication`,
+      state: "waiting",
+    },
+  });
+  assert.doesNotMatch(JSON.stringify(waitingProjection), /handoffUrl|portalUrl|cdp|secretref:/i);
+
+  const waitingAnalysis = await analysisStatus(new Request(
+    `https://control.example/api/analysis-runs/${run.id}`,
+    { headers: { cookie: headers.cookie } },
+  ), runContext(run.id));
+  assert.equal(waitingAnalysis.status, 200);
+  assert.deepEqual((await waitingAnalysis.json()).websiteUserHandoff, waitingProjection);
+
+  await repository.cancelWorkflow(owner, {
+    runId: run.id,
+    idempotencyKey: "website-authentication-projection-cancel",
+    inputHash: "website-authentication-projection-cancel",
+  });
+  const cancelledWorkflow = await workflowStatus(new Request(
+    `https://control.example/api/workflow-runs/${run.id}`,
+    { headers: { cookie: headers.cookie } },
+  ), runContext(run.id));
+  assert.equal(cancelledWorkflow.status, 200);
+  const cancelledProjection = (await cancelledWorkflow.json()).websiteUserHandoff;
+  assert.deepEqual(cancelledProjection, {
+    ownership: {
+      endpoint: `/api/projects/${project.id}/website-ownership`,
+      requiredBeforeAnalysis: true,
+    },
+    authentication: {
+      endpoint: `/api/workflow-runs/${run.id}/website-authentication`,
+      state: "cancelled",
+    },
+  });
+  const cancelledAnalysis = await analysisStatus(new Request(
+    `https://control.example/api/analysis-runs/${run.id}`,
+    { headers: { cookie: headers.cookie } },
+  ), runContext(run.id));
+  assert.equal(cancelledAnalysis.status, 200);
+  assert.deepEqual((await cancelledAnalysis.json()).websiteUserHandoff, cancelledProjection);
 });

@@ -101,6 +101,7 @@ function controlHarness(input: Readonly<{
   rejectedReadinessControl?: string;
   legacyReadinessControl?: "ownership-store";
   legacyAuthenticationProtocol?: boolean;
+  legacyAuthenticationUserHandoffProtocol?: boolean;
   swappedResumeCdpReference?: boolean;
   loseAuthenticationCheckpointCreateResponse?: boolean;
 }> = {}) {
@@ -141,7 +142,12 @@ function controlHarness(input: Readonly<{
           ? { sourceAttestationProtocolVersion: 1 }
           : {}),
         ...(control === "authentication-handoff" && !input.legacyAuthenticationProtocol
-          ? { authenticationCheckpointProtocolVersion: 1 }
+          ? {
+            authenticationCheckpointProtocolVersion: 1,
+            ...(input.legacyAuthenticationUserHandoffProtocol
+              ? {}
+              : { authenticationUserHandoffProtocolVersion: 1 }),
+          }
           : {}),
         ...(control === "browser-use-v4"
           ? {
@@ -414,6 +420,10 @@ test("website control inventory is exact, sorted, validates values, and never re
   assert.equal(allMissing.length, 20);
   assert.deepEqual(allMissing, [...allMissing].sort());
   assert.deepEqual(websiteMissingControls(environment()), []);
+  assert.deepEqual(websiteMissingControls({
+    ...environment(),
+    PAGE2WEBMCP_AUTH_HANDOFF_ORIGIN: "https://browser-gateway.example",
+  }), ["PAGE2WEBMCP_AUTH_HANDOFF_ORIGIN", "PAGE2WEBMCP_BROWSER_USE_API_ORIGIN"]);
   const malformed = environment();
   malformed.PAGE2WEBMCP_AUTH_HANDOFF_TOKEN = "actual-secret-value";
   malformed.PAGE2WEBMCP_BROWSER_USE_API_ORIGIN = "https://browser-gateway.example/path";
@@ -520,6 +530,15 @@ test("website startup rejects authentication handoff without the durable checkpo
     controlTransport: harness.transport,
   }, new AbortController().signal), /^Error: WEBSITE_HANDOFF_PROTOCOL_UNSUPPORTED$/);
   assert.equal(harness.calls.some(({ url }) => url.endsWith(WEBSITE_LIVE_CONTROL_PATHS.browserStart)), false);
+});
+
+test("website startup rejects a Task13-only authentication gateway before browser or lease work", async () => {
+  const harness = controlHarness({ legacyAuthenticationUserHandoffProtocol: true });
+  await assert.rejects(probeConfiguredWebsiteControlStartup(environment(), {
+    controlTransport: harness.transport,
+  }, new AbortController().signal), /^Error: WEBSITE_HANDOFF_PROTOCOL_UNSUPPORTED$/);
+  assert.equal(harness.calls.some(({ url }) => url.endsWith(WEBSITE_LIVE_CONTROL_PATHS.browserStart)), false);
+  assert.equal(harness.calls.some(({ url }) => url.endsWith(WEBSITE_LIVE_CONTROL_PATHS.leaseClaim)), false);
 });
 
 test("website readiness aborts and settles all target/control siblings after the first failure", async () => {

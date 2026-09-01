@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useEffect, useState } from "react";
+import { FormEvent, useEffect, useRef, useState } from "react";
 import type { CapabilityPlan } from "../../../packages/capability-ir/src/plan.ts";
 import {
   analysisCompletion,
@@ -16,6 +16,7 @@ import {
   completeOperation,
   loadWorkflow,
   operationKey,
+  recoverableAnalysisRunId,
   reconcileProjectRecovery,
   saveWorkflow,
   type PersistedWorkflow,
@@ -33,12 +34,26 @@ type Capability = {
   planDigest: string;
 };
 type ApiFailure = { code?: string };
+type WebsiteAuthenticationState = {
+  state: "waiting" | "ready" | "resumed" | "expired" | "failed" | "cancelled";
+  targetOrigin: string;
+  expiresAt: string;
+  canAct: boolean;
+  portalUrl?: string;
+  endpoint: string;
+};
 type AnalysisStatus = {
-  run: { status: "queued" | "running" | "succeeded" | "failed" | "cancelled"; errorCode?: string };
+  run: { id: string; status: "queued" | "running" | "waiting" | "succeeded" | "failed" | "cancelled"; errorCode?: string };
   capabilities: Capability[];
   result?: {
     diagnostics?: AnalysisDiagnosticView[];
     release?: { contentHash: string };
+  };
+  websiteUserHandoff?: {
+    authentication?: {
+      endpoint: string;
+      state: "waiting" | "resumed" | "expired" | "failed" | "cancelled";
+    };
   };
 };
 type GitHubDraftPullRequest = {
@@ -160,63 +175,9 @@ export function ProjectEntry({ authState }: Readonly<{ authState?: "verified" | 
   const [busy, setBusy] = useState(false);
   const [handoffBusy, setHandoffBusy] = useState(false);
   const [websiteOwnership, setWebsiteOwnership] = useState<WebsiteOwnershipState>();
+  const [websiteAuthentication, setWebsiteAuthentication] = useState<WebsiteAuthenticationState>();
   const [websiteHandoffError, setWebsiteHandoffError] = useState<string>();
-
-  useEffect(() => {
-    const storage = browserStorage();
-    const restored = storage ? loadWorkflow(storage) : undefined;
-    if (!restored) return;
-    const controller = new AbortController();
-    queueMicrotask(() => {
-      if (controller.signal.aborted) return;
-      applySource({
-        sourceType: restored.sourceType,
-        sourceUrl: restored.url,
-        sourceConfiguration: restored.sourceConfiguration ?? defaultSourceConfiguration(restored.sourceType, restored.url)
-      });
-      setProjectId(restored.projectId);
-      setAnalysisRunId(restored.analysisRunId);
-      setWorkflowRunId(restored.workflowRunId);
-      if (restored.projectId) void refreshProject(restored.projectId, controller.signal).catch((error: unknown) => {
-        if (!controller.signal.aborted) setMessage(`Project recovery failed: ${errorCode(error)}`);
-      });
-      if (!restored.analysisRunId) return;
-      setBusy(true);
-      void waitForAnalysis(restored.analysisRunId, controller.signal)
-        .then(async (completed) => {
-          applyCompletedAnalysis(completed, restored.sourceType);
-          if (restored.sourceType === "github" && restored.workflowRunId) {
-            const workflow = await waitForGitHubWorkflow(restored.workflowRunId, controller.signal);
-            const githubRecovery = githubProjectRecovery(workflow.workflow, workflow.draftPullRequest);
-            setWorkflowRunId(githubRecovery.workflowRunId);
-            setGitHubOutcome(githubRecovery.outcome);
-            setGitHubAction(githubRecovery.action);
-            setGitHubDraftPullRequest(workflow.draftPullRequest);
-            persistWorkflow(withWorkflowRunId(restored, githubRecovery.workflowRunId));
-            setMessage(gitHubWorkflowMessage(workflow));
-          }
-        })
-        .catch((error: unknown) => {
-          if (controller.signal.aborted) return;
-          if (error instanceof GitHubWorkflowRunError && error.terminal) {
-            setWorkflowRunId(undefined);
-            setGitHubOutcome("github_workflow_terminal_without_installation");
-            setGitHubAction("retry");
-            persistWorkflow(withWorkflowRunId(restored, undefined));
-          } else if (error instanceof AnalysisRunError && error.terminal) {
-            setAnalysisRunId(undefined);
-            persistWorkflow({ ...restored, analysisRunId: undefined, releaseUrl: undefined });
-          }
-          setMessage(`${error instanceof GitHubWorkflowRunError ? "GitHub workflow" : "Analysis recovery"} failed: ${errorCode(error)}`);
-        })
-        .finally(() => {
-          if (!controller.signal.aborted) setBusy(false);
-        });
-    });
-    return () => controller.abort();
-    // Recovery intentionally consumes only the immutable snapshot loaded once at mount.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  const websiteAuthenticationRequestEpoch = useRef(0);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -261,7 +222,7 @@ export function ProjectEntry({ authState }: Readonly<{ authState?: "verified" | 
       if (analysisRunId) {
         try {
           const completed = await waitForAnalysis(analysisRunId);
-          applyCompletedAnalysis(completed, sourceType);
+          await applyAnalysisStatus(completed, sourceType);
         } catch (error) {
           if (error instanceof AnalysisRunError && error.terminal && projectId) {
             setAnalysisRunId(undefined);
@@ -428,6 +389,8 @@ export function ProjectEntry({ authState }: Readonly<{ authState?: "verified" | 
   }
 
   async function refreshProject(id: string, signal?: AbortSignal) {
+    invalidateWebsiteAuthenticationView();
+    setWebsiteHandoffError(undefined);
     const { response, body } = await requestJson<{
       project?: ProjectSummary;
       source?: ProjectSource;
@@ -439,12 +402,13 @@ export function ProjectEntry({ authState }: Readonly<{ authState?: "verified" | 
     } & ApiFailure>(`/api/projects/${encodeURIComponent(id)}`, { cache: "no-store", ...(signal ? { signal } : {}) });
     if (!response.ok || !body.project || !body.source) throw new Error(body.code ?? "PROJECT_LOAD_FAILED");
     const storage = browserStorage();
+    const recoveredAnalysisRunId = recoverableAnalysisRunId(body.latestAnalysis);
     const recovery = reconcileProjectRecovery(storage ? loadWorkflow(storage) : undefined, {
       sourceType: body.source.sourceType,
       url: body.source.sourceUrl,
       sourceConfiguration: body.source.sourceConfiguration,
       projectId: body.project.id,
-      analysisRunId: body.latestAnalysis?.id,
+      analysisRunId: recoveredAnalysisRunId,
     }, body.release);
     const githubRecovery = body.source.sourceType === "github"
       ? githubProjectRecovery(body.githubWorkflow, body.draftPullRequest)
@@ -454,7 +418,7 @@ export function ProjectEntry({ authState }: Readonly<{ authState?: "verified" | 
       : recovery.workflow;
     applySource(body.source);
     setProjectId(body.project.id);
-    setAnalysisRunId(body.latestAnalysis?.id);
+    setAnalysisRunId(recoveredAnalysisRunId);
     setCapabilities(body.capabilities ?? []);
     setWorkflowRunId(recovered.workflowRunId);
     setReleaseUrl(body.release?.url);
@@ -469,12 +433,14 @@ export function ProjectEntry({ authState }: Readonly<{ authState?: "verified" | 
       setWebsiteOwnership(undefined);
       setWebsiteHandoffError(undefined);
     }
-    if (body.latestAnalysis?.status === "succeeded") {
+    if (body.latestAnalysis && (["succeeded", "waiting"].includes(body.latestAnalysis.status)
+      || body.source.sourceType === "website" && ["failed", "cancelled"].includes(body.latestAnalysis.status))) {
       const completed = await analysisStatus(body.latestAnalysis.id, signal);
-      applyCompletedAnalysis(completed, body.source.sourceType);
+      await applyAnalysisStatus(completed, body.source.sourceType, signal);
     } else {
       setDiagnostics([]);
       setAnalysisNextStepReady(undefined);
+      invalidateWebsiteAuthenticationView();
     }
     return { ...body, project: body.project, source: body.source };
   }
@@ -510,6 +476,7 @@ export function ProjectEntry({ authState }: Readonly<{ authState?: "verified" | 
       setGitHubAction("create");
       setGitHubDraftPullRequest(undefined);
       setReleaseUrl(undefined);
+      invalidateWebsiteAuthenticationView();
     }
     try {
       let runId = analysisRunId;
@@ -527,7 +494,7 @@ export function ProjectEntry({ authState }: Readonly<{ authState?: "verified" | 
         persistWorkflow({ sourceType, url, sourceConfiguration: activeSourceConfiguration(), projectId, analysisRunId: runId });
       }
       const completed = await waitForAnalysis(runId);
-      applyCompletedAnalysis(completed, sourceType);
+      await applyAnalysisStatus(completed, sourceType);
     } catch (error) {
       if (error instanceof AnalysisRunError && error.terminal) {
         setAnalysisRunId(undefined);
@@ -734,6 +701,87 @@ export function ProjectEntry({ authState }: Readonly<{ authState?: "verified" | 
     }
   }
 
+  async function refreshWebsiteAuthentication(
+    status: AnalysisStatus,
+    signal?: AbortSignal,
+  ): Promise<WebsiteAuthenticationState> {
+    const requestEpoch = invalidateWebsiteAuthenticationView();
+    setWebsiteHandoffError(undefined);
+    const projection = status.websiteUserHandoff?.authentication;
+    const expectedEndpoint = `/api/workflow-runs/${encodeURIComponent(status.run.id)}/website-authentication`;
+    if (!projection || projection.endpoint !== expectedEndpoint) {
+      throw new Error("WEBSITE_AUTHENTICATION_HANDOFF_STATE_REQUIRED");
+    }
+    try {
+      const { response, body } = await requestJson<{
+        authentication?: Omit<WebsiteAuthenticationState, "endpoint">;
+      } & ApiFailure>(projection.endpoint, { cache: "no-store", ...(signal ? { signal } : {}) });
+      if (!response.ok || !body.authentication) {
+        throw new Error(body.code ?? "WEBSITE_HANDOFF_UNAVAILABLE");
+      }
+      if (requestEpoch !== websiteAuthenticationRequestEpoch.current) {
+        throw new Error("WEBSITE_AUTHENTICATION_CONTEXT_CHANGED");
+      }
+      const authentication = { ...body.authentication, endpoint: projection.endpoint };
+      setWebsiteAuthentication(authentication);
+      setWebsiteHandoffError(undefined);
+      return authentication;
+    } catch (error) {
+      if (!signal?.aborted && requestEpoch === websiteAuthenticationRequestEpoch.current) {
+        setWebsiteAuthentication(undefined);
+        setWebsiteHandoffError(errorCode(error));
+      }
+      throw error;
+    }
+  }
+
+  async function mutateWebsiteAuthentication(action: "check" | "cancel") {
+    if (!analysisRunId || !websiteAuthentication?.endpoint || !websiteAuthentication.canAct) return;
+    const requestEpoch = websiteAuthenticationRequestEpoch.current;
+    setHandoffBusy(true);
+    try {
+      const result = await postIdempotent<{
+        authentication?: Omit<WebsiteAuthenticationState, "endpoint">;
+      } & ApiFailure>(
+        websiteAuthentication.endpoint,
+        { action },
+        `website-authentication:${analysisRunId}:${action}`,
+      );
+      if (!result.response.ok || !result.body.authentication) {
+        throw new Error(result.body.code ?? "WEBSITE_HANDOFF_UNAVAILABLE");
+      }
+      if (requestEpoch !== websiteAuthenticationRequestEpoch.current) return;
+      const authentication: WebsiteAuthenticationState = {
+        ...result.body.authentication,
+        endpoint: websiteAuthentication.endpoint,
+        ...(result.body.authentication.portalUrl
+          ? {}
+          : websiteAuthentication.portalUrl ? { portalUrl: websiteAuthentication.portalUrl } : {}),
+      };
+      setWebsiteAuthentication(authentication);
+      setWebsiteHandoffError(undefined);
+      if (authentication.state === "resumed") {
+        setMessage("Authentication verified from gateway evidence. Website analysis resumed.");
+        const next = await waitForAnalysis(analysisRunId);
+        await applyAnalysisStatus(next, sourceType);
+      } else if (["cancelled", "expired", "failed"].includes(authentication.state)) {
+        setAnalysisRunId(undefined);
+        persistWorkflow({ sourceType, url, sourceConfiguration: activeSourceConfiguration(), projectId });
+        setMessage(authentication.state === "cancelled"
+          ? "Website analysis cancelled; gateway cleanup is restart-safe."
+          : authenticationMessage(authentication));
+      } else {
+        setMessage(authenticationMessage(authentication));
+      }
+    } catch (error) {
+      if (requestEpoch === websiteAuthenticationRequestEpoch.current) {
+        setWebsiteHandoffError(errorCode(error));
+      }
+    } finally {
+      setHandoffBusy(false);
+    }
+  }
+
   function selectSource(next: SourceType) {
     setSourceType(next);
     setUrl(DEFAULT_URLS[next]);
@@ -765,6 +813,12 @@ export function ProjectEntry({ authState }: Readonly<{ authState?: "verified" | 
     clearWorkflowView();
   }
 
+  function invalidateWebsiteAuthenticationView(): number {
+    websiteAuthenticationRequestEpoch.current += 1;
+    setWebsiteAuthentication(undefined);
+    return websiteAuthenticationRequestEpoch.current;
+  }
+
   function clearWorkflowView() {
     setProjectId(undefined);
     setAnalysisRunId(undefined);
@@ -779,7 +833,38 @@ export function ProjectEntry({ authState }: Readonly<{ authState?: "verified" | 
     setRelease(undefined);
     setVerificationEligible(undefined);
     setWebsiteOwnership(undefined);
+    invalidateWebsiteAuthenticationView();
     setWebsiteHandoffError(undefined);
+  }
+
+  async function applyAnalysisStatus(
+    status: AnalysisStatus,
+    completedSourceType: SourceType,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const projection = status.websiteUserHandoff?.authentication;
+    if (completedSourceType === "website" && projection
+      && ["expired", "failed", "cancelled"].includes(projection.state)) {
+      setCapabilities(status.capabilities);
+      setDiagnostics(status.result?.diagnostics ?? []);
+      setAnalysisNextStepReady(false);
+      setVerificationEligible(undefined);
+      const authentication = await refreshWebsiteAuthentication(status, signal);
+      setMessage(authenticationMessage(authentication));
+      return;
+    }
+    if (status.run.status === "waiting") {
+      setCapabilities(status.capabilities);
+      setDiagnostics(status.result?.diagnostics ?? []);
+      setAnalysisNextStepReady(false);
+      setVerificationEligible(undefined);
+      if (completedSourceType !== "website") throw new Error("ANALYSIS_WAIT_STATE_INVALID");
+      const authentication = await refreshWebsiteAuthentication(status, signal);
+      setMessage(authenticationMessage(authentication));
+      return;
+    }
+    invalidateWebsiteAuthenticationView();
+    applyCompletedAnalysis(status, completedSourceType);
   }
 
   function applyCompletedAnalysis(completed: AnalysisStatus, completedSourceType: SourceType) {
@@ -790,6 +875,62 @@ export function ProjectEntry({ authState }: Readonly<{ authState?: "verified" | 
     setVerificationEligible(undefined);
     setMessage(completion.summary);
   }
+
+  useEffect(() => {
+    const storage = browserStorage();
+    const restored = storage ? loadWorkflow(storage) : undefined;
+    if (!restored) return;
+    const controller = new AbortController();
+    queueMicrotask(() => {
+      if (controller.signal.aborted) return;
+      applySource({
+        sourceType: restored.sourceType,
+        sourceUrl: restored.url,
+        sourceConfiguration: restored.sourceConfiguration ?? defaultSourceConfiguration(restored.sourceType, restored.url)
+      });
+      setProjectId(restored.projectId);
+      setAnalysisRunId(restored.analysisRunId);
+      setWorkflowRunId(restored.workflowRunId);
+      if (restored.projectId) void refreshProject(restored.projectId, controller.signal).catch((error: unknown) => {
+        if (!controller.signal.aborted) setMessage(`Project recovery failed: ${errorCode(error)}`);
+      });
+      if (!restored.analysisRunId) return;
+      setBusy(true);
+      void waitForAnalysis(restored.analysisRunId, controller.signal)
+        .then(async (completed) => {
+          await applyAnalysisStatus(completed, restored.sourceType, controller.signal);
+          if (restored.sourceType === "github" && restored.workflowRunId) {
+            const workflow = await waitForGitHubWorkflow(restored.workflowRunId, controller.signal);
+            const githubRecovery = githubProjectRecovery(workflow.workflow, workflow.draftPullRequest);
+            setWorkflowRunId(githubRecovery.workflowRunId);
+            setGitHubOutcome(githubRecovery.outcome);
+            setGitHubAction(githubRecovery.action);
+            setGitHubDraftPullRequest(workflow.draftPullRequest);
+            persistWorkflow(withWorkflowRunId(restored, githubRecovery.workflowRunId));
+            setMessage(gitHubWorkflowMessage(workflow));
+          }
+        })
+        .catch((error: unknown) => {
+          if (controller.signal.aborted) return;
+          if (error instanceof GitHubWorkflowRunError && error.terminal) {
+            setWorkflowRunId(undefined);
+            setGitHubOutcome("github_workflow_terminal_without_installation");
+            setGitHubAction("retry");
+            persistWorkflow(withWorkflowRunId(restored, undefined));
+          } else if (error instanceof AnalysisRunError && error.terminal) {
+            setAnalysisRunId(undefined);
+            persistWorkflow({ ...restored, analysisRunId: undefined, releaseUrl: undefined });
+          }
+          setMessage(`${error instanceof GitHubWorkflowRunError ? "GitHub workflow" : "Analysis recovery"} failed: ${errorCode(error)}`);
+        })
+        .finally(() => {
+          if (!controller.signal.aborted) setBusy(false);
+        });
+    });
+    return () => controller.abort();
+    // Recovery intentionally consumes only the immutable snapshot loaded once at mount.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const displayedInstallationState = release
     ? releaseInstallationState({
@@ -861,6 +1002,33 @@ export function ProjectEntry({ authState }: Readonly<{ authState?: "verified" | 
       </>}
       {websiteOwnership && ["expired", "failed"].includes(websiteOwnership.state)
         && <p>Ownership state: {websiteOwnership.state}. Create a fresh challenge.</p>}
+    </section>}
+    {sourceType === "website" && websiteAuthentication && <section aria-labelledby="website-authentication-heading">
+      <h3 id="website-authentication-heading">
+        {["waiting", "ready"].includes(websiteAuthentication.state) ? "Authentication required" : "Website authentication"}
+      </h3>
+      <p>Sign in through the bounded gateway portal. Page2WebMCP receives deterministic evidence, never your credentials.</p>
+      <dl>
+        <dt>Target origin</dt><dd><code>{websiteAuthentication.targetOrigin}</code></dd>
+        <dt>Checkpoint expires</dt><dd>{websiteAuthentication.expiresAt}</dd>
+        <dt>State</dt><dd>{websiteAuthentication.state}</dd>
+      </dl>
+      {websiteAuthentication.canAct && websiteAuthentication.portalUrl && <p>
+        <a href={websiteAuthentication.portalUrl} target="_blank" rel="noopener noreferrer">Open sign-in</a>
+      </p>}
+      {websiteAuthentication.canAct && <p>
+        <button type="button" disabled={busy || handoffBusy}
+          onClick={() => mutateWebsiteAuthentication("check")}>Check sign-in state</button>{" "}
+        <button type="button" disabled={busy || handoffBusy}
+          onClick={() => mutateWebsiteAuthentication("cancel")}>Cancel website analysis</button>
+      </p>}
+      {!websiteAuthentication.canAct && websiteAuthentication.state === "waiting"
+        && <p>Your current membership can view this wait but cannot open or update the authentication handoff.</p>}
+      {websiteAuthentication.state === "expired"
+        && <p>The authentication checkpoint expired. Start website analysis again to create a fresh session.</p>}
+      {websiteAuthentication.state === "failed"
+        && <p>The authentication gateway failed closed. Retry website analysis after the operator resolves the gateway.</p>}
+      {websiteAuthentication.state === "cancelled" && <p>This website analysis was cancelled.</p>}
     </section>}
     <p>Local-live processing uses durable local services and a real provider, but it is not production verification. Production requires a stored native installation attestation for the exact published hash.</p>
     <button type="button" onClick={analyze}
@@ -981,7 +1149,7 @@ async function waitForAnalysis(
   let delayMs = 250;
   while (Date.now() < deadline) {
     const body = await analysisStatus(runId, signal);
-    if (body.run.status === "succeeded") return body;
+    if (body.run.status === "succeeded" || body.run.status === "waiting") return body;
     if (body.run.status === "failed" || body.run.status === "cancelled") {
       throw new AnalysisRunError(body.run.errorCode ?? "ANALYSIS_FAILED", true);
     }
@@ -1027,6 +1195,19 @@ function gitHubWorkflowMessage(status: GitHubWorkflowStatus): string {
     return `GitHub workflow ${status.workflow.status}; no draft pull request is claimed.`;
   }
   return "GitHub workflow has no persisted draft pull request identity yet; no pull request is claimed.";
+}
+
+function authenticationMessage(authentication: WebsiteAuthenticationState): string {
+  if (authentication.state === "waiting") {
+    return authentication.canAct
+      ? "Authentication required. Open sign-in, then ask the server to check gateway evidence."
+      : "Website analysis is waiting for authentication by an owner or editor.";
+  }
+  if (authentication.state === "ready") return "Authentication evidence is ready for server-side verification.";
+  if (authentication.state === "resumed") return "Authentication verified; website analysis resumed.";
+  if (authentication.state === "expired") return "Authentication checkpoint expired. Start website analysis again.";
+  if (authentication.state === "cancelled") return "Website analysis cancelled.";
+  return "Authentication gateway failed closed. Retry after the operator resolves the gateway.";
 }
 
 async function postIdempotent<T extends ApiFailure>(url: string, body: unknown, operation: string) {

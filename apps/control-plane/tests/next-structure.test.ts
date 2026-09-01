@@ -48,9 +48,16 @@ test("auth/project UI exposes actionable SSR states without trusting browser rol
   assert.match(entry, /Create ownership challenge/);
   assert.match(entry, /Check ownership/);
   assert.match(entry, /\/website-ownership/);
-  assert.doesNotMatch(entry, /Open secure browser handoff/);
+  assert.match(entry, /Authentication required/);
+  assert.match(entry, /Open sign-in/);
+  assert.match(entry, /Check sign-in state/);
+  assert.match(entry, /Cancel website analysis/);
+  assert.match(entry, /\/website-authentication/);
+  assert.match(entry, /websiteAuthenticationRequestEpoch/);
+  assert.match(entry, /invalidateWebsiteAuthenticationView\(\)/);
+  assert.match(entry, /requestEpoch !== websiteAuthenticationRequestEpoch\.current/);
+  assert.match(entry, /catch \(error\) \{[\s\S]*setWebsiteAuthentication\(undefined\);[\s\S]*setWebsiteHandoffError\(errorCode\(error\)\);/);
   assert.doesNotMatch(entry, /I&amp;apos;ve finished signing in|I&apos;ve finished signing in/);
-  assert.doesNotMatch(entry, /\/website-authentication/);
   assert.doesNotMatch(entry, /cdpReference|cdpUrl|secretReference/);
   assert.match(entry, /Real GitHub draft pull request/);
   assert.match(entry, /githubDraftPullRequest\.headCommitSha/);

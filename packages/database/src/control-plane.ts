@@ -461,6 +461,15 @@ export type ResumeAnalysisAfterAuthenticationInput = IdempotencyInput & Readonly
   sourceIdentityHash: string;
   targetOriginDigest: string;
 }>;
+export type TerminateAnalysisAuthenticationInput = IdempotencyInput & Readonly<{
+  runId: string;
+  checkpointReference: string;
+  sourceSnapshotId: string;
+  sourceIdentityHash: string;
+  targetOriginDigest: string;
+  expiresAt: string;
+  terminalState: "failed" | "expired";
+}>;
 export type ExpectedAnalysisSource = Readonly<{
   projectSourceId: string;
   sourceSnapshotId: string;
@@ -545,6 +554,10 @@ export interface ControlPlaneRepository extends WorkflowRepository {
   resumeAnalysisAfterAuthentication(
     actor: RepositoryActor,
     input: ResumeAnalysisAfterAuthenticationInput,
+  ): Promise<WebsiteAuthenticationCheckpointRecord>;
+  terminateAnalysisAuthentication(
+    actor: RepositoryActor,
+    input: TerminateAnalysisAuthenticationInput,
   ): Promise<WebsiteAuthenticationCheckpointRecord>;
   claimWebsiteAuthenticationCleanup(
     workerId: string,
@@ -2336,6 +2349,68 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
     return publicWebsiteAuthenticationCheckpoint(consumed);
   }
 
+  async terminateAnalysisAuthentication(
+    actor: RepositoryActor,
+    input: TerminateAnalysisAuthenticationInput,
+  ): Promise<WebsiteAuthenticationCheckpointRecord> {
+    if (actor.role === "viewer") throw new RepositoryError("FORBIDDEN");
+    const normalized = normalizeWebsiteAuthenticationTerminalInput(input);
+    const run = this.#workflowRunForActor(actor, normalized.runId);
+    const checkpoint = this.#websiteAuthenticationCheckpoints.get(run.id);
+    const task = [...this.#workflowTasks.values()]
+      .find((candidate) => candidate.workflowRunId === run.id && candidate.phase === "analysis");
+    const analysis = this.#runs.get(run.id);
+    if (!checkpoint || !task || !analysis || !websiteAuthenticationTerminalMatches(checkpoint, normalized)) {
+      throw new RepositoryError("INVALID_STATE");
+    }
+    if (checkpoint.state === normalized.terminalState) {
+      if (run.status !== "failed" || task.status !== "failed" || analysis.status !== "failed") {
+        throw new RepositoryError("INVALID_STATE");
+      }
+      return publicWebsiteAuthenticationCheckpoint(checkpoint);
+    }
+    if (checkpoint.state !== "waiting" || run.status !== "waiting" || task.status !== "waiting"
+      || task.checkpointReference !== checkpoint.checkpointReference
+      || task.waitReason !== "external_authentication" || analysis.status !== "waiting") {
+      throw new RepositoryError("INVALID_STATE");
+    }
+    if (normalized.terminalState === "expired" && new Date(checkpoint.expiresAt) > this.clock()) {
+      throw new RepositoryError("INVALID_STATE");
+    }
+    const snapshot = this.#sourceSnapshots.get(run.sourceSnapshotId);
+    if (!snapshot || snapshot.id !== checkpoint.sourceSnapshotId
+      || snapshot.sourceIdentityHash !== checkpoint.sourceIdentityHash) throw new RepositoryError("SOURCE_SNAPSHOT_STALE");
+    const now = this.#now();
+    const errorCode = normalized.terminalState === "expired"
+      ? "AUTHENTICATION_WAIT_EXPIRED"
+      : "AUTHENTICATION_HANDOFF_FAILED";
+    this.#closeWebsiteAuthenticationCheckpoint(run.id, normalized.terminalState, now);
+    this.#runs.set(analysis.id, {
+      ...analysis,
+      status: "failed",
+      leaseOwner: undefined,
+      leaseExpiresAt: undefined,
+      errorCode,
+      updatedAt: now,
+    });
+    this.#analysisAvailableAt.delete(analysis.id);
+    this.#workflowTasks.set(task.id, {
+      ...task,
+      status: "failed",
+      leaseOwner: undefined,
+      leaseExpiresAt: undefined,
+      retryClassification: "permanent",
+      errorCode,
+      updatedAt: now,
+    });
+    this.#workflowRuns.set(run.id, { ...run, status: "failed", errorCode, updatedAt: now });
+    const project = this.#projects.get(run.projectId);
+    if (project) this.#projects.set(project.id, { ...project, status: "failed" });
+    this.#appendWorkflowEvent(run.id, "task.failed", task.id, errorCode);
+    this.#appendWorkflowEvent(run.id, "workflow.failed", undefined, errorCode);
+    return publicWebsiteAuthenticationCheckpoint(this.#websiteAuthenticationCheckpoints.get(run.id)!);
+  }
+
   async completeAnalysis(
     workerId: string,
     runId: string,
@@ -3440,6 +3515,22 @@ function normalizeWebsiteAuthenticationResumeInput(
   };
 }
 
+function normalizeWebsiteAuthenticationTerminalInput(
+  input: TerminateAnalysisAuthenticationInput,
+): TerminateAnalysisAuthenticationInput {
+  assertIdempotencyKey(input.idempotencyKey);
+  stableHash(input.inputHash);
+  const expiresAt = Date.parse(input.expiresAt);
+  if (!Number.isFinite(expiresAt) || new Date(expiresAt).toISOString() !== input.expiresAt
+    || !["failed", "expired"].includes(input.terminalState)) throw new RepositoryError("INVALID_STATE");
+  return {
+    ...input,
+    checkpointReference: normalizeWebsiteAuthenticationReference(input.checkpointReference),
+    sourceIdentityHash: normalizeWebsiteAuthenticationDigest(input.sourceIdentityHash),
+    targetOriginDigest: normalizeWebsiteAuthenticationDigest(input.targetOriginDigest),
+  };
+}
+
 function websiteTargetOriginDigest(sourceUrl: string): string {
   let origin: string;
   try { origin = new URL(sourceUrl).origin; }
@@ -3469,6 +3560,18 @@ function websiteAuthenticationResumeMatches(
     && checkpoint.targetOriginDigest === input.targetOriginDigest
     && (checkpoint.authenticationEvidenceReference === undefined
       || checkpoint.authenticationEvidenceReference === input.authenticationEvidenceReference);
+}
+
+function websiteAuthenticationTerminalMatches(
+  checkpoint: WebsiteAuthenticationCheckpointRecord,
+  input: TerminateAnalysisAuthenticationInput,
+): boolean {
+  return checkpoint.analysisRunId === input.runId
+    && checkpoint.checkpointReference === input.checkpointReference
+    && checkpoint.sourceSnapshotId === input.sourceSnapshotId
+    && checkpoint.sourceIdentityHash === input.sourceIdentityHash
+    && checkpoint.targetOriginDigest === input.targetOriginDigest
+    && checkpoint.expiresAt === input.expiresAt;
 }
 
 function publicWebsiteAuthenticationCheckpoint(

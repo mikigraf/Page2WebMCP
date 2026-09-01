@@ -13,7 +13,9 @@ import {
   type ReleaseVerificationPort,
 } from "../src/release-verification.ts";
 import {
+  setWebsiteAuthenticationHandoffPortForTest,
   setWebsiteUserHandoffPortForTest,
+  type WebsiteAuthenticationHandoffPort,
   type WebsiteUserHandoffPort,
 } from "../src/website-user-handoff.ts";
 import {
@@ -93,6 +95,20 @@ export const hermeticWebsiteUserHandoffPort: WebsiteUserHandoffPort = {
   checkOwnership: async (binding) => ({ state: "verified", targetOrigin: binding.targetOrigin }),
 };
 
+export const hermeticWebsiteAuthenticationHandoffPort: WebsiteAuthenticationHandoffPort = {
+  loadAuthenticationPortal: async (binding) => ({
+    state: "waiting",
+    targetOrigin: binding.targetOrigin,
+    expiresAt: binding.expiresAt,
+    portalUrl: "https://authentication.example/portal?handoff=fixture_reference",
+  }),
+  checkAuthentication: async (binding) => ({
+    state: "waiting",
+    targetOrigin: binding.targetOrigin,
+    expiresAt: binding.expiresAt,
+  }),
+};
+
 setAuthServiceForTest(createFixtureAuthService());
 
 export function installTestRepository(repository = new InMemoryControlPlaneRepository()): InMemoryControlPlaneRepository {
@@ -104,6 +120,7 @@ export function installTestRepository(repository = new InMemoryControlPlaneRepos
   setReleaseVerificationPortForTest(hermeticReleaseVerificationPort);
   setReleaseArtifactStoreForTest(hermeticReleaseArtifactStore);
   setWebsiteUserHandoffPortForTest(hermeticWebsiteUserHandoffPort);
+  setWebsiteAuthenticationHandoffPortForTest(hermeticWebsiteAuthenticationHandoffPort);
   return repository;
 }
 

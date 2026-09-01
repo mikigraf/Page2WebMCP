@@ -137,6 +137,13 @@ export function websiteMissingControls(environment: RuntimeEnvironment): Website
       if (!kmsKeyReference(value)) invalid.add(key);
     } else if (key.endsWith("_TOKEN") && !boundedToken(value)) invalid.add(key);
   }
+  const authenticationOrigin = environment.PAGE2WEBMCP_AUTH_HANDOFF_ORIGIN;
+  const browserGatewayOrigin = environment.PAGE2WEBMCP_BROWSER_USE_API_ORIGIN;
+  if (exactHttpsOrigin(authenticationOrigin) && exactHttpsOrigin(browserGatewayOrigin)
+    && authenticationOrigin === browserGatewayOrigin) {
+    invalid.add("PAGE2WEBMCP_AUTH_HANDOFF_ORIGIN");
+    invalid.add("PAGE2WEBMCP_BROWSER_USE_API_ORIGIN");
+  }
   return [...invalid].sort();
 }
 
@@ -459,7 +466,10 @@ async function probeWebsiteControlServices(
     .update(environment.PAGE2WEBMCP_SECRET_STORE_KMS_KEY_ID, "utf8").digest("hex");
   const probes = [
     ["authentication-handoff", environment.PAGE2WEBMCP_AUTH_HANDOFF_ORIGIN,
-      bearer(environment.PAGE2WEBMCP_AUTH_HANDOFF_TOKEN), { authenticationCheckpointProtocolVersion: 1 }],
+      bearer(environment.PAGE2WEBMCP_AUTH_HANDOFF_TOKEN), {
+        authenticationCheckpointProtocolVersion: 1,
+        authenticationUserHandoffProtocolVersion: 1,
+      }],
     ["browser-lease-store", environment.PAGE2WEBMCP_BROWSER_LEASE_STORE_ORIGIN,
       bearer(environment.PAGE2WEBMCP_BROWSER_LEASE_STORE_TOKEN), {}],
     ["browser-use-v4", environment.PAGE2WEBMCP_BROWSER_USE_API_ORIGIN,
@@ -507,14 +517,19 @@ async function probeWebsiteControlServices(
         ...expectedExtra,
       };
       if (!same(actual, expected)) {
-        if ((control === "ownership-store" || control === "authentication-handoff") && actual && same(actual, {
+        const legacy = {
           gatewayProtocolVersion: WEBSITE_LIVE_GATEWAY_PROTOCOL_VERSION,
           status: "ready",
           readOnly: true,
           control,
           selectedReleaseHash,
           nonce,
-        })) throw new Error("WEBSITE_HANDOFF_PROTOCOL_UNSUPPORTED");
+        };
+        if (actual && (control === "ownership-store" && same(actual, legacy)
+          || control === "authentication-handoff" && (
+            same(actual, legacy)
+            || same(actual, { ...legacy, authenticationCheckpointProtocolVersion: 1 })
+          ))) throw new Error("WEBSITE_HANDOFF_PROTOCOL_UNSUPPORTED");
         throw new Error("WEBSITE_PROVIDER_PROBE_FAILED");
       }
     } catch (error) {

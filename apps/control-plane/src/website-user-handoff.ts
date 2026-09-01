@@ -10,8 +10,10 @@ const CONTROL_PROTOCOL_VERSION = 1;
 const CONTROL_DEADLINE_MS = 10_000;
 const MAX_CONTROL_BYTES = 64 * 1_024;
 const MAX_OWNERSHIP_CHALLENGE_TTL_MS = 15 * 60_000;
+const MAX_AUTHENTICATION_TTL_MS = 10 * 60_000;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const HASH = /^[0-9a-f]{64}$/;
+const HASH_REFERENCE = /^urn:sha256:[0-9a-f]{64}$/;
 const IDEMPOTENCY_KEY = /^[A-Za-z0-9._:-]{8,128}$/;
 
 export const WEBSITE_USER_HANDOFF_PATHS = Object.freeze({
@@ -25,6 +27,8 @@ export const WEBSITE_USER_HANDOFF_PATHS = Object.freeze({
   ownershipStatus: "/v1/website-ownership/source-attestations/status",
   ownershipChallenge: "/v1/website-ownership/source-attestations/issue",
   ownershipCheck: "/v1/website-ownership/source-attestations/check",
+  authenticationPortal: "/v1/authentication/checkpoints/portal",
+  authenticationStatus: "/v1/authentication/checkpoints/status",
 } as const);
 
 type RuntimeEnvironment = Readonly<Record<string, string | undefined>>;
@@ -74,6 +78,51 @@ export interface WebsiteUserHandoffPort {
   ): Promise<WebsiteOwnershipState>;
 }
 
+export type WebsiteAuthenticationHandoffBinding = Readonly<{
+  organizationId: string;
+  projectId: string;
+  workflowRunId: string;
+  analysisRunId: string;
+  workflowTaskId: string;
+  sourceSnapshotId: string;
+  sourceIdentityHash: string;
+  targetOrigin: string;
+  targetOriginDigest: string;
+  checkpointReference: string;
+  expiresAt: string;
+}>;
+
+export type WebsiteAuthenticationHandoffState =
+  | Readonly<{
+    state: "waiting";
+    targetOrigin: string;
+    expiresAt: string;
+    portalUrl?: string;
+  }>
+  | Readonly<{
+    state: "ready";
+    targetOrigin: string;
+    expiresAt: string;
+    authenticationEvidenceReference: string;
+  }>
+  | Readonly<{
+    state: "expired" | "failed" | "cancelled";
+    targetOrigin: string;
+    expiresAt: string;
+  }>;
+
+export interface WebsiteAuthenticationHandoffPort {
+  loadAuthenticationPortal(
+    binding: WebsiteAuthenticationHandoffBinding,
+    signal: AbortSignal,
+  ): Promise<WebsiteAuthenticationHandoffState>;
+  checkAuthentication(
+    binding: WebsiteAuthenticationHandoffBinding,
+    idempotencyKey: string,
+    signal: AbortSignal,
+  ): Promise<WebsiteAuthenticationHandoffState>;
+}
+
 export type WebsiteUserHandoffDependencies = Readonly<{
   transport?: NodePinnedJsonTransport;
   clock?: () => Date;
@@ -85,7 +134,13 @@ type HandoffConfiguration = Readonly<{
   ownershipToken: string;
 }>;
 
+type AuthenticationHandoffConfiguration = Readonly<{
+  authenticationOrigin: string;
+  authenticationToken: string;
+}>;
+
 let testPort: WebsiteUserHandoffPort | undefined;
+let testAuthenticationPort: WebsiteAuthenticationHandoffPort | undefined;
 
 export function setWebsiteUserHandoffPortForTest(port: WebsiteUserHandoffPort | undefined): void {
   if (process.env.NODE_ENV === "production") throw new Error("TEST_ADAPTER_FORBIDDEN");
@@ -94,6 +149,17 @@ export function setWebsiteUserHandoffPortForTest(port: WebsiteUserHandoffPort | 
 
 export function websiteUserHandoffPort(): WebsiteUserHandoffPort {
   return testPort ?? createConfiguredWebsiteUserHandoffPort(process.env);
+}
+
+export function setWebsiteAuthenticationHandoffPortForTest(
+  port: WebsiteAuthenticationHandoffPort | undefined,
+): void {
+  if (process.env.NODE_ENV === "production") throw new Error("TEST_ADAPTER_FORBIDDEN");
+  testAuthenticationPort = port;
+}
+
+export function websiteAuthenticationHandoffPort(): WebsiteAuthenticationHandoffPort {
+  return testAuthenticationPort ?? createConfiguredWebsiteAuthenticationHandoffPort(process.env);
 }
 
 export function createConfiguredWebsiteUserHandoffPort(
@@ -156,6 +222,65 @@ export function createConfiguredWebsiteUserHandoffPort(
   };
 }
 
+export function createConfiguredWebsiteAuthenticationHandoffPort(
+  environment: RuntimeEnvironment = process.env,
+  dependencies: WebsiteUserHandoffDependencies = {},
+): WebsiteAuthenticationHandoffPort {
+  const configuration = configuredAuthenticationEnvironment(environment);
+  const transport = dependencies.transport ?? createNodePinnedJsonTransport();
+  const clock = dependencies.clock ?? (() => new Date());
+  const deadlineMs = dependencies.deadlineMs ?? CONTROL_DEADLINE_MS;
+  if (!transport || typeof transport.request !== "function" || typeof clock !== "function"
+    || !Number.isInteger(deadlineMs) || deadlineMs < 1 || deadlineMs > CONTROL_DEADLINE_MS) {
+    throw stableError("WEBSITE_LIVE_CONFIGURATION_REQUIRED");
+  }
+
+  const requestAuthentication = async (
+    path: string,
+    operation: "portal" | "status",
+    binding: WebsiteAuthenticationHandoffBinding,
+    callerKey: string,
+    signal: AbortSignal,
+  ): Promise<WebsiteAuthenticationHandoffState> => {
+    const normalized = validateAuthenticationBinding(binding);
+    const request = authenticationControlEnvelope(normalized, operation, callerKey);
+    const response = await requestControl(
+      transport,
+      configuration.authenticationOrigin,
+      configuration.authenticationToken,
+      path,
+      request,
+      signal,
+      deadlineMs,
+    );
+    assertAuthenticationResponseEnvelope(response, request);
+    return authenticationState(
+      response,
+      normalized,
+      operation,
+      configuration.authenticationOrigin,
+      clock(),
+    );
+  };
+
+  return {
+    loadAuthenticationPortal: (binding, signal) => requestAuthentication(
+      WEBSITE_USER_HANDOFF_PATHS.authenticationPortal,
+      "portal",
+      binding,
+      `portal:${binding.checkpointReference.slice("urn:sha256:".length)}`,
+      signal,
+    ),
+    checkAuthentication: (binding, idempotencyKey, signal) => requestAuthentication(
+      WEBSITE_USER_HANDOFF_PATHS.authenticationStatus,
+      "status",
+      binding,
+      idempotencyKey,
+      signal,
+    ),
+  };
+}
+
 function configuredEnvironment(environment: RuntimeEnvironment): HandoffConfiguration {
   const ownershipOrigin = exactHttpsOrigin(environment.PAGE2WEBMCP_OWNERSHIP_STORE_ORIGIN);
   const ownershipToken = boundedToken(environment.PAGE2WEBMCP_OWNERSHIP_STORE_TOKEN);
@@ -163,6 +288,17 @@ function configuredEnvironment(environment: RuntimeEnvironment): HandoffConfigur
     throw stableError("WEBSITE_LIVE_CONFIGURATION_REQUIRED");
   }
   return { ownershipOrigin, ownershipToken };
+}
+
+function configuredAuthenticationEnvironment(environment: RuntimeEnvironment): AuthenticationHandoffConfiguration {
+  const authenticationOrigin = exactHttpsOrigin(environment.PAGE2WEBMCP_AUTH_HANDOFF_ORIGIN);
+  const browserGatewayOrigin = exactHttpsOrigin(environment.PAGE2WEBMCP_BROWSER_USE_API_ORIGIN);
+  const authenticationToken = boundedToken(environment.PAGE2WEBMCP_AUTH_HANDOFF_TOKEN);
+  if (!authenticationOrigin || !authenticationToken
+    || browserGatewayOrigin !== undefined && browserGatewayOrigin === authenticationOrigin) {
+    throw stableError("WEBSITE_LIVE_CONFIGURATION_REQUIRED");
+  }
+  return { authenticationOrigin, authenticationToken };
 }
 
 function exactHttpsOrigin(value: string | undefined): string | undefined {
@@ -198,6 +334,24 @@ function validateBinding(binding: WebsiteUserHandoffBinding): WebsiteUserHandoff
   return { ...binding, sourceUrl: binding.sourceUrl, targetOrigin: source.origin };
 }
 
+function validateAuthenticationBinding(
+  binding: WebsiteAuthenticationHandoffBinding,
+): WebsiteAuthenticationHandoffBinding {
+  if (!binding || !UUID.test(binding.organizationId) || !UUID.test(binding.projectId)
+    || !UUID.test(binding.workflowRunId) || !UUID.test(binding.analysisRunId)
+    || !UUID.test(binding.workflowTaskId) || !UUID.test(binding.sourceSnapshotId)
+    || !HASH.test(binding.sourceIdentityHash) || !HASH.test(binding.targetOriginDigest)
+    || !HASH_REFERENCE.test(binding.checkpointReference)
+    || exactHttpsOrigin(binding.targetOrigin) !== binding.targetOrigin) {
+    throw stableError("WEBSITE_HANDOFF_INPUT_INVALID");
+  }
+  const expiry = Date.parse(binding.expiresAt);
+  if (!Number.isFinite(expiry) || new Date(expiry).toISOString() !== binding.expiresAt) {
+    throw stableError("WEBSITE_HANDOFF_INPUT_INVALID");
+  }
+  return { ...binding };
+}
+
 function sourceControlEnvelope(
   binding: WebsiteUserHandoffBinding,
   operation: string,
@@ -226,6 +380,49 @@ function sourceControlEnvelope(
       sourceIdentityHash: binding.sourceIdentityHash,
       sourceUrl: binding.sourceUrl,
       targetOrigin: binding.targetOrigin,
+    },
+  };
+}
+
+function authenticationControlEnvelope(
+  binding: WebsiteAuthenticationHandoffBinding,
+  operation: "portal" | "status",
+  callerKey: string,
+): Record<string, unknown> {
+  if (!IDEMPOTENCY_KEY.test(callerKey)) throw stableError("WEBSITE_HANDOFF_INPUT_INVALID");
+  const idempotencyKey = `website-ui:${createHash("sha256").update([
+    binding.organizationId,
+    binding.projectId,
+    binding.workflowRunId,
+    binding.analysisRunId,
+    binding.workflowTaskId,
+    binding.sourceSnapshotId,
+    binding.sourceIdentityHash,
+    binding.targetOriginDigest,
+    binding.checkpointReference,
+    binding.expiresAt,
+    operation,
+    callerKey,
+  ].join("\0"), "utf8").digest("hex")}`;
+  return {
+    gatewayProtocolVersion: CONTROL_PROTOCOL_VERSION,
+    idempotencyKey,
+    scope: {
+      organizationId: binding.organizationId,
+      projectId: binding.projectId,
+    },
+    workflow: {
+      workflowRunId: binding.workflowRunId,
+      analysisRunId: binding.analysisRunId,
+      workflowTaskId: binding.workflowTaskId,
+    },
+    checkpoint: {
+      sourceSnapshotId: binding.sourceSnapshotId,
+      sourceIdentityHash: binding.sourceIdentityHash,
+      targetOrigin: binding.targetOrigin,
+      targetOriginDigest: binding.targetOriginDigest,
+      checkpointReference: binding.checkpointReference,
+      expiresAt: binding.expiresAt,
     },
   };
 }
@@ -286,6 +483,13 @@ function boundedJson(response: NodePinnedJsonResponse): Record<string, unknown> 
 }
 
 const SOURCE_ENVELOPE_KEYS = ["gatewayProtocolVersion", "idempotencyKey", "scope", "source"] as const;
+const AUTHENTICATION_ENVELOPE_KEYS = [
+  "gatewayProtocolVersion",
+  "idempotencyKey",
+  "scope",
+  "workflow",
+  "checkpoint",
+] as const;
 function assertEnvelopeKeys(
   response: Record<string, unknown>,
   request: Record<string, unknown>,
@@ -300,6 +504,105 @@ function assertEnvelopeKeys(
 
 function assertSourceResponseEnvelope(response: Record<string, unknown>, request: Record<string, unknown>): void {
   assertEnvelopeKeys(response, request, SOURCE_ENVELOPE_KEYS);
+}
+
+function assertAuthenticationResponseEnvelope(
+  response: Record<string, unknown>,
+  request: Record<string, unknown>,
+): void {
+  assertEnvelopeKeys(response, request, AUTHENTICATION_ENVELOPE_KEYS);
+}
+
+function authenticationState(
+  response: Record<string, unknown>,
+  binding: WebsiteAuthenticationHandoffBinding,
+  operation: "portal" | "status",
+  authenticationOrigin: string,
+  now: Date,
+): WebsiteAuthenticationHandoffState {
+  if (response.targetOrigin !== binding.targetOrigin || response.expiresAt !== binding.expiresAt) {
+    throw stableError("WEBSITE_HANDOFF_RESPONSE_INVALID");
+  }
+  const expiresAt = optionalExpiry(response.expiresAt, now, false, MAX_AUTHENTICATION_TTL_MS);
+  if (!expiresAt) throw stableError("WEBSITE_HANDOFF_RESPONSE_INVALID");
+  if (operation === "portal") {
+    assertExactKeys(response, responseKeys(
+      AUTHENTICATION_ENVELOPE_KEYS,
+      ["state", "targetOrigin", "expiresAt", "portalUrl"],
+    ));
+    if (!["waiting", "ready", "expired", "failed", "cancelled"].includes(String(response.state))) {
+      throw stableError("WEBSITE_HANDOFF_RESPONSE_INVALID");
+    }
+    if (response.state === "waiting") {
+      const portalUrl = safeAuthenticationPortal(response.portalUrl, authenticationOrigin);
+      if (!portalUrl || Date.parse(expiresAt) <= now.getTime()
+        || Date.parse(expiresAt) - now.getTime() > MAX_AUTHENTICATION_TTL_MS) {
+        throw stableError("WEBSITE_HANDOFF_RESPONSE_INVALID");
+      }
+      return { state: "waiting", targetOrigin: binding.targetOrigin, expiresAt, portalUrl };
+    }
+    if (response.portalUrl !== undefined) throw stableError("WEBSITE_HANDOFF_RESPONSE_INVALID");
+    if (response.state === "ready") {
+      return { state: "waiting", targetOrigin: binding.targetOrigin, expiresAt };
+    }
+    return {
+      state: response.state as "expired" | "failed" | "cancelled",
+      targetOrigin: binding.targetOrigin,
+      expiresAt,
+    };
+  }
+
+  assertExactKeys(response, responseKeys(
+    AUTHENTICATION_ENVELOPE_KEYS,
+    ["status", "targetOrigin", "expiresAt", "authenticationEvidenceReference"],
+  ));
+  if (!["waiting", "ready", "expired", "failed", "cancelled"].includes(String(response.status))) {
+    throw stableError("WEBSITE_HANDOFF_RESPONSE_INVALID");
+  }
+  if (response.status === "ready") {
+    if (!HASH_REFERENCE.test(String(response.authenticationEvidenceReference ?? ""))
+      || Date.parse(expiresAt) <= now.getTime()
+      || Date.parse(expiresAt) - now.getTime() > MAX_AUTHENTICATION_TTL_MS) {
+      throw stableError("WEBSITE_HANDOFF_RESPONSE_INVALID");
+    }
+    return {
+      state: "ready",
+      targetOrigin: binding.targetOrigin,
+      expiresAt,
+      authenticationEvidenceReference: String(response.authenticationEvidenceReference),
+    };
+  }
+  if (response.authenticationEvidenceReference !== undefined) {
+    throw stableError("WEBSITE_HANDOFF_RESPONSE_INVALID");
+  }
+  if (response.status === "waiting") {
+    return { state: "waiting", targetOrigin: binding.targetOrigin, expiresAt };
+  }
+  return {
+    state: response.status as "expired" | "failed" | "cancelled",
+    targetOrigin: binding.targetOrigin,
+    expiresAt,
+  };
+}
+
+function safeAuthenticationPortal(value: unknown, authenticationOrigin: string): string | undefined {
+  if (typeof value !== "string" || value.length < 1 || value.length > 2_048) return undefined;
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "https:" || url.origin !== authenticationOrigin || url.username || url.password
+      || url.hash || url.pathname !== "/portal" || url.searchParams.size !== 1
+      || !url.searchParams.has("handoff") || url.href !== value) return undefined;
+    for (const [key, parameter] of url.searchParams) {
+      if (!/^[a-z][a-z0-9_-]{0,31}$/.test(key) || parameter.length < 1 || parameter.length > 128
+        || !/^[A-Za-z0-9._~-]+$/.test(parameter)
+        || /token|secret|password|passcode|cookie|csrf|otp|credential|api[-_]?key|code|session|provider|live|cdp/i.test(key)) {
+        return undefined;
+      }
+    }
+    return url.toString();
+  } catch {
+    return undefined;
+  }
 }
 
 function ownershipState(

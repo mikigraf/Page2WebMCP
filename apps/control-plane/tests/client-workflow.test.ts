@@ -5,10 +5,21 @@ import {
   completeOperation,
   loadWorkflow,
   operationKey,
+  recoverableAnalysisRunId,
   reconcileProjectRecovery,
   reconcileProjectWorkflow,
   saveWorkflow
 } from "../src/client-workflow.ts";
+
+test("terminal analysis recovery clears stale run identity so the next action starts a fresh run", () => {
+  for (const status of ["queued", "running", "waiting", "succeeded"] as const) {
+    assert.equal(recoverableAnalysisRunId({ id: "analysis-1", status }), "analysis-1");
+  }
+  for (const status of ["failed", "cancelled"] as const) {
+    assert.equal(recoverableAnalysisRunId({ id: "analysis-1", status }), undefined);
+  }
+  assert.equal(recoverableAnalysisRunId(undefined), undefined);
+});
 
 test("operation keys survive ambiguous retries and rotate only for a different request", () => {
   const storage = new MemoryStorage();

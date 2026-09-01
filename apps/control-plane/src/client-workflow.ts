@@ -30,6 +30,15 @@ const OPERATION_PREFIX = "page2webmcp.operation.v1.";
 
 type OperationRecord = { requestBody: string; key: string };
 
+export function recoverableAnalysisRunId(
+  latest: Readonly<{
+    id: string;
+    status: "queued" | "running" | "waiting" | "succeeded" | "failed" | "cancelled";
+  }> | undefined,
+): string | undefined {
+  return latest && !["failed", "cancelled"].includes(latest.status) ? latest.id : undefined;
+}
+
 export function loadWorkflow(storage: Storage): PersistedWorkflow | undefined {
   try {
     const raw = storage.getItem(WORKFLOW_KEY);

@@ -8,7 +8,10 @@ import {
   successResponse
 } from "../../../../src/api.ts";
 import { analysisOutcome } from "../../../../src/analysis-outcome.ts";
-import { websiteUserHandoffProjection } from "../../../../src/website-user-handoff-api.ts";
+import {
+  websiteAuthenticationProjection,
+  websiteUserHandoffProjection,
+} from "../../../../src/website-user-handoff-api.ts";
 
 const RunIdSchema = z.string().uuid();
 
@@ -31,6 +34,13 @@ export async function GET(
     const capabilities = result
       ? await repository.listAnalysisCapabilities(actor, run.id)
       : [];
+    const workflow = project.sourceType === "website"
+      ? await repository.getWorkflowRun(actor, run.id)
+      : undefined;
+    const tasks = workflow ? await repository.listWorkflowTasks(actor, workflow.id) : [];
+    const authenticationCheckpoint = workflow?.analysisRunId
+      ? await repository.getWebsiteAuthenticationWait(actor, workflow.analysisRunId)
+      : undefined;
     return successResponse({
       run,
       projectId: run.projectId,
@@ -38,7 +48,10 @@ export async function GET(
       capabilities,
       analysisOutcome: analysisOutcome(result, capabilities.length),
       ...(project.sourceType === "website" ? {
-        websiteUserHandoff: websiteUserHandoffProjection(project.id),
+        websiteUserHandoff: websiteUserHandoffProjection(
+          project.id,
+          workflow ? websiteAuthenticationProjection(workflow, tasks, authenticationCheckpoint) : undefined,
+        ),
       } : {}),
     }, requestId);
   } catch (error) {

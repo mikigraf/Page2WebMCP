@@ -12,7 +12,10 @@ import {
   workflowPresentation,
 } from "../../../../src/workflow-presentation.ts";
 import { observeWorkflowStatus } from "../../../../../../packages/observability/src/workflow-runtime.ts";
-import { websiteUserHandoffProjection } from "../../../../src/website-user-handoff-api.ts";
+import {
+  websiteAuthenticationProjection,
+  websiteUserHandoffProjection,
+} from "../../../../src/website-user-handoff-api.ts";
 import { analysisOutcome } from "../../../../src/analysis-outcome.ts";
 import { gitHubDraftPullRequestProjection } from "../../../../src/github-result.ts";
 
@@ -56,6 +59,9 @@ export async function GET(request: Request, context: { params: Promise<{ runId: 
     const draftPullRequest = project.sourceType === "github"
       ? await repository.getLatestGitHubDraftPullRequest(actor, workflow.id)
       : undefined;
+    const authenticationCheckpoint = project.sourceType === "website" && workflow.analysisRunId
+      ? await repository.getWebsiteAuthenticationWait(actor, workflow.analysisRunId)
+      : undefined;
     const outcome = project.sourceType === "github"
       ? workflow.status === "succeeded" && draftPullRequest
         ? "tested_patch_draft_pull_request_check_preview_reconciled"
@@ -83,7 +89,10 @@ export async function GET(request: Request, context: { params: Promise<{ runId: 
       outcome,
       ...(draftPullRequest ? { draftPullRequest: gitHubDraftPullRequestProjection(draftPullRequest) } : {}),
       ...(project.sourceType === "website" ? {
-        websiteUserHandoff: websiteUserHandoffProjection(project.id),
+        websiteUserHandoff: websiteUserHandoffProjection(
+          project.id,
+          websiteAuthenticationProjection(workflow, tasks, authenticationCheckpoint),
+        ),
       } : {}),
     }, requestId);
   } catch (error) {

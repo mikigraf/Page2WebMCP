@@ -51,6 +51,7 @@ import {
   type WebsiteAuthenticationCheckpointRecord,
   type WorkflowExecutionMaterial,
   type ResumeAnalysisAfterAuthenticationInput,
+  type TerminateAnalysisAuthenticationInput,
 } from "./control-plane.ts";
 import { computeSourceIdentityHash } from "./source-identity.ts";
 import {
@@ -1985,6 +1986,103 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
     });
   }
 
+  async terminateAnalysisAuthentication(
+    actor: RepositoryActor,
+    input: TerminateAnalysisAuthenticationInput,
+  ): Promise<WebsiteAuthenticationCheckpointRecord> {
+    if (actor.role === "viewer") throw new RepositoryError("FORBIDDEN");
+    const normalized = normalizeWebsiteAuthenticationTerminalInput(input);
+    return this.#transaction({ kind: "app", actor }, async (client) => {
+      const workflowResult = await client.query(
+        "select * from public.workflow_runs where id = $1 and organization_id = $2 for update",
+        [normalized.runId, actor.organizationId],
+      );
+      if (!workflowResult.rows[0]) throw new RepositoryError("NOT_FOUND");
+      const workflow = mapWorkflowRun(workflowResult.rows[0]);
+      const jobResult = await client.query(
+        "select * from private.analysis_jobs where analysis_run_id = $1 and organization_id = $2 for update",
+        [normalized.runId, actor.organizationId],
+      );
+      const taskResult = await client.query(
+        "select * from private.workflow_tasks where workflow_run_id = $1 and phase = 'analysis' " +
+        "and organization_id = $2 for update",
+        [normalized.runId, actor.organizationId],
+      );
+      const checkpointResult = await client.query(
+        "select * from private.website_authentication_checkpoints " +
+        "where analysis_run_id = $1 and organization_id = $2 for update",
+        [normalized.runId, actor.organizationId],
+      );
+      if (!jobResult.rows[0] || !taskResult.rows[0] || !checkpointResult.rows[0]) {
+        throw new RepositoryError("INVALID_STATE");
+      }
+      const task = mapWorkflowTask(taskResult.rows[0]);
+      const checkpoint = mapWebsiteAuthenticationCheckpoint(checkpointResult.rows[0]);
+      if (!websiteAuthenticationTerminalMatches(checkpoint, normalized)
+        || workflow.sourceSnapshotId !== checkpoint.sourceSnapshotId) throw new RepositoryError("INVALID_STATE");
+      if (checkpoint.state === normalized.terminalState) {
+        if (workflow.status !== "failed" || task.status !== "failed" || jobResult.rows[0].status !== "failed") {
+          throw new RepositoryError("INVALID_STATE");
+        }
+        return checkpoint;
+      }
+      if (checkpoint.state !== "waiting" || workflow.status !== "waiting"
+        || task.status !== "waiting" || task.checkpointReference !== checkpoint.checkpointReference
+        || task.waitReason !== "external_authentication" || jobResult.rows[0].status !== "waiting") {
+        throw new RepositoryError("INVALID_STATE");
+      }
+      if (normalized.terminalState === "expired" && new Date(checkpoint.expiresAt) > new Date()) {
+        throw new RepositoryError("INVALID_STATE");
+      }
+      const snapshot = await client.query(
+        "select id, source_identity_hash from public.source_snapshots " +
+        "where id = $1 and project_id = $2 and organization_id = $3 limit 1",
+        [checkpoint.sourceSnapshotId, checkpoint.projectId, checkpoint.organizationId],
+      );
+      if (!snapshot.rows[0] || String(snapshot.rows[0].source_identity_hash) !== checkpoint.sourceIdentityHash) {
+        throw new RepositoryError("SOURCE_SNAPSHOT_STALE");
+      }
+      const errorCode = normalized.terminalState === "expired"
+        ? "AUTHENTICATION_WAIT_EXPIRED"
+        : "AUTHENTICATION_HANDOFF_FAILED";
+      const terminal = await client.query(
+        "update private.website_authentication_checkpoints set state = $2, terminal_at = now(), updated_at = now() " +
+        "where analysis_run_id = $1 and state = 'waiting' returning *",
+        [normalized.runId, normalized.terminalState],
+      );
+      if (!terminal.rows[0]) throw new RepositoryError("INVALID_STATE");
+      await client.query(
+        "update private.analysis_jobs set status = 'failed', lease_owner = null, lease_expires_at = null, " +
+        "updated_at = now() where analysis_run_id = $1 and status = 'waiting'",
+        [normalized.runId],
+      );
+      await client.query(
+        "update private.workflow_tasks set status = 'failed', retry_classification = 'permanent', " +
+        "error_code = $2, lease_owner = null, lease_expires_at = null, updated_at = now() " +
+        "where id = $1 and status = 'waiting'",
+        [task.id, errorCode],
+      );
+      await client.query(
+        "update public.analysis_runs set error_code = $2, updated_at = now() where id = $1",
+        [normalized.runId, errorCode],
+      );
+      await client.query(
+        "update public.workflow_runs set status = 'failed', error_code = $2, updated_at = now() where id = $1",
+        [normalized.runId, errorCode],
+      );
+      await client.query("update public.projects set status = 'failed' where id = $1", [workflow.projectId]);
+      await client.query(
+        "select private.append_workflow_event($1, $2, 'task.failed', $3)",
+        [normalized.runId, task.id, errorCode],
+      );
+      await client.query(
+        "select private.append_workflow_event($1, null, 'workflow.failed', $2)",
+        [normalized.runId, errorCode],
+      );
+      return mapWebsiteAuthenticationCheckpoint(terminal.rows[0]);
+    });
+  }
+
   async completeAnalysis(
     workerId: string,
     runId: string,
@@ -3451,6 +3549,22 @@ function normalizeWebsiteAuthenticationResumeInput(
   };
 }
 
+function normalizeWebsiteAuthenticationTerminalInput(
+  input: TerminateAnalysisAuthenticationInput,
+): TerminateAnalysisAuthenticationInput {
+  assertWebsiteAuthenticationIdempotencyKey(input.idempotencyKey);
+  stableHashBounded(input.inputHash);
+  const expiresAt = Date.parse(input.expiresAt);
+  if (!Number.isFinite(expiresAt) || new Date(expiresAt).toISOString() !== input.expiresAt
+    || !["failed", "expired"].includes(input.terminalState)) throw new RepositoryError("INVALID_STATE");
+  return {
+    ...input,
+    checkpointReference: normalizeWebsiteAuthenticationReference(input.checkpointReference),
+    sourceIdentityHash: normalizeWebsiteAuthenticationDigest(input.sourceIdentityHash),
+    targetOriginDigest: normalizeWebsiteAuthenticationDigest(input.targetOriginDigest),
+  };
+}
+
 function websiteTargetOriginDigest(sourceUrl: string): string {
   let origin: string;
   try {
@@ -3483,6 +3597,18 @@ function websiteAuthenticationResumeMatches(
     && checkpoint.targetOriginDigest === input.targetOriginDigest
     && (checkpoint.authenticationEvidenceReference === undefined
       || checkpoint.authenticationEvidenceReference === input.authenticationEvidenceReference);
+}
+
+function websiteAuthenticationTerminalMatches(
+  checkpoint: WebsiteAuthenticationCheckpointRecord,
+  input: TerminateAnalysisAuthenticationInput,
+): boolean {
+  return checkpoint.analysisRunId === input.runId
+    && checkpoint.checkpointReference === input.checkpointReference
+    && checkpoint.sourceSnapshotId === input.sourceSnapshotId
+    && checkpoint.sourceIdentityHash === input.sourceIdentityHash
+    && checkpoint.targetOriginDigest === input.targetOriginDigest
+    && checkpoint.expiresAt === input.expiresAt;
 }
 
 function workflowTaskEventPayload(input: WorkflowTaskEventInput): WorkflowTaskEventInput["payload"] {
