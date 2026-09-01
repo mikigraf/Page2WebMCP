@@ -18,6 +18,24 @@ function sourceResponse(url: string, source: string) {
   } as const;
 }
 
+function frozenSource(source: string, overrides: Partial<{
+  contentHash: string;
+  artifactReference: string;
+  finalUrl: string;
+  mimeType: string;
+  sizeBytes: number;
+}> = {}) {
+  const contentHash = createHash("sha256").update(source, "utf8").digest("hex");
+  return {
+    contentHash,
+    artifactReference: `urn:sha256:${contentHash}`,
+    finalUrl: "https://specs.widgets.example/openapi.json",
+    mimeType: "application/json",
+    sizeBytes: Buffer.byteLength(source, "utf8"),
+    ...overrides,
+  };
+}
+
 test("configured OpenAPI factory fails only invalid operator mode or transport construction at startup", async () => {
   assert.throws(() => createConfiguredOpenApiAnalysisAdapter({}, {}), /^Error: OPENAPI_LIVE_CONFIGURATION_REQUIRED$/);
   assert.throws(() => createConfiguredOpenApiAnalysisAdapter({ PAGE2WEBMCP_PROVIDER_MODE: "local" }, {}), /^Error: OPENAPI_LIVE_CONFIGURATION_REQUIRED$/);
@@ -111,6 +129,7 @@ test("OpenAPI readiness freshly exercises bounded DNS and HTTPS against the sele
       sourceType: "openapi",
       sourceUrl: "https://specs.widgets.example/openapi.json",
       sourceIdentityHash: "b".repeat(64),
+      sourceArtifact: frozenSource(source),
       sourceConfiguration: {
         kind: "openapi",
         targetOrigin: "https://widgets.example",
@@ -130,6 +149,122 @@ test("OpenAPI readiness freshly exercises bounded DNS and HTTPS against the sele
     credentials: "omit",
     signal: requests[0]!.signal,
   });
+});
+
+test("OpenAPI readiness accepts an unchanged document through the analysis byte ceiling", async () => {
+  const source = JSON.stringify({
+    openapi: "3.1.0",
+    info: { title: "Large widgets", version: "1" },
+    paths: {},
+    description: "x".repeat(70_000),
+  });
+  const provider = createConfiguredOpenApiProductionAdapter(
+    { PAGE2WEBMCP_PROVIDER_MODE: "openapi" },
+    {
+      resolver: { resolve: async () => ["93.184.216.34"] },
+      transport: { request: async (request) => sourceResponse(request.url, source) },
+    },
+  );
+
+  await provider.probe({
+    selectedReleaseHash: "a".repeat(64),
+    publicOrigin: "https://bimqgiedckdurqiywctl.supabase.co/storage/v1/object/public/page2webmcp-releases",
+    context: {
+      sourceType: "openapi",
+      sourceUrl: "https://specs.widgets.example/openapi.json",
+      sourceIdentityHash: "b".repeat(64),
+      sourceArtifact: frozenSource(source),
+      sourceConfiguration: {
+        kind: "openapi", targetOrigin: "https://widgets.example",
+        testPageUrl: "https://widgets.example/review", environment: "staging",
+      },
+    },
+    signal: new AbortController().signal,
+  });
+});
+
+test("OpenAPI readiness follows the analysis redirect policy before comparing the frozen final URL", async () => {
+  const source = JSON.stringify({ openapi: "3.1.0", info: { title: "Widgets", version: "1" }, paths: {} });
+  const requested: string[] = [];
+  const provider = createConfiguredOpenApiProductionAdapter(
+    { PAGE2WEBMCP_PROVIDER_MODE: "openapi" },
+    {
+      resolver: { resolve: async () => ["93.184.216.34"] },
+      transport: { request: async (request) => {
+        requested.push(request.url);
+        if (request.url === "https://specs.widgets.example/openapi.json") {
+          return {
+            status: 302,
+            url: request.url,
+            connectedAddress: "93.184.216.34",
+            tls: { authorized: true, servername: "specs.widgets.example", protocol: "TLSv1.3" },
+            headers: { location: "/frozen/openapi.json" },
+            body: { async *[Symbol.asyncIterator]() { /* empty redirect body */ } },
+          } as const;
+        }
+        return sourceResponse(request.url, source);
+      } },
+    },
+  );
+
+  await provider.probe({
+    selectedReleaseHash: "a".repeat(64),
+    publicOrigin: "https://bimqgiedckdurqiywctl.supabase.co/storage/v1/object/public/page2webmcp-releases",
+    context: {
+      sourceType: "openapi",
+      sourceUrl: "https://specs.widgets.example/openapi.json",
+      sourceIdentityHash: "b".repeat(64),
+      sourceArtifact: frozenSource(source, {
+        finalUrl: "https://specs.widgets.example/frozen/openapi.json",
+      }),
+      sourceConfiguration: {
+        kind: "openapi", targetOrigin: "https://widgets.example",
+        testPageUrl: "https://widgets.example/review", environment: "staging",
+      },
+    },
+    signal: new AbortController().signal,
+  });
+  assert.deepEqual(requested, [
+    "https://specs.widgets.example/openapi.json",
+    "https://specs.widgets.example/frozen/openapi.json",
+  ]);
+});
+
+test("OpenAPI readiness rejects drift in any frozen document identity field", async () => {
+  const source = JSON.stringify({ openapi: "3.1.0", info: { title: "Widgets", version: "1" }, paths: {} });
+  const unchanged = frozenSource(source);
+  const changedHash = "f".repeat(64);
+  const changes = [
+    { ...unchanged, contentHash: changedHash, artifactReference: `urn:sha256:${changedHash}` },
+    { ...unchanged, artifactReference: `urn:sha256:${"e".repeat(64)}` },
+    { ...unchanged, finalUrl: "https://specs.widgets.example/changed.json" },
+    { ...unchanged, mimeType: "application/yaml" },
+    { ...unchanged, sizeBytes: unchanged.sizeBytes + 1 },
+  ];
+  const provider = createConfiguredOpenApiProductionAdapter(
+    { PAGE2WEBMCP_PROVIDER_MODE: "openapi" },
+    {
+      resolver: { resolve: async () => ["93.184.216.34"] },
+      transport: { request: async (request) => sourceResponse(request.url, source) },
+    },
+  );
+  for (const sourceArtifact of changes) {
+    await assert.rejects(provider.probe({
+      selectedReleaseHash: "a".repeat(64),
+      publicOrigin: "https://bimqgiedckdurqiywctl.supabase.co/storage/v1/object/public/page2webmcp-releases",
+      context: {
+        sourceType: "openapi",
+        sourceUrl: "https://specs.widgets.example/openapi.json",
+        sourceIdentityHash: "b".repeat(64),
+        sourceArtifact,
+        sourceConfiguration: {
+          kind: "openapi", targetOrigin: "https://widgets.example",
+          testPageUrl: "https://widgets.example/review", environment: "staging",
+        },
+      },
+      signal: new AbortController().signal,
+    }), /^Error: OPENAPI_SOURCE_CHANGED_AFTER_FREEZE$/);
+  }
 });
 
 test("OpenAPI readiness rejects a descriptor for a different provider before network access", async () => {
@@ -170,6 +305,7 @@ test("OpenAPI readiness redacts an unreachable or rejected artifact transport", 
       sourceType: "openapi",
       sourceUrl: "https://specs.widgets.example/openapi.json",
       sourceIdentityHash: "b".repeat(64),
+      sourceArtifact: frozenSource("unreachable"),
       sourceConfiguration: {
         kind: "openapi", targetOrigin: "https://widgets.example",
         testPageUrl: "https://widgets.example/review", environment: "staging",

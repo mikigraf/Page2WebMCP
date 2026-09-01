@@ -172,10 +172,12 @@ export function createConfiguredReleaseArtifactStore(
         } catch (error) {
           if (error instanceof ReleaseArtifactError) throw error;
           if (lifecycle.signal.aborted) throw lifecycleError(lifecycle);
-          throw stableError("RELEASE_ARTIFACT_UPLOAD_FAILED");
+          if (!isAmbiguousUploadResponseLoss(error)) throw stableError("RELEASE_ARTIFACT_UPLOAD_FAILED");
+          upload = { data: null, error };
         }
         if (lifecycle.signal.aborted) throw lifecycleError(lifecycle);
-        if (upload.error !== null && !isObjectExists(upload.error)) {
+        if (upload.error !== null && !isObjectExists(upload.error)
+          && !isAmbiguousUploadResponseLoss(upload.error)) {
           throw stableError("RELEASE_ARTIFACT_UPLOAD_FAILED");
         }
         if (upload.error === null && upload.data === null) {
@@ -397,6 +399,28 @@ function isObjectExists(error: unknown): boolean {
   if (error.code === "ResourceAlreadyExists" || error.code === "KeyAlreadyExists"
     || error.statusCode === "ResourceAlreadyExists" || error.statusCode === "KeyAlreadyExists") return true;
   return error.status === 400 && error.code === undefined && error.statusCode === "409";
+}
+
+function isAmbiguousUploadResponseLoss(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  if (error.name === "StorageUnknownError") {
+    const original = (error as Error & { originalError?: unknown }).originalError;
+    return isFetchResponseLoss(original);
+  }
+  return isFetchResponseLoss(error);
+}
+
+function isFetchResponseLoss(error: unknown): boolean {
+  if (!(error instanceof TypeError) || error.message !== "fetch failed") return false;
+  const cause = (error as TypeError & { cause?: unknown }).cause;
+  if (!cause || typeof cause !== "object") return false;
+  const code = (cause as { code?: unknown }).code;
+  return typeof code === "string" && [
+    "ECONNRESET",
+    "EPIPE",
+    "ETIMEDOUT",
+    "UND_ERR_SOCKET",
+  ].includes(code);
 }
 
 function transientReadStatus(status: number): boolean {

@@ -26,6 +26,10 @@ test("local Supabase lifecycle is pinned, uses the pnpm CLI boundary, and declar
   const ignore = await readFile(join(workspaceRoot, ".gitignore"), "utf8");
 
   assert.equal(packageJson.devDependencies?.supabase, "2.116.0");
+  assert.match(
+    await readFile(join(workspaceRoot, "scripts/local-supabase.mjs"), "utf8"),
+    /const REQUIRED_MIGRATION = "20260901140000";/,
+  );
   for (const command of ["up", "reset", "status", "down"]) {
     assert.equal(packageJson.scripts?.[`local:${command}`], `node scripts/local-supabase.mjs ${command}`);
   }
@@ -89,7 +93,7 @@ test("local status verifies the pinned CLI, parses machine env output, and never
     await mkdir(join(directory, "supabase/migrations"), { recursive: true });
     await writeFile(join(
       directory,
-      "supabase/migrations/20260901094032_allow_waiting_authentication_failure.sql",
+      "supabase/migrations/20260901140000_live_verifier_attestation_v2_repair.sql",
     ), "-- fixture\n");
     await mkdir(bin);
     const fakePnpm = join(bin, "pnpm");
@@ -134,7 +138,7 @@ test("local lifecycle fails closed before stack commands when the executable ver
     await mkdir(join(directory, "supabase/migrations"), { recursive: true });
     await writeFile(join(
       directory,
-      "supabase/migrations/20260901094032_allow_waiting_authentication_failure.sql",
+      "supabase/migrations/20260901140000_live_verifier_attestation_v2_repair.sql",
     ), "-- fixture\n");
     await mkdir(bin);
     const fakePnpm = join(bin, "pnpm");

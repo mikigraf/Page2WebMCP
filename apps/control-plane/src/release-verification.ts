@@ -13,6 +13,14 @@ import {
   createNodePinnedJsonTransport,
   type NodePinnedJsonTransport,
 } from "../../worker/src/node-network.ts";
+import { configuredDeploymentIdentity } from "./deployment-identity.ts";
+import {
+  buildLiveVerifierRequest,
+  verifyLiveVerifierResponse,
+  type LiveVerifierAttestationIdentityV2,
+  type LiveVerifierReplayGuard,
+  type LiveVerifierScope,
+} from "./release-verifier-protocol-v2.ts";
 
 const HASH = /^[0-9a-f]{64}$/;
 const SRI = /^sha384-[A-Za-z0-9+/]+={0,2}$/;
@@ -23,12 +31,15 @@ const HERMETIC_VERIFIER_IDENTIFIER = "page2webmcp:hermetic-release-verifier:v1";
 
 export const REQUIRED_CANDIDATE_CHECKS = RELEASE_VERIFICATION_CHECK_NAMES;
 export const RELEASE_VERIFIER_PROTOCOL_VERSION = 1;
+export const LIVE_RELEASE_VERIFIER_PROTOCOL_VERSION = 2;
 export type { CandidateVerificationCheckName, ReleaseVerificationCheck, ReleaseVerificationFailureCode };
 
 export type VerificationMode = "hermetic" | "local_live" | "live";
+type CandidateVerifierAttestationV2 = LiveVerifierAttestationIdentityV2 & Readonly<{ operation: "candidate" }>;
+type InstallationVerifierAttestationV2 = LiveVerifierAttestationIdentityV2 & Readonly<{ operation: "installation" }>;
 
 export type VerifierIdentity = Readonly<{
-  protocolVersion: 1;
+  protocolVersion: 1 | 2;
   mode: VerificationMode;
   webMcpImplementation: "native";
   verifierOriginDigest: string;
@@ -62,6 +73,12 @@ export type CandidateVerificationInput = Readonly<{
   manifest: Readonly<{ releaseId: string }> & Record<string, unknown>;
   targetOrigin: string;
   expectedTools: readonly string[];
+  liveContext?: Readonly<{
+    projectId: string;
+    analysisRunId: string;
+    sourceIdentityHash: string;
+    environment: "test" | "staging" | "production";
+  }>;
 }>;
 
 export type CandidateVerificationReport = Readonly<{
@@ -88,6 +105,13 @@ export type InstalledVerificationInput = Readonly<{
   targetOrigin: string;
   expectedTools: readonly string[];
   selfHostedUrl?: string;
+  liveContext?: Readonly<{
+    projectId: string;
+    releaseId: string;
+    installationOperationId: string;
+    sourceIdentityHash: string;
+    environment: "test" | "staging" | "production";
+  }>;
 }>;
 
 export type InstalledVerificationReport = Readonly<{
@@ -136,14 +160,31 @@ export type InstalledAttestation = Readonly<{
   csp: InstalledVerificationReport["csp"];
   webMcpImplementation: InstalledVerificationReport["webMcpImplementation"];
   verifierIdentity: VerifierIdentity;
+  verifierAttestation?: InstallationVerifierAttestationV2;
   report: InstalledVerificationReport;
+}>;
+
+type LiveCandidateVerifierResult = Readonly<{
+  report: CandidateVerificationReport;
+  verifierAttestation: CandidateVerifierAttestationV2;
+}>;
+
+type LiveInstalledVerifierResult = Readonly<{
+  report: InstalledVerificationReport;
+  verifierAttestation: InstallationVerifierAttestationV2;
 }>;
 
 export interface ReleaseVerificationPort {
   readonly mode: VerificationMode;
   readonly readiness?: (signal: AbortSignal) => Promise<VerifierIdentity>;
-  verifyCandidate(input: CandidateVerificationInput, signal: AbortSignal): Promise<CandidateVerificationReport>;
-  verifyInstalled(input: InstalledVerificationInput, signal: AbortSignal): Promise<InstalledVerificationReport>;
+  verifyCandidate(
+    input: CandidateVerificationInput,
+    signal: AbortSignal,
+  ): Promise<CandidateVerificationReport | LiveCandidateVerifierResult>;
+  verifyInstalled(
+    input: InstalledVerificationInput,
+    signal: AbortSignal,
+  ): Promise<InstalledVerificationReport | LiveInstalledVerifierResult>;
 }
 
 export type ConfiguredReleaseVerificationPort = ReleaseVerificationPort & Readonly<{
@@ -162,6 +203,7 @@ export type CandidateAttestation = Readonly<{
   csp: CandidateVerificationReport["csp"];
   verificationMode: ReleaseVerificationPort["mode"];
   verifierIdentity: VerifierIdentity;
+  verifierAttestation?: CandidateVerifierAttestationV2;
   report: CandidateVerificationReport;
 }>;
 
@@ -185,9 +227,10 @@ export async function attestReleaseCandidate(
   signal: AbortSignal,
 ): Promise<CandidateAttestation> {
   assertCandidateInput(input);
-  const { verifierIdentity, report } = await withDeadline(async (deadlineSignal) => {
+  const { verifierIdentity, report, verifierAttestation } = await withDeadline(async (deadlineSignal) => {
     const identity = await verifiedIdentity(port, deadlineSignal);
-    return { verifierIdentity: identity, report: await port.verifyCandidate(input, deadlineSignal) };
+    const result = candidateVerifierResult(await port.verifyCandidate(input, deadlineSignal), port.mode);
+    return { verifierIdentity: identity, ...result };
   }, signal);
   if (!report || typeof report !== "object"
     || report.observedContentHash !== input.contentHash
@@ -220,6 +263,7 @@ export async function attestReleaseCandidate(
     csp: normalizedReport.csp,
     verificationMode: port.mode,
     verifierIdentity,
+    ...(verifierAttestation ? { verifierAttestation } : {}),
     report: normalizedReport,
   };
 }
@@ -230,9 +274,10 @@ export async function attestReleaseInstallation(
   signal: AbortSignal,
 ): Promise<InstalledAttestation> {
   assertInstalledInput(input, port.mode);
-  const { verifierIdentity, report } = await withDeadline(async (deadlineSignal) => {
+  const { verifierIdentity, report, verifierAttestation } = await withDeadline(async (deadlineSignal) => {
     const identity = await verifiedIdentity(port, deadlineSignal);
-    return { verifierIdentity: identity, report: await port.verifyInstalled(input, deadlineSignal) };
+    const result = installedVerifierResult(await port.verifyInstalled(input, deadlineSignal), port.mode);
+    return { verifierIdentity: identity, ...result };
   }, signal);
   if (!report || typeof report !== "object"
     || report.observedArtifactUrl !== input.artifactUrl
@@ -275,6 +320,7 @@ export async function attestReleaseInstallation(
       csp: normalizedCsp(report.csp),
       webMcpImplementation: report.webMcpImplementation,
       verifierIdentity,
+      ...(verifierAttestation ? { verifierAttestation } : {}),
       report: normalizedReport,
     };
   }
@@ -284,8 +330,41 @@ export async function attestReleaseInstallation(
     csp: normalizedCsp(report.csp),
     webMcpImplementation: report.webMcpImplementation,
     verifierIdentity,
+    ...(verifierAttestation ? { verifierAttestation } : {}),
     report: normalizedReport,
   };
+}
+
+function candidateVerifierResult(
+  value: CandidateVerificationReport | LiveCandidateVerifierResult,
+  mode: VerificationMode,
+): Readonly<{ report: CandidateVerificationReport; verifierAttestation?: CandidateVerifierAttestationV2 }> {
+  if (mode !== "live") return { report: value as CandidateVerificationReport };
+  if (!plainRecordWithKeys(value, ["report", "verifierAttestation"])) {
+    throw new Error("RELEASE_VERIFIER_ATTESTATION_REQUIRED");
+  }
+  const wrapped = value as LiveCandidateVerifierResult;
+  const attestation = wrapped.verifierAttestation;
+  if (!validVerifierAttestationIdentity(attestation, "candidate")) {
+    throw new Error("RELEASE_VERIFIER_ATTESTATION_INVALID");
+  }
+  return { report: wrapped.report, verifierAttestation: attestation };
+}
+
+function installedVerifierResult(
+  value: InstalledVerificationReport | LiveInstalledVerifierResult,
+  mode: VerificationMode,
+): Readonly<{ report: InstalledVerificationReport; verifierAttestation?: InstallationVerifierAttestationV2 }> {
+  if (mode !== "live") return { report: value as InstalledVerificationReport };
+  if (!plainRecordWithKeys(value, ["report", "verifierAttestation"])) {
+    throw new Error("RELEASE_VERIFIER_ATTESTATION_REQUIRED");
+  }
+  const wrapped = value as LiveInstalledVerifierResult;
+  const attestation = wrapped.verifierAttestation;
+  if (!validVerifierAttestationIdentity(attestation, "installation")) {
+    throw new Error("RELEASE_VERIFIER_ATTESTATION_INVALID");
+  }
+  return { report: wrapped.report, verifierAttestation: attestation };
 }
 
 export function configuredReleaseVerificationPort(
@@ -294,6 +373,11 @@ export function configuredReleaseVerificationPort(
     mode?: "live" | "local_live";
     transport?: ReleaseVerifierHttpTransport;
     fetch?: typeof fetch;
+    deploymentIdentityDigest?: string;
+    now?: () => Date;
+    randomUuid?: () => string;
+    randomBytes?: () => Uint8Array;
+    replayGuard?: LiveVerifierReplayGuard;
   }> = {},
 ): ConfiguredReleaseVerificationPort {
   const mode = dependencies.mode ?? "live";
@@ -306,11 +390,17 @@ export function configuredReleaseVerificationPort(
   if (!origin || !validVerifierToken(token) || dependencies.transport && dependencies.fetch) {
     throw new Error("RELEASE_VERIFIER_CONFIGURATION_REQUIRED");
   }
+  const deploymentIdentityDigest = mode === "live"
+    ? dependencies.deploymentIdentityDigest ?? configuredDeploymentIdentity(environment).identityDigest
+    : undefined;
+  if (mode === "live" && (!deploymentIdentityDigest || !HASH.test(deploymentIdentityDigest))) {
+    throw new Error("RELEASE_VERIFIER_CONFIGURATION_REQUIRED");
+  }
   const transport = dependencies.transport ?? (dependencies.fetch
     ? fetchReleaseVerifierTransport(dependencies.fetch)
     : mode === "live" ? pinnedReleaseVerifierTransport() : fetchReleaseVerifierTransport(fetch));
   const verifierOriginDigest = createHash("sha256").update(origin).digest("hex");
-  const request = async <T>(path: string, body: unknown, signal: AbortSignal): Promise<T> => {
+  const legacyRequest = async <T>(path: string, body: unknown, signal: AbortSignal): Promise<T> => {
     return await withDeadline(async (deadlineSignal) => {
       const url = `${origin}${path}`;
       const encodedBody = JSON.stringify(body);
@@ -328,20 +418,122 @@ export function configuredReleaseVerificationPort(
       catch { throw new Error("RELEASE_VERIFIER_RESPONSE_INVALID"); }
     }, signal);
   };
+  const liveRequest = async <T>(
+    path: string,
+    scope: LiveVerifierScope,
+    payload: unknown,
+    signal: AbortSignal,
+  ): Promise<Readonly<{ report: T; verifierAttestation: LiveVerifierAttestationIdentityV2 }>> => {
+    return await withDeadline(async (deadlineSignal) => {
+      const url = `${origin}${path}`;
+      const request = buildLiveVerifierRequest({
+        operation: scope.operation,
+        scope,
+        payload,
+        token,
+      }, {
+        ...(dependencies.now ? { now: dependencies.now } : {}),
+        ...(dependencies.randomUuid ? { randomUuid: dependencies.randomUuid } : {}),
+        ...(dependencies.randomBytes ? { randomBytes: dependencies.randomBytes } : {}),
+      });
+      const response = await transport.request({
+        url,
+        method: "POST",
+        redirect: "error",
+        credentials: "omit",
+        signal: deadlineSignal,
+        headers: {
+          authorization: `Bearer ${token}`,
+          "content-type": "application/json",
+          "x-page2webmcp-signature": request.signature,
+        },
+        body: request.body,
+      });
+      if (!validVerifierResponse(response, url)) throw new Error("RELEASE_VERIFIER_RESPONSE_INVALID");
+      const verified = verifyLiveVerifierResponse({
+        body: response.body,
+        signature: headerValue(response.headers, "x-page2webmcp-signature"),
+        token,
+        request: request.context,
+      }, {
+        ...(dependencies.now ? { now: dependencies.now } : {}),
+        ...(dependencies.replayGuard ? { replayGuard: dependencies.replayGuard } : {}),
+      });
+      return {
+        report: verified.report as T,
+        verifierAttestation: verified.attestation,
+      };
+    }, signal);
+  };
   return {
     mode,
     readiness: async (signal) => {
-      const response = await request<unknown>("/v1/readiness", {}, signal);
-      if (!validReadinessResponse(response, mode)) throw new Error("RELEASE_VERIFIER_IDENTITY_INVALID");
+      const response = mode === "live"
+        ? (await liveRequest<unknown>("/v2/readiness", {
+          operation: "readiness",
+          deploymentIdentityDigest: deploymentIdentityDigest!,
+        }, {}, signal)).report
+        : await legacyRequest<unknown>("/v1/readiness", {}, signal);
+      const protocolVersion = mode === "live"
+        ? LIVE_RELEASE_VERIFIER_PROTOCOL_VERSION : RELEASE_VERIFIER_PROTOCOL_VERSION;
+      if (!validReadinessResponse(response, mode, protocolVersion)) {
+        throw new Error("RELEASE_VERIFIER_IDENTITY_INVALID");
+      }
       return {
-        protocolVersion: RELEASE_VERIFIER_PROTOCOL_VERSION,
+        protocolVersion,
         mode,
         webMcpImplementation: "native",
         verifierOriginDigest,
       };
     },
-    verifyCandidate: (input, signal) => request("/v1/candidates/verify", input, signal),
-    verifyInstalled: (input, signal) => request("/v1/installations/verify", input, signal),
+    verifyCandidate: (input, signal) => {
+      if (mode !== "live") return legacyRequest("/v1/candidates/verify", input, signal);
+      const context = input.liveContext;
+      const payload = {
+        code: input.code,
+        contentHash: input.contentHash,
+        integrity: input.integrity,
+        manifest: input.manifest,
+        targetOrigin: input.targetOrigin,
+        expectedTools: input.expectedTools,
+      };
+      return liveRequest("/v2/candidates/verify", {
+        operation: "candidate",
+        projectId: context?.projectId ?? "",
+        analysisRunId: context?.analysisRunId ?? "",
+        sourceIdentityHash: context?.sourceIdentityHash ?? "",
+        targetOrigin: input.targetOrigin,
+        environment: context?.environment ?? "" as "test",
+        contentHash: input.contentHash,
+      }, payload, signal) as Promise<LiveCandidateVerifierResult>;
+    },
+    verifyInstalled: (input, signal) => {
+      if (mode !== "live") return legacyRequest("/v1/installations/verify", input, signal);
+      const context = input.liveContext;
+      const payload = {
+        pageUrl: input.pageUrl,
+        artifactUrl: input.artifactUrl,
+        downloadUrl: input.downloadUrl,
+        localOnly: input.localOnly,
+        contentHash: input.contentHash,
+        integrity: input.integrity,
+        manifest: input.manifest,
+        targetOrigin: input.targetOrigin,
+        expectedTools: input.expectedTools,
+        ...(input.selfHostedUrl ? { selfHostedUrl: input.selfHostedUrl } : {}),
+      };
+      return liveRequest("/v2/installations/verify", {
+        operation: "installation",
+        projectId: context?.projectId ?? "",
+        releaseId: context?.releaseId ?? "",
+        installationOperationId: context?.installationOperationId ?? "",
+        sourceIdentityHash: context?.sourceIdentityHash ?? "",
+        pageUrl: input.pageUrl,
+        targetOrigin: input.targetOrigin,
+        environment: context?.environment ?? "" as "test",
+        selectedHash: input.contentHash,
+      }, payload, signal) as Promise<LiveInstalledVerifierResult>;
+    },
   };
 }
 
@@ -454,13 +646,17 @@ function hasHeader(headers: Readonly<Record<string, string>> | undefined, expect
   return !!headers && Object.keys(headers).some((name) => name.toLowerCase() === expectedName);
 }
 
-function validReadinessResponse(value: unknown, mode: "live" | "local_live"): boolean {
+function validReadinessResponse(
+  value: unknown,
+  mode: "live" | "local_live",
+  protocolVersion: 1 | 2,
+): boolean {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const record = value as Record<string, unknown>;
   const keys = Object.keys(record).sort(compareStrings);
   return keys.length === 3
     && keys[0] === "mode" && keys[1] === "protocolVersion" && keys[2] === "webMcpImplementation"
-    && record.protocolVersion === RELEASE_VERIFIER_PROTOCOL_VERSION
+    && record.protocolVersion === protocolVersion
     && record.mode === mode
     && record.webMcpImplementation === "native";
 }
@@ -470,14 +666,16 @@ async function verifiedIdentity(port: ReleaseVerificationPort, signal: AbortSign
     ? await port.readiness(signal)
     : port.mode === "hermetic" ? hermeticVerifierIdentity() : undefined;
   if (!identity) throw new Error("RELEASE_VERIFIER_IDENTITY_REQUIRED");
+  const expectedProtocolVersion = port.mode === "live"
+    ? LIVE_RELEASE_VERIFIER_PROTOCOL_VERSION : RELEASE_VERIFIER_PROTOCOL_VERSION;
   const keys = Object.keys(identity).sort(compareStrings);
   if (keys.length !== 4 || keys[0] !== "mode" || keys[1] !== "protocolVersion"
     || keys[2] !== "verifierOriginDigest" || keys[3] !== "webMcpImplementation"
-    || identity.protocolVersion !== RELEASE_VERIFIER_PROTOCOL_VERSION
+    || identity.protocolVersion !== expectedProtocolVersion
     || identity.mode !== port.mode || identity.webMcpImplementation !== "native"
     || !HASH.test(identity.verifierOriginDigest)) throw new Error("RELEASE_VERIFIER_IDENTITY_INVALID");
   return {
-    protocolVersion: RELEASE_VERIFIER_PROTOCOL_VERSION,
+    protocolVersion: expectedProtocolVersion,
     mode: identity.mode,
     webMcpImplementation: "native",
     verifierOriginDigest: identity.verifierOriginDigest,
@@ -676,6 +874,30 @@ function validTools(value: readonly string[]): boolean {
   return Array.isArray(value) && value.length > 0 && value.length <= 100
     && value.every((name) => typeof name === "string" && /^[a-z][a-z0-9_]{0,63}$/.test(name))
     && new Set(value).size === value.length;
+}
+
+function validVerifierAttestationIdentity<Operation extends "candidate" | "installation">(
+  value: unknown,
+  operation: Operation,
+): value is LiveVerifierAttestationIdentityV2 & Readonly<{ operation: Operation }> {
+  if (!plainRecordWithKeys(value, [
+    "attestationId", "attestedAt", "expiresAt", "issuedAt", "nonceDigest", "operation",
+    "payloadDigest", "protocolVersion", "requestId", "scopeDigest",
+  ])) return false;
+  const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+  const timestamp = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+  return value.protocolVersion === LIVE_RELEASE_VERIFIER_PROTOCOL_VERSION
+    && value.operation === operation
+    && typeof value.attestationId === "string" && uuid.test(value.attestationId)
+    && typeof value.requestId === "string" && uuid.test(value.requestId)
+    && typeof value.nonceDigest === "string" && HASH.test(value.nonceDigest)
+    && typeof value.scopeDigest === "string" && HASH.test(value.scopeDigest)
+    && typeof value.payloadDigest === "string" && HASH.test(value.payloadDigest)
+    && typeof value.issuedAt === "string" && timestamp.test(value.issuedAt)
+    && typeof value.expiresAt === "string" && timestamp.test(value.expiresAt)
+    && typeof value.attestedAt === "string" && timestamp.test(value.attestedAt)
+    && Date.parse(value.issuedAt) <= Date.parse(value.attestedAt)
+    && Date.parse(value.attestedAt) < Date.parse(value.expiresAt);
 }
 
 function equalStrings(left: readonly string[], right: readonly string[]): boolean {

@@ -1,6 +1,7 @@
 import { getControlPlaneRepository } from "../../../packages/database/src/factory.ts";
 import type { ControlPlaneRepository } from "../../../packages/database/src/control-plane.ts";
 import { validateWorkerRuntimeConfiguration } from "../../control-plane/src/config.ts";
+import { deploymentIdentityMissingControls } from "../../control-plane/src/deployment-identity.ts";
 import {
   registerObservability,
   shutdownObservability
@@ -59,7 +60,14 @@ export async function runProductionWorker(
       }
       throw error;
     }
-    (dependencies.validateConfiguration ?? validateWorkerRuntimeConfiguration)(environment);
+    try {
+      (dependencies.validateConfiguration ?? validateWorkerRuntimeConfiguration)(environment);
+    } catch (error) {
+      if (error instanceof Error && error.message === "DEPLOYMENT_IDENTITY_CONFIGURATION_REQUIRED") {
+        throw new WorkerStartupConfigurationError(error.message, deploymentIdentityMissingControls(environment));
+      }
+      throw error;
+    }
     if (provider.startupProbe) await provider.startupProbe(signal);
     repository = (dependencies.getRepository ?? getControlPlaneRepository)();
     const runtime = (dependencies.createRuntime ?? createProductionWorkerRuntimeFromProvider)(repository, provider);

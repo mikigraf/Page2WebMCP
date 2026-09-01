@@ -79,8 +79,17 @@ export type SourceSnapshotRecord = Readonly<{
   sourceIdentityHash: string;
   artifactReference?: string;
   contentHash?: string;
+  sourceArtifact?: ImmutableSourceArtifactIdentity;
   isFixture: boolean;
   createdAt: string;
+}>;
+
+export type ImmutableSourceArtifactIdentity = Readonly<{
+  contentHash: string;
+  artifactReference: string;
+  finalUrl: string;
+  mimeType: string;
+  sizeBytes: number;
 }>;
 
 export type WorkflowRunRecord = Readonly<{

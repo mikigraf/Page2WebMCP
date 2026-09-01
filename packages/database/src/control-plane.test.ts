@@ -7,6 +7,7 @@ import { compileWebMcpRelease } from "../../compiler/src/compiler.ts";
 import {
   capabilityStateDigest,
   InMemoryControlPlaneRepository,
+  normalizePersistedAnalysisSourceArtifact,
   parsePersistedSourceConfiguration,
   RELEASE_VERIFICATION_CHECK_NAMES,
   RepositoryError,
@@ -15,6 +16,31 @@ import {
   type RepositoryActor,
   type VerificationRequest,
 } from "./control-plane.ts";
+
+test("durable OpenAPI source identity remains valid after transient evidence retention", () => {
+  const contentHash = "d".repeat(64);
+  const sourceArtifact = {
+    contentHash,
+    artifactReference: `urn:sha256:${contentHash}`,
+    finalUrl: "https://specs.widgets.example/openapi.json",
+    mimeType: "application/json",
+    sizeBytes: 87,
+  } as const;
+  const provenance = {
+    mode: "openapi", adapter: "bounded-openapi", adapterVersion: 1, fixture: false,
+  } as const;
+
+  assert.deepEqual(normalizePersistedAnalysisSourceArtifact(
+    sourceArtifact,
+    provenance,
+    sourceArtifact,
+  ), sourceArtifact);
+  assert.throws(() => normalizePersistedAnalysisSourceArtifact(
+    sourceArtifact,
+    provenance,
+    { ...sourceArtifact, sizeBytes: 88 },
+  ), (error: unknown) => error instanceof RepositoryError && error.code === "SOURCE_SNAPSHOT_STALE");
+});
 
 function passedVerificationChecks() {
   return RELEASE_VERIFICATION_CHECK_NAMES.map((name) => ({ name, status: "passed" as const }));
@@ -285,17 +311,63 @@ test("analysis completion persists only the exact source-compatible provider pro
     adapterVersion: 1 as const,
     fixture: false as const,
   };
+  const sourceContentHash = createHash("sha256").update("openapi-document", "utf8").digest("hex");
+  const sourceArtifact = {
+    contentHash: sourceContentHash,
+    artifactReference: `urn:sha256:${sourceContentHash}`,
+    finalUrl: "https://widgets.example/openapi.json",
+    mimeType: "application/json",
+    sizeBytes: Buffer.byteLength("openapi-document", "utf8"),
+  } as const;
+  const evidenceContent = JSON.stringify({ sourceDigest: sourceArtifact.artifactReference });
   const completed = await repository.completeAnalysis("provider-provenance-worker", run.id, {
     capabilities: [],
     diagnostics: [{ code: "NO_SUPPORTED_OPERATIONS", operationKey: "document" }],
     evidence: [{
       source: "openapi",
-      content: "{}",
-      reference: `urn:sha256:${createHash("sha256").update("{}").digest("hex")}`,
+      content: evidenceContent,
+      reference: `urn:sha256:${createHash("sha256").update(evidenceContent).digest("hex")}`,
     }],
     providerProvenance,
+    sourceArtifact,
   }, claim!.leaseGeneration);
   assert.deepEqual(completed.providerProvenance, providerProvenance);
+  assert.deepEqual((await repository.listSourceSnapshots(owner, project.id))[0]?.sourceArtifact, sourceArtifact);
+
+  const changedRun = await repository.enqueueAnalysis(owner, {
+    projectId: project.id,
+    idempotencyKey: "provider-provenance-analysis-changed",
+    inputHash: "provider-provenance-analysis-changed",
+  });
+  const changedClaim = await repository.claimAnalysis("provider-provenance-worker-changed", 60_000);
+  assert.equal(changedClaim?.id, changedRun.id);
+  const changedHash = "f".repeat(64);
+  const changedEvidence = JSON.stringify({ sourceDigest: `urn:sha256:${changedHash}` });
+  await assert.rejects(repository.completeAnalysis("provider-provenance-worker-changed", changedRun.id, {
+    capabilities: [],
+    diagnostics: [{ code: "NO_SUPPORTED_OPERATIONS", operationKey: "document" }],
+    evidence: [{
+      source: "openapi", content: evidenceContent,
+      reference: `urn:sha256:${createHash("sha256").update(evidenceContent).digest("hex")}`,
+    }],
+    providerProvenance,
+  }, changedClaim!.leaseGeneration), (error: unknown) => error instanceof RepositoryError
+    && error.code === "INVALID_STATE");
+  await assert.rejects(repository.completeAnalysis("provider-provenance-worker-changed", changedRun.id, {
+    capabilities: [],
+    diagnostics: [{ code: "NO_SUPPORTED_OPERATIONS", operationKey: "document" }],
+    evidence: [{
+      source: "openapi", content: changedEvidence,
+      reference: `urn:sha256:${createHash("sha256").update(changedEvidence).digest("hex")}`,
+    }],
+    providerProvenance,
+    sourceArtifact: {
+      ...sourceArtifact,
+      contentHash: changedHash,
+      artifactReference: `urn:sha256:${changedHash}`,
+    },
+  }, changedClaim!.leaseGeneration), (error: unknown) => error instanceof RepositoryError
+    && error.code === "SOURCE_SNAPSHOT_STALE");
 
   const invalidProject = await repository.createProject(owner, {
     name: "Invalid provider provenance",

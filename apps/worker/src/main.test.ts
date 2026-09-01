@@ -100,6 +100,43 @@ test("website control protocol support fails startup before a repository can lea
   assert.equal(repositoryOpened, false);
 });
 
+test("a configured provider still fails startup with exact missing deployment identity controls", async () => {
+  let repositoryOpened = false;
+  const provider = {
+    analysisSourceTypes: ["openapi"] as const,
+    provenance: {
+      mode: "openapi" as const,
+      adapter: "bounded-openapi" as const,
+      adapterVersion: 1 as const,
+      fixture: false as const,
+    },
+    analyze: async () => ({ capabilities: [], diagnostics: [], evidence: [] }),
+    probe: async () => undefined,
+  };
+  await assert.rejects(runProductionWorker({
+    PAGE2WEBMCP_STORAGE_MODE: "postgres",
+    PAGE2WEBMCP_PROVIDER_MODE: "openapi",
+    DATABASE_URL: "postgresql://database.example/page2webmcp",
+  }, {
+    signal: AbortSignal.abort(),
+    constructProvider: () => provider,
+    getRepository: () => {
+      repositoryOpened = true;
+      return new InMemoryControlPlaneRepository();
+    },
+  }), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal(error.message, "DEPLOYMENT_IDENTITY_CONFIGURATION_REQUIRED");
+    assert.deepEqual((error as Error & { missingEnvironment: readonly string[] }).missingEnvironment, [
+      "PAGE2WEBMCP_APPLICATION_RELEASE_ID",
+      "PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN",
+      "PAGE2WEBMCP_GIT_COMMIT_SHA",
+    ]);
+    return true;
+  });
+  assert.equal(repositoryOpened, false);
+});
+
 test("website controls fail startup with sorted operator key names before repository construction", async () => {
   const failure = await runFailure({
     PAGE2WEBMCP_PROVIDER_MODE: "website",

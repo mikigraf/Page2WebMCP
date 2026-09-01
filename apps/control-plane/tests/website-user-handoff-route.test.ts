@@ -20,6 +20,7 @@ import type {
 } from "../src/website-user-handoff.ts";
 import { setWebsiteUserHandoffPortForTest } from "../src/website-user-handoff.ts";
 import { authenticatedHeaders, installTestRepository, owner, viewer } from "./auth-test-helpers.ts";
+import { websiteSuspensionEvidenceFixture } from "../../../test-support/website-suspension-evidence.ts";
 
 const pendingOwnership: WebsiteOwnershipState = {
   state: "pending",
@@ -330,12 +331,19 @@ test("website run projections expose only exact durable authentication wait and 
   const claim = await repository.claimAnalysis("website-authentication-projection-worker", 60_000, ["website"]);
   assert.equal(claim?.id, run.id);
   const expiresAt = new Date(Date.now() + 5 * 60_000).toISOString();
+  const checkpointReference = `urn:sha256:${"c".repeat(64)}`;
+  const targetOriginDigest = createHash("sha256").update("https://widgets.example", "utf8").digest("hex");
   await repository.waitAnalysisForAuthentication("website-authentication-projection-worker", run.id, {
-    checkpointReference: `urn:sha256:${"c".repeat(64)}`,
+    checkpointReference,
     sourceSnapshotId: claim!.sourceSnapshotId,
     sourceIdentityHash: snapshot.sourceIdentityHash,
-    targetOriginDigest: createHash("sha256").update("https://widgets.example", "utf8").digest("hex"),
+    targetOriginDigest,
     expiresAt,
+    suspensionEvidence: websiteSuspensionEvidenceFixture({
+      checkpointReference, sourceSnapshotId: claim!.sourceSnapshotId,
+      sourceIdentityHash: snapshot.sourceIdentityHash, targetOriginDigest, expiresAt,
+      workerId: "website-authentication-projection-worker", leaseGeneration: claim!.leaseGeneration,
+    }),
     idempotencyKey: "website-authentication-projection-wait",
     inputHash: "website-authentication-projection-wait",
   }, claim!.leaseGeneration);

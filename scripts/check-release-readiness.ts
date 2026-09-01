@@ -6,6 +6,10 @@ import {
   type VerifierIdentity,
 } from "../apps/control-plane/src/release-verification.ts";
 import {
+  configuredDeploymentIdentity,
+  type DeploymentIdentityDependencies,
+} from "../apps/control-plane/src/deployment-identity.ts";
+import {
   createProductionProvider,
   inspectProductionProviderConfiguration,
 } from "../apps/worker/src/production-runtime.ts";
@@ -59,6 +63,11 @@ const CURRENT_MIGRATION_LEDGER = [
   "20260901090842_website_authentication_cleanup_lease.sql",
   "20260901092107_website_authentication_cleanup_attempt_budget.sql",
   "20260901094032_allow_waiting_authentication_failure.sql",
+  "20260901100000_openapi_document_freeze.sql",
+  "20260901110000_website_live_receipt_evidence.sql",
+  "20260901120000_live_verifier_attestation_v2.sql",
+  "20260901130000_production_live_receipt_evidence.sql",
+  "20260901140000_live_verifier_attestation_v2_repair.sql",
 ] as const;
 
 type Environment = Readonly<Record<string, string | undefined>>;
@@ -71,9 +80,17 @@ type Output = Readonly<{
 type CliResult = Readonly<{ output: Output; exitCode: 0 | 1 | 2 }>;
 
 export type ReadinessCliDependencies = Readonly<{
+  now?: () => Date;
   fetch?: typeof fetch;
+  deploymentIdentityDigest?: string;
+  loadBuildIdentity?: NonNullable<DeploymentIdentityDependencies["loadBuildIdentity"]>;
   constructProvider?: typeof createProductionProvider;
-  handshake?: (environment: Environment, mode: "local_live" | "live", signal: AbortSignal) => Promise<VerifierIdentity>;
+  handshake?: (
+    environment: Environment,
+    mode: "local_live" | "live",
+    signal: AbortSignal,
+    binding: Readonly<{ deploymentIdentityDigest?: string }>,
+  ) => Promise<VerifierIdentity>;
   createMaintenanceRepository?: (input: Readonly<{
     connectionString: string;
     mode: "local-live" | "live";
@@ -113,6 +130,21 @@ export async function runReadinessCli(
         missingKeys: controls.missingKeys },
       exitCode: 2,
     };
+  }
+  let deploymentIdentityDigest: string | undefined;
+  if (mode === "live") {
+    try {
+      const exact = configuredDeploymentIdentity(environment, {
+        ...(dependencies.loadBuildIdentity ? { loadBuildIdentity: dependencies.loadBuildIdentity } : {}),
+      }).identityDigest;
+      if (dependencies.deploymentIdentityDigest !== undefined
+        && dependencies.deploymentIdentityDigest !== exact) {
+        throw new Error("DEPLOYMENT_IDENTITY_MISMATCH");
+      }
+      deploymentIdentityDigest = exact;
+    } catch (error) {
+      return result("failed", deploymentIdentityFailureCode(error), 1);
+    }
   }
   const constructProvider = dependencies.constructProvider ?? createProductionProvider;
   let provider: ReturnType<typeof createProductionProvider>;
@@ -215,6 +247,7 @@ export async function runReadinessCli(
       environment,
       mode === "live" ? "live" : "local_live",
       new AbortController().signal,
+      { ...(deploymentIdentityDigest ? { deploymentIdentityDigest } : {}) },
     );
   } catch {
     return result("failed", "RELEASE_VERIFIER_READINESS_FAILED", 1);
@@ -233,6 +266,7 @@ export async function runReadinessCli(
     storage: artifact,
     verifier,
     installationProof: proof,
+    evaluatedAt: (dependencies.now ?? (() => new Date()))().toISOString(),
   });
   const exitCode = output.status === "passed" ? 0 : output.status === "skipped" ? 2 : 1;
   return { output, exitCode };
@@ -272,9 +306,22 @@ async function defaultHandshake(
   environment: Environment,
   mode: "local_live" | "live",
   signal: AbortSignal,
+  binding: Readonly<{ deploymentIdentityDigest?: string }>,
 ): Promise<VerifierIdentity> {
-  const port = configuredReleaseVerificationPort(environment, { mode });
+  const port = configuredReleaseVerificationPort(environment, {
+    mode,
+    ...(binding.deploymentIdentityDigest
+      ? { deploymentIdentityDigest: binding.deploymentIdentityDigest }
+      : {}),
+  });
   return port.readiness(signal);
+}
+
+function deploymentIdentityFailureCode(error: unknown): string {
+  const message = error instanceof Error ? error.message : "";
+  return /^DEPLOYMENT_(?:BUILD|IDENTITY)_[A-Z_]+$/.test(message)
+    ? message
+    : "DEPLOYMENT_IDENTITY_VERIFICATION_FAILED";
 }
 
 async function fetchSelectedArtifact(
@@ -380,6 +427,15 @@ async function localFacts() {
   const selectedProviderContext = await readFile(new URL(
     "../supabase/migrations/20260901000000_selected_provider_probe_context.sql", import.meta.url,
   ), "utf8");
+  const openApiDocumentFreeze = await readFile(new URL(
+    "../supabase/migrations/20260901100000_openapi_document_freeze.sql", import.meta.url,
+  ), "utf8");
+  const verifierAttestationV2 = await readFile(new URL(
+    "../supabase/migrations/20260901120000_live_verifier_attestation_v2.sql", import.meta.url,
+  ), "utf8");
+  const verifierAttestationV2Repair = await readFile(new URL(
+    "../supabase/migrations/20260901140000_live_verifier_attestation_v2_repair.sql", import.meta.url,
+  ), "utf8");
   const task6 = await readFile(new URL(
     "../supabase/migrations/20260830094622_trusted_release_installations.sql", import.meta.url,
   ), "utf8");
@@ -391,6 +447,20 @@ async function localFacts() {
       && /grant execute[^;]+page2webmcp_maintenance/is.test(singleInstallationProof)
       && /selected_provider_probe_context/i.test(selectedProviderContext)
       && /grant execute[^;]+page2webmcp_maintenance/is.test(selectedProviderContext)
+      && /source_artifact_metadata/i.test(openApiDocumentFreeze)
+      && /force row level security/i.test(openApiDocumentFreeze)
+      && /revoke update \(content_hash, artifact_reference, source_artifact_metadata\)/i.test(openApiDocumentFreeze)
+      && /grant execute[^;]+page2webmcp_maintenance/is.test(openApiDocumentFreeze)
+      && /verification_runs_candidate_attestation_id_uidx/i.test(verifierAttestationV2)
+      && /release_installations_installation_attestation_id_uidx/i.test(verifierAttestationV2)
+      && /selected_native_installation_proof/i.test(verifierAttestationV2)
+      && /grant execute[^;]+page2webmcp_maintenance/is.test(verifierAttestationV2)
+      && /validate constraint verification_runs_live_verifier_attestation_check/i.test(verifierAttestationV2Repair)
+      && /validate constraint release_installations_live_verifier_attestation_check/i.test(verifierAttestationV2Repair)
+      && /create or replace function private\.selected_native_installation_proof/i.test(verifierAttestationV2Repair)
+      && /not installation\.route_interception/i.test(verifierAttestationV2Repair)
+      && /constraint_row\.convalidated/i.test(verifierAttestationV2Repair)
+      && /grant execute[^;]+page2webmcp_maintenance/is.test(verifierAttestationV2Repair)
       && /github_draft_pull_requests/i.test(durableResultSurfaces)
       && /force row level security/i.test(durableResultSurfaces)
       && /security definer/i.test(analysisSourceLock)

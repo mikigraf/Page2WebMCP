@@ -9,6 +9,7 @@ import {
   type ResumeAnalysisAfterAuthenticationInput,
   type WaitAnalysisForAuthenticationInput,
 } from "./control-plane.ts";
+import { websiteSuspensionEvidenceFixture } from "../../../test-support/website-suspension-evidence.ts";
 
 const owner: RepositoryActor = {
   id: "11111111-1111-1111-1111-111111111111",
@@ -71,11 +72,11 @@ async function runningWebsite(
 }
 
 function waitInput(
-  source: Pick<Awaited<ReturnType<typeof runningWebsite>>, "sourceSnapshotId" | "sourceIdentityHash">,
+  source: Pick<Awaited<ReturnType<typeof runningWebsite>>, "sourceSnapshotId" | "sourceIdentityHash" | "claim">,
   expiresAt: string,
   overrides: Partial<WaitAnalysisForAuthenticationInput> = {},
 ): WaitAnalysisForAuthenticationInput {
-  return {
+  const command = {
     checkpointReference: CHECKPOINT_REFERENCE,
     sourceSnapshotId: source.sourceSnapshotId,
     sourceIdentityHash: source.sourceIdentityHash,
@@ -84,6 +85,18 @@ function waitInput(
     idempotencyKey: "authentication-wait-command",
     inputHash: "authentication-wait-command",
     ...overrides,
+  };
+  return {
+    ...command,
+    suspensionEvidence: overrides.suspensionEvidence ?? websiteSuspensionEvidenceFixture({
+      checkpointReference: command.checkpointReference,
+      sourceSnapshotId: command.sourceSnapshotId,
+      sourceIdentityHash: command.sourceIdentityHash,
+      targetOriginDigest: command.targetOriginDigest,
+      expiresAt: command.expiresAt,
+      workerId: command.suspensionEvidence ? "unused" : source.claim.leaseOwner!,
+      leaseGeneration: source.claim.leaseGeneration,
+    }),
   };
 }
 
@@ -144,6 +157,15 @@ test("website authentication wait atomically releases both leases and is idempot
     { ...input, inputHash: "changed-wait-command" },
     source.claim.leaseGeneration,
   ), (error: unknown) => error instanceof RepositoryError && error.code === "IDEMPOTENCY_CONFLICT");
+  await assert.rejects(repository.waitAnalysisForAuthentication(
+    "authentication-worker-atomic-wait",
+    source.runId,
+    {
+      ...input,
+      suspensionEvidence: { ...input.suspensionEvidence, ownershipDecisionDigest: "f".repeat(64) },
+    },
+    source.claim.leaseGeneration,
+  ), (error: unknown) => error instanceof RepositoryError && error.code === "IDEMPOTENCY_CONFLICT");
   assert.equal((await repository.listWorkflowEvents(owner, source.runId))
     .filter(({ type }) => type === "task.waiting").length, 1);
 });
@@ -180,7 +202,9 @@ test("website authentication resume requires exact evidence and returns it on th
   assert.deepEqual(await repository.resumeAnalysisAfterAuthentication(editor, resumeInput(source)), consumed);
   const claim = await repository.claimAnalysis("authentication-resumed-worker", 60_000, ["website"]);
   assert.equal(claim?.id, source.runId);
-  assert.deepEqual(claim?.authenticationCheckpoint, {
+  const { liveReceiptEvidence, ...publicClaimCheckpoint } = claim!.authenticationCheckpoint!;
+  assert.ok(liveReceiptEvidence);
+  assert.deepEqual(publicClaimCheckpoint, {
     checkpointReference: CHECKPOINT_REFERENCE,
     authenticationEvidenceReference: AUTHENTICATION_EVIDENCE_REFERENCE,
     sourceSnapshotId: source.sourceSnapshotId,
@@ -227,15 +251,22 @@ test("completion, permanent failure, cancellation, and expiry close authenticati
   await repository.resumeAnalysisAfterAuthentication(owner, resumeInput(completedSource));
   const completedClaim = await repository.claimAnalysis("authentication-terminal-complete", 60_000, ["website"]);
   assert.equal(completedClaim?.id, completedSource.runId);
-  await repository.completeAnalysis("authentication-terminal-complete", completedSource.runId, {
+  const completionResult = {
     capabilities: [],
     diagnostics: [{ code: "NO_SUPPORTED_OPERATIONS", operationKey: "website" }],
     evidence: [{
-      source: "runtime",
+      source: "runtime" as const,
       content: "{}",
       reference: "urn:sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
     }],
-  }, completedClaim!.leaseGeneration);
+  };
+  const resultCheckpoint = await repository.checkpointWebsiteAuthenticationResult(
+    "authentication-terminal-complete", completedSource.runId, completionResult, completedClaim!.leaseGeneration,
+  );
+  await repository.completeCheckpointedWebsiteAuthenticationAnalysis(
+    "authentication-terminal-complete", completedSource.runId, resultCheckpoint.resultHash,
+    completedClaim!.leaseGeneration,
+  );
   assert.equal((await repository.getWebsiteAuthenticationWait(owner, completedSource.runId))?.state, "completed");
 
   const failedSource = await runningWebsite(repository, "failed");

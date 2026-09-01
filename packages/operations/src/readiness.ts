@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 export const PINNED_RELEASE_VERSIONS = Object.freeze({
   node: "24",
   pnpm: "10.14.0",
@@ -64,9 +66,52 @@ type SelectedSourceIdentity = Readonly<{
   sourceIdentityHash: string;
 }>;
 
+export type FrozenOpenApiSourceIdentity = Readonly<{
+  contentHash: string;
+  artifactReference: string;
+  finalUrl: string;
+  mimeType: string;
+  sizeBytes: number;
+}>;
+
+const OPENAPI_SOURCE_MIME_TYPES = new Set([
+  "application/json", "application/openapi+json", "application/vnd.oai.openapi+json",
+  "application/yaml", "application/x-yaml", "text/yaml", "application/vnd.oai.openapi",
+  "application/vnd.oai.openapi+yaml",
+]);
+
+export function normalizeFrozenOpenApiSourceIdentity(value: unknown): FrozenOpenApiSourceIdentity {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+    || Object.keys(value).sort().join(",") !== "artifactReference,contentHash,finalUrl,mimeType,sizeBytes") {
+    throw new Error("OPENAPI_SOURCE_IDENTITY_INVALID");
+  }
+  const identity = value as Record<string, unknown>;
+  let finalUrl: URL;
+  try { finalUrl = new URL(String(identity.finalUrl)); }
+  catch { throw new Error("OPENAPI_SOURCE_IDENTITY_INVALID"); }
+  if (typeof identity.contentHash !== "string" || !/^[0-9a-f]{64}$/.test(identity.contentHash)
+    || identity.artifactReference !== `urn:sha256:${identity.contentHash}`
+    || typeof identity.finalUrl !== "string" || identity.finalUrl.length > 4_096
+    || finalUrl.protocol !== "https:" || finalUrl.username || finalUrl.password
+    || finalUrl.toString() !== identity.finalUrl
+    || typeof identity.mimeType !== "string" || !OPENAPI_SOURCE_MIME_TYPES.has(identity.mimeType)
+    || !Number.isSafeInteger(identity.sizeBytes) || Number(identity.sizeBytes) < 1
+    || Number(identity.sizeBytes) > 1_000_000) {
+    throw new Error("OPENAPI_SOURCE_IDENTITY_INVALID");
+  }
+  return {
+    contentHash: identity.contentHash,
+    artifactReference: identity.artifactReference as string,
+    finalUrl: identity.finalUrl,
+    mimeType: identity.mimeType,
+    sizeBytes: Number(identity.sizeBytes),
+  };
+}
+
 export type SelectedProviderProbeContext =
   | SelectedSourceIdentity & Readonly<{
     sourceType: "openapi";
+    sourceArtifact: FrozenOpenApiSourceIdentity;
     sourceConfiguration: Readonly<{
       kind: "openapi";
       targetOrigin: string;
@@ -139,6 +184,33 @@ export type NativeInstallationProof = Readonly<{
   zeroModelCalls: boolean;
   trustedLoaderEnforced: boolean;
   candidateChecksPassed: boolean;
+  projectId: string;
+  analysisRunId: string;
+  releaseId: string;
+  sourceIdentityHash: string;
+  targetOrigin: string;
+  environment: "test" | "staging" | "production";
+  installationPageUrl: string;
+  installationOperationId: string;
+  candidateAttestationId: string;
+  candidateAttestationRequestId: string;
+  candidateAttestationNonceDigest: string;
+  candidateAttestationOperation: "candidate";
+  candidateAttestationScopeDigest: string;
+  candidateAttestationPayloadDigest: string;
+  candidateAttestationIssuedAt: string;
+  candidateAttestationExpiresAt: string;
+  candidateAttestationAttestedAt: string;
+  installationAttestationId: string;
+  installationAttestationRequestId: string;
+  installationAttestationNonceDigest: string;
+  installationAttestationOperation: "installation";
+  installationAttestationScopeDigest: string;
+  installationAttestationPayloadDigest: string;
+  installationAttestationIssuedAt: string;
+  installationAttestationExpiresAt: string;
+  installationAttestationAttestedAt: string;
+  installationVerifiedAt: string;
 }>;
 
 export type DeploymentReadinessInput = Readonly<{
@@ -159,6 +231,7 @@ export type DeploymentReadinessInput = Readonly<{
   }>;
   verifier?: ReadinessVerifierIdentity;
   installationProof?: NativeInstallationProof;
+  evaluatedAt?: string;
 }>;
 
 export type DeploymentReadiness = Readonly<{
@@ -194,6 +267,8 @@ export function evaluateDeploymentReadiness(input: DeploymentReadinessInput): De
 const SHA256 = /^[0-9a-f]{64}$/;
 const SRI = /^sha384-[A-Za-z0-9+/]+={0,2}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const EXACT_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 const HOSTED_PUBLIC_ORIGIN =
   "https://bimqgiedckdurqiywctl.supabase.co/storage/v1/object/public/page2webmcp-releases";
 
@@ -211,7 +286,7 @@ function exactNativeInstallationProof(input: DeploymentReadinessInput): boolean 
     && storage.localOnly === false
     && storage.contentHash === selected
     && SRI.test(storage.integrity)
-    && verifier.protocolVersion === 1
+    && verifier.protocolVersion === 2
     && verifier.mode === "live"
     && verifier.webMcpImplementation === "native"
     && SHA256.test(verifier.verifierOriginDigest)
@@ -263,7 +338,107 @@ function exactNativeInstallationProof(input: DeploymentReadinessInput): boolean 
     && proof.zeroControlPlaneCalls === true
     && proof.zeroModelCalls === true
     && proof.trustedLoaderEnforced === true
-    && proof.candidateChecksPassed === true;
+    && proof.candidateChecksPassed === true
+    && exactLiveVerifierProofScope(input, proof);
+}
+
+function exactLiveVerifierProofScope(input: DeploymentReadinessInput, proof: NativeInstallationProof): boolean {
+  const evaluatedAt = exactTimestampMs(input.evaluatedAt);
+  const candidateIssuedAt = exactTimestampMs(proof.candidateAttestationIssuedAt);
+  const candidateExpiresAt = exactTimestampMs(proof.candidateAttestationExpiresAt);
+  const candidateAttestedAt = exactTimestampMs(proof.candidateAttestationAttestedAt);
+  const installationIssuedAt = exactTimestampMs(proof.installationAttestationIssuedAt);
+  const installationExpiresAt = exactTimestampMs(proof.installationAttestationExpiresAt);
+  const installationAttestedAt = exactTimestampMs(proof.installationAttestationAttestedAt);
+  const installationVerifiedAt = exactTimestampMs(proof.installationVerifiedAt);
+  if (evaluatedAt === undefined || candidateIssuedAt === undefined || candidateExpiresAt === undefined
+    || candidateAttestedAt === undefined || installationIssuedAt === undefined
+    || installationExpiresAt === undefined || installationAttestedAt === undefined
+    || installationVerifiedAt === undefined) return false;
+  if (!UUID_V4.test(proof.projectId) || !UUID_V4.test(proof.analysisRunId) || !UUID_V4.test(proof.releaseId)
+    || !UUID_V4.test(proof.candidateAttestationId) || !UUID_V4.test(proof.candidateAttestationRequestId)
+    || !UUID_V4.test(proof.installationAttestationId) || !UUID_V4.test(proof.installationAttestationRequestId)
+    || proof.candidateAttestationId === proof.installationAttestationId
+    || proof.candidateAttestationRequestId === proof.installationAttestationRequestId
+    || !SHA256.test(proof.sourceIdentityHash) || !SHA256.test(proof.installationOperationId)
+    || !SHA256.test(proof.candidateAttestationNonceDigest)
+    || !SHA256.test(proof.candidateAttestationPayloadDigest)
+    || !SHA256.test(proof.installationAttestationNonceDigest)
+    || !SHA256.test(proof.installationAttestationPayloadDigest)
+    || proof.candidateAttestationOperation !== "candidate"
+    || proof.installationAttestationOperation !== "installation"
+    || !["test", "staging", "production"].includes(proof.environment)
+    || exactHttpsOrigin(proof.targetOrigin) !== proof.targetOrigin
+    || !exactInstallationPage(proof.installationPageUrl, proof.targetOrigin)) return false;
+  if (candidateIssuedAt > candidateAttestedAt || candidateAttestedAt >= candidateExpiresAt
+    || candidateExpiresAt - candidateIssuedAt > 120_000 || candidateAttestedAt > evaluatedAt
+    || installationIssuedAt > installationAttestedAt || installationAttestedAt >= installationExpiresAt
+    || installationExpiresAt - installationIssuedAt > 120_000
+    || installationAttestedAt > installationVerifiedAt || installationVerifiedAt > evaluatedAt
+    || evaluatedAt >= installationExpiresAt) return false;
+  const selectedHash = input.selectedReleaseHash!;
+  const candidateScopeDigest = verifierScopeDigest({
+    operation: "candidate",
+    projectId: proof.projectId,
+    analysisRunId: proof.analysisRunId,
+    sourceIdentityHash: proof.sourceIdentityHash,
+    targetOrigin: proof.targetOrigin,
+    environment: proof.environment,
+    contentHash: selectedHash,
+  });
+  const installationScopeDigest = verifierScopeDigest({
+    operation: "installation",
+    projectId: proof.projectId,
+    releaseId: proof.releaseId,
+    installationOperationId: proof.installationOperationId,
+    sourceIdentityHash: proof.sourceIdentityHash,
+    pageUrl: proof.installationPageUrl,
+    targetOrigin: proof.targetOrigin,
+    environment: proof.environment,
+    selectedHash,
+  });
+  return proof.candidateAttestationScopeDigest === candidateScopeDigest
+    && proof.installationAttestationScopeDigest === installationScopeDigest;
+}
+
+function exactTimestampMs(value: unknown): number | undefined {
+  if (typeof value !== "string" || !EXACT_TIMESTAMP.test(value)) return undefined;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) && new Date(parsed).toISOString() === value ? parsed : undefined;
+}
+
+function exactHttpsOrigin(value: unknown): string | undefined {
+  if (typeof value !== "string" || value.length > 2_048) return undefined;
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" && url.origin === value && url.pathname === "/"
+      && !url.username && !url.password && !url.search && !url.hash ? value : undefined;
+  } catch { return undefined; }
+}
+
+function exactInstallationPage(value: unknown, targetOrigin: string): boolean {
+  if (typeof value !== "string" || value.length > 4_096) return false;
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" && url.origin === targetOrigin && !url.username && !url.password
+      && !url.search && !url.hash && url.toString() === value;
+  } catch { return false; }
+}
+
+function verifierScopeDigest(value: unknown): string {
+  return createHash("sha256").update(canonicalJson(value), "utf8").digest("hex");
+}
+
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value === "boolean" || typeof value === "string") return JSON.stringify(value);
+  if (typeof value === "number" && Number.isFinite(value)) return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record).sort(compareStrings).map((key) =>
+      `${JSON.stringify(key)}:${canonicalJson(record[key])}`).join(",")}}`;
+  }
+  throw new Error("CANONICAL_JSON_INVALID");
 }
 
 function exactProductionProvider(provider: ProductionProviderProvenance): boolean {

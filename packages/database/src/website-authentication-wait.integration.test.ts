@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import test from "node:test";
 import pg from "pg";
 import {
@@ -12,6 +12,7 @@ import {
   type WaitAnalysisForAuthenticationInput,
 } from "./control-plane.ts";
 import { createPostgresRepository } from "./postgres.ts";
+import { websiteSuspensionEvidenceFixture } from "../../../test-support/website-suspension-evidence.ts";
 
 const explicitApplicationConnectionString = process.env.PAGE2WEBMCP_TEST_APP_DATABASE_URL;
 const explicitWorkerConnectionString = process.env.PAGE2WEBMCP_TEST_WORKER_DATABASE_URL;
@@ -114,12 +115,12 @@ async function runningWebsite(
 }
 
 function waitInput(
-  source: Pick<Awaited<ReturnType<typeof runningWebsite>>, "sourceSnapshotId" | "sourceIdentityHash">,
+  source: Pick<Awaited<ReturnType<typeof runningWebsite>>, "sourceSnapshotId" | "sourceIdentityHash" | "claim" | "workerId">,
   checkpointReference: string,
   suffix: string,
   expiresAt = new Date(Date.now() + 5 * 60_000).toISOString(),
 ): WaitAnalysisForAuthenticationInput {
-  return {
+  const command = {
     checkpointReference,
     sourceSnapshotId: source.sourceSnapshotId,
     sourceIdentityHash: source.sourceIdentityHash,
@@ -127,6 +128,18 @@ function waitInput(
     expiresAt,
     idempotencyKey: `authentication-wait-${suffix}`,
     inputHash: `authentication-wait-${suffix}`,
+  };
+  return {
+    ...command,
+    suspensionEvidence: websiteSuspensionEvidenceFixture({
+      checkpointReference: command.checkpointReference,
+      sourceSnapshotId: command.sourceSnapshotId,
+      sourceIdentityHash: command.sourceIdentityHash,
+      targetOriginDigest: command.targetOriginDigest,
+      expiresAt: command.expiresAt,
+      workerId: source.workerId,
+      leaseGeneration: source.claim.leaseGeneration,
+    }),
   };
 }
 
@@ -217,6 +230,18 @@ test("Postgres website authentication wait and resume are four-record atomic and
       waitingInput,
       source.claim.leaseGeneration,
     ), waiting);
+    await assert.rejects(workerRepository.waitAnalysisForAuthentication(
+      source.workerId,
+      source.runId,
+      {
+        ...waitingInput,
+        suspensionEvidence: {
+          ...waitingInput.suspensionEvidence,
+          ownershipDecisionDigest: "f".repeat(64),
+        },
+      },
+      source.claim.leaseGeneration,
+    ), (error: unknown) => error instanceof RepositoryError && error.code === "IDEMPOTENCY_CONFLICT");
     const fourWaiting = await admin.query(
       "select job.status as job_status, analysis.status as analysis_status, task.status as task_status, " +
       "workflow.status as workflow_status, job.lease_owner, job.lease_expires_at, " +
@@ -261,14 +286,23 @@ test("Postgres website authentication wait and resume are four-record atomic and
     });
     const claimed = await workerRepository.claimAnalysis("authentication-postgres-resumed", 60_000, ["website"]);
     assert.equal(claimed?.id, source.runId);
-    assert.deepEqual(claimed?.authenticationCheckpoint, {
+    assert.deepEqual({
+      ...claimed?.authenticationCheckpoint,
+      liveReceiptEvidence: undefined,
+    }, {
       checkpointReference,
       authenticationEvidenceReference: evidenceReference,
       sourceSnapshotId: source.sourceSnapshotId,
       sourceIdentityHash: source.sourceIdentityHash,
       targetOriginDigest: TARGET_ORIGIN_DIGEST,
       expiresAt: waitingInput.expiresAt,
+      liveReceiptEvidence: undefined,
     });
+    assert.ok(claimed?.authenticationCheckpoint?.liveReceiptEvidence);
+    assert.equal(claimed.authenticationCheckpoint.liveReceiptEvidence.restartVerified, false);
+    assert.equal(claimed.authenticationCheckpoint.resultCheckpoint, undefined);
+    assert.doesNotMatch(JSON.stringify(claimed.authenticationCheckpoint.liveReceiptEvidence),
+      /authentication-postgres-resumed|secretref:|https?:\/\/|wss?:\/\//);
   } finally {
     if (projectId) await admin.query("delete from public.projects where id = $1", [projectId]);
     await applicationRepository.close();
@@ -681,7 +715,183 @@ test("Postgres website authentication checkpoint table denies public and mainten
     );
     assert.equal(columns.rows.some(({ column_name }) =>
       /live_url|cdp_url|provider_session_id|cookie|credential|token|otp|raw_target_page|kms_secret/i.test(column_name)), false);
+    const receipt = await admin.query(
+      "select c.relrowsecurity, c.relforcerowsecurity, " +
+      "has_table_privilege('anon', c.oid, 'select') as anon_select, " +
+      "has_table_privilege('authenticated', c.oid, 'select') as authenticated_select, " +
+      "has_table_privilege('service_role', c.oid, 'select') as service_select, " +
+      "has_table_privilege('page2webmcp_maintenance', c.oid, 'select') as maintenance_select, " +
+      "has_table_privilege('page2webmcp_app', c.oid, 'select') as app_select, " +
+      "has_table_privilege('page2webmcp_worker', c.oid, 'select') as worker_select " +
+      "from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid = c.relnamespace " +
+      "where n.nspname = 'private' and c.relname = 'website_live_receipt_evidence'",
+    );
+    assert.deepEqual(receipt.rows[0], {
+      relrowsecurity: true,
+      relforcerowsecurity: true,
+      anon_select: false,
+      authenticated_select: false,
+      service_select: false,
+      maintenance_select: false,
+      app_select: false,
+      worker_select: true,
+    });
   } finally {
     await admin.end();
+  }
+});
+
+test("Postgres website receipt RLS exposes only the exact active analysis or cleanup lease", {
+  skip: !applicationConnectionString || !workerConnectionString || !adminConnectionString,
+}, async () => {
+  const applicationRepository = createPostgresRepository({ connectionString: applicationConnectionString!, maxConnections: 2 });
+  const workerRepository = createPostgresRepository({ connectionString: workerConnectionString!, maxConnections: 2 });
+  const worker = new pg.Client({ connectionString: workerConnectionString! });
+  const admin = new pg.Pool({ connectionString: adminConnectionString!, max: 1 });
+  let projectId: string | undefined;
+  try {
+    await worker.connect();
+    const source = await runningWebsite(applicationRepository, workerRepository, "receipt-rls");
+    projectId = source.projectId;
+    const checkpointReference = `urn:sha256:${"d".repeat(64)}`;
+    const waiting = waitInput(source, checkpointReference, "receipt-rls");
+    await workerRepository.waitAnalysisForAuthentication(
+      source.workerId, source.runId, waiting, source.claim.leaseGeneration,
+    );
+    await applicationRepository.resumeAnalysisAfterAuthentication(owner, resumeInput(
+      source, checkpointReference, `urn:sha256:${"e".repeat(64)}`, "receipt-rls",
+    ));
+    const claimed = await workerRepository.claimAnalysis("receipt-rls-worker", 60_000, ["website"]);
+    assert.equal(claimed?.id, source.runId);
+
+    const visible = async (taskId: string, workerId: string, generation: number): Promise<number> => {
+      await worker.query("begin");
+      try {
+        await worker.query(
+          "select set_config('page2webmcp.workflow_task_id', $1, true), " +
+          "set_config('page2webmcp.worker_id', $2, true), " +
+          "set_config('page2webmcp.lease_generation', $3, true)",
+          [taskId, workerId, String(generation)],
+        );
+        const result = await worker.query(
+          "select count(*)::integer as count from private.website_live_receipt_evidence where analysis_run_id = $1",
+          [source.runId],
+        );
+        await worker.query("rollback");
+        return Number(result.rows[0]?.count);
+      } catch (error) {
+        await worker.query("rollback");
+        throw error;
+      }
+    };
+
+    assert.equal(await visible(claimed!.workflowTaskId, "wrong-worker", claimed!.leaseGeneration), 0);
+    assert.equal(await visible(claimed!.workflowTaskId, "receipt-rls-worker", claimed!.leaseGeneration + 1), 0);
+    assert.equal(await visible(claimed!.workflowTaskId, "receipt-rls-worker", claimed!.leaseGeneration), 1);
+
+    await workerRepository.failAnalysis(
+      "receipt-rls-worker", source.runId, "TEST_TERMINAL_FAILURE", false, claimed!.leaseGeneration,
+    );
+    const cleanup = await workerRepository.claimWebsiteAuthenticationCleanup("receipt-cleanup-worker", 60_000);
+    assert.equal(cleanup?.analysisRunId, source.runId);
+    assert.equal(await visible(cleanup!.workflowTaskId, "wrong-cleanup-worker", cleanup!.leaseGeneration), 0);
+    assert.equal(await visible(cleanup!.workflowTaskId, "receipt-cleanup-worker", cleanup!.leaseGeneration + 1), 0);
+    assert.equal(await visible(randomUUID(), "receipt-cleanup-worker", cleanup!.leaseGeneration), 0);
+    assert.equal(await visible(cleanup!.workflowTaskId, "receipt-cleanup-worker", cleanup!.leaseGeneration), 1);
+  } finally {
+    if (projectId) await admin.query("delete from public.projects where id = $1", [projectId]);
+    await Promise.allSettled([worker.end(), applicationRepository.close(), workerRepository.close(), admin.end()]);
+  }
+});
+
+test("Postgres authentication result checkpoint completes after lease recovery without duplicate persistence", {
+  skip: !applicationConnectionString || !workerConnectionString || !adminConnectionString,
+}, async () => {
+  const applicationRepository = createPostgresRepository({ connectionString: applicationConnectionString!, maxConnections: 2 });
+  const workerRepository = createPostgresRepository({ connectionString: workerConnectionString!, maxConnections: 2 });
+  const admin = new pg.Pool({ connectionString: adminConnectionString!, max: 1 });
+  let projectId: string | undefined;
+  try {
+    const source = await runningWebsite(applicationRepository, workerRepository, "result-checkpoint");
+    projectId = source.projectId;
+    const checkpointReference = `urn:sha256:${"6".repeat(64)}`;
+    const waiting = waitInput(source, checkpointReference, "result-checkpoint");
+    await workerRepository.waitAnalysisForAuthentication(
+      source.workerId, source.runId, waiting, source.claim.leaseGeneration,
+    );
+    await applicationRepository.resumeAnalysisAfterAuthentication(owner, resumeInput(
+      source, checkpointReference, `urn:sha256:${"7".repeat(64)}`, "result-checkpoint",
+    ));
+    const workerB = await workerRepository.claimAnalysis("result-checkpoint-worker-b", 60_000, ["website"]);
+    assert.equal(workerB?.id, source.runId);
+    const result = {
+      capabilities: [],
+      diagnostics: [{ code: "NO_SUPPORTED_OPERATIONS", operationKey: "website" }],
+      evidence: [{ source: "runtime" as const, content: "{}",
+        reference: "urn:sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a" }],
+    };
+    const checkpoint = await workerRepository.checkpointWebsiteAuthenticationResult(
+      "result-checkpoint-worker-b", source.runId, result, workerB!.leaseGeneration,
+    );
+    assert.doesNotMatch(JSON.stringify(checkpoint), /https?:|secretref:|result-checkpoint-worker-b/);
+    const persisted = await admin.query(
+      "select ownership_decision_digest, result_checkpoint_hash, result_checkpoint_output_reference, " +
+      "result_checkpoint_worker_identity_digest, result_checkpoint_lease_generation, result_checkpointed_at, " +
+      "job.status as job_status, task.status as task_status " +
+      "from private.website_live_receipt_evidence evidence " +
+      "join private.analysis_jobs job on job.analysis_run_id = evidence.analysis_run_id " +
+      "join private.workflow_tasks task on task.id = evidence.workflow_task_id " +
+      "where evidence.analysis_run_id = $1",
+      [source.runId],
+    );
+    assert.equal(persisted.rows[0]?.ownership_decision_digest, "a".repeat(64));
+    assert.equal(persisted.rows[0]?.result_checkpoint_hash, checkpoint.resultHash);
+    assert.equal(persisted.rows[0]?.result_checkpoint_output_reference, checkpoint.outputReference);
+    assert.equal(persisted.rows[0]?.result_checkpoint_worker_identity_digest,
+      createHash("sha256").update("result-checkpoint-worker-b").digest("hex"));
+    assert.equal(Number(persisted.rows[0]?.result_checkpoint_lease_generation), workerB!.leaseGeneration);
+    assert.ok(persisted.rows[0]?.result_checkpointed_at);
+    assert.equal(persisted.rows[0]?.job_status, "running");
+    assert.equal(persisted.rows[0]?.task_status, "running");
+
+    await admin.query(
+      "update private.analysis_jobs set lease_expires_at = now() - interval '1 millisecond' where analysis_run_id = $1",
+      [source.runId],
+    );
+    await admin.query(
+      "update private.workflow_tasks set lease_expires_at = now() - interval '1 millisecond' " +
+      "where workflow_run_id = $1 and phase = 'analysis'",
+      [source.runId],
+    );
+    const workerC = await workerRepository.claimAnalysis("result-checkpoint-worker-c", 60_000, ["website"]);
+    assert.equal(workerC?.authenticationCheckpoint?.resultCheckpoint?.resultHash, checkpoint.resultHash);
+    await workerRepository.completeCheckpointedWebsiteAuthenticationAnalysis(
+      "result-checkpoint-worker-c", source.runId, checkpoint.resultHash, workerC!.leaseGeneration,
+    );
+    const completed = await admin.query(
+      "select completion_worker_identity_digest, completion_lease_generation, restart_verified, " +
+      "resume_acknowledged_at from private.website_live_receipt_evidence where analysis_run_id = $1",
+      [source.runId],
+    );
+    assert.deepEqual({
+      ...completed.rows[0],
+      completion_lease_generation: Number(completed.rows[0]?.completion_lease_generation),
+      resume_acknowledged_at: Boolean(completed.rows[0]?.resume_acknowledged_at),
+    }, {
+      completion_worker_identity_digest: createHash("sha256").update("result-checkpoint-worker-c").digest("hex"),
+      completion_lease_generation: workerC!.leaseGeneration,
+      restart_verified: true,
+      resume_acknowledged_at: true,
+    });
+    assert.equal((await applicationRepository.getAnalysisResult(owner, source.runId))?.evidence.length, 1);
+    const counts = await admin.query(
+      "select (select count(*)::integer from public.analysis_evidence where analysis_run_id = $1) as evidence, " +
+      "(select count(*)::integer from public.workflow_evidence where workflow_run_id = $1) as links",
+      [source.runId],
+    );
+    assert.deepEqual(counts.rows[0], { evidence: 1, links: 1 });
+  } finally {
+    if (projectId) await admin.query("delete from public.projects where id = $1", [projectId]);
+    await Promise.allSettled([applicationRepository.close(), workerRepository.close(), admin.end()]);
   }
 });

@@ -1,9 +1,16 @@
 import { unsafeSupabaseBrowserKey } from "./supabase-config.ts";
 import { validateReleaseArtifactStorageConfiguration } from "./artifact-storage.ts";
+import {
+  configuredDeploymentIdentity,
+  type DeploymentIdentityDependencies,
+} from "./deployment-identity.ts";
 
 type RuntimeEnvironment = Record<string, string | undefined>;
 
-export function validateRuntimeConfiguration(environment: RuntimeEnvironment = process.env): void {
+export function validateRuntimeConfiguration(
+  environment: RuntimeEnvironment = process.env,
+  dependencies: DeploymentIdentityDependencies = {},
+): void {
   if (environment.NODE_ENV !== "production") return;
   if ((environment.PAGE2WEBMCP_SESSION_SECRET?.length ?? 0) < 32) throw new Error("SESSION_SECRET_REQUIRED");
   validateReleaseArtifactStorageConfiguration(environment);
@@ -14,11 +21,16 @@ export function validateRuntimeConfiguration(environment: RuntimeEnvironment = p
     || (publicOrigin.protocol !== "https:" && !localStackHttpOrigin(publicOrigin, environment, "3100"))) {
     throw new Error("INVALID_CONTROL_PLANE_PUBLIC_ORIGIN");
   }
+  if (environment.PAGE2WEBMCP_LOCAL_STACK !== "true") configuredDeploymentIdentity(environment, dependencies);
   validateSharedRuntimeConfiguration(environment, true);
 }
 
-export function validateWorkerRuntimeConfiguration(environment: RuntimeEnvironment = process.env): void {
+export function validateWorkerRuntimeConfiguration(
+  environment: RuntimeEnvironment = process.env,
+  dependencies: DeploymentIdentityDependencies = {},
+): void {
   validateSharedRuntimeConfiguration(environment, false);
+  if (environment.PAGE2WEBMCP_LOCAL_STACK !== "true") configuredDeploymentIdentity(environment, dependencies);
 }
 
 function validateSharedRuntimeConfiguration(environment: RuntimeEnvironment, allowTestMemory: boolean): void {

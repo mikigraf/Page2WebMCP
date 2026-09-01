@@ -7,7 +7,12 @@ import {
   type BrowserUseCloudV4Request,
 } from "../../../packages/providers/src/browser-use-v4.ts";
 import type { WebsiteProviderControls } from "../../../packages/providers/src/website.ts";
+import {
+  initialWebsiteCleanupResources,
+  type WebsiteLiveReceiptEvidence,
+} from "../../../packages/database/src/control-plane.ts";
 import type { NodePinnedJsonTransport } from "./node-network.ts";
+import { bindWebsiteSuspensionToWorker, type WebsiteAuthenticationWaitingOutcome } from "./workflow.ts";
 import {
   createConfiguredWebsiteAnalysisAdapter,
   probeConfiguredWebsiteControlStartup,
@@ -87,6 +92,25 @@ type ControlCall = Readonly<{
   body: Record<string, unknown>;
 }>;
 
+function liveReceiptFor(
+  waiting: WebsiteAuthenticationWaitingOutcome,
+  authenticationEvidenceReference: string,
+): WebsiteLiveReceiptEvidence {
+  if (!waiting.suspensionEvidence) throw new Error("TEST_SUSPENSION_EVIDENCE_REQUIRED");
+  const suspension = bindWebsiteSuspensionToWorker(waiting.suspensionEvidence, "suspending-worker", 1);
+  return {
+    ...suspension,
+    authenticationEvidenceReferenceDigest: createHash("sha256")
+      .update(authenticationEvidenceReference, "utf8").digest("hex"),
+    authenticationConsumedAt: "2026-08-31T12:00:30.000Z",
+    resumedWorkerIdentityDigest: createHash("sha256").update("resumed-worker", "utf8").digest("hex"),
+    resumeLeaseGeneration: 2,
+    resumeClaimedAt: "2026-08-31T12:00:45.000Z",
+    restartVerified: false,
+    cleanupResources: initialWebsiteCleanupResources(suspension),
+  };
+}
+
 function controlHarness(input: Readonly<{
   badPolicyDigest?: boolean;
   badGatewayUrl?: boolean;
@@ -112,9 +136,33 @@ function controlHarness(input: Readonly<{
   const issuedBrowserSessions = new Map<string, string>();
   const evidenceRecords = new Map<string, Record<string, unknown>>();
   const authenticationCheckpoints = new Map<string, Record<string, unknown>>();
+  const terminalCleanupByCheckpoint = new Map<string, readonly Record<string, unknown>[]>();
   const activeLeaseByRun = new Map<string, string>();
   let browserStartAttempts = 0;
   let observationCount = 0;
+  const cleanupResourcesFor = (checkpointReference: string) => {
+    const retained = terminalCleanupByCheckpoint.get(checkpointReference);
+    if (retained) return retained;
+    const checkpoint = authenticationCheckpoints.get(checkpointReference);
+    if (!checkpoint) throw new Error("TEST_CHECKPOINT_REQUIRED");
+    const timestamp = "2026-08-31T12:02:00.000Z";
+    const digest = (value: unknown) => createHash("sha256").update(String(value), "utf8").digest("hex");
+    const ttlSecrets = [
+      { purpose: "browser_cdp_url", referenceDigest: digest(checkpoint.cdpReference), expiresAt: checkpoint.expiresAt },
+      { purpose: "browser_live_url", referenceDigest: digest(checkpoint.liveReference), expiresAt: checkpoint.expiresAt },
+    ];
+    const resources = [
+      { resource: "authentication_handoff_checkpoint", identityDigest: digest(checkpointReference), disposition: "destroyed", timestamp },
+      { resource: "browser_lease", identityDigest: digest(checkpoint.leaseId), disposition: "released", timestamp },
+      { resource: "browser_session", identityDigest: checkpoint.providerSessionIdDigest, disposition: "destroyed", timestamp },
+      { resource: "cdp_observation_lease", identityDigest: digest(checkpoint.cdpReference), disposition: "released", timestamp },
+      { resource: "egress_policy_proxy", identityDigest: digest(checkpoint.egressPolicyReference), disposition: "revoked", timestamp },
+      { resource: "evidence_lease", identityDigest: digest(checkpoint.publicEvidenceReference), disposition: "retained_immutable", timestamp },
+      { resource: "ttl_secrets", identityDigest: digest(JSON.stringify(ttlSecrets)), disposition: "destroyed", timestamp },
+    ];
+    terminalCleanupByCheckpoint.set(checkpointReference, resources);
+    return resources;
+  };
   const fetcher: typeof fetch = async (rawUrl, init) => {
     const url = String(rawUrl);
     const method = init?.method ?? "GET";
@@ -362,7 +410,8 @@ function controlHarness(input: Readonly<{
       });
     }
     if (url.endsWith(WEBSITE_LIVE_CONTROL_PATHS.authenticationCheckpointFinalize)) {
-      return jsonResponse(url, { ...body, finalized: true });
+      return jsonResponse(url, { ...body, finalized: true,
+        cleanupResources: cleanupResourcesFor(String(body.checkpointReference)) });
     }
     if (url.endsWith(WEBSITE_LIVE_CONTROL_PATHS.authenticationCheckpointReconcile)) {
       if (body.binding && typeof body.binding === "object") {
@@ -375,8 +424,9 @@ function controlHarness(input: Readonly<{
         if (resolvedReference) authenticationCheckpoints.delete(resolvedReference);
         return jsonResponse(url, { ...body, reconciled: true, checkpointOwned, terminated: checkpointOwned });
       }
+      const cleanupResources = cleanupResourcesFor(String(body.checkpointReference));
       authenticationCheckpoints.delete(String(body.checkpointReference));
-      return jsonResponse(url, { ...body, reconciled: true, terminated: true });
+      return jsonResponse(url, { ...body, reconciled: true, terminated: true, cleanupResources });
     }
     if (url.endsWith("/v1/website-evidence/put")) {
       const record = body.record as Record<string, unknown>;
@@ -830,24 +880,37 @@ test("website TTL secrets stay exact and authenticated sites return only a durab
   assert.equal(harness.calls.filter(({ url }) => url.endsWith(WEBSITE_LIVE_CONTROL_PATHS.leaseRelease)).length, 0);
   assert.equal(harness.calls.filter(({ url }) => url.endsWith(WEBSITE_LIVE_CONTROL_PATHS.policyRevoke)).length, 0);
   if (waiting.disposition !== "waiting_for_authentication") throw new Error("WAITING_OUTCOME_REQUIRED");
-  const completed = await adapter({
+  const authenticationEvidenceReference = `urn:sha256:${"b".repeat(64)}`;
+  const resumedSource = {
     id: "analysis-run-auth", organizationId: "organization-1", projectId: "project-1",
-    sourceType: "website", sourceUrl: "https://widgets.example/app", sourceConfiguration: { kind: "website" },
-    sourceSnapshotId: "snapshot-auth", leaseGeneration: 2,
+    sourceType: "website" as const, sourceUrl: "https://widgets.example/app",
+    sourceConfiguration: { kind: "website" as const },
+    sourceSnapshotId: "snapshot-auth", sourceIdentityHash: waiting.sourceIdentityHash, leaseGeneration: 2,
     authenticationCheckpoint: {
       checkpointReference: waiting.checkpointReference,
-      authenticationEvidenceReference: `urn:sha256:${"b".repeat(64)}`,
+      authenticationEvidenceReference,
       sourceSnapshotId: waiting.sourceSnapshotId,
       sourceIdentityHash: waiting.sourceIdentityHash,
       targetOriginDigest: waiting.targetOriginDigest,
       expiresAt: waiting.expiresAt,
+      liveReceiptEvidence: liveReceiptFor(waiting, authenticationEvidenceReference),
     },
-  }, new AbortController().signal);
+  };
+  const completed = await adapter(resumedSource, new AbortController().signal);
   assert.equal(completed.disposition, undefined);
   assert.equal(harness.calls.filter(({ url }) => url.endsWith(WEBSITE_LIVE_CONTROL_PATHS.policyIssue)).length, 1);
   assert.equal(harness.calls.filter(({ url }) => url.endsWith(WEBSITE_LIVE_CONTROL_PATHS.browserStart)).length, 1);
   assert.equal(harness.calls.filter(({ url }) => url.endsWith(WEBSITE_LIVE_CONTROL_PATHS.authenticationCheckpointStatus)).length, 1);
   assert.equal(harness.calls.filter(({ url }) => url.endsWith(WEBSITE_LIVE_CONTROL_PATHS.authenticationCheckpointResume)).length, 1);
+  assert.equal(harness.calls.filter(({ url }) => url.endsWith(WEBSITE_LIVE_CONTROL_PATHS.authenticationCheckpointFinalize)).length, 0);
+  assert.equal(harness.calls.filter(({ url }) => url.endsWith(WEBSITE_LIVE_CONTROL_PATHS.authenticationCheckpointReconcile)).length, 0);
+  assert.ok(adapter.finalizeAuthenticationCheckpoint);
+  const cleanupResources = await adapter.finalizeAuthenticationCheckpoint(
+    resumedSource,
+    new AbortController().signal,
+  );
+  assert.equal(cleanupResources?.length, 7);
+  assert.ok(cleanupResources?.every(({ disposition }) => disposition !== "pending" && disposition !== "failed"));
   assert.equal(harness.calls.filter(({ url }) => url.endsWith(WEBSITE_LIVE_CONTROL_PATHS.authenticationCheckpointFinalize)).length, 1);
   assert.equal(harness.calls.filter(({ url }) => url.endsWith(WEBSITE_LIVE_CONTROL_PATHS.authenticationCheckpointReconcile)).length, 1);
   for (const call of harness.calls.filter(({ url }) => url.includes("/v1/authentication/checkpoints/")
@@ -878,20 +941,25 @@ test("checkpoint terminal retries keep one gateway idempotency key across change
   };
   const waiting = await adapter(source, new AbortController().signal);
   if (waiting.disposition !== "waiting_for_authentication") throw new Error("WAITING_OUTCOME_REQUIRED");
+  const authenticationEvidenceReference = `urn:sha256:${"b".repeat(64)}`;
   const resumedSource = {
     ...source,
+    sourceIdentityHash: waiting.sourceIdentityHash,
     leaseGeneration: 2,
     authenticationCheckpoint: {
       checkpointReference: waiting.checkpointReference,
-      authenticationEvidenceReference: `urn:sha256:${"b".repeat(64)}`,
+      authenticationEvidenceReference,
       sourceSnapshotId: waiting.sourceSnapshotId,
       sourceIdentityHash: waiting.sourceIdentityHash,
       targetOriginDigest: waiting.targetOriginDigest,
       expiresAt: waiting.expiresAt,
+      liveReceiptEvidence: liveReceiptFor(waiting, authenticationEvidenceReference),
     },
   };
 
   await adapter(resumedSource, new AbortController().signal);
+  assert.ok(adapter.finalizeAuthenticationCheckpoint);
+  await adapter.finalizeAuthenticationCheckpoint(resumedSource, new AbortController().signal);
   await assert.rejects(
     adapter(resumedSource, new AbortController().signal),
     /^Error: WEBSITE_CONTROL_RESPONSE_INVALID$/,
@@ -944,16 +1012,18 @@ test("website live resume rejects a CDP reference outside the content-addressed 
   };
   const waiting = await adapter(source, new AbortController().signal);
   if (waiting.disposition !== "waiting_for_authentication") throw new Error("WAITING_OUTCOME_REQUIRED");
+  const authenticationEvidenceReference = `urn:sha256:${"b".repeat(64)}`;
   await assert.rejects(adapter({
     ...source,
     leaseGeneration: 2,
     authenticationCheckpoint: {
       checkpointReference: waiting.checkpointReference,
-      authenticationEvidenceReference: `urn:sha256:${"b".repeat(64)}`,
+      authenticationEvidenceReference,
       sourceSnapshotId: waiting.sourceSnapshotId,
       sourceIdentityHash: waiting.sourceIdentityHash,
       targetOriginDigest: waiting.targetOriginDigest,
       expiresAt: waiting.expiresAt,
+      liveReceiptEvidence: liveReceiptFor(waiting, authenticationEvidenceReference),
     },
   }, new AbortController().signal), /^Error: WEBSITE_CONTROL_RESPONSE_INVALID$/);
 });

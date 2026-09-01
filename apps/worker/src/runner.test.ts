@@ -10,6 +10,7 @@ import {
   type RepositoryActor,
 } from "../../../packages/database/src/control-plane.ts";
 import { computeSourceIdentityHash } from "../../../packages/database/src/source-identity.ts";
+import { websiteSuspensionProjectionFixture } from "../../../test-support/website-suspension-evidence.ts";
 import { processNextAnalysis } from "./runner.ts";
 
 const owner: RepositoryActor = {
@@ -138,6 +139,12 @@ test("analysis deadline awaits aborted cleanup and preserves an attested authent
           sourceIdentityHash: computeSourceIdentityHash("website", "https://widgets.example/", { kind: "website" }),
           targetOriginDigest: createHash("sha256").update("https://widgets.example").digest("hex"),
           expiresAt: "2026-09-01T12:09:00.000Z",
+          suspensionEvidence: websiteSuspensionProjectionFixture({
+            checkpointReference: `urn:sha256:${"d".repeat(64)}`, sourceSnapshotId: source.sourceSnapshotId,
+            sourceIdentityHash: computeSourceIdentityHash("website", "https://widgets.example/", { kind: "website" }),
+            targetOriginDigest: createHash("sha256").update("https://widgets.example").digest("hex"),
+            expiresAt: "2026-09-01T12:09:00.000Z",
+          }),
         });
       }, { once: true });
     }),
@@ -216,10 +223,22 @@ test("worker atomically waits without completing or failing and a fresh worker r
   const { project, run } = await enqueue(repository, "website", "https://widgets.example/");
   const sourceIdentityHash = computeSourceIdentityHash("website", "https://widgets.example/", { kind: "website" });
   let completes = 0;
+  let checkpoints = 0;
+  let cleanupCompletions = 0;
+  let persistedCleanupResources: unknown;
   let failures = 0;
-  const complete = repository.completeAnalysis.bind(repository);
+  const checkpoint = repository.checkpointWebsiteAuthenticationResult.bind(repository);
+  const complete = repository.completeCheckpointedWebsiteAuthenticationAnalysis.bind(repository);
   const fail = repository.failAnalysis.bind(repository);
-  repository.completeAnalysis = async (...args) => { completes += 1; return complete(...args); };
+  repository.checkpointWebsiteAuthenticationResult = async (...args) => {
+    checkpoints += 1;
+    return checkpoint(...args);
+  };
+  repository.completeCheckpointedWebsiteAuthenticationAnalysis = async (...args) => {
+    completes += 1;
+    persistedCleanupResources = args[4];
+    return complete(...args);
+  };
   repository.failAnalysis = async (...args) => { failures += 1; return fail(...args); };
 
   const waitingResult = await processNextAnalysis(repository, {
@@ -234,6 +253,11 @@ test("worker atomically waits without completing or failing and a fresh worker r
       sourceIdentityHash,
       targetOriginDigest: createHash("sha256").update("https://widgets.example").digest("hex"),
       expiresAt: "2026-09-01T12:09:00.000Z",
+      suspensionEvidence: websiteSuspensionProjectionFixture({
+        checkpointReference: `urn:sha256:${"a".repeat(64)}`, sourceSnapshotId: source.sourceSnapshotId!,
+        sourceIdentityHash, targetOriginDigest: createHash("sha256").update("https://widgets.example").digest("hex"),
+        expiresAt: "2026-09-01T12:09:00.000Z",
+      }),
     }),
   });
   assert.equal(waitingResult, undefined);
@@ -254,17 +278,101 @@ test("worker atomically waits without completing or failing and a fresh worker r
     idempotencyKey: "resume-authentication-runner-test",
     inputHash: "c".repeat(64),
   });
-  const completed = await processNextAnalysis(repository, {
-    workerId: "authentication-resume-fresh-worker",
-    analyze: async (source) => {
-      assert.equal(source.authenticationCheckpoint?.checkpointReference, `urn:sha256:${"a".repeat(64)}`);
-      assert.equal(source.authenticationCheckpoint?.authenticationEvidenceReference, `urn:sha256:${"b".repeat(64)}`);
-      return fixtureAnalysisResult();
+  const resumedAdapter = Object.assign(async (source: ClaimedAnalysisRunRecord) => {
+    assert.equal(source.authenticationCheckpoint?.checkpointReference, `urn:sha256:${"a".repeat(64)}`);
+    assert.equal(source.authenticationCheckpoint?.authenticationEvidenceReference, `urn:sha256:${"b".repeat(64)}`);
+    return fixtureAnalysisResult();
+  }, {
+    finalizeAuthenticationCheckpoint: async (source: ClaimedAnalysisRunRecord) => {
+      cleanupCompletions += 1;
+      assert.ok(source.authenticationCheckpoint?.liveReceiptEvidence);
+      const terminalDisposition = {
+        authentication_handoff_checkpoint: "destroyed",
+        browser_lease: "released",
+        browser_session: "destroyed",
+        cdp_observation_lease: "released",
+        egress_policy_proxy: "revoked",
+        evidence_lease: "retained_immutable",
+        ttl_secrets: "destroyed",
+      } as const;
+      return source.authenticationCheckpoint.liveReceiptEvidence.cleanupResources.map((resource) => ({
+        ...resource,
+        disposition: terminalDisposition[resource.resource],
+        timestamp: "2026-09-01T12:01:00.000Z",
+      }));
     },
   });
+  const completed = await processNextAnalysis(repository, {
+    workerId: "authentication-resume-fresh-worker",
+    analyze: resumedAdapter,
+  });
   assert.equal(completed?.status, "succeeded");
+  assert.equal(checkpoints, 1);
   assert.equal(completes, 1);
+  assert.equal(cleanupCompletions, 1);
+  assert.equal(Array.isArray(persistedCleanupResources) && persistedCleanupResources.length, 7);
+  assert.ok((persistedCleanupResources as Array<{ disposition: string }>).every(
+    ({ disposition }) => disposition !== "pending" && disposition !== "failed",
+  ));
   assert.equal(failures, 0);
+});
+
+test("a lost authentication result-checkpoint response resumes after lease expiry without re-analysis", async () => {
+  let now = new Date("2026-09-01T12:00:00.000Z");
+  const repository = new InMemoryControlPlaneRepository(() => now);
+  const { run } = await enqueue(repository, "website", "https://widgets.example/");
+  const sourceIdentityHash = computeSourceIdentityHash("website", "https://widgets.example/", { kind: "website" });
+  const first = await repository.claimAnalysis("authentication-public", 60_000, ["website"]);
+  assert.ok(first);
+  const checkpointReference = `urn:sha256:${"d".repeat(64)}`;
+  const targetOriginDigest = createHash("sha256").update("https://widgets.example").digest("hex");
+  await repository.waitAnalysisForAuthentication("authentication-public", run.id, {
+    checkpointReference, sourceSnapshotId: first.sourceSnapshotId, sourceIdentityHash, targetOriginDigest,
+    expiresAt: "2026-09-01T12:09:00.000Z",
+    suspensionEvidence: {
+      ...websiteSuspensionProjectionFixture({ checkpointReference, sourceSnapshotId: first.sourceSnapshotId,
+        sourceIdentityHash, targetOriginDigest, expiresAt: "2026-09-01T12:09:00.000Z" }),
+      suspendedWorkerIdentityDigest: createHash("sha256").update("authentication-public").digest("hex"),
+      suspendedLeaseGeneration: first.leaseGeneration,
+    },
+    idempotencyKey: "result-response-loss-wait", inputHash: "result-response-loss-wait",
+  }, first.leaseGeneration);
+  await repository.resumeAnalysisAfterAuthentication(owner, {
+    runId: run.id, checkpointReference, authenticationEvidenceReference: `urn:sha256:${"e".repeat(64)}`,
+    sourceSnapshotId: first.sourceSnapshotId, sourceIdentityHash, targetOriginDigest,
+    idempotencyKey: "result-response-loss-resume", inputHash: "result-response-loss-resume",
+  });
+
+  const originalCheckpoint = repository.checkpointWebsiteAuthenticationResult.bind(repository);
+  let analysisCalls = 0;
+  let cleanupCalls = 0;
+  repository.checkpointWebsiteAuthenticationResult = async (...args) => {
+    await originalCheckpoint(...args);
+    throw new Error("DATABASE_RESULT_CHECKPOINT_RESPONSE_LOST");
+  };
+  const adapter = Object.assign(async () => {
+    analysisCalls += 1;
+    return fixtureAnalysisResult();
+  }, { finalizeAuthenticationCheckpoint: async () => { cleanupCalls += 1; } });
+  await assert.rejects(processNextAnalysis(repository, {
+    workerId: "authentication-result-worker-b", leaseMs: 1_000, analyze: adapter,
+  }), /DATABASE_RESULT_CHECKPOINT_RESPONSE_LOST/);
+  assert.equal(analysisCalls, 1);
+  assert.equal(cleanupCalls, 0);
+  assert.equal((await repository.getAnalysis(owner, run.id)).status, "running");
+
+  repository.checkpointWebsiteAuthenticationResult = originalCheckpoint;
+  now = new Date("2026-09-01T12:00:01.001Z");
+  const completed = await processNextAnalysis(repository, {
+    workerId: "authentication-result-worker-c",
+    analyze: Object.assign(async () => {
+      analysisCalls += 1;
+      throw new Error("RESULT_CHECKPOINT_MUST_SKIP_ANALYSIS");
+    }, { finalizeAuthenticationCheckpoint: async () => { cleanupCalls += 1; } }),
+  });
+  assert.equal(completed?.status, "succeeded");
+  assert.equal(analysisCalls, 1);
+  assert.equal(cleanupCalls, 1);
 });
 
 test("durable authentication suspension does not emit a successful analysis completion", async () => {
@@ -287,6 +395,12 @@ test("durable authentication suspension does not emit a successful analysis comp
         sourceIdentityHash: computeSourceIdentityHash("website", "https://widgets.example/", { kind: "website" }),
         targetOriginDigest: createHash("sha256").update("https://widgets.example").digest("hex"),
         expiresAt: "2026-09-01T12:09:00.000Z",
+        suspensionEvidence: websiteSuspensionProjectionFixture({
+          checkpointReference: `urn:sha256:${"e".repeat(64)}`, sourceSnapshotId: source.sourceSnapshotId,
+          sourceIdentityHash: computeSourceIdentityHash("website", "https://widgets.example/", { kind: "website" }),
+          targetOriginDigest: createHash("sha256").update("https://widgets.example").digest("hex"),
+          expiresAt: "2026-09-01T12:09:00.000Z",
+        }),
       }),
     });
   } finally {
@@ -316,6 +430,12 @@ test("worker reconciles an externally created checkpoint when the database wait 
     sourceIdentityHash: computeSourceIdentityHash("website", "https://widgets.example/", { kind: "website" }),
     targetOriginDigest: createHash("sha256").update("https://widgets.example").digest("hex"),
     expiresAt: "2026-09-01T12:09:00.000Z",
+    suspensionEvidence: websiteSuspensionProjectionFixture({
+      checkpointReference: `urn:sha256:${"c".repeat(64)}`, sourceSnapshotId: source.sourceSnapshotId,
+      sourceIdentityHash: computeSourceIdentityHash("website", "https://widgets.example/", { kind: "website" }),
+      targetOriginDigest: createHash("sha256").update("https://widgets.example").digest("hex"),
+      expiresAt: "2026-09-01T12:09:00.000Z",
+    }),
   }), {
     reconcileAuthenticationCheckpoint: async () => { reconciliations += 1; },
   });

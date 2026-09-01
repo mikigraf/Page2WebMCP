@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
 import {
   createApplicationReadinessRepository,
@@ -7,6 +8,24 @@ import {
 } from "./readiness.ts";
 
 const selectedHash = "a".repeat(64);
+const projectId = "22222222-2222-4222-8222-222222222222";
+const analysisRunId = "33333333-3333-4333-8333-333333333333";
+const releaseId = "44444444-4444-4444-8444-444444444444";
+const sourceIdentityHash = "d".repeat(64);
+const targetOrigin = "https://widgets.example";
+const pageUrl = "https://widgets.example/account";
+const installationOperationId = "e".repeat(64);
+
+function scopeDigest(value: Record<string, unknown>): string {
+  const canonical = (item: unknown): string => {
+    if (item === null || typeof item === "string" || typeof item === "boolean") return JSON.stringify(item);
+    if (typeof item === "number" && Number.isFinite(item)) return JSON.stringify(item);
+    if (Array.isArray(item)) return `[${item.map(canonical).join(",")}]`;
+    const record = item as Record<string, unknown>;
+    return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${canonical(record[key])}`).join(",")}}`;
+  };
+  return createHash("sha256").update(canonical(value)).digest("hex");
+}
 
 function proofRow() {
   return {
@@ -22,8 +41,8 @@ function proofRow() {
     candidate_verification_run_id: "11111111-1111-4111-8111-111111111111",
     candidate_mode: "live",
     installation_mode: "live",
-    candidate_protocol_version: 1,
-    installation_protocol_version: 1,
+    candidate_protocol_version: 2,
+    installation_protocol_version: 2,
     candidate_verifier_origin_digest: "b".repeat(64),
     installation_verifier_origin_digest: "b".repeat(64),
     candidate_webmcp_implementation: "native",
@@ -56,6 +75,39 @@ function proofRow() {
     zero_model_calls: true,
     trusted_loader_enforced: true,
     candidate_checks_passed: true,
+    project_id: projectId,
+    analysis_run_id: analysisRunId,
+    release_id: releaseId,
+    source_identity_hash: sourceIdentityHash,
+    target_origin: targetOrigin,
+    environment: "production",
+    installation_page_url: pageUrl,
+    installation_operation_id: installationOperationId,
+    candidate_attestation_id: "55555555-5555-4555-8555-555555555555",
+    candidate_attestation_request_id: "66666666-6666-4666-8666-666666666666",
+    candidate_attestation_nonce_digest: "f".repeat(64),
+    candidate_attestation_operation: "candidate",
+    candidate_attestation_scope_digest: scopeDigest({
+      operation: "candidate", projectId, analysisRunId, sourceIdentityHash,
+      targetOrigin, environment: "production", contentHash: selectedHash,
+    }),
+    candidate_attestation_payload_digest: "1".repeat(64),
+    candidate_attestation_issued_at: "2026-09-01T11:59:00.000Z",
+    candidate_attestation_expires_at: "2026-09-01T12:00:00.000Z",
+    candidate_attestation_attested_at: "2026-09-01T11:59:01.000Z",
+    installation_attestation_id: "77777777-7777-4777-8777-777777777777",
+    installation_attestation_request_id: "88888888-8888-4888-8888-888888888888",
+    installation_attestation_nonce_digest: "2".repeat(64),
+    installation_attestation_operation: "installation",
+    installation_attestation_scope_digest: scopeDigest({
+      operation: "installation", projectId, releaseId, installationOperationId, sourceIdentityHash,
+      pageUrl, targetOrigin, environment: "production", selectedHash,
+    }),
+    installation_attestation_payload_digest: "3".repeat(64),
+    installation_attestation_issued_at: "2026-09-01T12:00:00.000Z",
+    installation_attestation_expires_at: "2026-09-01T12:01:00.000Z",
+    installation_attestation_attested_at: "2026-09-01T12:00:01.000Z",
+    installation_verified_at: "2026-09-01T12:00:02.000Z",
   };
 }
 
@@ -83,6 +135,11 @@ function probeContextRow() {
       environment: "production",
     },
     source_identity_hash: "d".repeat(64),
+    source_content_hash: "e".repeat(64),
+    source_artifact_reference: `urn:sha256:${"e".repeat(64)}`,
+    source_final_url: "https://specs.widgets.example/openapi.json",
+    source_mime_type: "application/json",
+    source_size_bytes: 87,
     github_installation_id: null,
     github_repository_id: null,
     github_owner: null,
@@ -226,8 +283,8 @@ test("maintenance readiness reads only the exact selected hash through the bound
     candidateVerificationRunId: "11111111-1111-4111-8111-111111111111",
     candidateMode: "live",
     installationMode: "live",
-    candidateProtocolVersion: 1,
-    installationProtocolVersion: 1,
+    candidateProtocolVersion: 2,
+    installationProtocolVersion: 2,
     candidateVerifierOriginDigest: "b".repeat(64),
     installationVerifierOriginDigest: "b".repeat(64),
     candidateWebMcpImplementation: "native",
@@ -260,6 +317,33 @@ test("maintenance readiness reads only the exact selected hash through the bound
     zeroModelCalls: true,
     trustedLoaderEnforced: true,
     candidateChecksPassed: true,
+    projectId,
+    analysisRunId,
+    releaseId,
+    sourceIdentityHash,
+    targetOrigin,
+    environment: "production",
+    installationPageUrl: pageUrl,
+    installationOperationId,
+    candidateAttestationId: "55555555-5555-4555-8555-555555555555",
+    candidateAttestationRequestId: "66666666-6666-4666-8666-666666666666",
+    candidateAttestationNonceDigest: "f".repeat(64),
+    candidateAttestationOperation: "candidate",
+    candidateAttestationScopeDigest: proofRow().candidate_attestation_scope_digest,
+    candidateAttestationPayloadDigest: "1".repeat(64),
+    candidateAttestationIssuedAt: "2026-09-01T11:59:00.000Z",
+    candidateAttestationExpiresAt: "2026-09-01T12:00:00.000Z",
+    candidateAttestationAttestedAt: "2026-09-01T11:59:01.000Z",
+    installationAttestationId: "77777777-7777-4777-8777-777777777777",
+    installationAttestationRequestId: "88888888-8888-4888-8888-888888888888",
+    installationAttestationNonceDigest: "2".repeat(64),
+    installationAttestationOperation: "installation",
+    installationAttestationScopeDigest: proofRow().installation_attestation_scope_digest,
+    installationAttestationPayloadDigest: "3".repeat(64),
+    installationAttestationIssuedAt: "2026-09-01T12:00:00.000Z",
+    installationAttestationExpiresAt: "2026-09-01T12:01:00.000Z",
+    installationAttestationAttestedAt: "2026-09-01T12:00:01.000Z",
+    installationVerifiedAt: "2026-09-01T12:00:02.000Z",
   });
   assert.deepEqual(fake.queries.filter(({ text }) => text.includes("selected_native_installation_proof")), [{
     text: "select * from private.selected_native_installation_proof($1)", values: [selectedHash],
@@ -282,6 +366,13 @@ test("maintenance readiness loads a typed source descriptor only from the exact 
     sourceType: "openapi",
     sourceUrl: "https://specs.widgets.example/openapi.json",
     sourceIdentityHash: "d".repeat(64),
+    sourceArtifact: {
+      contentHash: "e".repeat(64),
+      artifactReference: `urn:sha256:${"e".repeat(64)}`,
+      finalUrl: "https://specs.widgets.example/openapi.json",
+      mimeType: "application/json",
+      sizeBytes: 87,
+    },
     sourceConfiguration: {
       kind: "openapi", targetOrigin: "https://widgets.example",
       testPageUrl: "https://widgets.example/webmcp-test", environment: "production",

@@ -20,6 +20,14 @@ test("exposes a machine-readable local demo seed command", () => {
   assert.equal(root.scripts["demo:seed"], "node scripts/demo-seed.mjs");
 });
 
+test("production-live commands load the operator .env without changing provider selection", () => {
+  for (const name of ["live:preflight", "live:openapi", "live:website"]) {
+    assert.match(root.scripts[name], /node --env-file-if-exists=\.env --import=tsx/);
+  }
+  assert.match(root.scripts["live:openapi"], /--provider openapi$/);
+  assert.match(root.scripts["live:website"], /--provider website$/);
+});
+
 test("prints only local demo endpoints and fixture identities", () => {
   const output = execFileSync(process.execPath, ["scripts/demo-seed.mjs"], { encoding: "utf8" });
   assert.deepEqual(JSON.parse(output), {

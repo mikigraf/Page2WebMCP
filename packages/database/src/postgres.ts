@@ -7,17 +7,31 @@ import {
 import {
   capabilityPlanDigest,
   capabilityStateDigest,
+  candidateVerifierScopeMatches,
+  advanceWebsiteCleanupResources,
   gitHubDraftPullRequestMatchesRequest,
   normalizeAnalysisDiagnostics,
   normalizeAnalysisSourceTypes,
   normalizeProviderProvenance,
+  normalizeImmutableSourceArtifactIdentity,
+  normalizeAnalysisSourceArtifact,
+  normalizePersistedAnalysisSourceArtifact,
   parsePersistedSourceConfiguration,
   normalizeSourceConfiguration,
   normalizeReleaseArtifactIdentity,
   normalizeReleaseInstallation,
+  normalizeVerifierAttestationIdentity,
   normalizeGitHubDraftPullRequest,
+  initialWebsiteCleanupResources,
+  installationVerifierScopeMatches,
+  normalizeWebsiteSuspensionEvidence,
+  normalizeWebsiteCleanupResources,
   persistedReleaseArtifactIdentity,
   releaseFailures,
+  websiteReferenceDigest,
+  websiteAuthenticationWaitCommandHash,
+  websiteAuthenticationResultCheckpoint,
+  websiteWorkerIdentityDigest,
   RepositoryError,
   type AnalysisResult,
   type AnalysisEvidence,
@@ -47,8 +61,12 @@ import {
   type SourceType,
   type VerificationRecord,
   type VerificationRequest,
+  type VerifierAttestationIdentityRecordV2,
   type WaitAnalysisForAuthenticationInput,
   type WebsiteAuthenticationCheckpointRecord,
+  type WebsiteAuthenticationCleanupResourceEvidence,
+  type WebsiteLiveReceiptEvidence,
+  type WebsiteAuthenticationResultCheckpoint,
   type WorkflowExecutionMaterial,
   type ResumeAnalysisAfterAuthenticationInput,
   type TerminateAnalysisAuthenticationInput,
@@ -76,6 +94,7 @@ import {
   type WorkflowTaskEventInput,
   type WorkflowTaskRecord,
   type SourceConfiguration,
+  type ImmutableSourceArtifactIdentity,
 } from "./workflow.ts";
 
 type PostgresOptions = {
@@ -99,6 +118,10 @@ const MAX_CAPABILITIES = 1_000;
 const MAX_EVIDENCE = 1_000;
 const MAX_AUDIT_EVENTS = 1_000;
 const MAX_RELEASE_BYTES = 64 * 1_024;
+const VERIFIER_ATTESTATION_COLUMNS =
+  "verifier_attestation_id, verifier_attestation_request_id, verifier_attestation_nonce_digest, " +
+  "verifier_attestation_operation, verifier_attestation_scope_digest, verifier_attestation_payload_digest, " +
+  "verifier_attestation_issued_at, verifier_attestation_expires_at, verifier_attestation_attested_at";
 const RELEASE_INSTALLATION_COLUMNS =
   "id, organization_id, project_id, release_id, actor_id, page_url, artifact_url, self_hosted_url, " +
   "target_origin, artifact_content_hash, integrity, expected_tools, status, delivery, csp_status, csp_directive, " +
@@ -110,6 +133,7 @@ const RELEASE_INSTALLATION_COLUMNS =
   "authenticated_read_authenticated, authenticated_read_succeeded, confirmed_mutation_tool_name, " +
   "confirmed_mutation_confirmation, confirmed_mutation_reversible, confirmed_mutation_succeeded, " +
   "confirmed_mutation_effect_count, final_state_mutation_tool_name, final_state_source, final_state_verified, " +
+  `${VERIFIER_ATTESTATION_COLUMNS}, ` +
   "created_at, verified_at";
 const GITHUB_DRAFT_PULL_REQUEST_COLUMNS =
   "id, organization_id, project_id, workflow_run_id, task_id, analysis_run_id, source_snapshot_id, " +
@@ -481,6 +505,35 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
     if (!locked.rows[0]?.locked) throw new RepositoryError("INVALID_STATE");
   }
 
+  async #verificationSourceBinding(
+    db: Db,
+    actor: RepositoryActor,
+    projectId: string,
+    analysisRunId: string,
+  ): Promise<Readonly<{ sourceIdentityHash: string; sourceConfiguration: SourceConfiguration }>> {
+    const result = await db.query(
+      "select snapshot.source_identity_hash, source.source_type, source.source_configuration " +
+      "from public.workflow_runs workflow " +
+      "join public.source_snapshots snapshot on snapshot.id = workflow.source_snapshot_id " +
+      "and snapshot.organization_id = workflow.organization_id and snapshot.project_id = workflow.project_id " +
+      "join public.project_sources source on source.id = snapshot.project_source_id " +
+      "and source.organization_id = snapshot.organization_id and source.project_id = snapshot.project_id " +
+      "where workflow.analysis_run_id = $1 and workflow.project_id = $2 and workflow.organization_id = $3 limit 1",
+      [analysisRunId, projectId, actor.organizationId],
+    );
+    const row = result.rows[0];
+    if (!row || !/^[0-9a-f]{64}$/.test(String(row.source_identity_hash ?? ""))) {
+      throw new RepositoryError("INVALID_STATE");
+    }
+    return {
+      sourceIdentityHash: String(row.source_identity_hash),
+      sourceConfiguration: parsePersistedSourceConfiguration(
+        row.source_type as SourceType,
+        row.source_configuration as SourceConfiguration,
+      ),
+    };
+  }
+
   async getAnalysis(actor: RepositoryActor, id: string): Promise<AnalysisRunRecord> {
     return this.#transaction({ kind: "app", actor }, (client) => this.#analysis(client, actor, id));
   }
@@ -590,7 +643,7 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
       await this.#project(client, actor, projectId);
       const result = await client.query(
         "select id, organization_id, project_id, project_source_id, source_identity_hash, " +
-        "artifact_reference, content_hash, is_fixture, created_at from public.source_snapshots " +
+        "artifact_reference, content_hash, source_artifact_metadata, is_fixture, created_at from public.source_snapshots " +
         "where project_id = $1 and organization_id = $2 order by created_at, id limit 1000",
         [projectId, actor.organizationId]
       );
@@ -1480,7 +1533,20 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
         "join private.analysis_jobs job on job.analysis_run_id = claimed.analysis_run_id",
         [workerId, boundedLease],
       );
-      return result.rows[0] ? mapClaimedWebsiteAuthenticationCleanup(result.rows[0]) : undefined;
+      if (!result.rows[0]) return undefined;
+      await setWorkerWorkflowLeaseContext(
+        client,
+        workerId,
+        String(result.rows[0].workflow_task_id),
+        Number(result.rows[0].cleanup_lease_generation),
+      );
+      const receipt = await client.query(
+        "select * from private.website_live_receipt_evidence where analysis_run_id = $1",
+        [result.rows[0].analysis_run_id],
+      );
+      if (!receipt.rows[0]) throw new RepositoryError("INVALID_STATE");
+      result.rows[0].live_receipt_evidence = mapWebsiteLiveReceiptEvidence(receipt.rows[0]);
+      return mapClaimedWebsiteAuthenticationCleanup(result.rows[0]);
     });
   }
 
@@ -1488,9 +1554,29 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
     workerId: string,
     runId: string,
     leaseGeneration: number,
+    resourceUpdates: readonly WebsiteAuthenticationCleanupResourceEvidence[] = [],
   ): Promise<void> {
     assertWorkflowWorkerId(workerId);
     return this.#transaction({ kind: "worker" }, async (client) => {
+      const cleanupLease = await client.query(
+        "select workflow_task_id from private.website_authentication_checkpoints " +
+        "where analysis_run_id = $1 and cleanup_status = 'running' and cleanup_lease_owner = $2 " +
+        "and cleanup_lease_expires_at > now() and cleanup_lease_generation = $3 for update",
+        [runId, workerId, leaseGeneration],
+      );
+      if (!cleanupLease.rows[0]) throw new RepositoryError("LEASE_LOST");
+      await setWorkerWorkflowLeaseContext(
+        client, workerId, String(cleanupLease.rows[0].workflow_task_id), leaseGeneration,
+      );
+      const receipt = await client.query(
+        "select * from private.website_live_receipt_evidence where analysis_run_id = $1 for update",
+        [runId],
+      );
+      if (!receipt.rows[0]) throw new RepositoryError("INVALID_STATE");
+      const cleanupResources = advanceWebsiteCleanupResources(
+        mapWebsiteLiveReceiptEvidence(receipt.rows[0]).cleanupResources,
+        resourceUpdates,
+      );
       const completed = await client.query(
         "update private.website_authentication_checkpoints set cleanup_status = 'succeeded', " +
         "cleanup_lease_owner = null, cleanup_lease_expires_at = null, cleanup_completed_at = now(), " +
@@ -1500,6 +1586,11 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
         [runId, workerId, leaseGeneration],
       );
       if (!completed.rows[0]) throw new RepositoryError("LEASE_LOST");
+      await client.query(
+        "update private.website_live_receipt_evidence set cleanup_resources = $2::jsonb, updated_at = now() " +
+        "where analysis_run_id = $1",
+        [runId, JSON.stringify(cleanupResources)],
+      );
     });
   }
 
@@ -1509,17 +1600,30 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
     leaseGeneration: number,
     errorCode: string,
     retryable = true,
+    resourceUpdates: readonly WebsiteAuthenticationCleanupResourceEvidence[] = [],
   ): Promise<void> {
     assertWorkflowWorkerId(workerId);
     validateWorkflowErrorCode(errorCode);
     return this.#transaction({ kind: "worker" }, async (client) => {
       const locked = await client.query(
-        "select cleanup_attempts from private.website_authentication_checkpoints where analysis_run_id = $1 " +
+        "select cleanup_attempts, workflow_task_id from private.website_authentication_checkpoints where analysis_run_id = $1 " +
         "and cleanup_status = 'running' and cleanup_lease_owner = $2 " +
         "and cleanup_lease_expires_at > now() and cleanup_lease_generation = $3 for update",
         [runId, workerId, leaseGeneration],
       );
       if (!locked.rows[0]) throw new RepositoryError("LEASE_LOST");
+      await setWorkerWorkflowLeaseContext(
+        client, workerId, String(locked.rows[0].workflow_task_id), leaseGeneration,
+      );
+      const receipt = await client.query(
+        "select * from private.website_live_receipt_evidence where analysis_run_id = $1 for update",
+        [runId],
+      );
+      if (!receipt.rows[0]) throw new RepositoryError("INVALID_STATE");
+      const cleanupResources = advanceWebsiteCleanupResources(
+        mapWebsiteLiveReceiptEvidence(receipt.rows[0]).cleanupResources,
+        resourceUpdates,
+      );
       const attempts = Number(locked.rows[0].cleanup_attempts);
       const exhausted = !retryable || attempts >= 3;
       const retryDelayMs = workflowRetryDelayMs(attempts, undefined, this.#random);
@@ -1533,6 +1637,11 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
         [runId, workerId, leaseGeneration, exhausted ? "failed" : "pending", retryDelayMs, errorCode],
       );
       if (!retried.rows[0]) throw new RepositoryError("LEASE_LOST");
+      await client.query(
+        "update private.website_live_receipt_evidence set cleanup_resources = $2::jsonb, updated_at = now() " +
+        "where analysis_run_id = $1",
+        [runId, JSON.stringify(cleanupResources)],
+      );
     });
   }
 
@@ -1706,6 +1815,24 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
         || authenticationCheckpoint.targetOriginDigest !== websiteTargetOriginDigest(String(job.rows[0].source_url)))) {
         throw new RepositoryError("INVALID_STATE");
       }
+      let liveReceiptEvidence: WebsiteLiveReceiptEvidence | undefined;
+      if (authenticationCheckpoint) {
+        const receiptEvidenceResult = await client.query(
+          "update private.website_live_receipt_evidence set " +
+          "resumed_worker_identity_digest = $2, resume_lease_generation = $3, " +
+          "resume_claimed_at = now(), updated_at = now() " +
+          "where analysis_run_id = $1 and resumed_worker_identity_digest is null returning *",
+          [runId, websiteWorkerIdentityDigest(workerId), workflowTask.leaseGeneration],
+        );
+        const persistedReceiptResult = receiptEvidenceResult.rows[0] ? receiptEvidenceResult : await client.query(
+          "select * from private.website_live_receipt_evidence where analysis_run_id = $1 for update",
+          [runId],
+        );
+        if (!persistedReceiptResult.rows[0]) throw new RepositoryError("INVALID_STATE");
+        liveReceiptEvidence = mapWebsiteLiveReceiptEvidence(persistedReceiptResult.rows[0]);
+        if (!liveReceiptEvidence.authenticationEvidenceReferenceDigest
+          || !liveReceiptEvidence.authenticationConsumedAt) throw new RepositoryError("INVALID_STATE");
+      }
       await client.query("select private.append_workflow_event($1, $2, 'task.claimed', null)", [runId, workflowTask.id]);
       const result = await client.query(
         "select ar.id, ar.organization_id, ar.project_id, ar.requested_by, ar.status, ar.attempts, " +
@@ -1728,6 +1855,7 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
           authentication_source_identity_hash: authenticationCheckpoint.sourceIdentityHash,
           authentication_target_origin_digest: authenticationCheckpoint.targetOriginDigest,
           authentication_expires_at: authenticationCheckpoint.expiresAt,
+          authentication_live_receipt_evidence: liveReceiptEvidence,
         });
       }
       return mapClaimedAnalysis(result.rows[0]);
@@ -1766,7 +1894,7 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
   ): Promise<WebsiteAuthenticationCheckpointRecord> {
     assertWorkflowWorkerId(workerId);
     const normalized = normalizeWebsiteAuthenticationWaitInput(input, new Date());
-    const waitInputHash = stableHashBounded(input.inputHash);
+    const waitInputHash = websiteAuthenticationWaitCommandHash(input.inputHash, normalized.suspensionEvidence);
     return this.#transaction({ kind: "worker" }, async (client) => {
       const workflowResult = await client.query(
         "select * from public.workflow_runs where id = $1 for update",
@@ -1812,6 +1940,10 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
         || task.leaseGeneration !== (leaseGeneration ?? task.leaseGeneration)) {
         throw new RepositoryError("LEASE_LOST");
       }
+      if (normalized.suspensionEvidence.suspendedWorkerIdentityDigest !== websiteWorkerIdentityDigest(workerId)
+        || normalized.suspensionEvidence.suspendedLeaseGeneration !== task.leaseGeneration) {
+        throw new RepositoryError("LEASE_LOST");
+      }
       if (workflow.status !== "running" || workflow.sourceSnapshotId !== normalized.sourceSnapshotId
         || workflow.organizationId !== String(job.organization_id)
         || workflow.projectId !== String(job.project_id)) {
@@ -1840,6 +1972,30 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
         [runId, workflow.organizationId, workflow.projectId, task.id, workflow.sourceSnapshotId,
           normalized.sourceIdentityHash, normalized.targetOriginDigest, normalized.checkpointReference,
           normalized.expiresAt, input.idempotencyKey, waitInputHash],
+      );
+      const suspension = normalized.suspensionEvidence;
+      await client.query(
+        "insert into private.website_live_receipt_evidence " +
+        "(analysis_run_id, organization_id, project_id, workflow_task_id, source_snapshot_id, " +
+        "source_identity_hash, target_origin_digest, checkpoint_reference, checkpoint_expires_at, " +
+        "ownership_decision_digest, provider_session_identity_digest, browser_use_api_version, browser_use_model, browser_use_adapter, " +
+        "browser_use_adapter_version, browser_policy_digest, browser_lease_identity_digest, " +
+        "browser_lease_expires_at, egress_policy_reference_digest, egress_policy_digest, cdp_reference_digest, " +
+        "public_evidence_reference, ttl_secret_references, suspended_worker_identity_digest, " +
+        "suspended_lease_generation, cleanup_resources) " +
+        "values ($1, $2, $3, $4, $5, $6, $7, $8, $9::timestamptz, $10, $11, $12, $13, $14, $15, $16, " +
+        "$17, $18::timestamptz, $19, $20, $21, $22, $23::jsonb, $24, $25, $26::jsonb)",
+        [runId, workflow.organizationId, workflow.projectId, task.id, workflow.sourceSnapshotId,
+          suspension.checkpoint.sourceIdentityHash, suspension.checkpoint.targetOriginDigest,
+          suspension.checkpoint.checkpointReference, suspension.checkpoint.expiresAt,
+          suspension.ownershipDecisionDigest, suspension.providerSessionIdentityDigest, suspension.browserUse.apiVersion,
+          suspension.browserUse.model, suspension.browserUse.adapter, suspension.browserUse.adapterVersion,
+          suspension.browserUse.policyDigest, suspension.browserLease.identityDigest,
+          suspension.browserLease.expiresAt, suspension.egressPolicy.referenceDigest,
+          suspension.egressPolicy.policyDigest, suspension.cdpReferenceDigest,
+          suspension.publicEvidenceReference, JSON.stringify(suspension.ttlSecrets),
+          suspension.suspendedWorkerIdentityDigest, suspension.suspendedLeaseGeneration,
+          JSON.stringify(initialWebsiteCleanupResources(suspension))],
       );
       const updatedTask = await client.query(
         "update private.workflow_tasks set status = 'waiting', checkpoint_reference = $2, " +
@@ -1925,6 +2081,11 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
           || !websiteAuthenticationResumeMatches(checkpoint, normalized)) {
           throw new RepositoryError("IDEMPOTENCY_CONFLICT");
         }
+        const evidenceReplay = await client.query(
+          "select private.record_website_authentication_evidence($1, $2, $3) as recorded",
+          [input.runId, actor.organizationId, websiteReferenceDigest(normalized.authenticationEvidenceReference)],
+        );
+        if (evidenceReplay.rows[0]?.recorded !== true) throw new RepositoryError("IDEMPOTENCY_CONFLICT");
         return checkpoint;
       }
       if (workflow.cancelRequestedAt || workflow.status === "cancelled") throw new RepositoryError("CANCELLED");
@@ -1961,6 +2122,11 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
         [input.runId, normalized.authenticationEvidenceReference, input.idempotencyKey, resumeInputHash],
       );
       if (!consumed.rows[0]) throw new RepositoryError("INVALID_STATE");
+      const authenticationEvidence = await client.query(
+        "select private.record_website_authentication_evidence($1, $2, $3) as recorded",
+        [input.runId, actor.organizationId, websiteReferenceDigest(normalized.authenticationEvidenceReference)],
+      );
+      if (authenticationEvidence.rows[0]?.recorded !== true) throw new RepositoryError("INVALID_STATE");
       const updatedTask = await client.query(
         "update private.workflow_tasks set status = 'queued', resumed_at = now(), available_at = now(), " +
         "lease_owner = null, lease_expires_at = null, updated_at = now() " +
@@ -2083,12 +2249,35 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
     });
   }
 
+  async checkpointWebsiteAuthenticationResult(
+    workerId: string,
+    runId: string,
+    result: AnalysisResult,
+    leaseGeneration: number,
+  ): Promise<WebsiteAuthenticationResultCheckpoint> {
+    const persisted = await this.#persistAnalysisResult(workerId, runId, result, leaseGeneration, true);
+    if ("status" in persisted) throw new RepositoryError("INVALID_STATE");
+    return persisted;
+  }
+
   async completeAnalysis(
     workerId: string,
     runId: string,
     result: AnalysisResult,
     leaseGeneration?: number,
   ): Promise<AnalysisRunRecord> {
+    const persisted = await this.#persistAnalysisResult(workerId, runId, result, leaseGeneration, false);
+    if (!("status" in persisted)) throw new RepositoryError("INVALID_STATE");
+    return persisted;
+  }
+
+  async #persistAnalysisResult(
+    workerId: string,
+    runId: string,
+    result: AnalysisResult,
+    leaseGeneration: number | undefined,
+    checkpointOnly: boolean,
+  ): Promise<AnalysisRunRecord | WebsiteAuthenticationResultCheckpoint> {
     if (result.capabilities.length > MAX_CAPABILITIES || result.evidence.length > MAX_EVIDENCE
       || result.release !== undefined && Buffer.byteLength(result.release.code) > MAX_RELEASE_BYTES) {
       throw new RepositoryError("INVALID_STATE");
@@ -2130,6 +2319,12 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
       const organizationId = String(job.rows[0].organization_id);
       const projectId = String(job.rows[0].project_id);
       const workflowTaskId = String(job.rows[0].workflow_task_id);
+      await setWorkerWorkflowLeaseContext(
+        client,
+        workerId,
+        workflowTaskId,
+        Number(job.rows[0].workflow_lease_generation),
+      );
       const providerProvenance = result.providerProvenance === undefined ? undefined
         : normalizeProviderProvenance(result.providerProvenance, job.rows[0].source_type as SourceType);
       const normalizedEvidence = result.evidence.map((item) => normalizeEvidence(
@@ -2145,6 +2340,85 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
       if (!evidenceResolves(normalizedEvidence, canonicalPlans,
         organizationId, projectId, runId, new Date())) {
         throw new RepositoryError("INVALID_STATE");
+      }
+      const sourceArtifact = normalizeAnalysisSourceArtifact(
+        result.sourceArtifact,
+        providerProvenance,
+        normalizedEvidence,
+      );
+      const releaseHash = result.release === undefined
+        ? null
+        : createHash("sha256").update(Buffer.from(result.release.code)).digest("hex");
+      const outputHash = stableHash(canonicalJson({
+        diagnostics: normalizedDiagnostics,
+        evidence: normalizedEvidence.map(({ reference }) => reference).sort(compareStrings),
+        plans: canonicalPlans.map((plan) => capabilityPlanDigest(plan)).sort(compareStrings),
+        release: releaseHash ?? undefined,
+        providerProvenance,
+      }));
+      const outputReference = releaseHash
+        ? `urn:sha256:${releaseHash}`
+        : normalizedEvidence[0]?.reference;
+      if (!outputReference) throw new RepositoryError("INVALID_STATE");
+      const authenticationReceipt = await client.query(
+        "select receipt.*, checkpoint.state as authentication_state " +
+        "from private.website_live_receipt_evidence receipt " +
+        "join private.website_authentication_checkpoints checkpoint " +
+        "on checkpoint.analysis_run_id = receipt.analysis_run_id " +
+        "where receipt.analysis_run_id = $1 for update of receipt",
+        [runId],
+      );
+      if (checkpointOnly && authenticationReceipt.rows[0]?.authentication_state !== "consumed") {
+        throw new RepositoryError("INVALID_STATE");
+      }
+      if (authenticationReceipt.rows[0]?.result_checkpoint_hash) {
+        const checkpointed = mapWebsiteLiveReceiptEvidence(authenticationReceipt.rows[0]);
+        const checkpoint = websiteAuthenticationResultCheckpoint(checkpointed);
+        if (!checkpointOnly || !checkpoint || checkpoint.resultHash !== outputHash
+          || checkpoint.outputReference !== outputReference
+          || checkpointed.resultCheckpointWorkerIdentityDigest !== websiteWorkerIdentityDigest(workerId)
+          || checkpoint.leaseGeneration !== Number(job.rows[0].workflow_lease_generation)) {
+          throw new RepositoryError("IDEMPOTENCY_CONFLICT");
+        }
+        return checkpoint;
+      }
+      if (!checkpointOnly && authenticationReceipt.rows[0]) {
+        // Authentication completion is always checkpointed before external cleanup.
+        throw new RepositoryError("INVALID_STATE");
+      }
+      if (sourceArtifact) {
+        const frozen = await client.query(
+          "select content_hash, artifact_reference, source_artifact_metadata from public.source_snapshots " +
+          "where id = $1 and project_id = $2 and organization_id = $3 for update",
+          [workflow.sourceSnapshotId, projectId, organizationId],
+        );
+        if (!frozen.rows[0]) throw new RepositoryError("INVALID_STATE");
+        const existingValues = [frozen.rows[0].content_hash, frozen.rows[0].artifact_reference,
+          frozen.rows[0].source_artifact_metadata];
+        if (existingValues.some((value) => value !== null && value !== undefined)) {
+          let existing: ImmutableSourceArtifactIdentity;
+          try {
+            const metadata = frozen.rows[0].source_artifact_metadata as Record<string, unknown>;
+            existing = normalizeImmutableSourceArtifactIdentity({
+              contentHash: String(frozen.rows[0].content_hash),
+              artifactReference: String(frozen.rows[0].artifact_reference),
+              finalUrl: metadata?.finalUrl as string,
+              mimeType: metadata?.mimeType as string,
+              sizeBytes: metadata?.sizeBytes as number,
+            });
+          } catch { throw new RepositoryError("SOURCE_SNAPSHOT_STALE"); }
+          if (canonicalJson(existing) !== canonicalJson(sourceArtifact)) {
+            throw new RepositoryError("SOURCE_SNAPSHOT_STALE");
+          }
+        } else {
+          await client.query(
+            "update public.source_snapshots set content_hash = $2, artifact_reference = $3, " +
+            "source_artifact_metadata = $4::jsonb where id = $1",
+            [workflow.sourceSnapshotId, sourceArtifact.contentHash, sourceArtifact.artifactReference,
+              JSON.stringify({ finalUrl: sourceArtifact.finalUrl, mimeType: sourceArtifact.mimeType,
+                sizeBytes: sourceArtifact.sizeBytes })],
+          );
+        }
       }
       const insertedEvidence: Array<{ id: string; reference: string }> = [];
       for (const evidence of normalizedEvidence) {
@@ -2171,19 +2445,49 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
         );
         insertedCapabilities.push({ id: capabilityId, planDigest });
       }
-      const releaseHash = result.release === undefined
-        ? null
-        : createHash("sha256").update(Buffer.from(result.release.code)).digest("hex");
       await client.query(
         "update public.analysis_runs set result = $2::jsonb, release_code = $3, release_hash = $4, " +
         "allowed_origin = $5, release_manifest = $6::jsonb, provider_mode = $7, provider_adapter = $8, " +
         "provider_adapter_version = $9, provider_fixture = $10, error_code = null, updated_at = now() where id = $1",
-        [runId, JSON.stringify({ diagnostics: normalizedDiagnostics, draftPullRequest: result.draftPullRequest }),
+        [runId, JSON.stringify({ diagnostics: normalizedDiagnostics, draftPullRequest: result.draftPullRequest,
+          ...(sourceArtifact ? { sourceArtifact } : {}) }),
           result.release?.code ?? null, releaseHash, result.release?.allowedOrigin ?? null,
           result.release === undefined ? null : JSON.stringify(result.release.manifest ?? {}),
           providerProvenance?.mode ?? null, providerProvenance?.adapter ?? null,
           providerProvenance?.adapterVersion ?? null, providerProvenance?.fixture ?? null]
       );
+      if (checkpointOnly) {
+        for (const evidence of insertedEvidence) {
+          await client.query(
+            "insert into public.workflow_evidence " +
+            "(organization_id, project_id, workflow_run_id, task_id, evidence_id, reference) " +
+            "values ($1, $2, $3, $4, $5, $6)",
+            [organizationId, projectId, runId, workflowTaskId, evidence.id, evidence.reference],
+          );
+        }
+        for (const capability of insertedCapabilities) {
+          await client.query(
+            "insert into public.capability_plans " +
+            "(organization_id, project_id, workflow_run_id, task_id, capability_id, plan_digest) " +
+            "values ($1, $2, $3, $4, $5, $6)",
+            [organizationId, projectId, runId, workflowTaskId, capability.id, capability.planDigest],
+          );
+        }
+        const checkpointed = await client.query(
+          "update private.website_live_receipt_evidence set result_checkpoint_hash = $2, " +
+          "result_checkpoint_output_reference = $3, result_checkpoint_worker_identity_digest = $4, " +
+          "result_checkpoint_lease_generation = $5, result_checkpointed_at = now(), updated_at = now() " +
+          "where analysis_run_id = $1 and result_checkpoint_hash is null " +
+          "and resumed_worker_identity_digest is not null and resume_acknowledged_at is null " +
+          "returning result_checkpointed_at",
+          [runId, outputHash, outputReference, websiteWorkerIdentityDigest(workerId),
+            Number(job.rows[0].workflow_lease_generation)],
+        );
+        if (!checkpointed.rows[0]) throw new RepositoryError("INVALID_STATE");
+        return { resultHash: outputHash, outputReference,
+          leaseGeneration: Number(job.rows[0].workflow_lease_generation),
+          checkpointedAt: iso(checkpointed.rows[0].result_checkpointed_at) };
+      }
       const completed = await client.query(
         "update private.analysis_jobs set status = 'succeeded', lease_owner = null, lease_expires_at = null, " +
         "updated_at = now() where analysis_run_id = $1 and lease_owner = $2 and lease_expires_at > now() " +
@@ -2191,24 +2495,33 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
         [runId, workerId]
       );
       if (!completed.rows[0]) throw new RepositoryError("LEASE_LOST");
+      const authenticationCheckpoint = await client.query(
+        "select state from private.website_authentication_checkpoints where analysis_run_id = $1 for update",
+        [runId],
+      );
+      if (authenticationCheckpoint.rows[0]?.state === "consumed") {
+        const acknowledged = await client.query(
+          "update private.website_live_receipt_evidence set resume_acknowledged_at = now(), " +
+          "restart_verified = resumed_worker_identity_digest <> suspended_worker_identity_digest, updated_at = now() " +
+          "where analysis_run_id = $1 and resumed_worker_identity_digest is not null " +
+          "and resume_acknowledged_at is null returning analysis_run_id",
+          [runId],
+        );
+        if (!acknowledged.rows[0]) throw new RepositoryError("INVALID_STATE");
+      } else if (authenticationCheckpoint.rows[0]) {
+        throw new RepositoryError("INVALID_STATE");
+      }
       await client.query(
         "update private.website_authentication_checkpoints set state = 'completed', terminal_at = now(), updated_at = now() " +
         "where analysis_run_id = $1 and state = 'consumed'",
         [runId],
       );
-      const outputHash = stableHash(canonicalJson({
-        diagnostics: normalizedDiagnostics,
-        evidence: insertedEvidence.map(({ reference }) => reference).sort(compareStrings),
-        plans: insertedCapabilities.map(({ planDigest }) => planDigest).sort(compareStrings),
-        release: releaseHash ?? undefined,
-        providerProvenance,
-      }));
       await client.query(
         "update private.workflow_tasks set status = 'succeeded', output_hash = $2, output_reference = $3, " +
         "lease_owner = null, lease_expires_at = null, error_code = null, updated_at = now() " +
         "where id = $1 and lease_generation = coalesce($4, lease_generation)",
         [workflowTaskId, outputHash,
-          releaseHash ? `urn:sha256:${releaseHash}` : insertedEvidence[0]?.reference ?? null,
+          outputReference,
           leaseGeneration ?? null]
       );
       for (const evidence of insertedEvidence) {
@@ -2232,6 +2545,113 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
         [runId]
       );
       await client.query("select private.append_workflow_event($1, $2, 'task.completed', null)", [runId, workflowTaskId]);
+      await client.query("select private.append_workflow_event($1, null, 'workflow.completed', null)", [runId]);
+      return this.#workerAnalysis(client, runId);
+    });
+  }
+
+  async completeCheckpointedWebsiteAuthenticationAnalysis(
+    workerId: string,
+    runId: string,
+    resultHash: string,
+    leaseGeneration: number,
+    resourceUpdates: readonly WebsiteAuthenticationCleanupResourceEvidence[] = [],
+  ): Promise<AnalysisRunRecord> {
+    assertWorkflowWorkerId(workerId);
+    if (!/^[0-9a-f]{64}$/.test(resultHash) || !Number.isSafeInteger(leaseGeneration) || leaseGeneration < 1) {
+      throw new RepositoryError("INVALID_STATE");
+    }
+    return this.#transaction({ kind: "worker" }, async (client) => {
+      const workflow = await this.#workerWorkflowRun(client, runId, true);
+      if (workflow.cancelRequestedAt || workflow.status === "cancelled") throw new RepositoryError("CANCELLED");
+      const leased = await client.query(
+        "select job.organization_id, analysis.project_id, task.id as workflow_task_id, " +
+        "task.lease_generation from private.analysis_jobs job " +
+        "join public.analysis_runs analysis on analysis.id = job.analysis_run_id " +
+        "and analysis.organization_id = job.organization_id " +
+        "join private.workflow_tasks task on task.workflow_run_id = job.analysis_run_id " +
+        "and task.phase = 'analysis' " +
+        "where job.analysis_run_id = $1 and job.status = 'running' and job.lease_owner = $2 " +
+        "and job.lease_expires_at > now() and task.status = 'running' and task.lease_owner = $2 " +
+        "and task.lease_expires_at > now() and task.lease_generation = $3 for update of job, task",
+        [runId, workerId, leaseGeneration],
+      );
+      if (!leased.rows[0]) throw new RepositoryError("LEASE_LOST");
+      const taskId = String(leased.rows[0].workflow_task_id);
+      const completingGeneration = Number(leased.rows[0].lease_generation);
+      await setWorkerWorkflowLeaseContext(client, workerId, taskId, completingGeneration);
+      const receipt = await client.query(
+        "select evidence.result_checkpoint_hash, evidence.result_checkpoint_output_reference, " +
+        "evidence.suspended_worker_identity_digest, evidence.resume_acknowledged_at, evidence.cleanup_resources, checkpoint.state, " +
+        "analysis.result is not null as result_persisted, analysis.release_hash, " +
+        "exists (select 1 from public.workflow_evidence link where link.workflow_run_id = evidence.analysis_run_id " +
+        "and link.task_id = evidence.workflow_task_id) as has_evidence, " +
+        "exists (select 1 from public.workflow_evidence link where link.workflow_run_id = evidence.analysis_run_id " +
+        "and link.task_id = evidence.workflow_task_id " +
+        "and link.reference = evidence.result_checkpoint_output_reference) as output_is_evidence " +
+        "from private.website_live_receipt_evidence evidence " +
+        "join private.website_authentication_checkpoints checkpoint " +
+        "on checkpoint.analysis_run_id = evidence.analysis_run_id " +
+        "and checkpoint.organization_id = evidence.organization_id " +
+        "and checkpoint.project_id = evidence.project_id " +
+        "and checkpoint.workflow_task_id = evidence.workflow_task_id " +
+        "and checkpoint.source_snapshot_id = evidence.source_snapshot_id " +
+        "and checkpoint.source_identity_hash = evidence.source_identity_hash " +
+        "and checkpoint.target_origin_digest = evidence.target_origin_digest " +
+        "and checkpoint.checkpoint_reference = evidence.checkpoint_reference " +
+        "and checkpoint.expires_at = evidence.checkpoint_expires_at " +
+        "join public.analysis_runs analysis on analysis.id = evidence.analysis_run_id " +
+        "and analysis.organization_id = evidence.organization_id and analysis.project_id = evidence.project_id " +
+        "where evidence.analysis_run_id = $1 for update of evidence, checkpoint",
+        [runId],
+      );
+      if (receipt.rows[0]?.state !== "consumed"
+        || String(receipt.rows[0].result_checkpoint_hash ?? "") !== resultHash
+        || !/^urn:sha256:[0-9a-f]{64}$/.test(String(receipt.rows[0].result_checkpoint_output_reference ?? ""))
+        || receipt.rows[0].result_persisted !== true || receipt.rows[0].has_evidence !== true
+        || !(receipt.rows[0].output_is_evidence === true
+          || String(receipt.rows[0].result_checkpoint_output_reference)
+            === `urn:sha256:${String(receipt.rows[0].release_hash ?? "")}`)
+          || receipt.rows[0].resume_acknowledged_at) {
+        throw new RepositoryError("INVALID_STATE");
+      }
+      const completionWorkerIdentityDigest = websiteWorkerIdentityDigest(workerId);
+      const cleanupResources = advanceWebsiteCleanupResources(
+        receipt.rows[0].cleanup_resources as WebsiteAuthenticationCleanupResourceEvidence[],
+        resourceUpdates,
+      );
+      const acknowledged = await client.query(
+        "update private.website_live_receipt_evidence set completion_worker_identity_digest = $2, " +
+        "completion_lease_generation = $3, resume_acknowledged_at = now(), " +
+        "restart_verified = suspended_worker_identity_digest <> $2, cleanup_resources = $5::jsonb, updated_at = now() " +
+        "where analysis_run_id = $1 and result_checkpoint_hash = $4 " +
+        "and completion_worker_identity_digest is null and resume_acknowledged_at is null returning analysis_run_id",
+        [runId, completionWorkerIdentityDigest, completingGeneration, resultHash, JSON.stringify(cleanupResources)],
+      );
+      if (!acknowledged.rows[0]) throw new RepositoryError("INVALID_STATE");
+      const completed = await client.query(
+        "update private.analysis_jobs set status = 'succeeded', lease_owner = null, lease_expires_at = null, " +
+        "updated_at = now() where analysis_run_id = $1 and lease_owner = $2 and lease_expires_at > now() " +
+        "returning analysis_run_id",
+        [runId, workerId],
+      );
+      if (!completed.rows[0]) throw new RepositoryError("LEASE_LOST");
+      await client.query(
+        "update private.website_authentication_checkpoints set state = 'completed', terminal_at = now(), updated_at = now() " +
+        "where analysis_run_id = $1 and state = 'consumed'",
+        [runId],
+      );
+      await client.query(
+        "update private.workflow_tasks set status = 'succeeded', output_hash = $2, output_reference = $3, " +
+        "lease_owner = null, lease_expires_at = null, error_code = null, updated_at = now() " +
+        "where id = $1 and lease_generation = $4",
+        [taskId, resultHash, String(receipt.rows[0].result_checkpoint_output_reference), completingGeneration],
+      );
+      await client.query(
+        "update public.workflow_runs set status = 'succeeded', error_code = null, updated_at = now() where id = $1",
+        [runId],
+      );
+      await client.query("select private.append_workflow_event($1, $2, 'task.completed', null)", [runId, taskId]);
       await client.query("select private.append_workflow_event($1, null, 'workflow.completed', null)", [runId]);
       return this.#workerAnalysis(client, runId);
     });
@@ -2298,9 +2718,16 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
   async getAnalysisResult(actor: RepositoryActor, runId: string): Promise<AnalysisResult | undefined> {
     return this.#transaction({ kind: "app", actor }, async (client) => {
       const run = await client.query(
-        "select result, release_code, release_hash, allowed_origin, release_manifest, provider_mode, " +
-        "provider_adapter, provider_adapter_version, provider_fixture from public.analysis_runs " +
-        "where id = $1 and organization_id = $2 and status = 'succeeded' limit 1",
+        "select analysis.result, analysis.release_code, analysis.release_hash, analysis.allowed_origin, " +
+        "analysis.release_manifest, analysis.provider_mode, analysis.provider_adapter, " +
+        "analysis.provider_adapter_version, analysis.provider_fixture, " +
+        "snapshot.content_hash as source_content_hash, snapshot.artifact_reference as source_artifact_reference, " +
+        "snapshot.source_artifact_metadata from public.analysis_runs analysis " +
+        "left join public.workflow_runs workflow on workflow.analysis_run_id = analysis.id " +
+        "and workflow.project_id = analysis.project_id and workflow.organization_id = analysis.organization_id " +
+        "left join public.source_snapshots snapshot on snapshot.id = workflow.source_snapshot_id " +
+        "and snapshot.project_id = workflow.project_id and snapshot.organization_id = workflow.organization_id " +
+        "where analysis.id = $1 and analysis.organization_id = $2 and analysis.status = 'succeeded' limit 1",
         [runId, actor.organizationId]
       );
       if (!run.rows[0]) {
@@ -2321,6 +2748,7 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
       const stored = run.rows[0].result as {
         diagnostics?: AnalysisResult["diagnostics"];
         draftPullRequest?: AnalysisResult["draftPullRequest"];
+        sourceArtifact?: AnalysisResult["sourceArtifact"];
       } | null;
       const diagnostics = normalizeAnalysisDiagnostics(stored?.diagnostics ?? []);
       const providerProvenance = run.rows[0].provider_mode === null ? undefined
@@ -2338,15 +2766,42 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
         || capabilities.rows.length > 0 && !hasRelease) {
         throw new RepositoryError("INVALID_STATE");
       }
+      const mappedEvidence = evidence.rows.map(mapEvidence);
+      let sourceSnapshotArtifact: ImmutableSourceArtifactIdentity | undefined;
+      if (providerProvenance?.mode === "openapi" || stored?.sourceArtifact !== undefined) {
+        const snapshotValues = [run.rows[0].source_content_hash, run.rows[0].source_artifact_reference,
+          run.rows[0].source_artifact_metadata];
+        if (!snapshotValues.every((value) => value !== null && value !== undefined)) {
+          throw new RepositoryError("SOURCE_SNAPSHOT_STALE");
+        }
+        const metadata = run.rows[0].source_artifact_metadata as Record<string, unknown>;
+        try {
+          sourceSnapshotArtifact = normalizeImmutableSourceArtifactIdentity({
+            contentHash: String(run.rows[0].source_content_hash),
+            artifactReference: String(run.rows[0].source_artifact_reference),
+            finalUrl: metadata.finalUrl as string,
+            mimeType: metadata.mimeType as string,
+            sizeBytes: metadata.sizeBytes as number,
+          });
+        } catch {
+          throw new RepositoryError("SOURCE_SNAPSHOT_STALE");
+        }
+      }
+      const sourceArtifact = normalizePersistedAnalysisSourceArtifact(
+        stored?.sourceArtifact,
+        providerProvenance,
+        sourceSnapshotArtifact,
+      );
       return {
         capabilities: capabilities.rows.map((row) => ({ plan: row.plan as CapabilityPlan,
           status: row.status as CapabilityRecord["status"] })),
         diagnostics,
-        evidence: evidence.rows.map(mapEvidence),
+        evidence: mappedEvidence,
         release: hasRelease ? { code: String(run.rows[0].release_code), contentHash: String(run.rows[0].release_hash),
           allowedOrigin: String(run.rows[0].allowed_origin), manifest: run.rows[0].release_manifest } : undefined,
         draftPullRequest: stored?.draftPullRequest,
         ...(providerProvenance ? { providerProvenance } : {}),
+        ...(sourceArtifact ? { sourceArtifact } : {}),
       };
     });
   }
@@ -2443,6 +2898,9 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
       await this.#lockReleaseAnalysisRun(client, actor, projectId, input.analysisRunId);
       const run = await this.#analysis(client, actor, input.analysisRunId);
       if (run.projectId !== projectId || run.status !== "succeeded") throw new RepositoryError("INVALID_STATE");
+      const sourceBinding = await this.#verificationSourceBinding(client, actor, projectId, run.id);
+      if (!candidateVerifierScopeMatches(input, projectId, sourceBinding.sourceIdentityHash,
+        sourceBinding.sourceConfiguration)) throw new RepositoryError("INVALID_STATE");
       const capabilities = await this.#analysisCapabilities(client, actor, run.id, true);
       if (capabilities.some((capability) => !capabilityPlanBindingValid(capability))) {
         throw new RepositoryError("RELEASE_GATE_FAILED", ["CAPABILITY_PLAN_MISMATCH"]);
@@ -2489,6 +2947,7 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
           "verifier_protocol_version, verifier_origin_digest, verifier_webmcp_implementation, observed_content_hash, " +
           "observed_integrity, observed_release_id, observed_target_origin, registered_tools, trusted_loader_enforced, " +
           "trusted_loader_content_hash, control_plane_request_count, model_request_count, " +
+          `${VERIFIER_ATTESTATION_COLUMNS}, ` +
           "eligible, failures, created_at " +
           "from public.verification_runs where id = $1 and project_id = $2 and organization_id = $3 limit 1",
           [published.rows[0].verification_run_id, projectId, actor.organizationId]
@@ -2505,6 +2964,7 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
         throw new RepositoryError("RELEASE_GATE_FAILED", ["CANDIDATE_CHANGED"]);
       }
       const failures = releaseFailures(input);
+      const verifierAttestation = input.observation.verifierAttestation;
       const result = await client.query(
         "insert into public.verification_runs " +
         "(organization_id, project_id, analysis_run_id, capability_state_digest, candidate_content_hash, " +
@@ -2512,14 +2972,17 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
         "no_secret_leakage, browser_execution, selection_score, checks, csp_result, verification_mode, eligible, failures, " +
         "verifier_protocol_version, verifier_origin_digest, verifier_webmcp_implementation, observed_content_hash, " +
         "observed_integrity, observed_release_id, observed_target_origin, registered_tools, trusted_loader_enforced, " +
-        "trusted_loader_content_hash, control_plane_request_count, model_request_count) " +
+        "trusted_loader_content_hash, control_plane_request_count, model_request_count, " +
+        `${VERIFIER_ATTESTATION_COLUMNS}) ` +
         "values ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10,$11,$12,$13,$14,$15::jsonb,$16::jsonb,$17,$18,$19," +
-        "$20,$21,$22,$23,$24,$25,$26,$27::jsonb,$28,$29,$30,$31) " +
+        "$20,$21,$22,$23,$24,$25,$26,$27::jsonb,$28,$29,$30,$31," +
+        "$32::uuid,$33::uuid,$34,$35,$36,$37,$38::timestamptz,$39::timestamptz,$40::timestamptz) " +
         "returning id, project_id, analysis_run_id, capability_state_digest, candidate_content_hash, schema_valid, authenticated, " +
         "replay_passes, no_secret_leakage, browser_execution, selection_score, checks, csp_result, verification_mode, " +
         "eligible, failures, verifier_protocol_version, verifier_origin_digest, verifier_webmcp_implementation, " +
         "observed_content_hash, observed_integrity, observed_release_id, observed_target_origin, registered_tools, " +
-        "trusted_loader_enforced, trusted_loader_content_hash, control_plane_request_count, model_request_count, created_at",
+        "trusted_loader_enforced, trusted_loader_content_hash, control_plane_request_count, model_request_count, " +
+        `${VERIFIER_ATTESTATION_COLUMNS}, created_at`,
         [actor.organizationId, projectId, input.analysisRunId, input.capabilityStateDigest, candidateContentHash,
           input.candidate.code, input.candidate.allowedOrigin, JSON.stringify(input.candidate.manifest ?? {}),
           input.schema, input.authenticated, input.replayPasses, input.noSecretLeakage, input.browserExecution,
@@ -2530,7 +2993,12 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
           input.observation.observedReleaseId, input.observation.observedTargetOrigin,
           JSON.stringify(input.observation.registeredTools), input.observation.trustedLoader.enforcedBeforeEvaluation,
           input.observation.trustedLoader.evaluatedContentHash,
-          input.observation.controlPlaneRequestsDuringExecution, input.observation.modelRequestsDuringExecution]
+          input.observation.controlPlaneRequestsDuringExecution, input.observation.modelRequestsDuringExecution,
+          verifierAttestation?.attestationId ?? null, verifierAttestation?.requestId ?? null,
+          verifierAttestation?.nonceDigest ?? null, verifierAttestation?.operation ?? null,
+          verifierAttestation?.scopeDigest ?? null, verifierAttestation?.payloadDigest ?? null,
+          verifierAttestation?.issuedAt ?? null, verifierAttestation?.expiresAt ?? null,
+          verifierAttestation?.attestedAt ?? null]
       );
       return mapVerification(result.rows[0]);
     });
@@ -2701,7 +3169,8 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
         "no_secret_leakage, browser_execution, selection_score, checks, csp_result, verification_mode, " +
         "eligible, failures, verifier_protocol_version, verifier_origin_digest, verifier_webmcp_implementation, " +
         "observed_content_hash, observed_integrity, observed_release_id, observed_target_origin, registered_tools, " +
-        "trusted_loader_enforced, trusted_loader_content_hash, control_plane_request_count, model_request_count, created_at " +
+        "trusted_loader_enforced, trusted_loader_content_hash, control_plane_request_count, model_request_count, " +
+        `${VERIFIER_ATTESTATION_COLUMNS}, created_at ` +
         "from public.verification_runs where id = $1 and project_id = $2 and organization_id = $3 " +
         "and analysis_run_id = $4 and capability_state_digest = $5 and candidate_content_hash = $6 and eligible " +
         "and candidate_code = $7 and candidate_allowed_origin = $8 and candidate_manifest = $9::jsonb " +
@@ -2756,7 +3225,8 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
         [input.releaseId, projectId, actor.organizationId]
       );
       if (!releaseResult.rows[0]) throw new RepositoryError("NOT_FOUND");
-      const normalized = normalizeReleaseInstallation(input, mapRelease(releaseResult.rows[0]));
+      const release = mapRelease(releaseResult.rows[0]);
+      const normalized = normalizeReleaseInstallation(input, release);
       const executionEvidence = normalized.attestation.executionEvidence;
       const keyed = await client.query(
         `select ${RELEASE_INSTALLATION_COLUMNS} ` +
@@ -2770,6 +3240,11 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
         }
         return replay;
       }
+      const sourceBinding = await this.#verificationSourceBinding(
+        client, actor, projectId, release.analysisRunId,
+      );
+      if (!installationVerifierScopeMatches(normalized, projectId, sourceBinding.sourceIdentityHash,
+        sourceBinding.sourceConfiguration)) throw new RepositoryError("INVALID_STATE");
       const result = await client.query(
         "insert into public.release_installations " +
         "(organization_id, project_id, release_id, actor_id, page_url, artifact_url, self_hosted_url, target_origin, " +
@@ -2782,10 +3257,12 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
         "authenticated_read_authenticated, authenticated_read_succeeded, confirmed_mutation_tool_name, " +
         "confirmed_mutation_confirmation, confirmed_mutation_reversible, confirmed_mutation_succeeded, " +
         "confirmed_mutation_effect_count, final_state_mutation_tool_name, final_state_source, final_state_verified, " +
+        `${VERIFIER_ATTESTATION_COLUMNS}, ` +
         "verified_at) " +
         "values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12,$13,$14,$15,$16,$17::jsonb,$18,$19," +
         "$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31::jsonb,$32,$33,$34,$35,$36,$37,$38,$39," +
         "$40,$41,$42,$43,$44,$45,$46,$47,$48,$49,$50," +
+        "$51::uuid,$52::uuid,$53,$54,$55,$56,$57::timestamptz,$58::timestamptz,$59::timestamptz," +
         "case when $12 = 'verified' then now() else null end) " +
         "on conflict (organization_id, actor_id, idempotency_key) do nothing " +
         `returning ${RELEASE_INSTALLATION_COLUMNS}`,
@@ -2813,7 +3290,16 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
           executionEvidence?.confirmedReversibleMutation.effectCount ?? null,
           executionEvidence?.authoritativeFinalState.mutationToolName ?? null,
           executionEvidence?.authoritativeFinalState.source ?? null,
-          executionEvidence?.authoritativeFinalState.verified ?? null]
+          executionEvidence?.authoritativeFinalState.verified ?? null,
+          normalized.attestation.verifierAttestation?.attestationId ?? null,
+          normalized.attestation.verifierAttestation?.requestId ?? null,
+          normalized.attestation.verifierAttestation?.nonceDigest ?? null,
+          normalized.attestation.verifierAttestation?.operation ?? null,
+          normalized.attestation.verifierAttestation?.scopeDigest ?? null,
+          normalized.attestation.verifierAttestation?.payloadDigest ?? null,
+          normalized.attestation.verifierAttestation?.issuedAt ?? null,
+          normalized.attestation.verifierAttestation?.expiresAt ?? null,
+          normalized.attestation.verifierAttestation?.attestedAt ?? null]
       );
       if (result.rows[0]) return mapReleaseInstallation(result.rows[0]);
       const existing = await client.query(
@@ -2946,6 +3432,7 @@ function mapAnalysis(row: QueryResultRow): AnalysisRunRecord {
 }
 
 function mapClaimedAnalysis(row: QueryResultRow): ClaimedAnalysisRunRecord {
+  const liveReceiptEvidence = row.authentication_live_receipt_evidence as WebsiteLiveReceiptEvidence | undefined;
   const checkpoint = row.authentication_checkpoint_reference
     ? {
         checkpointReference: String(row.authentication_checkpoint_reference),
@@ -2954,6 +3441,10 @@ function mapClaimedAnalysis(row: QueryResultRow): ClaimedAnalysisRunRecord {
         sourceIdentityHash: String(row.authentication_source_identity_hash),
         targetOriginDigest: String(row.authentication_target_origin_digest),
         expiresAt: iso(row.authentication_expires_at),
+        ...(liveReceiptEvidence && websiteAuthenticationResultCheckpoint(liveReceiptEvidence) ? {
+          resultCheckpoint: websiteAuthenticationResultCheckpoint(liveReceiptEvidence),
+        } : {}),
+        liveReceiptEvidence: liveReceiptEvidence!,
       }
     : undefined;
   return {
@@ -2999,6 +3490,81 @@ function mapWebsiteAuthenticationCheckpoint(row: QueryResultRow): WebsiteAuthent
   };
 }
 
+function mapWebsiteLiveReceiptEvidence(row: QueryResultRow): WebsiteLiveReceiptEvidence {
+  const suspension = normalizeWebsiteSuspensionEvidence({
+    schemaVersion: 1,
+    ownershipDecisionDigest: String(row.ownership_decision_digest),
+    providerSessionIdentityDigest: String(row.provider_session_identity_digest),
+    browserUse: {
+      adapter: String(row.browser_use_adapter),
+      adapterVersion: Number(row.browser_use_adapter_version),
+      apiVersion: String(row.browser_use_api_version),
+      model: String(row.browser_use_model),
+      policyDigest: String(row.browser_policy_digest),
+    },
+    browserLease: {
+      identityDigest: String(row.browser_lease_identity_digest),
+      expiresAt: iso(row.browser_lease_expires_at),
+    },
+    egressPolicy: {
+      referenceDigest: String(row.egress_policy_reference_digest),
+      policyDigest: String(row.egress_policy_digest),
+    },
+    cdpReferenceDigest: String(row.cdp_reference_digest),
+    publicEvidenceReference: String(row.public_evidence_reference),
+    ttlSecrets: row.ttl_secret_references as WebsiteLiveReceiptEvidence["ttlSecrets"],
+    checkpoint: {
+      checkpointReference: String(row.checkpoint_reference),
+      sourceSnapshotId: String(row.source_snapshot_id),
+      sourceIdentityHash: String(row.source_identity_hash),
+      targetOriginDigest: String(row.target_origin_digest),
+      expiresAt: iso(row.checkpoint_expires_at),
+    },
+    suspendedWorkerIdentityDigest: String(row.suspended_worker_identity_digest),
+    suspendedLeaseGeneration: Number(row.suspended_lease_generation),
+  } as never);
+  const cleanupResources = normalizeWebsiteCleanupResources(
+    row.cleanup_resources as WebsiteAuthenticationCleanupResourceEvidence[],
+    initialWebsiteCleanupResources(suspension),
+  );
+  const evidence: WebsiteLiveReceiptEvidence = {
+    ...suspension,
+    ...(row.authentication_evidence_reference_digest ? {
+      authenticationEvidenceReferenceDigest: String(row.authentication_evidence_reference_digest),
+      authenticationConsumedAt: iso(row.authentication_consumed_at),
+    } : {}),
+    ...(row.resumed_worker_identity_digest ? {
+      resumedWorkerIdentityDigest: String(row.resumed_worker_identity_digest),
+      resumeLeaseGeneration: Number(row.resume_lease_generation),
+      resumeClaimedAt: iso(row.resume_claimed_at),
+    } : {}),
+    ...(row.result_checkpoint_hash ? {
+      resultCheckpointHash: String(row.result_checkpoint_hash),
+      resultCheckpointOutputReference: String(row.result_checkpoint_output_reference),
+      resultCheckpointWorkerIdentityDigest: String(row.result_checkpoint_worker_identity_digest),
+      resultCheckpointLeaseGeneration: Number(row.result_checkpoint_lease_generation),
+      resultCheckpointedAt: iso(row.result_checkpointed_at),
+    } : {}),
+    ...(row.completion_worker_identity_digest ? {
+      completionWorkerIdentityDigest: String(row.completion_worker_identity_digest),
+      completionLeaseGeneration: Number(row.completion_lease_generation),
+    } : {}),
+    ...(row.resume_acknowledged_at ? { resumeAcknowledgedAt: iso(row.resume_acknowledged_at) } : {}),
+    restartVerified: row.restart_verified === true,
+    cleanupResources,
+  };
+  websiteAuthenticationResultCheckpoint(evidence);
+  if ((evidence.completionWorkerIdentityDigest === undefined)
+      !== (evidence.completionLeaseGeneration === undefined)
+    || (evidence.completionWorkerIdentityDigest === undefined) !== (evidence.resumeAcknowledgedAt === undefined)
+    || evidence.restartVerified && (!evidence.resumeAcknowledgedAt
+    || evidence.completionWorkerIdentityDigest === evidence.suspendedWorkerIdentityDigest
+    || !evidence.completionLeaseGeneration)) {
+    throw new RepositoryError("INVALID_STATE");
+  }
+  return evidence;
+}
+
 function mapClaimedWebsiteAuthenticationCleanup(
   row: QueryResultRow,
 ): ClaimedWebsiteAuthenticationCleanupRecord {
@@ -3021,6 +3587,7 @@ function mapClaimedWebsiteAuthenticationCleanup(
     leaseOwner: String(row.cleanup_lease_owner),
     leaseExpiresAt: iso(row.cleanup_lease_expires_at),
     leaseGeneration: Number(row.cleanup_lease_generation),
+    liveReceiptEvidence: row.live_receipt_evidence as WebsiteLiveReceiptEvidence,
   };
 }
 
@@ -3037,11 +3604,27 @@ function mapProjectSource(row: QueryResultRow): ProjectSourceRecord {
 }
 
 function mapSourceSnapshot(row: QueryResultRow): SourceSnapshotRecord {
+  const identityValues = [row.artifact_reference, row.content_hash, row.source_artifact_metadata];
+  let sourceArtifact: ImmutableSourceArtifactIdentity | undefined;
+  if (row.source_artifact_metadata !== null && row.source_artifact_metadata !== undefined) {
+    if (!identityValues.every((value) => value !== null && value !== undefined)) {
+      throw new RepositoryError("INVALID_STATE");
+    }
+    const metadata = row.source_artifact_metadata as Record<string, unknown>;
+    sourceArtifact = normalizeImmutableSourceArtifactIdentity({
+      contentHash: String(row.content_hash),
+      artifactReference: String(row.artifact_reference),
+      finalUrl: metadata.finalUrl as string,
+      mimeType: metadata.mimeType as string,
+      sizeBytes: metadata.sizeBytes as number,
+    });
+  }
   return {
     id: String(row.id), organizationId: String(row.organization_id), projectId: String(row.project_id),
     projectSourceId: String(row.project_source_id), sourceIdentityHash: String(row.source_identity_hash),
     ...(row.artifact_reference ? { artifactReference: String(row.artifact_reference) } : {}),
     ...(row.content_hash ? { contentHash: String(row.content_hash) } : {}),
+    ...(sourceArtifact ? { sourceArtifact } : {}),
     isFixture: row.is_fixture === false ? false : true,
     createdAt: iso(row.created_at),
   };
@@ -3144,9 +3727,13 @@ function mapEvidence(row: QueryResultRow): AnalysisEvidence {
 }
 
 function mapVerification(row: QueryResultRow): VerificationRecord {
+  const verifierAttestation = mapVerifierAttestation(row, "candidate");
+  if ((row.verification_mode === "live" && Number(row.verifier_protocol_version) === 2) !== !!verifierAttestation) {
+    throw new RepositoryError("INVALID_STATE", ["VERIFIER_ATTESTATION_INVALID"]);
+  }
   const provenance = row.verifier_protocol_version === null || row.verifier_protocol_version === undefined ? {} : {
     verifierIdentity: {
-      protocolVersion: Number(row.verifier_protocol_version) as 1,
+      protocolVersion: Number(row.verifier_protocol_version) as 1 | 2,
       mode: row.verification_mode as "hermetic" | "local_live" | "live",
       webMcpImplementation: row.verifier_webmcp_implementation as "native",
       verifierOriginDigest: String(row.verifier_origin_digest),
@@ -3163,6 +3750,7 @@ function mapVerification(row: QueryResultRow): VerificationRecord {
       },
       controlPlaneRequestsDuringExecution: Number(row.control_plane_request_count),
       modelRequestsDuringExecution: Number(row.model_request_count),
+      ...(verifierAttestation ? { verifierAttestation } : {}),
     },
   };
   return { id: String(row.id), projectId: String(row.project_id), analysisRunId: String(row.analysis_run_id),
@@ -3231,11 +3819,15 @@ function mapReleaseInstallation(row: QueryResultRow): ReleaseInstallationRecord 
     throw new RepositoryError("INVALID_STATE");
   }
   const verifierIdentity = {
-    protocolVersion: Number(row.verifier_protocol_version) as 1,
+    protocolVersion: Number(row.verifier_protocol_version) as 1 | 2,
     mode: row.verification_mode as "hermetic" | "local_live" | "live",
     webMcpImplementation: row.verifier_webmcp_implementation as "native",
     verifierOriginDigest: String(row.verifier_origin_digest),
   };
+  const verifierAttestation = mapVerifierAttestation(row, "installation");
+  if ((row.verification_mode === "live" && Number(row.verifier_protocol_version) === 2) !== !!verifierAttestation) {
+    throw new RepositoryError("INVALID_STATE", ["VERIFIER_ATTESTATION_INVALID"]);
+  }
   const executionColumns = [
     row.authenticated_read_tool_name,
     row.authenticated_read_authenticated,
@@ -3310,6 +3902,7 @@ function mapReleaseInstallation(row: QueryResultRow): ReleaseInstallationRecord 
       hosted: row.csp_status as "allowed" | "blocked",
       ...(row.csp_directive ? { directive: String(row.csp_directive) } : {}),
     },
+    ...(verifierAttestation ? { verifierAttestation } : {}),
   };
   return {
     id: String(row.id), organizationId: String(row.organization_id), projectId: String(row.project_id),
@@ -3327,6 +3920,39 @@ function mapReleaseInstallation(row: QueryResultRow): ReleaseInstallationRecord 
     idempotencyKey: String(row.idempotency_key), inputHash: String(row.input_hash),
     createdAt: iso(row.created_at), ...(row.verified_at ? { verifiedAt: iso(row.verified_at) } : {}),
   };
+}
+
+function mapVerifierAttestation(
+  row: QueryResultRow,
+  operation: VerifierAttestationIdentityRecordV2["operation"],
+): VerifierAttestationIdentityRecordV2 | undefined {
+  const values = [
+    row.verifier_attestation_id,
+    row.verifier_attestation_request_id,
+    row.verifier_attestation_nonce_digest,
+    row.verifier_attestation_operation,
+    row.verifier_attestation_scope_digest,
+    row.verifier_attestation_payload_digest,
+    row.verifier_attestation_issued_at,
+    row.verifier_attestation_expires_at,
+    row.verifier_attestation_attested_at,
+  ];
+  if (values.every((value) => value === null || value === undefined)) return undefined;
+  if (values.some((value) => value === null || value === undefined)) {
+    throw new RepositoryError("INVALID_STATE", ["VERIFIER_ATTESTATION_INVALID"]);
+  }
+  return normalizeVerifierAttestationIdentity({
+    protocolVersion: 2,
+    attestationId: String(row.verifier_attestation_id),
+    requestId: String(row.verifier_attestation_request_id),
+    nonceDigest: String(row.verifier_attestation_nonce_digest),
+    operation: String(row.verifier_attestation_operation) as VerifierAttestationIdentityRecordV2["operation"],
+    scopeDigest: String(row.verifier_attestation_scope_digest),
+    payloadDigest: String(row.verifier_attestation_payload_digest),
+    issuedAt: iso(row.verifier_attestation_issued_at),
+    expiresAt: iso(row.verifier_attestation_expires_at),
+    attestedAt: iso(row.verifier_attestation_attested_at),
+  }, operation);
 }
 
 function mapVerificationCandidate(row: QueryResultRow): CandidateRelease {
@@ -3526,12 +4152,21 @@ function normalizeWebsiteAuthenticationWaitInput(
   if (!Number.isFinite(expiry) || expiry <= now.getTime() || expiry - now.getTime() > 10 * 60_000) {
     throw new RepositoryError("INVALID_STATE");
   }
+  const suspensionEvidence = normalizeWebsiteSuspensionEvidence(input.suspensionEvidence);
+  if (suspensionEvidence.checkpoint.checkpointReference !== input.checkpointReference
+    || suspensionEvidence.checkpoint.sourceSnapshotId !== input.sourceSnapshotId
+    || suspensionEvidence.checkpoint.sourceIdentityHash !== input.sourceIdentityHash
+    || suspensionEvidence.checkpoint.targetOriginDigest !== input.targetOriginDigest
+    || suspensionEvidence.checkpoint.expiresAt !== new Date(expiry).toISOString()) {
+    throw new RepositoryError("INVALID_STATE");
+  }
   return {
     ...input,
     checkpointReference: normalizeWebsiteAuthenticationReference(input.checkpointReference),
     sourceIdentityHash: normalizeWebsiteAuthenticationDigest(input.sourceIdentityHash),
     targetOriginDigest: normalizeWebsiteAuthenticationDigest(input.targetOriginDigest),
     expiresAt: new Date(expiry).toISOString(),
+    suspensionEvidence,
   };
 }
 

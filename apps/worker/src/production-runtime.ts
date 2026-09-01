@@ -181,6 +181,7 @@ function stampProviderProvenance(
     if ("disposition" in outcome && outcome.disposition === "waiting_for_authentication") return outcome;
     return { ...outcome, providerProvenance: provenance };
   };
+  stamped.finalizeAuthenticationCheckpoint = analyze.finalizeAuthenticationCheckpoint?.bind(analyze);
   stamped.reconcileAuthenticationCheckpoint = analyze.reconcileAuthenticationCheckpoint?.bind(analyze);
   return stamped;
 }
@@ -228,6 +229,7 @@ async function reconcileTerminalWebsiteAuthentication(
       sourceUrl: cleanup.sourceUrl,
       sourceSnapshotId: cleanup.sourceSnapshotId,
       sourceIdentityHash: cleanup.sourceIdentityHash,
+      liveReceiptEvidence: cleanup.liveReceiptEvidence,
     };
     const waiting: WebsiteAuthenticationWaitingOutcome = {
       disposition: "waiting_for_authentication",
@@ -240,11 +242,14 @@ async function reconcileTerminalWebsiteAuthentication(
       targetOriginDigest: cleanup.targetOriginDigest,
       expiresAt: cleanup.expiresAt,
     };
-    await analyze.reconcileAuthenticationCheckpoint(source, waiting, signal, cleanup.outcome);
+    const resourceUpdates = await analyze.reconcileAuthenticationCheckpoint(
+      source, waiting, signal, cleanup.outcome,
+    );
     await repository.completeWebsiteAuthenticationCleanup(
       workerId,
       cleanup.analysisRunId,
       cleanup.leaseGeneration,
+      resourceUpdates ?? [],
     );
   } catch (error) {
     const failureCode = authenticationCleanupFailureCode(error);

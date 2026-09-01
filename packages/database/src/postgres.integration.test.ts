@@ -170,6 +170,44 @@ test("Postgres copies canonical OpenAPI verification context into an immutable a
     assert.deepEqual(stored.rows[0]?.source_configuration, configuration);
     const claimed = await repository.claimAnalysis("postgres-source-configuration-worker", 60_000);
     assert.deepEqual(claimed?.sourceConfiguration, configuration);
+    const sourceHash = createHash("sha256").update("postgres-openapi-document").digest("hex");
+    const sourceArtifact = {
+      contentHash: sourceHash,
+      artifactReference: `urn:sha256:${sourceHash}`,
+      finalUrl: "https://api.configuration.widgets.example/openapi.json",
+      mimeType: "application/json",
+      sizeBytes: Buffer.byteLength("postgres-openapi-document"),
+    } as const;
+    const sourceEvidence = JSON.stringify({ sourceDigest: sourceArtifact.artifactReference });
+    await repository.completeAnalysis("postgres-source-configuration-worker", run.id, {
+      capabilities: [],
+      diagnostics: [{ code: "NO_SUPPORTED_OPERATIONS", operationKey: "document" }],
+      evidence: [{ source: "openapi", content: sourceEvidence,
+        reference: `urn:sha256:${createHash("sha256").update(sourceEvidence).digest("hex")}` }],
+      providerProvenance: {
+        mode: "openapi", adapter: "bounded-openapi", adapterVersion: 1, fixture: false,
+      },
+      sourceArtifact,
+    }, claimed!.leaseGeneration);
+    assert.deepEqual((await repository.listSourceSnapshots(actor, project.id))[0]?.sourceArtifact, sourceArtifact);
+    const frozen = await admin.query(
+      "select content_hash, artifact_reference, source_artifact_metadata from public.source_snapshots " +
+      "where project_id = $1",
+      [project.id],
+    );
+    assert.deepEqual(frozen.rows[0], {
+      content_hash: sourceArtifact.contentHash,
+      artifact_reference: sourceArtifact.artifactReference,
+      source_artifact_metadata: {
+        finalUrl: sourceArtifact.finalUrl, mimeType: sourceArtifact.mimeType, sizeBytes: sourceArtifact.sizeBytes,
+      },
+    });
+    await admin.query("delete from public.analysis_evidence where analysis_run_id = $1", [run.id]);
+    assert.deepEqual((await repository.getAnalysisResult(actor, run.id))?.sourceArtifact, sourceArtifact);
+    await assert.rejects(admin.query(
+      "update public.source_snapshots set content_hash = $2 where project_id = $1",
+      [project.id, "f".repeat(64)],
+    ), (error: unknown) => (error as { code?: string }).code === "23514");
     await assert.rejects(admin.query(
       "update public.project_sources set source_configuration = $2::jsonb where project_id = $1 and active",
       [project.id, JSON.stringify({

@@ -1,9 +1,10 @@
 import pg from "pg";
 import { createHash } from "node:crypto";
-import type {
-  NativeInstallationProof,
-  ProductionProviderProvenance,
-  SelectedProviderProbeContext,
+import {
+  normalizeFrozenOpenApiSourceIdentity,
+  type NativeInstallationProof,
+  type ProductionProviderProvenance,
+  type SelectedProviderProbeContext,
 } from "../../operations/src/readiness.ts";
 import { parsePersistedSourceConfiguration } from "./control-plane.ts";
 
@@ -97,6 +98,33 @@ const PROOF_COLUMNS = Object.freeze({
   zero_model_calls: "zeroModelCalls",
   trusted_loader_enforced: "trustedLoaderEnforced",
   candidate_checks_passed: "candidateChecksPassed",
+  project_id: "projectId",
+  analysis_run_id: "analysisRunId",
+  release_id: "releaseId",
+  source_identity_hash: "sourceIdentityHash",
+  target_origin: "targetOrigin",
+  environment: "environment",
+  installation_page_url: "installationPageUrl",
+  installation_operation_id: "installationOperationId",
+  candidate_attestation_id: "candidateAttestationId",
+  candidate_attestation_request_id: "candidateAttestationRequestId",
+  candidate_attestation_nonce_digest: "candidateAttestationNonceDigest",
+  candidate_attestation_operation: "candidateAttestationOperation",
+  candidate_attestation_scope_digest: "candidateAttestationScopeDigest",
+  candidate_attestation_payload_digest: "candidateAttestationPayloadDigest",
+  candidate_attestation_issued_at: "candidateAttestationIssuedAt",
+  candidate_attestation_expires_at: "candidateAttestationExpiresAt",
+  candidate_attestation_attested_at: "candidateAttestationAttestedAt",
+  installation_attestation_id: "installationAttestationId",
+  installation_attestation_request_id: "installationAttestationRequestId",
+  installation_attestation_nonce_digest: "installationAttestationNonceDigest",
+  installation_attestation_operation: "installationAttestationOperation",
+  installation_attestation_scope_digest: "installationAttestationScopeDigest",
+  installation_attestation_payload_digest: "installationAttestationPayloadDigest",
+  installation_attestation_issued_at: "installationAttestationIssuedAt",
+  installation_attestation_expires_at: "installationAttestationExpiresAt",
+  installation_attestation_attested_at: "installationAttestationAttestedAt",
+  installation_verified_at: "installationVerifiedAt",
 } as const);
 
 export function createApplicationReadinessRepository(
@@ -258,6 +286,11 @@ const PROVIDER_CONTEXT_COLUMNS = [
   "source_url",
   "source_configuration",
   "source_identity_hash",
+  "source_content_hash",
+  "source_artifact_reference",
+  "source_final_url",
+  "source_mime_type",
+  "source_size_bytes",
   "github_installation_id",
   "github_repository_id",
   "github_owner",
@@ -305,7 +338,29 @@ function mapProviderProbeContext(row: Record<string, unknown>): SelectedProvider
     sourceIdentityHash: row.source_identity_hash as string,
     sourceConfiguration,
   } as const;
-  const githubValues = PROVIDER_CONTEXT_COLUMNS.slice(4).map((column) => row[column]);
+  const frozenValues = [row.source_content_hash, row.source_artifact_reference, row.source_final_url,
+    row.source_mime_type, row.source_size_bytes];
+  const githubValues = [row.github_installation_id, row.github_repository_id, row.github_owner,
+    row.github_repository, row.github_ref, row.github_commit_sha, row.github_target_origin];
+  if (sourceType === "openapi") {
+    if (githubValues.some((value) => value !== null)) throw new Error("READINESS_PROVIDER_CONTEXT_INVALID");
+    try {
+      return {
+        ...common,
+        sourceType: "openapi",
+        sourceConfiguration: sourceConfiguration as Extract<SelectedProviderProbeContext,
+          { sourceType: "openapi" }>["sourceConfiguration"],
+        sourceArtifact: normalizeFrozenOpenApiSourceIdentity({
+          contentHash: row.source_content_hash,
+          artifactReference: row.source_artifact_reference,
+          finalUrl: row.source_final_url,
+          mimeType: row.source_mime_type,
+          sizeBytes: positiveSafeInteger(row.source_size_bytes),
+        }),
+      };
+    } catch { throw new Error("READINESS_PROVIDER_CONTEXT_INVALID"); }
+  }
+  if (frozenValues.some((value) => value !== null)) throw new Error("READINESS_PROVIDER_CONTEXT_INVALID");
   if (sourceType !== "github") {
     if (githubValues.some((value) => value !== null)) throw new Error("READINESS_PROVIDER_CONTEXT_INVALID");
     return common as SelectedProviderProbeContext;
@@ -410,6 +465,15 @@ function mapProof(row: Record<string, unknown>): NativeInstallationProof {
   }
   const mapped: Record<string, unknown> = {};
   for (const [column, property] of Object.entries(PROOF_COLUMNS)) mapped[property] = row[column];
+  for (const key of ["candidateAttestationIssuedAt", "candidateAttestationExpiresAt",
+    "candidateAttestationAttestedAt", "installationAttestationIssuedAt",
+    "installationAttestationExpiresAt", "installationAttestationAttestedAt",
+    "installationVerifiedAt"] as const) {
+    const value = mapped[key];
+    const date = value instanceof Date ? value : typeof value === "string" ? new Date(value) : undefined;
+    if (!date || !Number.isFinite(date.getTime())) throw new Error("LIVE_INSTALLATION_EVIDENCE_INVALID");
+    mapped[key] = date.toISOString();
+  }
   const strings = Object.entries(mapped).filter(([, value]) => typeof value === "string") as Array<[string, string]>;
   if (strings.some(([, value]) => value.length === 0 || value.length > 4_096)
     || !["hermetic", "local_live", "live"].includes(String(mapped.candidateMode))
@@ -420,6 +484,19 @@ function mapProof(row: Record<string, unknown>): NativeInstallationProof {
     || !["openapi", "website", "github"].includes(String(mapped.sourceType))
     || !UUID.test(String(mapped.releaseVerificationRunId))
     || !UUID.test(String(mapped.candidateVerificationRunId))
+    || !UUID.test(String(mapped.projectId))
+    || !UUID.test(String(mapped.analysisRunId))
+    || !UUID.test(String(mapped.releaseId))
+    || !UUID.test(String(mapped.candidateAttestationId))
+    || !UUID.test(String(mapped.candidateAttestationRequestId))
+    || !UUID.test(String(mapped.installationAttestationId))
+    || !UUID.test(String(mapped.installationAttestationRequestId))
+    || mapped.candidateAttestationOperation !== "candidate"
+    || mapped.installationAttestationOperation !== "installation"
+    || !["test", "staging", "production"].includes(String(mapped.environment))
+    || !exactHttpsUrl(mapped.targetOrigin) || new URL(mapped.targetOrigin).origin !== mapped.targetOrigin
+    || !exactHttpsUrl(mapped.installationPageUrl)
+    || new URL(mapped.installationPageUrl).origin !== mapped.targetOrigin
     || !SRI.test(String(mapped.releaseIntegrity))
     || !SRI.test(String(mapped.candidateObservedIntegrity))
     || !SRI.test(String(mapped.installationObservedIntegrity))) {
@@ -428,6 +505,11 @@ function mapProof(row: Record<string, unknown>): NativeInstallationProof {
   for (const key of ["selectedReleaseHash", "releaseContentHash", "servedContentHash", "executedContentHash",
     "trustedLoaderContentHash", "candidateVerifierOriginDigest", "installationVerifierOriginDigest",
     "expectedToolsDigest", "registeredToolsDigest"] as const) {
+    if (!HASH.test(String(mapped[key]))) throw new Error("LIVE_INSTALLATION_EVIDENCE_INVALID");
+  }
+  for (const key of ["sourceIdentityHash", "installationOperationId", "candidateAttestationNonceDigest",
+    "candidateAttestationScopeDigest", "candidateAttestationPayloadDigest", "installationAttestationNonceDigest",
+    "installationAttestationScopeDigest", "installationAttestationPayloadDigest"] as const) {
     if (!HASH.test(String(mapped[key]))) throw new Error("LIVE_INSTALLATION_EVIDENCE_INVALID");
   }
   for (const key of ["candidateProtocolVersion", "installationProtocolVersion", "providerAdapterVersion",

@@ -61,6 +61,14 @@ test("OpenAPI worker adapter binds exact source bytes to generic canonical plans
     targetOrigin: "https://widgets.example",
     testPageUrl: "https://widgets.example/review/openapi",
   });
+  const documentHash = createHash("sha256").update(source, "utf8").digest("hex");
+  assert.deepEqual(result.sourceArtifact, {
+    contentHash: documentHash,
+    artifactReference: `urn:sha256:${documentHash}`,
+    finalUrl: "https://specs.widgets.example/openapi.json",
+    mimeType: "application/json",
+    sizeBytes: Buffer.byteLength(source, "utf8"),
+  });
   assert.doesNotMatch(JSON.stringify(result), /sk-live|never-persist/i);
 });
 
@@ -374,10 +382,19 @@ test("website worker checkpoints public evidence and resumes the exact suspended
   }, new AbortController().signal);
   assert.equal(waiting.disposition, "waiting_for_authentication");
   assert.match(waiting.checkpointReference, /^urn:sha256:[a-f0-9]{64}$/);
+  const ownershipDecision = JSON.stringify({
+    expiresAt: ownershipExpiry,
+    method: "dns_txt",
+    targetOrigin: websiteOrigin,
+    tokenDigest: createHash("sha256").update(ownershipToken, "utf8").digest("hex"),
+    version: 1,
+  });
+  assert.equal(waiting.suspensionEvidence?.ownershipDecisionDigest,
+    createHash("sha256").update(ownershipDecision, "utf8").digest("hex"));
   assert.deepEqual(phases, ["public"]);
   assert.deepEqual(events, []);
 
-  const completed = await adapter({
+  const resumedSource = {
     sourceType: "website", sourceUrl: `${websiteOrigin}/`,
     organizationId: "org-1", projectId: "project-1", id: "run-auth",
     sourceConfiguration: { kind: "website" }, sourceIdentityHash: "f".repeat(64), sourceSnapshotId: "snapshot-1",
@@ -389,9 +406,13 @@ test("website worker checkpoints public evidence and resumes the exact suspended
       targetOriginDigest: createHash("sha256").update(websiteOrigin).digest("hex"),
       expiresAt: browserExpiry,
     },
-  }, new AbortController().signal);
+  } as const;
+  const completed = await adapter(resumedSource, new AbortController().signal);
   assert.equal(completed.capabilities[0]?.plan.authentication.mode, "same_origin_cookie");
   assert.deepEqual(phases, ["public", "authenticated"]);
+  assert.deepEqual(events, [], "successful cleanup must wait until the result checkpoint is durable");
+  assert.ok(adapter.finalizeAuthenticationCheckpoint);
+  await adapter.finalizeAuthenticationCheckpoint(resumedSource, new AbortController().signal);
   assert.deepEqual(events, ["auth:finalize", "auth:reconcile"]);
 
   const failedEvents: string[] = [];

@@ -5,6 +5,7 @@ import { readdir } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import test from "node:test";
+import { buildDeploymentIdentity } from "../apps/control-plane/src/deployment-identity.ts";
 import {
   parseReadinessMode,
   runReadinessCli,
@@ -23,6 +24,13 @@ const selectedContext = {
   sourceType: "openapi" as const,
   sourceUrl: "https://specs.widgets.example/openapi.json",
   sourceIdentityHash: "e".repeat(64),
+  sourceArtifact: {
+    contentHash: "f".repeat(64),
+    artifactReference: `urn:sha256:${"f".repeat(64)}`,
+    finalUrl: "https://specs.widgets.example/openapi.json",
+    mimeType: "application/json",
+    sizeBytes: 87,
+  },
   sourceConfiguration: {
     kind: "openapi" as const,
     targetOrigin: "https://widgets.example",
@@ -30,6 +38,12 @@ const selectedContext = {
     environment: "production" as const,
   },
 };
+const deployment = buildDeploymentIdentity({
+  gitCommitSha: "c".repeat(40),
+  applicationReleaseId: "page2webmcp-2026_09_01-rc1",
+  controlPlaneOrigin: "https://control.example",
+  sourceTreeSha256: "d".repeat(64),
+});
 
 async function spawn(args: string[], environment: Record<string, string | undefined> = {}) {
   return run(process.execPath, ["--import", "tsx", script, ...args], {
@@ -56,6 +70,8 @@ function completeEnvironment(mode: "live" | "local-live" = "live") {
     PAGE2WEBMCP_RELEASE_VERIFIER_TOKEN: "v".repeat(32),
     ...(mode === "live" ? {
       PAGE2WEBMCP_RELEASE_VERIFIER_ORIGIN: "https://verifier.example",
+      PAGE2WEBMCP_GIT_COMMIT_SHA: deployment.gitCommitSha,
+      PAGE2WEBMCP_APPLICATION_RELEASE_ID: deployment.applicationReleaseId,
     } : {
       PAGE2WEBMCP_LOCAL_STACK: "true",
       PAGE2WEBMCP_LOCAL_RELEASE_VERIFIER_ORIGIN: "http://127.0.0.1:3900",
@@ -76,6 +92,8 @@ function dependencies(
   context: typeof selectedContext | undefined = selectedContext,
 ): ReadinessCliDependencies {
   return {
+    deploymentIdentityDigest: deployment.identityDigest,
+    loadBuildIdentity: () => deployment,
     constructProvider: () => {
       order.push("provider");
       return {
@@ -99,8 +117,9 @@ function dependencies(
       });
       return response(String(input));
     },
-    handshake: async (_environment, mode) => {
+    handshake: async (_environment, mode, _signal, binding) => {
       order.push("verifier");
+      if (mode === "live") assert.equal(binding.deploymentIdentityDigest, deployment.identityDigest);
       return { protocolVersion: 1, mode, webMcpImplementation: "native", verifierOriginDigest: "b".repeat(64) };
     },
     createApplicationRepository: () => {
@@ -232,8 +251,9 @@ test("local-live databases require exact IP-literal loopback port 58322", async 
     "LIVE_INSTALLATION_EVIDENCE_REQUIRED");
 });
 
-test("source readiness requires the complete migration ledger through website authentication wait", async () => {
+test("source readiness requires the complete migration ledger through the verifier-v2 repair", async () => {
   const migrations = await readdir(new URL("../supabase/migrations/", import.meta.url));
+  assert.equal(migrations.includes("20260901100000_openapi_document_freeze.sql"), true);
   assert.equal(sourceMigrationLedgerCurrent(migrations), true);
   assert.equal(sourceMigrationLedgerCurrent(
     migrations.filter((name) => name !== "20260901071658_website_authentication_wait.sql"),
@@ -316,6 +336,19 @@ test("live loads the exact selected-release context before probing its provider"
     "database-construction", "database-topology", "database-provider-context", "database-query", "database-close",
     "provider-probe", "artifact", "verifier",
   ]);
+});
+
+test("live readiness rejects a digest that is not the exact local build identity before external work", async () => {
+  const order: string[] = [];
+  const outcome = await runReadinessCli(["--live"], completeEnvironment(), {
+    ...dependencies(order),
+    deploymentIdentityDigest: "e".repeat(64),
+  });
+  assert.deepEqual(outcome, {
+    output: { status: "failed", code: "DEPLOYMENT_IDENTITY_MISMATCH", liveSuccess: false },
+    exitCode: 1,
+  });
+  assert.deepEqual(order, []);
 });
 
 test("a syntactically valid but unreachable or revoked provider fails closed before artifact and databases", async () => {

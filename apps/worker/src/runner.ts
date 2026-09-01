@@ -7,7 +7,12 @@ import type {
   SourceType,
 } from "../../../packages/database/src/control-plane.ts";
 import { getObservability } from "../../../packages/observability/src/server.ts";
-import type { AnalysisAdapter, AnalysisAdapterOutcome, WebsiteAuthenticationWaitingOutcome } from "./workflow.ts";
+import {
+  bindWebsiteSuspensionToWorker,
+  type AnalysisAdapter,
+  type AnalysisAdapterOutcome,
+  type WebsiteAuthenticationWaitingOutcome,
+} from "./workflow.ts";
 
 const LEASE_MS = 60_000;
 const HEARTBEAT_MS = 15_000;
@@ -23,6 +28,7 @@ export type ProcessAnalysisOptions = {
 };
 
 type RunnerAnalysisAdapter = ((source: ClaimedAnalysisRunRecord, signal: AbortSignal) => Promise<AnalysisAdapterOutcome>) & {
+  finalizeAuthenticationCheckpoint?: AnalysisAdapter["finalizeAuthenticationCheckpoint"];
   reconcileAuthenticationCheckpoint?: AnalysisAdapter["reconcileAuthenticationCheckpoint"];
 };
 
@@ -58,25 +64,35 @@ export async function processNextAnalysis(
     if (stableFailureCode(error) === "LEASE_LOST") heartbeatFailure = error;
     },
   );
+  let durableAuthenticationCheckpointAttempted = false;
 
   try {
     const analyze = options.analyze ?? testAnalysisAdapter;
-    const outcome = await withDeadline(
+    const persistedResultCheckpoint = run.authenticationCheckpoint?.resultCheckpoint;
+    const outcome = persistedResultCheckpoint ? undefined : await withDeadline(
       (signal) => analyze ? analyze(run, signal) : Promise.reject(new Error("ANALYZER_NOT_CONFIGURED")),
       deadlineMs,
       isAuthenticationWait,
     );
-    heartbeatController.abort();
-    await heartbeat;
     if (heartbeatFailure) throw heartbeatFailure;
     if (isAuthenticationWait(outcome)) {
+      heartbeatController.abort();
+      await heartbeat;
+      if (heartbeatFailure) throw heartbeatFailure;
       try {
+        if (!outcome.suspensionEvidence) throw new Error("WEBSITE_SUSPENSION_EVIDENCE_REQUIRED");
+        const suspensionEvidence = bindWebsiteSuspensionToWorker(
+          outcome.suspensionEvidence,
+          workerId,
+          run.leaseGeneration,
+        );
         await repository.waitAnalysisForAuthentication(workerId, run.id, {
           checkpointReference: outcome.checkpointReference,
           sourceSnapshotId: outcome.sourceSnapshotId,
           sourceIdentityHash: outcome.sourceIdentityHash,
           targetOriginDigest: outcome.targetOriginDigest,
           expiresAt: outcome.expiresAt,
+          suspensionEvidence,
           idempotencyKey: `website-auth-wait:${outcome.checkpointReference.slice("urn:sha256:".length)}`,
           inputHash: createHash("sha256").update(JSON.stringify({
             checkpointReference: outcome.checkpointReference,
@@ -84,6 +100,7 @@ export async function processNextAnalysis(
             sourceIdentityHash: outcome.sourceIdentityHash,
             sourceSnapshotId: outcome.sourceSnapshotId,
             targetOriginDigest: outcome.targetOriginDigest,
+            suspensionEvidence,
           }), "utf8").digest("hex"),
         }, run.leaseGeneration);
         return undefined;
@@ -96,14 +113,42 @@ export async function processNextAnalysis(
         throw error;
       }
     }
-    const result = completedResult(outcome);
-    const completed = await repository.completeAnalysis(workerId, run.id, result, run.leaseGeneration);
+    let completed: AnalysisRunRecord;
+    if (run.authenticationCheckpoint) {
+      if (!analyze?.finalizeAuthenticationCheckpoint) {
+        throw new Error("WEBSITE_AUTHENTICATION_FINALIZE_NOT_CONFIGURED");
+      }
+      durableAuthenticationCheckpointAttempted = true;
+      const resultCheckpoint = persistedResultCheckpoint ?? await repository.checkpointWebsiteAuthenticationResult(
+        workerId, run.id, completedResult(outcome), run.leaseGeneration,
+      );
+      const remainingDeadlineMs = Math.max(10, deadlineMs - (Date.now() - startedAt));
+      const cleanupResources = await withDeadline(
+        (signal) => analyze.finalizeAuthenticationCheckpoint!(run, signal),
+        remainingDeadlineMs,
+      );
+      heartbeatController.abort();
+      await heartbeat;
+      if (heartbeatFailure) throw heartbeatFailure;
+      completed = await repository.completeCheckpointedWebsiteAuthenticationAnalysis(
+        workerId, run.id, resultCheckpoint.resultHash, run.leaseGeneration, cleanupResources ?? [],
+      );
+    } else {
+      heartbeatController.abort();
+      await heartbeat;
+      if (heartbeatFailure) throw heartbeatFailure;
+      completed = await repository.completeAnalysis(workerId, run.id, completedResult(outcome), run.leaseGeneration);
+    }
     await recordAnalysisOutcome(run.id, "success", run.sourceType, undefined, startedAt, run.attempts);
     return completed;
   } catch (error) {
     heartbeatController.abort();
     await heartbeat;
     const code = stableFailureCode(error);
+    if (durableAuthenticationCheckpointAttempted) {
+      await recordAnalysisOutcome(run.id, "failure", run.sourceType, code, startedAt, run.attempts);
+      throw error;
+    }
     try {
       const failed = await repository.failAnalysis(
         workerId, run.id, code, isRetryableFailure(code), run.leaseGeneration,
@@ -122,12 +167,13 @@ export async function processNextAnalysis(
 
 }
 
-function isAuthenticationWait(value: AnalysisAdapterOutcome): value is WebsiteAuthenticationWaitingOutcome {
+function isAuthenticationWait(value: AnalysisAdapterOutcome | undefined): value is WebsiteAuthenticationWaitingOutcome {
   return Boolean(value && typeof value === "object"
     && "disposition" in value && value.disposition === "waiting_for_authentication");
 }
 
-function completedResult(value: AnalysisAdapterOutcome): AnalysisResult {
+function completedResult(value: AnalysisAdapterOutcome | undefined): AnalysisResult {
+  if (!value) throw new Error("WEBSITE_AUTHENTICATION_RESULT_CHECKPOINT_INVALID");
   return value as AnalysisResult;
 }
 

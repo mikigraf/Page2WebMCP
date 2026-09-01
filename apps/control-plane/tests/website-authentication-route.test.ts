@@ -15,6 +15,7 @@ import {
   type WebsiteAuthenticationHandoffPort,
 } from "../src/website-user-handoff.ts";
 import { authenticatedHeaders, installTestRepository, owner, viewer } from "./auth-test-helpers.ts";
+import { websiteSuspensionEvidenceFixture } from "../../../test-support/website-suspension-evidence.ts";
 
 const CHECKPOINT_REFERENCE = `urn:sha256:${"a".repeat(64)}`;
 const EVIDENCE_REFERENCE = `urn:sha256:${"b".repeat(64)}`;
@@ -53,16 +54,23 @@ async function waitingWebsite(
   assert.ok(snapshot);
   const claim = await repository.claimAnalysis(`authentication-ui-worker-${suffix}`, 60_000, ["website"]);
   assert.equal(claim?.id, run.id);
+  const sourceIdentityHash = snapshot.sourceIdentityHash;
+  const targetOriginDigest = createHash("sha256").update(TARGET_ORIGIN, "utf8").digest("hex");
   await repository.waitAnalysisForAuthentication(`authentication-ui-worker-${suffix}`, run.id, {
     checkpointReference: CHECKPOINT_REFERENCE,
     sourceSnapshotId: claim!.sourceSnapshotId,
-    sourceIdentityHash: snapshot.sourceIdentityHash,
-    targetOriginDigest: createHash("sha256").update(TARGET_ORIGIN, "utf8").digest("hex"),
+    sourceIdentityHash,
+    targetOriginDigest,
     expiresAt,
+    suspensionEvidence: websiteSuspensionEvidenceFixture({
+      checkpointReference: CHECKPOINT_REFERENCE, sourceSnapshotId: claim!.sourceSnapshotId,
+      sourceIdentityHash, targetOriginDigest, expiresAt,
+      workerId: `authentication-ui-worker-${suffix}`, leaseGeneration: claim!.leaseGeneration,
+    }),
     idempotencyKey: `authentication-ui-wait-${suffix}`,
     inputHash: `authentication-ui-wait-${suffix}`,
   }, claim!.leaseGeneration);
-  return { projectId: project.id, runId: run.id, claim: claim!, sourceIdentityHash: snapshot.sourceIdentityHash };
+  return { projectId: project.id, runId: run.id, claim: claim!, sourceIdentityHash };
 }
 
 function handoffPort(input: Readonly<{

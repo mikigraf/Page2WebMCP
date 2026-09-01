@@ -27,6 +27,11 @@ import {
 } from "./workflow.ts";
 import type { SelectedProviderProbeContext } from "../../../packages/operations/src/readiness.ts";
 import { computeSourceIdentityHash } from "../../../packages/database/src/source-identity.ts";
+import {
+  advanceWebsiteCleanupResources,
+  type WebsiteAuthenticationCleanupResourceEvidence,
+  type WebsiteLiveReceiptEvidence,
+} from "../../../packages/database/src/control-plane.ts";
 
 type RuntimeEnvironment = Readonly<Record<string, string | undefined>>;
 
@@ -38,6 +43,28 @@ const HOSTED_PUBLIC_ORIGIN =
 const LOCAL_PUBLIC_ORIGIN =
   "http://127.0.0.1:58321/storage/v1/object/public/page2webmcp-releases";
 const referencePattern = /^secretref:[A-Za-z0-9._:-]{1,200}$/;
+
+function cleanupResourcesFromResponse(
+  value: unknown,
+): readonly WebsiteAuthenticationCleanupResourceEvidence[] {
+  if (!Array.isArray(value) || value.length > 7) throw new Error("WEBSITE_CONTROL_RESPONSE_INVALID");
+  return value as WebsiteAuthenticationCleanupResourceEvidence[];
+}
+
+function validateCleanupResourceOutcomes(
+  expected: WebsiteLiveReceiptEvidence | undefined,
+  outcomes: readonly (readonly WebsiteAuthenticationCleanupResourceEvidence[])[],
+): readonly WebsiteAuthenticationCleanupResourceEvidence[] {
+  if (!expected) throw new Error("WEBSITE_AUTHENTICATION_CLEANUP_EVIDENCE_INVALID");
+  let advanced = [...expected.cleanupResources];
+  try {
+    for (const outcome of outcomes) advanced = advanceWebsiteCleanupResources(advanced, outcome);
+  } catch {
+    throw new Error("WEBSITE_CONTROL_RESPONSE_INVALID");
+  }
+  const stored = new Map(expected.cleanupResources.map((item) => [item.resource, canonicalJson(item)]));
+  return advanced.filter((item) => stored.get(item.resource) !== canonicalJson(item));
+}
 const identifierPattern = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 
 export const WEBSITE_LIVE_GATEWAY_PROTOCOL_VERSION = 1 as const;
@@ -690,7 +717,7 @@ export function createConfiguredWebsiteAnalysisAdapter(
         if (response.finalized !== true || Object.entries(input).some(([key, value]) => !same(response[key], value))) {
           throw new Error("WEBSITE_CONTROL_RESPONSE_INVALID");
         }
-        return { finalized: true };
+        return { finalized: true, cleanupResources: cleanupResourcesFromResponse(response.cleanupResources) };
       },
       reconcile: async (input) => {
         const { response } = await checkpointStateful(
@@ -700,7 +727,8 @@ export function createConfiguredWebsiteAnalysisAdapter(
           || Object.entries(input).some(([key, value]) => !same(response[key], value))) {
           throw new Error("WEBSITE_CONTROL_RESPONSE_INVALID");
         }
-        return { reconciled: true, terminated: true };
+        return { reconciled: true, terminated: true,
+          cleanupResources: cleanupResourcesFromResponse(response.cleanupResources) };
       },
     };
     const explorer: WebsiteAnalysisConfiguration["explorer"] = {
@@ -997,7 +1025,7 @@ export function createConfiguredWebsiteAnalysisAdapter(
             if (response.finalized !== true || Object.entries(input).some(([key, value]) => !same(response[key], value))) {
               throw new Error("WEBSITE_CONTROL_RESPONSE_INVALID");
             }
-            return { finalized: true };
+            return { finalized: true, cleanupResources: cleanupResourcesFromResponse(response.cleanupResources) };
           },
           reconcile: async (input) => {
             const { response } = await checkpointStateful(
@@ -1007,7 +1035,8 @@ export function createConfiguredWebsiteAnalysisAdapter(
               || Object.entries(input).some(([key, value]) => !same(response[key], value))) {
               throw new Error("WEBSITE_CONTROL_RESPONSE_INVALID");
             }
-            return { reconciled: true, terminated: true };
+            return { reconciled: true, terminated: true,
+              cleanupResources: cleanupResourcesFromResponse(response.cleanupResources) };
           },
         },
         explorer: {
@@ -1084,6 +1113,61 @@ export function createConfiguredWebsiteAnalysisAdapter(
       if (primaryError === undefined && cleanupErrors.length > 0) throw new Error("WEBSITE_EGRESS_POLICY_CLEANUP_FAILED");
     }
   };
+  configuredAdapter.finalizeAuthenticationCheckpoint = async (source, finalizeSignal) => {
+    if (!source.id || !source.organizationId || !source.projectId || !source.sourceSnapshotId
+      || !source.sourceIdentityHash || !source.authenticationCheckpoint) {
+      throw new Error("WEBSITE_AUTHENTICATION_CHECKPOINT_INVALID");
+    }
+    const ownershipIdentity = {
+      organizationId: source.organizationId,
+      projectId: source.projectId,
+      runId: source.id,
+    };
+    const payload = {
+      checkpointReference: source.authenticationCheckpoint.checkpointReference,
+      ...ownershipIdentity,
+      sourceSnapshotId: source.sourceSnapshotId,
+      sourceIdentityHash: source.sourceIdentityHash,
+      targetOriginDigest: source.authenticationCheckpoint.targetOriginDigest,
+      expiresAt: source.authenticationCheckpoint.expiresAt,
+      outcome: "completed" as const,
+    };
+    const request = (operation: "checkpoint-finalize" | "checkpoint-reconcile") => ({
+      gatewayProtocolVersion: WEBSITE_LIVE_GATEWAY_PROTOCOL_VERSION,
+      idempotencyKey: `website:${source.id}:authentication:${operation}:${checkpointIdempotencyDigest(payload)}`,
+      ownership: ownershipIdentity,
+      ...payload,
+    });
+    const finalizeRequest = request("checkpoint-finalize");
+    const finalized = await auth.request(
+      WEBSITE_LIVE_CONTROL_PATHS.authenticationCheckpointFinalize,
+      finalizeRequest,
+      finalizeSignal,
+    );
+    if (finalized.gatewayProtocolVersion !== WEBSITE_LIVE_GATEWAY_PROTOCOL_VERSION
+      || finalized.idempotencyKey !== finalizeRequest.idempotencyKey
+      || !same(finalized.ownership, ownershipIdentity) || finalized.finalized !== true
+      || Object.entries(payload).some(([key, value]) => !same(finalized[key], value))) {
+      throw new Error("WEBSITE_CONTROL_RESPONSE_INVALID");
+    }
+    const reconcileRequest = request("checkpoint-reconcile");
+    const reconciled = await auth.request(
+      WEBSITE_LIVE_CONTROL_PATHS.authenticationCheckpointReconcile,
+      reconcileRequest,
+      finalizeSignal,
+    );
+    if (reconciled.gatewayProtocolVersion !== WEBSITE_LIVE_GATEWAY_PROTOCOL_VERSION
+      || reconciled.idempotencyKey !== reconcileRequest.idempotencyKey
+      || !same(reconciled.ownership, ownershipIdentity)
+      || reconciled.reconciled !== true || reconciled.terminated !== true
+      || Object.entries(payload).some(([key, value]) => !same(reconciled[key], value))) {
+      throw new Error("WEBSITE_CONTROL_RESPONSE_INVALID");
+    }
+    return validateCleanupResourceOutcomes(source.authenticationCheckpoint.liveReceiptEvidence, [
+      cleanupResourcesFromResponse(finalized.cleanupResources),
+      cleanupResourcesFromResponse(reconciled.cleanupResources),
+    ]);
+  };
   configuredAdapter.reconcileAuthenticationCheckpoint = async (
     source,
     waiting,
@@ -1120,6 +1204,7 @@ export function createConfiguredWebsiteAnalysisAdapter(
       || Object.entries(payload).some(([key, value]) => !same(response[key], value))) {
       throw new Error("WEBSITE_AUTHENTICATION_RECONCILE_FAILED");
     }
+    return cleanupResourcesFromResponse(response.cleanupResources);
   };
   return configuredAdapter;
 }

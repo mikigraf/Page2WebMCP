@@ -145,6 +145,33 @@ PAGE2WEBMCP_PUBLIC_ORIGIN=http://127.0.0.1:58321/storage/v1/object/public/page2w
 
 Production uses distinct managed app, worker, and maintenance login secrets and verified-TLS database URLs. Never deploy with the migration owner URL or give one login multiple authorization memberships.
 
+## Production images and deployment identity
+
+Build the control plane and worker as separate images from one clean, committed source tree. The operator must supply an approved `node:24@sha256:<lowercase-digest>` base image (an optional registry prefix is allowed); an unpinned tag or a non-Node-24 repository/tag is rejected inside each build. Generate the immutable identity and committed-source archive once before either image build, then pass the same commit, release ID, and HTTPS control-plane origin to both builds:
+
+```bash
+PAGE2WEBMCP_GIT_COMMIT_SHA=<exact-clean-commit> \
+PAGE2WEBMCP_APPLICATION_RELEASE_ID=<immutable-release-id> \
+PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN=https://control.example \
+pnpm build:identity
+
+docker build -f deploy/Dockerfile.control-plane \
+  --build-arg NODE_BASE_IMAGE=<approved-node-24-image@sha256:digest> \
+  --build-arg PAGE2WEBMCP_GIT_COMMIT_SHA=<exact-clean-commit> \
+  --build-arg PAGE2WEBMCP_APPLICATION_RELEASE_ID=<immutable-release-id> \
+  --build-arg PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN=https://control.example \
+  -t page2webmcp-control-plane:<immutable-release-id> .
+
+docker build -f deploy/Dockerfile.worker \
+  --build-arg NODE_BASE_IMAGE=<approved-node-24-image@sha256:digest> \
+  --build-arg PAGE2WEBMCP_GIT_COMMIT_SHA=<exact-clean-commit> \
+  --build-arg PAGE2WEBMCP_APPLICATION_RELEASE_ID=<immutable-release-id> \
+  --build-arg PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN=https://control.example \
+  -t page2webmcp-worker:<immutable-release-id> .
+```
+
+Identity generation fails on a dirty tree, commit mismatch, non-HTTPS origin, or conflicting prior manifest/archive. It writes read-only `.dist/deployment-identity.json` and `.dist/deployment-source.tar`. Each image extracts only that exact committed archive, re-hashes it, compares its active Dockerfile with the committed Dockerfile, and verifies the same runtime identity arguments before installing or compiling anything. Later workspace edits therefore cannot enter an image under an older identity. Both images run as the base image's non-root `node` user and copy the same read-only deployment identity.
+
 ## Immutable Supabase Storage artifacts
 
 The fixed public bucket is `page2webmcp-releases`; every key is exactly `<sha256>.js`. Publication uploads the exact candidate bytes with `upsert:false`. If the object exists, publication reads and verifies it instead of overwriting it. Serving and download bytes, SHA-256 and SHA-384 SRI, release identity, candidate observation, and installed observation must match.
@@ -190,6 +217,34 @@ Local-live may use `PAGE2WEBMCP_LOCAL_RELEASE_VERIFIER_ORIGIN=http://127.0.0.1:<
 Both verifier profiles must answer authenticated `POST /v1/readiness` without redirect and report the exact supported mode, protocol, and native implementation. Live evidence is accepted only when the release, served, executed, and trusted-loader hashes; SRI; candidate/install verifier identity; provider provenance; expected/registered tool digest and count; and target/artifact identity all match. The page load must be normal and unintercepted native WebMCP, with no injection, synthetic harness, harmful duplicate load, model call, or control-plane call.
 
 The readiness CLI emits one bounded JSON object. Exit 0 means the selected diagnostic gate passed; exit 1 means a deterministic gate failed; exit 2 means required controls or installation evidence are absent. No mode scans for another tenant's “latest” success.
+
+## Production-live operator journeys
+
+The shared preflight and the two customer-path commands are:
+
+```bash
+pnpm live:preflight -- --dry-run --provider openapi
+pnpm live:preflight -- --dry-run --provider website
+pnpm live:openapi -- --dry-run
+pnpm live:website -- --dry-run
+pnpm live:openapi -- --live
+pnpm live:website -- --live
+```
+
+The live commands load `.env` with Node's built-in `--env-file-if-exists=.env` support. Keep that file owner-only and never commit it; the commands print control names only, never values.
+
+Set `PAGE2WEBMCP_OPERATOR_CREDENTIALS_FILE` to an owner-only, non-symlink mode-0600 JSON file containing exactly `email` and `password`. Set `PAGE2WEBMCP_E2E_ENVIRONMENT=test|staging|production`. The command authenticates through the deployed control-plane CSRF/session APIs; it never inserts journey rows with SQL and never prints the credentials.
+
+These commands are deliberately resumable through server idempotency and durable PostgreSQL state. A nonzero action result is a checkpoint, not success:
+
+- `WEBSITE_OWNERSHIP_ACTION_REQUIRED`: complete the displayed project ownership flow in the UI, then rerun.
+- `WEBSITE_WORKER_RESTART_AND_AUTHENTICATION_REQUIRED`: recycle the production worker, complete the safe owner/editor handoff in the UI, then rerun Website with `--resume-authentication`. The database still requires a different completing worker/lease generation; the flag itself is not evidence.
+- `CAPABILITY_REVIEW_REQUIRED`: review the evidence-backed capabilities in the UI, then rerun.
+- `INSTALLATION_ACTION_REQUIRED`: install the returned exact module script in the target's site-wide layout. Rerun with `--confirm-installed <returned-sha256>` only after installation.
+
+The command then requests normal-load native installation verification, runs `--live` readiness for that exact hash, and writes a receipt only from the bounded persisted maintenance projection. A missing projection, stale verifier attestation, incomplete cleanup, or unsuccessful readiness remains nonzero with `liveSuccess:false`.
+
+Successful live receipts are stored under `.page2webmcp/production-live-receipts/<receipt-sha256>.json`. The writer creates the directory with mode 0700 and each immutable file with mode 0600; it rejects symlinks, non-owner paths, permissive modes, and any same-name byte conflict. Preserve these receipts with the corresponding deployment and artifact records.
 
 ## Operator diagnostics
 

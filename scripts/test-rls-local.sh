@@ -26,11 +26,15 @@ trap cleanup EXIT
 "$task_initdb" -D "$task_data_dir" --auth=trust --no-locale >/dev/null
 "$task_pg_ctl" -D "$task_data_dir" -o "-k $task_tmp_dir -p $task_port" -w start >/dev/null
 
-"$task_psql" -h "$task_tmp_dir" -p "$task_port" -d postgres -v ON_ERROR_STOP=1 -c "create schema extensions; create extension if not exists pgcrypto with schema extensions; create schema auth; create table auth.users (id uuid primary key, email text not null, email_confirmed_at timestamptz); create table auth.sessions (id uuid primary key, user_id uuid not null references auth.users(id), not_after timestamptz); create function auth.uid() returns uuid language sql stable as 'select nullif(current_setting(''request.jwt.claim.sub'', true), '''')::uuid'; create schema storage; create table storage.buckets (id text primary key, name text not null, public boolean default false, file_size_limit bigint default null, allowed_mime_types text[] default null); create role anon nologin; create role authenticated nologin;"
+"$task_psql" -h "$task_tmp_dir" -p "$task_port" -d postgres -v ON_ERROR_STOP=1 -c "create schema extensions; create extension if not exists pgcrypto with schema extensions; create schema auth; create table auth.users (id uuid primary key, email text not null, email_confirmed_at timestamptz); create table auth.sessions (id uuid primary key, user_id uuid not null references auth.users(id), not_after timestamptz); create function auth.uid() returns uuid language sql stable as 'select nullif(current_setting(''request.jwt.claim.sub'', true), '''')::uuid'; create schema storage; create table storage.buckets (id text primary key, name text not null, public boolean default false, file_size_limit bigint default null, allowed_mime_types text[] default null); create role anon nologin; create role authenticated nologin; create role service_role nologin;"
 for migration in supabase/migrations/*.sql; do
   if [[ "$(basename "$migration")" == "20260901010000_single_installation_proof.sql" ]]; then
     "$task_psql" -h "$task_tmp_dir" -p "$task_port" -d postgres -v ON_ERROR_STOP=1 \
       -f supabase/tests/single_installation_proof_upgrade_before.sql
+  fi
+  if [[ "$(basename "$migration")" == "20260901120000_live_verifier_attestation_v2.sql" ]]; then
+    "$task_psql" -h "$task_tmp_dir" -p "$task_port" -d postgres -v ON_ERROR_STOP=1 \
+      -f supabase/tests/live_verifier_attestation_v2_upgrade_before.sql
   fi
   "$task_psql" -h "$task_tmp_dir" -p "$task_port" -d postgres -v ON_ERROR_STOP=1 -f "$migration"
   if [[ "$(basename "$migration")" == "20260826000000_page2webmcp.sql" ]]; then
@@ -132,6 +136,10 @@ for migration in supabase/migrations/*.sql; do
   if [[ "$(basename "$migration")" == "20260901010000_single_installation_proof.sql" ]]; then
     "$task_psql" -h "$task_tmp_dir" -p "$task_port" -d postgres -v ON_ERROR_STOP=1 \
       -f supabase/tests/single_installation_proof_upgrade_after.sql
+  fi
+  if [[ "$(basename "$migration")" == "20260901120000_live_verifier_attestation_v2.sql" ]]; then
+    "$task_psql" -h "$task_tmp_dir" -p "$task_port" -d postgres -v ON_ERROR_STOP=1 \
+      -f supabase/tests/live_verifier_attestation_v2_upgrade_after.sql
   fi
 done
 

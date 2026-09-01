@@ -44,6 +44,7 @@ export type OpenApiSource = Readonly<{
   format: "json" | "yaml";
   contentType: string;
   evidenceReference: string;
+  sizeBytes: number;
   finalUrl?: string;
 }>;
 
@@ -82,6 +83,7 @@ function immutableSource(bytes: Uint8Array, contentTypeValue: string, finalUrl?:
     format: sourceFormat(contentTypeValue),
     contentType: contentTypeValue,
     evidenceReference: `urn:sha256:${createHash("sha256").update(bytes).digest("hex")}`,
+    sizeBytes: bytes.byteLength,
     ...(finalUrl ? { finalUrl } : {}),
   };
 }

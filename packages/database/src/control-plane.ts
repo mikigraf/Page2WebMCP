@@ -30,6 +30,7 @@ import {
   type WorkflowRunRecord,
   type WorkflowTaskCompletion,
   type WorkflowTaskRecord,
+  type ImmutableSourceArtifactIdentity,
 } from "./workflow.ts";
 import { computeSourceIdentityHash } from "./source-identity.ts";
 
@@ -45,10 +46,23 @@ export type ProviderProvenance =
   | Readonly<{ mode: "github"; adapter: "github-app"; adapterVersion: 20260310; fixture: false }>;
 
 export type VerifierIdentityRecord = Readonly<{
-  protocolVersion: 1;
+  protocolVersion: 1 | 2;
   mode: "hermetic" | "local_live" | "live";
   webMcpImplementation: "native";
   verifierOriginDigest: string;
+}>;
+
+export type VerifierAttestationIdentityRecordV2 = Readonly<{
+  protocolVersion: 2;
+  attestationId: string;
+  requestId: string;
+  nonceDigest: string;
+  operation: "candidate" | "installation";
+  scopeDigest: string;
+  payloadDigest: string;
+  issuedAt: string;
+  expiresAt: string;
+  attestedAt: string;
 }>;
 
 export type CandidateVerificationObservation = Readonly<{
@@ -60,6 +74,7 @@ export type CandidateVerificationObservation = Readonly<{
   trustedLoader: Readonly<{ enforcedBeforeEvaluation: boolean; evaluatedContentHash: string }>;
   controlPlaneRequestsDuringExecution: number;
   modelRequestsDuringExecution: number;
+  verifierAttestation?: VerifierAttestationIdentityRecordV2;
 }>;
 
 export type InstalledVerificationObservation = Readonly<{
@@ -80,6 +95,7 @@ export type InstalledVerificationObservation = Readonly<{
   duplicateLoadHarmless: boolean | null;
   executionEvidence: InstalledExecutionEvidence | null;
   csp: Readonly<{ hosted: "allowed" | "blocked"; directive?: string }>;
+  verifierAttestation?: VerifierAttestationIdentityRecordV2;
 }>;
 
 export type InstalledExecutionEvidence = Readonly<{
@@ -158,6 +174,95 @@ export type WebsiteAuthenticationCheckpointRecord = Readonly<{
   updatedAt: string;
 }>;
 
+export type WebsiteAuthenticationTtlSecretEvidence = Readonly<{
+  purpose: "browser_cdp_url" | "browser_live_url";
+  referenceDigest: string;
+  expiresAt: string;
+}>;
+
+export type WebsiteAuthenticationSuspensionProjection = Readonly<{
+  schemaVersion: 1;
+  ownershipDecisionDigest: string;
+  providerSessionIdentityDigest: string;
+  browserUse: Readonly<{
+    adapter: "browser-use-v4";
+    adapterVersion: 4;
+    apiVersion: "v4";
+    model: "browser-use-2.0";
+    policyDigest: string;
+  }>;
+  browserLease: Readonly<{ identityDigest: string; expiresAt: string }>;
+  egressPolicy: Readonly<{ referenceDigest: string; policyDigest: string }>;
+  cdpReferenceDigest: string;
+  publicEvidenceReference: string;
+  ttlSecrets: readonly WebsiteAuthenticationTtlSecretEvidence[];
+  checkpoint: Readonly<{
+    checkpointReference: string;
+    sourceSnapshotId: string;
+    sourceIdentityHash: string;
+    targetOriginDigest: string;
+    expiresAt: string;
+  }>;
+}>;
+
+export type WebsiteAuthenticationSuspensionEvidence = Readonly<
+  WebsiteAuthenticationSuspensionProjection & {
+    suspendedWorkerIdentityDigest: string;
+    suspendedLeaseGeneration: number;
+  }
+>;
+
+export type WebsiteAuthenticationCleanupResourceKind =
+  | "browser_session"
+  | "browser_lease"
+  | "egress_policy_proxy"
+  | "ttl_secrets"
+  | "authentication_handoff_checkpoint"
+  | "evidence_lease"
+  | "cdp_observation_lease";
+
+export type WebsiteAuthenticationCleanupDisposition =
+  | "pending"
+  | "failed"
+  | "revoked"
+  | "released"
+  | "reconciled"
+  | "destroyed"
+  | "retained_immutable";
+
+export type WebsiteAuthenticationCleanupResourceEvidence = Readonly<{
+  resource: WebsiteAuthenticationCleanupResourceKind;
+  identityDigest: string;
+  disposition: WebsiteAuthenticationCleanupDisposition;
+  timestamp?: string;
+  errorCode?: string;
+}>;
+
+export type WebsiteLiveReceiptEvidence = Readonly<WebsiteAuthenticationSuspensionEvidence & {
+  authenticationEvidenceReferenceDigest?: string;
+  authenticationConsumedAt?: string;
+  resumedWorkerIdentityDigest?: string;
+  resumeLeaseGeneration?: number;
+  resumeClaimedAt?: string;
+  resultCheckpointHash?: string;
+  resultCheckpointOutputReference?: string;
+  resultCheckpointWorkerIdentityDigest?: string;
+  resultCheckpointLeaseGeneration?: number;
+  resultCheckpointedAt?: string;
+  completionWorkerIdentityDigest?: string;
+  completionLeaseGeneration?: number;
+  resumeAcknowledgedAt?: string;
+  restartVerified: boolean;
+  cleanupResources: readonly WebsiteAuthenticationCleanupResourceEvidence[];
+}>;
+
+export type WebsiteAuthenticationResultCheckpoint = Readonly<{
+  resultHash: string;
+  outputReference: string;
+  leaseGeneration: number;
+  checkpointedAt: string;
+}>;
+
 export type WebsiteAuthenticationCleanupTerminalState = Extract<
   WebsiteAuthenticationCheckpointState,
   "failed" | "cancelled" | "expired"
@@ -181,6 +286,7 @@ export type ClaimedWebsiteAuthenticationCleanupRecord = Readonly<{
   leaseOwner: string;
   leaseExpiresAt: string;
   leaseGeneration: number;
+  liveReceiptEvidence: WebsiteLiveReceiptEvidence;
 }>;
 
 export type WebsiteAuthenticationClaimCheckpoint = Readonly<{
@@ -190,6 +296,8 @@ export type WebsiteAuthenticationClaimCheckpoint = Readonly<{
   sourceIdentityHash: string;
   targetOriginDigest: string;
   expiresAt: string;
+  resultCheckpoint?: WebsiteAuthenticationResultCheckpoint;
+  liveReceiptEvidence?: WebsiteLiveReceiptEvidence;
 }>;
 
 type StoredWebsiteAuthenticationCheckpoint = WebsiteAuthenticationCheckpointRecord & Readonly<{
@@ -264,6 +372,7 @@ export type AnalysisResult = {
   release?: CandidateRelease;
   draftPullRequest?: { draft: boolean; url?: string; files?: string[] };
   providerProvenance?: ProviderProvenance;
+  sourceArtifact?: ImmutableSourceArtifactIdentity;
 };
 
 export type WorkflowExecutionMaterial = Readonly<{
@@ -452,6 +561,7 @@ export type WaitAnalysisForAuthenticationInput = IdempotencyInput & Readonly<{
   sourceIdentityHash: string;
   targetOriginDigest: string;
   expiresAt: string;
+  suspensionEvidence: WebsiteAuthenticationSuspensionEvidence;
 }>;
 export type ResumeAnalysisAfterAuthenticationInput = IdempotencyInput & Readonly<{
   runId: string;
@@ -567,6 +677,7 @@ export interface ControlPlaneRepository extends WorkflowRepository {
     workerId: string,
     runId: string,
     leaseGeneration: number,
+    resourceUpdates?: readonly WebsiteAuthenticationCleanupResourceEvidence[],
   ): Promise<void>;
   retryWebsiteAuthenticationCleanup(
     workerId: string,
@@ -574,7 +685,21 @@ export interface ControlPlaneRepository extends WorkflowRepository {
     leaseGeneration: number,
     errorCode: string,
     retryable?: boolean,
+    resourceUpdates?: readonly WebsiteAuthenticationCleanupResourceEvidence[],
   ): Promise<void>;
+  checkpointWebsiteAuthenticationResult(
+    workerId: string,
+    runId: string,
+    result: AnalysisResult,
+    leaseGeneration: number,
+  ): Promise<WebsiteAuthenticationResultCheckpoint>;
+  completeCheckpointedWebsiteAuthenticationAnalysis(
+    workerId: string,
+    runId: string,
+    resultHash: string,
+    leaseGeneration: number,
+    resourceUpdates?: readonly WebsiteAuthenticationCleanupResourceEvidence[],
+  ): Promise<AnalysisRunRecord>;
   completeAnalysis(workerId: string, runId: string, result: AnalysisResult, leaseGeneration?: number): Promise<AnalysisRunRecord>;
   failAnalysis(workerId: string, runId: string, code: string, retryable: boolean, leaseGeneration?: number): Promise<AnalysisRunRecord>;
   getAnalysisResult(actor: RepositoryActor, runId: string): Promise<AnalysisResult | undefined>;
@@ -810,6 +935,154 @@ export function capabilityPlanDigest(plan: CapabilityPlan): string {
   return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
 }
 
+export type LiveCandidateVerifierScopeBinding = Readonly<{
+  projectId: string;
+  analysisRunId: string;
+  sourceIdentityHash: string;
+  targetOrigin: string;
+  environment: "test" | "staging" | "production";
+  contentHash: string;
+}>;
+
+export type LiveInstallationVerifierScopeBinding = Readonly<{
+  projectId: string;
+  releaseId: string;
+  installationOperationId: string;
+  sourceIdentityHash: string;
+  pageUrl: string;
+  targetOrigin: string;
+  environment: "test" | "staging" | "production";
+  selectedHash: string;
+}>;
+
+const STRICT_UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const STRICT_SHA256 = /^[0-9a-f]{64}$/;
+const STRICT_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+
+export function normalizeVerifierAttestationIdentity(
+  value: VerifierAttestationIdentityRecordV2,
+  operation: VerifierAttestationIdentityRecordV2["operation"],
+): VerifierAttestationIdentityRecordV2 {
+  if (!plainRecordWithKeys(value, [
+    "attestationId", "attestedAt", "expiresAt", "issuedAt", "nonceDigest", "operation",
+    "payloadDigest", "protocolVersion", "requestId", "scopeDigest",
+  ]) || value.protocolVersion !== 2 || value.operation !== operation
+    || !STRICT_UUID_V4.test(value.attestationId) || !STRICT_UUID_V4.test(value.requestId)
+    || !STRICT_SHA256.test(value.nonceDigest) || !STRICT_SHA256.test(value.scopeDigest)
+    || !STRICT_SHA256.test(value.payloadDigest)
+    || !exactVerifierTimestamp(value.issuedAt) || !exactVerifierTimestamp(value.expiresAt)
+    || !exactVerifierTimestamp(value.attestedAt)
+    || Date.parse(value.issuedAt) >= Date.parse(value.expiresAt)
+    || Date.parse(value.attestedAt) < Date.parse(value.issuedAt)
+    || Date.parse(value.attestedAt) >= Date.parse(value.expiresAt)
+    || Date.parse(value.expiresAt) - Date.parse(value.issuedAt) > 120_000) {
+    throw new RepositoryError("INVALID_STATE", ["VERIFIER_ATTESTATION_INVALID"]);
+  }
+  return copy(value);
+}
+
+export function liveCandidateVerifierScopeDigest(binding: LiveCandidateVerifierScopeBinding): string {
+  if (!binding || !STRICT_UUID_V4.test(binding.projectId) || !STRICT_UUID_V4.test(binding.analysisRunId)
+    || !STRICT_SHA256.test(binding.sourceIdentityHash) || !STRICT_SHA256.test(binding.contentHash)
+    || !["test", "staging", "production"].includes(binding.environment)
+    || canonicalHttpsOrigin(binding.targetOrigin) !== binding.targetOrigin) {
+    throw new RepositoryError("INVALID_STATE", ["VERIFIER_SCOPE_INVALID"]);
+  }
+  return createHash("sha256").update(canonicalJson({
+    operation: "candidate",
+    ...binding,
+  }), "utf8").digest("hex");
+}
+
+export function liveInstallationVerifierScopeDigest(binding: LiveInstallationVerifierScopeBinding): string {
+  let page: URL;
+  try { page = new URL(binding.pageUrl); }
+  catch { throw new RepositoryError("INVALID_STATE", ["VERIFIER_SCOPE_INVALID"]); }
+  if (!STRICT_UUID_V4.test(binding.projectId) || !STRICT_UUID_V4.test(binding.releaseId)
+    || !STRICT_SHA256.test(binding.installationOperationId)
+    || !STRICT_SHA256.test(binding.sourceIdentityHash) || !STRICT_SHA256.test(binding.selectedHash)
+    || !["test", "staging", "production"].includes(binding.environment)
+    || canonicalHttpsOrigin(binding.targetOrigin) !== binding.targetOrigin
+    || page.protocol !== "https:" || page.origin !== binding.targetOrigin || page.username || page.password
+    || page.search || page.hash || page.toString() !== binding.pageUrl) {
+    throw new RepositoryError("INVALID_STATE", ["VERIFIER_SCOPE_INVALID"]);
+  }
+  return createHash("sha256").update(canonicalJson({
+    operation: "installation",
+    ...binding,
+  }), "utf8").digest("hex");
+}
+
+export function deriveInstallationOperationId(input: Readonly<{
+  projectId: string;
+  releaseId: string;
+  idempotencyKey: string;
+  inputHash: string;
+}>): string {
+  if (!input || !STRICT_UUID_V4.test(input.projectId) || !STRICT_UUID_V4.test(input.releaseId)
+    || !/^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/.test(input.idempotencyKey)
+    || !STRICT_SHA256.test(input.inputHash)) throw new RepositoryError("INVALID_STATE");
+  return createHash("sha256").update(canonicalJson(input), "utf8").digest("hex");
+}
+
+export function verifierEnvironmentForSource(
+  configuration: SourceConfiguration,
+): "test" | "staging" | "production" {
+  return configuration.kind === "openapi" ? configuration.environment : "production";
+}
+
+export function candidateVerifierScopeMatches(
+  input: VerificationRequest,
+  projectId: string,
+  sourceIdentityHash: string,
+  sourceConfiguration: SourceConfiguration,
+): boolean {
+  if (input.verificationMode !== "live") return input.observation.verifierAttestation === undefined;
+  try {
+    const attestation = normalizeVerifierAttestationIdentity(input.observation.verifierAttestation!, "candidate");
+    return attestation.scopeDigest === liveCandidateVerifierScopeDigest({
+      projectId,
+      analysisRunId: input.analysisRunId,
+      sourceIdentityHash,
+      targetOrigin: input.candidate.allowedOrigin,
+      environment: verifierEnvironmentForSource(sourceConfiguration),
+      contentHash: input.candidate.contentHash,
+    });
+  } catch { return false; }
+}
+
+export function installationVerifierScopeMatches(
+  input: ReleaseInstallationRequest,
+  projectId: string,
+  sourceIdentityHash: string,
+  sourceConfiguration: SourceConfiguration,
+): boolean {
+  if (input.verifierIdentity.mode !== "live") return input.attestation.verifierAttestation === undefined;
+  try {
+    const attestation = normalizeVerifierAttestationIdentity(input.attestation.verifierAttestation!, "installation");
+    const installationOperationId = deriveInstallationOperationId({
+      projectId,
+      releaseId: input.releaseId,
+      idempotencyKey: input.idempotencyKey,
+      inputHash: input.inputHash,
+    });
+    return attestation.scopeDigest === liveInstallationVerifierScopeDigest({
+      projectId,
+      releaseId: input.releaseId,
+      installationOperationId,
+      sourceIdentityHash,
+      pageUrl: input.pageUrl,
+      targetOrigin: input.targetOrigin,
+      environment: verifierEnvironmentForSource(sourceConfiguration),
+      selectedHash: input.artifactContentHash,
+    });
+  } catch { return false; }
+}
+
+function exactVerifierTimestamp(value: string): boolean {
+  return STRICT_TIMESTAMP.test(value) && new Date(value).toISOString() === value;
+}
+
 export function releaseFailures(input: VerificationRequest): string[] {
   const typedFailures = verificationCheckFailures(input.checks);
   if (typedFailures.includes("VERIFICATION_REPORT_INVALID") || !verificationSummaryMatches(input)
@@ -821,10 +1094,11 @@ export function releaseFailures(input: VerificationRequest): string[] {
 
 function verificationSummaryMatches(input: VerificationRequest): boolean {
   const passed = new Set(input.checks.filter(({ status }) => status === "passed").map(({ name }) => name));
+  const expectedProtocolVersion = input.verificationMode === "live" ? 2 : 1;
   return (input.verificationMode === "live" || input.verificationMode === "local_live"
       || input.verificationMode === "hermetic")
     && input.verifierIdentity.mode === input.verificationMode
-    && input.verifierIdentity.protocolVersion === 1
+    && input.verifierIdentity.protocolVersion === expectedProtocolVersion
     && input.verifierIdentity.webMcpImplementation === "native"
     && /^[0-9a-f]{64}$/.test(input.verifierIdentity.verifierOriginDigest)
     && (input.csp.hosted === "allowed" || input.csp.hosted === "blocked")
@@ -855,6 +1129,79 @@ export function normalizeProviderProvenance(
   return copy(value);
 }
 
+const OPENAPI_SOURCE_MIME_TYPES = new Set([
+  "application/json",
+  "application/openapi+json",
+  "application/vnd.oai.openapi+json",
+  "application/yaml",
+  "application/x-yaml",
+  "text/yaml",
+  "application/vnd.oai.openapi",
+  "application/vnd.oai.openapi+yaml",
+]);
+
+export function normalizeImmutableSourceArtifactIdentity(
+  value: ImmutableSourceArtifactIdentity,
+): ImmutableSourceArtifactIdentity {
+  if (!isPlainRecord(value) || Object.keys(value).sort(compareCodePoints).join(",")
+      !== "artifactReference,contentHash,finalUrl,mimeType,sizeBytes"
+    || typeof value.contentHash !== "string" || !/^[0-9a-f]{64}$/.test(value.contentHash)
+    || value.artifactReference !== `urn:sha256:${value.contentHash}`
+    || typeof value.finalUrl !== "string" || value.finalUrl.length > 4_096
+    || canonicalHttpsUrl(value.finalUrl) !== value.finalUrl
+    || typeof value.mimeType !== "string" || !OPENAPI_SOURCE_MIME_TYPES.has(value.mimeType)
+    || !Number.isSafeInteger(value.sizeBytes) || value.sizeBytes < 1 || value.sizeBytes > 1_000_000) {
+    throw new RepositoryError("INVALID_STATE");
+  }
+  return copy(value);
+}
+
+export function normalizeAnalysisSourceArtifact(
+  sourceArtifact: ImmutableSourceArtifactIdentity | undefined,
+  provenance: ProviderProvenance | undefined,
+  evidence: readonly AnalysisEvidence[],
+): ImmutableSourceArtifactIdentity | undefined {
+  if (provenance?.mode !== "openapi") {
+    if (sourceArtifact !== undefined) throw new RepositoryError("INVALID_STATE");
+    return undefined;
+  }
+  if (sourceArtifact === undefined) throw new RepositoryError("INVALID_STATE");
+  const normalized = normalizeImmutableSourceArtifactIdentity(sourceArtifact);
+  const matchingEvidence = evidence.some((item) => {
+    if (item.source !== "openapi") return false;
+    try {
+      const content = JSON.parse(item.content) as unknown;
+      return isPlainRecord(content) && content.sourceDigest === normalized.artifactReference;
+    } catch { return false; }
+  });
+  if (!matchingEvidence) throw new RepositoryError("INVALID_STATE");
+  return normalized;
+}
+
+export function normalizePersistedAnalysisSourceArtifact(
+  sourceArtifact: ImmutableSourceArtifactIdentity | undefined,
+  provenance: ProviderProvenance | undefined,
+  sourceSnapshotArtifact: ImmutableSourceArtifactIdentity | undefined,
+): ImmutableSourceArtifactIdentity | undefined {
+  if (provenance?.mode !== "openapi") {
+    if (sourceArtifact !== undefined) throw new RepositoryError("INVALID_STATE");
+    return undefined;
+  }
+  if (sourceArtifact === undefined) throw new RepositoryError("INVALID_STATE");
+  const normalized = normalizeImmutableSourceArtifactIdentity(sourceArtifact);
+  let frozen: ImmutableSourceArtifactIdentity;
+  try {
+    if (sourceSnapshotArtifact === undefined) throw new Error("missing frozen source identity");
+    frozen = normalizeImmutableSourceArtifactIdentity(sourceSnapshotArtifact);
+  } catch {
+    throw new RepositoryError("SOURCE_SNAPSHOT_STALE");
+  }
+  if (canonicalJson(normalized) !== canonicalJson(frozen)) {
+    throw new RepositoryError("SOURCE_SNAPSHOT_STALE");
+  }
+  return normalized;
+}
+
 function candidateObservationMatches(input: VerificationRequest): boolean {
   const observation = input.observation;
   const manifest = input.candidate.manifest;
@@ -862,11 +1209,27 @@ function candidateObservationMatches(input: VerificationRequest): boolean {
   const releaseId = isPlainRecord(manifest) && typeof manifest.releaseId === "string" ? manifest.releaseId : undefined;
   const expectedTools = plans?.map(({ tool }) => tool.name).sort(compareCodePoints);
   const integrity = `sha384-${createHash("sha384").update(input.candidate.code).digest("base64")}`;
+  const expectedKeys = [
+    "controlPlaneRequestsDuringExecution", "modelRequestsDuringExecution", "observedContentHash",
+    "observedIntegrity", "observedReleaseId", "observedTargetOrigin", "registeredTools", "trustedLoader",
+    ...(input.verificationMode === "live" ? ["verifierAttestation"] : []),
+  ].sort(compareCodePoints).join(",");
+  let verifierAttestation: VerifierAttestationIdentityRecordV2 | undefined;
+  try {
+    verifierAttestation = input.verificationMode === "live"
+      ? normalizeVerifierAttestationIdentity(input.observation.verifierAttestation!, "candidate")
+      : undefined;
+  } catch { return false; }
+  const expectedPayloadDigest = createHash("sha256").update(canonicalJson({
+    code: input.candidate.code,
+    contentHash: input.candidate.contentHash,
+    expectedTools,
+    integrity,
+    manifest: input.candidate.manifest,
+    targetOrigin: input.candidate.allowedOrigin,
+  }), "utf8").digest("hex");
   return isPlainRecord(observation)
-    && Object.keys(observation).sort(compareCodePoints).join(",") === [
-      "controlPlaneRequestsDuringExecution", "modelRequestsDuringExecution", "observedContentHash",
-      "observedIntegrity", "observedReleaseId", "observedTargetOrigin", "registeredTools", "trustedLoader",
-    ].sort(compareCodePoints).join(",")
+    && Object.keys(observation).sort(compareCodePoints).join(",") === expectedKeys
     && observation.observedContentHash === input.candidate.contentHash
     && observation.observedIntegrity === integrity
     && observation.observedReleaseId === releaseId
@@ -876,7 +1239,8 @@ function candidateObservationMatches(input: VerificationRequest): boolean {
     && observation.trustedLoader.enforcedBeforeEvaluation === true
     && observation.trustedLoader.evaluatedContentHash === input.candidate.contentHash
     && observation.controlPlaneRequestsDuringExecution === 0
-    && observation.modelRequestsDuringExecution === 0;
+    && observation.modelRequestsDuringExecution === 0
+    && (input.verificationMode !== "live" || verifierAttestation?.payloadDigest === expectedPayloadDigest);
 }
 
 export function verificationCheckFailures(checks: readonly ReleaseVerificationCheckRecord[]): string[] {
@@ -914,6 +1278,7 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
   readonly #idempotency = new Map<string, IdempotencyRecord>();
   readonly #analysisAvailableAt = new Map<string, string>();
   readonly #websiteAuthenticationCheckpoints = new Map<string, StoredWebsiteAuthenticationCheckpoint>();
+  readonly #websiteLiveReceiptEvidence = new Map<string, WebsiteLiveReceiptEvidence>();
   readonly #analysisSources = new Map<string, Readonly<{
     sourceType: SourceType;
     sourceUrl: string;
@@ -1961,6 +2326,8 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
     if (!checkpoint) return undefined;
     const source = this.#analysisSources.get(checkpoint.analysisRunId);
     if (!source || source.sourceType !== "website") throw new RepositoryError("INVALID_STATE");
+    const liveReceiptEvidence = this.#websiteLiveReceiptEvidence.get(checkpoint.analysisRunId);
+    if (!liveReceiptEvidence) throw new RepositoryError("INVALID_STATE");
     const claimed: StoredWebsiteAuthenticationCheckpoint = {
       ...checkpoint,
       cleanupStatus: "running",
@@ -1991,6 +2358,7 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
       leaseOwner: workerId,
       leaseExpiresAt: claimed.cleanupLeaseExpiresAt!,
       leaseGeneration: claimed.cleanupLeaseGeneration,
+      liveReceiptEvidence,
     });
   }
 
@@ -1998,6 +2366,7 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
     workerId: string,
     runId: string,
     leaseGeneration: number,
+    resourceUpdates: readonly WebsiteAuthenticationCleanupResourceEvidence[] = [],
   ): Promise<void> {
     assertWorkerId(workerId);
     const checkpoint = this.#websiteAuthenticationCheckpoints.get(runId);
@@ -2009,6 +2378,12 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
       throw new RepositoryError("LEASE_LOST");
     }
     const timestamp = now.toISOString();
+    const receiptEvidence = this.#websiteLiveReceiptEvidence.get(runId);
+    if (!receiptEvidence) throw new RepositoryError("INVALID_STATE");
+    this.#websiteLiveReceiptEvidence.set(runId, {
+      ...receiptEvidence,
+      cleanupResources: advanceWebsiteCleanupResources(receiptEvidence.cleanupResources, resourceUpdates),
+    });
     this.#websiteAuthenticationCheckpoints.set(runId, {
       ...checkpoint,
       cleanupStatus: "succeeded",
@@ -2026,6 +2401,7 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
     leaseGeneration: number,
     errorCode: string,
     retryable = true,
+    resourceUpdates: readonly WebsiteAuthenticationCleanupResourceEvidence[] = [],
   ): Promise<void> {
     assertWorkerId(workerId);
     if (!/^[A-Z][A-Z0-9_]{0,63}$/.test(errorCode)) throw new RepositoryError("INVALID_STATE");
@@ -2038,6 +2414,12 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
       throw new RepositoryError("LEASE_LOST");
     }
     const timestamp = now.toISOString();
+    const receiptEvidence = this.#websiteLiveReceiptEvidence.get(runId);
+    if (!receiptEvidence) throw new RepositoryError("INVALID_STATE");
+    this.#websiteLiveReceiptEvidence.set(runId, {
+      ...receiptEvidence,
+      cleanupResources: advanceWebsiteCleanupResources(receiptEvidence.cleanupResources, resourceUpdates),
+    });
     const retryDelayMs = workflowRetryDelayMs(
       checkpoint.cleanupAttempts,
       undefined,
@@ -2141,6 +2523,18 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
         updatedAt: now.toISOString(),
       };
       this.#workflowTasks.set(task.id, workflowTask);
+      let liveReceiptEvidence: WebsiteLiveReceiptEvidence | undefined;
+      if (authenticationCheckpoint) {
+        const persistedEvidence = this.#websiteLiveReceiptEvidence.get(run.id);
+        if (!persistedEvidence) throw new RepositoryError("INVALID_STATE");
+        liveReceiptEvidence = persistedEvidence.resumedWorkerIdentityDigest ? persistedEvidence : {
+          ...persistedEvidence,
+          resumedWorkerIdentityDigest: websiteWorkerIdentityDigest(workerId),
+          resumeLeaseGeneration: workflowTask.leaseGeneration,
+          resumeClaimedAt: now.toISOString(),
+        };
+        this.#websiteLiveReceiptEvidence.set(run.id, liveReceiptEvidence);
+      }
       this.#organizationClaimOrder.set(run.organizationId, ++this.#claimSequence);
       this.#workflowRuns.set(workflow.id, { ...workflow, status: "running", currentPhase: "analysis", updatedAt: now.toISOString() });
       this.#appendWorkflowEvent(workflow.id, "task.claimed", task.id);
@@ -2158,6 +2552,10 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
             sourceIdentityHash: authenticationCheckpoint.sourceIdentityHash,
             targetOriginDigest: authenticationCheckpoint.targetOriginDigest,
             expiresAt: authenticationCheckpoint.expiresAt,
+            ...(websiteAuthenticationResultCheckpoint(liveReceiptEvidence!) ? {
+              resultCheckpoint: websiteAuthenticationResultCheckpoint(liveReceiptEvidence!),
+            } : {}),
+            liveReceiptEvidence: liveReceiptEvidence!,
           },
         } : {}),
       });
@@ -2194,11 +2592,14 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
   ): Promise<WebsiteAuthenticationCheckpointRecord> {
     assertWorkerId(workerId);
     const normalized = normalizeWebsiteAuthenticationWaitInput(input, this.clock());
-    const inputHash = stableHash(input.inputHash);
+    const inputHash = websiteAuthenticationWaitCommandHash(input.inputHash, normalized.suspensionEvidence);
     const existing = this.#websiteAuthenticationCheckpoints.get(runId);
     if (existing) {
+      const existingEvidence = this.#websiteLiveReceiptEvidence.get(runId);
       if (existing.waitIdempotencyKey !== input.idempotencyKey || existing.waitInputHash !== inputHash
-        || !websiteAuthenticationWaitMatches(existing, normalized)) throw new RepositoryError("IDEMPOTENCY_CONFLICT");
+        || !websiteAuthenticationWaitMatches(existing, normalized) || !existingEvidence) {
+        throw new RepositoryError("IDEMPOTENCY_CONFLICT");
+      }
       return publicWebsiteAuthenticationCheckpoint(existing);
     }
     const workflow = this.#workflowRuns.get(runId);
@@ -2212,6 +2613,10 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
     if (run.status !== "running" || run.leaseOwner !== workerId || !run.leaseExpiresAt
       || new Date(run.leaseExpiresAt) <= this.clock()) throw new RepositoryError("LEASE_LOST");
     this.#assertWorkflowLease(workerId, task, leaseGeneration ?? task.leaseGeneration);
+    if (normalized.suspensionEvidence.suspendedWorkerIdentityDigest !== websiteWorkerIdentityDigest(workerId)
+      || normalized.suspensionEvidence.suspendedLeaseGeneration !== (leaseGeneration ?? task.leaseGeneration)) {
+      throw new RepositoryError("LEASE_LOST");
+    }
     const snapshot = this.#sourceSnapshots.get(workflow.sourceSnapshotId);
     if (!snapshot || snapshot.organizationId !== run.organizationId || snapshot.projectId !== run.projectId
       || normalized.sourceSnapshotId !== snapshot.id
@@ -2246,6 +2651,11 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
       throw new RepositoryError("INVALID_STATE");
     }
     this.#websiteAuthenticationCheckpoints.set(run.id, checkpoint);
+    this.#websiteLiveReceiptEvidence.set(run.id, {
+      ...normalized.suspensionEvidence,
+      restartVerified: false,
+      cleanupResources: initialWebsiteCleanupResources(normalized.suspensionEvidence),
+    });
     this.#runs.set(run.id, {
       ...run,
       status: "waiting",
@@ -2327,6 +2737,13 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
       updatedAt: now,
     };
     this.#websiteAuthenticationCheckpoints.set(run.id, consumed);
+    const persistedEvidence = this.#websiteLiveReceiptEvidence.get(run.id);
+    if (!persistedEvidence) throw new RepositoryError("INVALID_STATE");
+    this.#websiteLiveReceiptEvidence.set(run.id, {
+      ...persistedEvidence,
+      authenticationEvidenceReferenceDigest: websiteReferenceDigest(normalized.authenticationEvidenceReference),
+      authenticationConsumedAt: now,
+    });
     this.#runs.set(analysis.id, {
       ...analysis,
       status: "queued",
@@ -2411,13 +2828,37 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
     return publicWebsiteAuthenticationCheckpoint(this.#websiteAuthenticationCheckpoints.get(run.id)!);
   }
 
+  async checkpointWebsiteAuthenticationResult(
+    workerId: string,
+    runId: string,
+    result: AnalysisResult,
+    leaseGeneration: number,
+  ): Promise<WebsiteAuthenticationResultCheckpoint> {
+    const persisted = await this.#persistAnalysisResult(workerId, runId, result, leaseGeneration, true);
+    if ("status" in persisted) throw new RepositoryError("INVALID_STATE");
+    return persisted;
+  }
+
   async completeAnalysis(
     workerId: string,
     runId: string,
     result: AnalysisResult,
     leaseGeneration?: number,
   ): Promise<AnalysisRunRecord> {
+    const persisted = await this.#persistAnalysisResult(workerId, runId, result, leaseGeneration, false);
+    if (!("status" in persisted)) throw new RepositoryError("INVALID_STATE");
+    return persisted;
+  }
+
+  async #persistAnalysisResult(
+    workerId: string,
+    runId: string,
+    result: AnalysisResult,
+    leaseGeneration: number | undefined,
+    checkpointOnly: boolean,
+  ): Promise<AnalysisRunRecord | WebsiteAuthenticationResultCheckpoint> {
     const workflow = this.#workflowRuns.get(runId);
+    if (!workflow) throw new RepositoryError("INVALID_STATE");
     if (workflow?.cancelRequestedAt || workflow?.status === "cancelled") throw new RepositoryError("CANCELLED");
     const run = this.#runs.get(runId);
     if (!run || run.status !== "running" || run.leaseOwner !== workerId || !run.leaseExpiresAt
@@ -2466,6 +2907,31 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
     if (!evidenceResolves(normalizedEvidence, canonicalPlans, run, this.clock())) {
       throw new RepositoryError("INVALID_STATE");
     }
+    const sourceArtifact = normalizeAnalysisSourceArtifact(
+      result.sourceArtifact,
+      providerProvenance,
+      normalizedEvidence,
+    );
+    let sourceSnapshotToFreeze: SourceSnapshotRecord | undefined;
+    if (sourceArtifact) {
+      const snapshot = this.#sourceSnapshots.get(workflow.sourceSnapshotId);
+      if (!snapshot || snapshot.projectId !== run.projectId || snapshot.organizationId !== run.organizationId) {
+        throw new RepositoryError("INVALID_STATE");
+      }
+      if (snapshot.sourceArtifact !== undefined
+        && canonicalJson(snapshot.sourceArtifact) !== canonicalJson(sourceArtifact)
+        || snapshot.contentHash !== undefined && snapshot.contentHash !== sourceArtifact.contentHash
+        || snapshot.artifactReference !== undefined
+          && snapshot.artifactReference !== sourceArtifact.artifactReference) {
+        throw new RepositoryError("SOURCE_SNAPSHOT_STALE");
+      }
+      sourceSnapshotToFreeze = {
+        ...snapshot,
+        contentHash: sourceArtifact.contentHash,
+        artifactReference: sourceArtifact.artifactReference,
+        sourceArtifact,
+      };
+    }
     const releaseCode = result.release === undefined ? undefined : Buffer.from(result.release.code);
     const normalizedResult: AnalysisResult = {
       ...structuredClone(result),
@@ -2478,7 +2944,41 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
         manifest: structuredClone(result.release.manifest ?? {})
       },
       ...(providerProvenance ? { providerProvenance } : {}),
+      ...(sourceArtifact ? { sourceArtifact } : {}),
     };
+    const outputHash = stableHash(canonicalJson({
+      diagnostics: normalizedDiagnostics,
+      evidence: normalizedEvidence.map(({ reference }) => reference).sort(compareCodePoints),
+      plans: canonicalPlans.map((plan) => capabilityPlanDigest(plan)).sort(compareCodePoints),
+      release: normalizedResult.release?.contentHash,
+      providerProvenance,
+    }));
+    const outputReference = normalizedResult.release
+      ? `urn:sha256:${normalizedResult.release.contentHash}`
+      : normalizedEvidence[0]?.reference;
+    if (!outputReference) throw new RepositoryError("INVALID_STATE");
+    const authenticationCheckpoint = this.#websiteAuthenticationCheckpoints.get(run.id);
+    const persistedReceipt = this.#websiteLiveReceiptEvidence.get(run.id);
+    if (checkpointOnly && authenticationCheckpoint?.state !== "consumed") {
+      throw new RepositoryError("INVALID_STATE");
+    }
+    if (!checkpointOnly && authenticationCheckpoint?.state === "consumed") {
+      throw new RepositoryError("INVALID_STATE");
+    }
+    if (persistedReceipt?.resultCheckpointHash) {
+      if (!checkpointOnly || persistedReceipt.resultCheckpointHash !== outputHash
+        || persistedReceipt.resultCheckpointOutputReference !== outputReference
+        || persistedReceipt.resultCheckpointWorkerIdentityDigest !== websiteWorkerIdentityDigest(workerId)
+        || persistedReceipt.resultCheckpointLeaseGeneration !== workflowTask.leaseGeneration
+        || !persistedReceipt.resultCheckpointedAt) {
+        throw new RepositoryError("IDEMPOTENCY_CONFLICT");
+      }
+      return copy({ resultHash: outputHash, outputReference,
+        leaseGeneration: workflowTask.leaseGeneration, checkpointedAt: persistedReceipt.resultCheckpointedAt });
+    }
+    if (sourceSnapshotToFreeze) {
+      this.#sourceSnapshots.set(sourceSnapshotToFreeze.id, sourceSnapshotToFreeze);
+    }
     this.#results.set(run.id, normalizedResult);
     const insertedCapabilities: CapabilityRecord[] = [];
     for (const plan of canonicalPlans) {
@@ -2501,6 +3001,21 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
       insertedCapabilities.push(capability);
     }
     const now = this.#now();
+    if (checkpointOnly) {
+      if (!persistedReceipt?.resumedWorkerIdentityDigest || persistedReceipt.resumeAcknowledgedAt) {
+        throw new RepositoryError("INVALID_STATE");
+      }
+      this.#websiteLiveReceiptEvidence.set(run.id, {
+        ...persistedReceipt,
+        resultCheckpointHash: outputHash,
+        resultCheckpointOutputReference: outputReference,
+        resultCheckpointWorkerIdentityDigest: websiteWorkerIdentityDigest(workerId),
+        resultCheckpointLeaseGeneration: workflowTask.leaseGeneration,
+        resultCheckpointedAt: now,
+      });
+      return copy({ resultHash: outputHash, outputReference,
+        leaseGeneration: workflowTask.leaseGeneration, checkpointedAt: now });
+    }
     const completed: AnalysisRunRecord = {
       ...run,
       status: "succeeded",
@@ -2515,19 +3030,11 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
     this.#analysisAvailableAt.delete(run.id);
     const project = this.#projects.get(run.projectId);
     if (project) this.#projects.set(project.id, { ...project, status: "analyzed" });
-    const outputHash = stableHash(canonicalJson({
-      diagnostics: normalizedDiagnostics,
-      evidence: normalizedEvidence.map(({ reference }) => reference).sort(compareCodePoints),
-      plans: insertedCapabilities.map(({ planDigest }) => planDigest).sort(compareCodePoints),
-      release: normalizedResult.release?.contentHash,
-    }));
     this.#workflowTasks.set(workflowTask.id, {
       ...workflowTask,
       status: "succeeded",
       outputHash,
-      outputReference: normalizedResult.release
-        ? `urn:sha256:${normalizedResult.release.contentHash}`
-        : normalizedEvidence[0]?.reference,
+      outputReference,
       leaseOwner: undefined,
       leaseExpiresAt: undefined,
       errorCode: undefined,
@@ -2558,6 +3065,86 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
     })));
     this.#appendWorkflowEvent(currentWorkflow.id, "task.completed", workflowTask.id);
     this.#appendWorkflowEvent(currentWorkflow.id, "workflow.completed");
+    return copy(completed);
+  }
+
+  async completeCheckpointedWebsiteAuthenticationAnalysis(
+    workerId: string,
+    runId: string,
+    resultHash: string,
+    leaseGeneration: number,
+    resourceUpdates: readonly WebsiteAuthenticationCleanupResourceEvidence[] = [],
+  ): Promise<AnalysisRunRecord> {
+    assertWorkerId(workerId);
+    if (!/^[0-9a-f]{64}$/.test(resultHash) || !Number.isSafeInteger(leaseGeneration) || leaseGeneration < 1) {
+      throw new RepositoryError("INVALID_STATE");
+    }
+    const workflow = this.#workflowRuns.get(runId);
+    if (!workflow) throw new RepositoryError("INVALID_STATE");
+    if (workflow.cancelRequestedAt || workflow.status === "cancelled") throw new RepositoryError("CANCELLED");
+    const run = this.#runs.get(runId);
+    const nowDate = this.clock();
+    if (!run || run.status !== "running" || run.leaseOwner !== workerId || !run.leaseExpiresAt
+      || new Date(run.leaseExpiresAt) <= nowDate) throw new RepositoryError("LEASE_LOST");
+    const workflowTask = [...this.#workflowTasks.values()].find((candidate) =>
+      candidate.workflowRunId === runId && candidate.phase === "analysis");
+    if (!workflowTask) throw new RepositoryError("INVALID_STATE");
+    this.#assertWorkflowLease(workerId, workflowTask, leaseGeneration);
+    const authenticationCheckpoint = this.#websiteAuthenticationCheckpoints.get(run.id);
+    const receipt = this.#websiteLiveReceiptEvidence.get(run.id);
+    const result = this.#results.get(run.id);
+    if (authenticationCheckpoint?.state !== "consumed" || !receipt || !result
+      || receipt.resultCheckpointHash !== resultHash || !receipt.resultCheckpointOutputReference
+      || !receipt.resultCheckpointWorkerIdentityDigest || !receipt.resultCheckpointLeaseGeneration
+      || !receipt.resultCheckpointedAt || receipt.resumeAcknowledgedAt || result.evidence.length === 0
+      || !(result.evidence.some(({ reference }) => reference === receipt.resultCheckpointOutputReference)
+        || result.release !== undefined
+          && `urn:sha256:${result.release.contentHash}` === receipt.resultCheckpointOutputReference)) {
+      throw new RepositoryError("INVALID_STATE");
+    }
+    const capabilities = this.#analysisCapabilities(run.id);
+    const now = nowDate.toISOString();
+    this.#websiteLiveReceiptEvidence.set(run.id, acknowledgeWebsiteAuthenticationCompletion({
+      ...receipt,
+      cleanupResources: advanceWebsiteCleanupResources(receipt.cleanupResources, resourceUpdates),
+    }, workerId, workflowTask.leaseGeneration, now));
+    const completed: AnalysisRunRecord = {
+      ...run,
+      status: "succeeded",
+      leaseOwner: undefined,
+      leaseExpiresAt: undefined,
+      errorCode: undefined,
+      ...(result.providerProvenance ? { providerProvenance: result.providerProvenance } : {}),
+      updatedAt: now,
+    };
+    this.#runs.set(run.id, completed);
+    this.#closeWebsiteAuthenticationCheckpoint(run.id, "completed", now);
+    this.#analysisAvailableAt.delete(run.id);
+    const project = this.#projects.get(run.projectId);
+    if (project) this.#projects.set(project.id, { ...project, status: "analyzed" });
+    this.#workflowTasks.set(workflowTask.id, {
+      ...workflowTask,
+      status: "succeeded",
+      outputHash: resultHash,
+      outputReference: receipt.resultCheckpointOutputReference,
+      leaseOwner: undefined,
+      leaseExpiresAt: undefined,
+      errorCode: undefined,
+      updatedAt: now,
+    });
+    this.#workflowRuns.set(workflow.id, { ...workflow, status: "succeeded", errorCode: undefined, updatedAt: now });
+    this.#workflowEvidence.set(run.id, result.evidence.map((evidence) => ({
+      id: randomUUID(), organizationId: run.organizationId, projectId: run.projectId,
+      workflowRunId: run.id, taskId: workflowTask.id, evidenceId: evidence.id!,
+      reference: evidence.reference, createdAt: now,
+    })));
+    this.#workflowCapabilityPlans.set(run.id, capabilities.map((capability) => ({
+      id: randomUUID(), organizationId: run.organizationId, projectId: run.projectId,
+      workflowRunId: run.id, taskId: workflowTask.id, capabilityId: capability.id,
+      planDigest: capability.planDigest, createdAt: now,
+    })));
+    this.#appendWorkflowEvent(workflow.id, "task.completed", workflowTask.id);
+    this.#appendWorkflowEvent(workflow.id, "workflow.completed");
     return copy(completed);
   }
 
@@ -2690,6 +3277,15 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
     const run = this.#runs.get(input.analysisRunId);
     if (!run || run.organizationId !== actor.organizationId) throw new RepositoryError("NOT_FOUND");
     if (run.projectId !== projectId || run.status !== "succeeded") throw new RepositoryError("INVALID_STATE");
+    const workflow = [...this.#workflowRuns.values()].find((item) => item.analysisRunId === run.id);
+    const sourceSnapshot = workflow ? this.#sourceSnapshots.get(workflow.sourceSnapshotId) : undefined;
+    const projectSource = sourceSnapshot ? this.#projectSources.get(sourceSnapshot.projectSourceId) : undefined;
+    if (!workflow || !sourceSnapshot || !projectSource
+      || workflow.projectId !== projectId || sourceSnapshot.projectId !== projectId
+      || projectSource.projectId !== projectId || sourceSnapshot.organizationId !== actor.organizationId
+      || projectSource.organizationId !== actor.organizationId
+      || !candidateVerifierScopeMatches(input, projectId, sourceSnapshot.sourceIdentityHash,
+        projectSource.sourceConfiguration)) throw new RepositoryError("INVALID_STATE");
     const currentCapabilities = this.#analysisCapabilities(run.id);
     if (currentCapabilities.some((capability) => !capabilityPlanBindingValid(capability))) {
       throw new RepositoryError("RELEASE_GATE_FAILED", ["CAPABILITY_PLAN_MISMATCH"]);
@@ -2735,6 +3331,12 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
         return copy(verification);
       }
       throw new RepositoryError("RELEASE_GATE_FAILED", ["CANDIDATE_CHANGED"]);
+    }
+    const verifierAttestation = input.observation.verifierAttestation;
+    if (verifierAttestation && [...this.#verifications.values()].some((item) =>
+      item.observation?.verifierAttestation?.attestationId === verifierAttestation.attestationId
+      || item.observation?.verifierAttestation?.requestId === verifierAttestation.requestId)) {
+      throw new RepositoryError("INVALID_STATE", ["VERIFIER_ATTESTATION_REPLAYED"]);
     }
     const failures = releaseFailures(input);
     const { candidate, ...checks } = input;
@@ -2924,6 +3526,21 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
       }
       return copy(record);
     }
+    const workflow = [...this.#workflowRuns.values()].find((item) => item.analysisRunId === release.analysisRunId);
+    const sourceSnapshot = workflow ? this.#sourceSnapshots.get(workflow.sourceSnapshotId) : undefined;
+    const projectSource = sourceSnapshot ? this.#projectSources.get(sourceSnapshot.projectSourceId) : undefined;
+    if (!workflow || !sourceSnapshot || !projectSource
+      || workflow.projectId !== projectId || sourceSnapshot.projectId !== projectId
+      || projectSource.projectId !== projectId || sourceSnapshot.organizationId !== actor.organizationId
+      || projectSource.organizationId !== actor.organizationId
+      || !installationVerifierScopeMatches(normalized, projectId, sourceSnapshot.sourceIdentityHash,
+        projectSource.sourceConfiguration)) throw new RepositoryError("INVALID_STATE");
+    const verifierAttestation = normalized.attestation.verifierAttestation;
+    if (verifierAttestation && [...this.#releaseInstallations.values()].some((item) =>
+      item.attestation.verifierAttestation?.attestationId === verifierAttestation.attestationId
+      || item.attestation.verifierAttestation?.requestId === verifierAttestation.requestId)) {
+      throw new RepositoryError("INVALID_STATE", ["VERIFIER_ATTESTATION_REPLAYED"]);
+    }
     const record: ReleaseInstallationRecord = {
       id: randomUUID(),
       organizationId: actor.organizationId,
@@ -2977,6 +3594,8 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
     this.#gitHubDraftPullRequests.clear();
     this.#idempotency.clear();
     this.#analysisAvailableAt.clear();
+    this.#websiteAuthenticationCheckpoints.clear();
+    this.#websiteLiveReceiptEvidence.clear();
     this.#analysisSources.clear();
     this.#projectSources.clear();
     this.#sourceSnapshots.clear();
@@ -3028,7 +3647,7 @@ export function normalizeReleaseInstallation(
     || input.csp.directive !== undefined && (input.csp.directive.length > 512 || /[\r\n]/.test(input.csp.directive))
     || canonicalAttestation === "__INVALID_JSON__" || Buffer.byteLength(canonicalAttestation) > 16_384
     || !validVerifierIdentity(input.verifierIdentity, input.verifierIdentity.mode)
-    || !attestation || !installedObservationMatches(input, releaseArtifactIdentity, plans, attestation)
+    || !attestation || !installedObservationMatches(input, releaseArtifactIdentity, release.manifest, plans, attestation)
     || !/^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/.test(input.idempotencyKey)
     || !/^[0-9a-f]{64}$/.test(input.inputHash)) throw new RepositoryError("INVALID_STATE");
   return {
@@ -3134,7 +3753,7 @@ function validVerifierIdentity(
   return isPlainRecord(identity)
     && Object.keys(identity).sort(compareCodePoints).join(",")
       === "mode,protocolVersion,verifierOriginDigest,webMcpImplementation"
-    && identity.protocolVersion === 1
+    && identity.protocolVersion === (mode === "live" ? 2 : 1)
     && identity.mode === mode
     && identity.webMcpImplementation === "native"
     && /^[0-9a-f]{64}$/.test(identity.verifierOriginDigest);
@@ -3143,18 +3762,47 @@ function validVerifierIdentity(
 function installedObservationMatches(
   input: ReleaseInstallationRequest,
   identity: Extract<ReleaseArtifactIdentity, { artifactUrl: string }>,
+  manifest: unknown,
   plans: readonly CapabilityPlan[],
   report: InstalledVerificationObservation,
 ): boolean {
   const expectedTools = plans.map(({ tool }) => tool.name).sort(compareCodePoints);
-  if (!isPlainRecord(report) || report.observedArtifactUrl !== identity.artifactUrl
+  const expectedKeys = [
+    "csp", "duplicateLoadHarmless", "executedArtifactUrl", "executedContentHash", "executionEvidence",
+    "injectedRegistration", "normalPageLoad", "observedArtifactUrl", "observedDownloadUrl",
+    "observedIntegrity", "observedLocalOnly", "observedTargetOrigin", "registeredTools", "routeInterception",
+    "servedContentHash", "syntheticHarness", "webMcpImplementation",
+    ...(input.verifierIdentity.mode === "live" ? ["verifierAttestation"] : []),
+  ].sort(compareCodePoints).join(",");
+  let verifierAttestation: VerifierAttestationIdentityRecordV2 | undefined;
+  try {
+    verifierAttestation = input.verifierIdentity.mode === "live"
+      ? normalizeVerifierAttestationIdentity(report.verifierAttestation!, "installation")
+      : undefined;
+  } catch { return false; }
+  const payload = {
+    pageUrl: input.pageUrl,
+    artifactUrl: input.artifactUrl,
+    downloadUrl: input.downloadUrl,
+    localOnly: input.localOnly,
+    contentHash: input.artifactContentHash,
+    integrity: input.integrity,
+    manifest,
+    targetOrigin: input.targetOrigin,
+    expectedTools,
+    ...(input.selfHostedUrl ? { selfHostedUrl: input.selfHostedUrl } : {}),
+  };
+  if (!isPlainRecord(report) || Object.keys(report).sort(compareCodePoints).join(",") !== expectedKeys
+    || report.observedArtifactUrl !== identity.artifactUrl
     || report.observedDownloadUrl !== identity.downloadUrl || report.observedLocalOnly !== identity.localOnly
     || report.observedIntegrity !== input.integrity || report.observedTargetOrigin !== input.targetOrigin
     || report.servedContentHash !== input.artifactContentHash || report.normalPageLoad !== true
     || report.routeInterception !== false || report.injectedRegistration !== false
     || report.syntheticHarness !== false || report.webMcpImplementation !== input.webMcpImplementation
     || !isPlainRecord(report.csp) || report.csp.hosted !== input.csp.hosted
-    || report.csp.directive !== input.csp.directive) return false;
+    || report.csp.directive !== input.csp.directive
+    || input.verifierIdentity.mode === "live" && verifierAttestation?.payloadDigest
+      !== createHash("sha256").update(canonicalJson(payload), "utf8").digest("hex")) return false;
   if (input.status === "pending_self_host") {
     return report.executedArtifactUrl === null && report.executedContentHash === null
       && report.duplicateLoadHarmless === null && Array.isArray(report.registeredTools)
@@ -3492,13 +4140,293 @@ function normalizeWebsiteAuthenticationWaitInput(
   if (!Number.isFinite(expiry) || expiry <= now.getTime() || expiry - now.getTime() > 10 * 60_000) {
     throw new RepositoryError("INVALID_STATE");
   }
+  const suspensionEvidence = normalizeWebsiteSuspensionEvidence(input.suspensionEvidence);
+  if (suspensionEvidence.checkpoint.checkpointReference !== input.checkpointReference
+    || suspensionEvidence.checkpoint.sourceSnapshotId !== input.sourceSnapshotId
+    || suspensionEvidence.checkpoint.sourceIdentityHash !== input.sourceIdentityHash
+    || suspensionEvidence.checkpoint.targetOriginDigest !== input.targetOriginDigest
+    || suspensionEvidence.checkpoint.expiresAt !== new Date(expiry).toISOString()) {
+    throw new RepositoryError("INVALID_STATE");
+  }
   return {
     ...input,
     checkpointReference: normalizeWebsiteAuthenticationReference(input.checkpointReference),
     sourceIdentityHash: normalizeWebsiteAuthenticationDigest(input.sourceIdentityHash),
     targetOriginDigest: normalizeWebsiteAuthenticationDigest(input.targetOriginDigest),
     expiresAt: new Date(expiry).toISOString(),
+    suspensionEvidence,
   };
+}
+
+export function normalizeWebsiteSuspensionEvidence(
+  value: WebsiteAuthenticationSuspensionEvidence,
+): WebsiteAuthenticationSuspensionEvidence {
+  const reference = (candidate: unknown): string => {
+    if (typeof candidate !== "string" || !/^urn:sha256:[0-9a-f]{64}$/.test(candidate)) {
+      throw new RepositoryError("INVALID_STATE");
+    }
+    return candidate;
+  };
+  const identifier = (candidate: unknown): string => {
+    if (typeof candidate !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(candidate)) {
+      throw new RepositoryError("INVALID_STATE");
+    }
+    return candidate;
+  };
+  const instant = (candidate: unknown): string => {
+    if (typeof candidate !== "string" || !Number.isFinite(Date.parse(candidate))
+      || new Date(candidate).toISOString() !== candidate) throw new RepositoryError("INVALID_STATE");
+    return candidate;
+  };
+  if (!value || typeof value !== "object" || Array.isArray(value)
+    || value.schemaVersion !== 1 || value.browserUse?.adapter !== "browser-use-v4"
+    || value.browserUse.adapterVersion !== 4 || value.browserUse.apiVersion !== "v4"
+    || value.browserUse.model !== "browser-use-2.0"
+    || !Number.isSafeInteger(value.suspendedLeaseGeneration) || value.suspendedLeaseGeneration < 1
+    || !Array.isArray(value.ttlSecrets) || value.ttlSecrets.length !== 2) {
+    throw new RepositoryError("INVALID_STATE");
+  }
+  const ttlSecrets = [...value.ttlSecrets].map((item) => ({
+    purpose: normalizeWebsiteTtlSecretPurpose(item?.purpose),
+    referenceDigest: normalizeWebsiteAuthenticationDigest(item?.referenceDigest),
+    expiresAt: instant(item?.expiresAt),
+  })).sort((left, right) => compareCodePoints(left.purpose, right.purpose));
+  if (ttlSecrets[0]?.purpose !== "browser_cdp_url" || ttlSecrets[1]?.purpose !== "browser_live_url"
+    || new Set(ttlSecrets.map(({ referenceDigest }) => referenceDigest)).size !== 2) {
+    throw new RepositoryError("INVALID_STATE");
+  }
+  const normalized: WebsiteAuthenticationSuspensionEvidence = {
+    schemaVersion: 1,
+    ownershipDecisionDigest: normalizeWebsiteAuthenticationDigest(value.ownershipDecisionDigest),
+    providerSessionIdentityDigest: normalizeWebsiteAuthenticationDigest(value.providerSessionIdentityDigest),
+    browserUse: {
+      adapter: "browser-use-v4",
+      adapterVersion: 4,
+      apiVersion: "v4",
+      model: "browser-use-2.0",
+      policyDigest: normalizeWebsiteAuthenticationDigest(value.browserUse.policyDigest),
+    },
+    browserLease: {
+      identityDigest: normalizeWebsiteAuthenticationDigest(value.browserLease?.identityDigest),
+      expiresAt: instant(value.browserLease?.expiresAt),
+    },
+    egressPolicy: {
+      referenceDigest: normalizeWebsiteAuthenticationDigest(value.egressPolicy?.referenceDigest),
+      policyDigest: normalizeWebsiteAuthenticationDigest(value.egressPolicy?.policyDigest),
+    },
+    cdpReferenceDigest: normalizeWebsiteAuthenticationDigest(value.cdpReferenceDigest),
+    publicEvidenceReference: reference(value.publicEvidenceReference),
+    ttlSecrets: ttlSecrets as WebsiteAuthenticationTtlSecretEvidence[],
+    checkpoint: {
+      checkpointReference: reference(value.checkpoint?.checkpointReference),
+      sourceSnapshotId: identifier(value.checkpoint?.sourceSnapshotId),
+      sourceIdentityHash: normalizeWebsiteAuthenticationDigest(value.checkpoint?.sourceIdentityHash),
+      targetOriginDigest: normalizeWebsiteAuthenticationDigest(value.checkpoint?.targetOriginDigest),
+      expiresAt: instant(value.checkpoint?.expiresAt),
+    },
+    suspendedWorkerIdentityDigest: normalizeWebsiteAuthenticationDigest(value.suspendedWorkerIdentityDigest),
+    suspendedLeaseGeneration: value.suspendedLeaseGeneration,
+  };
+  if (normalized.browserLease.expiresAt !== normalized.checkpoint.expiresAt
+    || normalized.ttlSecrets.some(({ expiresAt }) => expiresAt !== normalized.checkpoint.expiresAt)
+    || normalized.cdpReferenceDigest !== normalized.ttlSecrets[0]!.referenceDigest
+    || canonicalJson(value) !== canonicalJson(normalized)
+    || Buffer.byteLength(canonicalJson(normalized), "utf8") > 8_192) {
+    throw new RepositoryError("INVALID_STATE");
+  }
+  return normalized;
+}
+
+function normalizeWebsiteTtlSecretPurpose(value: unknown): WebsiteAuthenticationTtlSecretEvidence["purpose"] {
+  if (value !== "browser_cdp_url" && value !== "browser_live_url") {
+    throw new RepositoryError("INVALID_STATE");
+  }
+  return value;
+}
+
+export function websiteReferenceDigest(value: string): string {
+  return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+export function websiteWorkerIdentityDigest(workerId: string): string {
+  assertWorkerId(workerId);
+  return websiteReferenceDigest(workerId);
+}
+
+export function initialWebsiteCleanupResources(
+  evidence: WebsiteAuthenticationSuspensionEvidence,
+): WebsiteAuthenticationCleanupResourceEvidence[] {
+  return [
+    { resource: "authentication_handoff_checkpoint", identityDigest: websiteReferenceDigest(
+      evidence.checkpoint.checkpointReference,
+    ), disposition: "pending" },
+    { resource: "browser_lease", identityDigest: evidence.browserLease.identityDigest, disposition: "pending" },
+    { resource: "browser_session", identityDigest: evidence.providerSessionIdentityDigest, disposition: "pending" },
+    { resource: "cdp_observation_lease", identityDigest: evidence.cdpReferenceDigest, disposition: "pending" },
+    { resource: "egress_policy_proxy", identityDigest: evidence.egressPolicy.referenceDigest, disposition: "pending" },
+    { resource: "evidence_lease", identityDigest: websiteReferenceDigest(
+      evidence.publicEvidenceReference,
+    ), disposition: "pending" },
+    { resource: "ttl_secrets", identityDigest: websiteReferenceDigest(JSON.stringify(evidence.ttlSecrets)),
+      disposition: "pending" },
+  ];
+}
+
+const WEBSITE_CLEANUP_TERMINAL_DISPOSITIONS: Readonly<
+  Record<WebsiteAuthenticationCleanupResourceKind, ReadonlySet<WebsiteAuthenticationCleanupDisposition>>
+> = {
+  authentication_handoff_checkpoint: new Set(["destroyed", "reconciled"]),
+  browser_lease: new Set(["released", "reconciled"]),
+  browser_session: new Set(["destroyed", "reconciled"]),
+  cdp_observation_lease: new Set(["released", "reconciled"]),
+  egress_policy_proxy: new Set(["revoked", "reconciled"]),
+  evidence_lease: new Set(["released", "retained_immutable"]),
+  ttl_secrets: new Set(["destroyed", "revoked"]),
+};
+
+export function normalizeWebsiteCleanupResources(
+  value: readonly WebsiteAuthenticationCleanupResourceEvidence[],
+  expected?: readonly WebsiteAuthenticationCleanupResourceEvidence[],
+): WebsiteAuthenticationCleanupResourceEvidence[] {
+  if (!Array.isArray(value) || value.length !== 7
+    || Buffer.byteLength(canonicalJson(value), "utf8") > 16_384) throw new RepositoryError("INVALID_STATE");
+  const normalized = value.map((item): WebsiteAuthenticationCleanupResourceEvidence => {
+    if (!isPlainRecord(item)
+      || typeof item.resource !== "string" || !(item.resource in WEBSITE_CLEANUP_TERMINAL_DISPOSITIONS)
+      || typeof item.identityDigest !== "string" || !/^[0-9a-f]{64}$/.test(item.identityDigest)
+      || typeof item.disposition !== "string") throw new RepositoryError("INVALID_STATE");
+    const resource = item.resource as WebsiteAuthenticationCleanupResourceKind;
+    const disposition = item.disposition as WebsiteAuthenticationCleanupDisposition;
+    const terminal = WEBSITE_CLEANUP_TERMINAL_DISPOSITIONS[resource];
+    if (disposition !== "pending" && disposition !== "failed" && !terminal.has(disposition)) {
+      throw new RepositoryError("INVALID_STATE");
+    }
+    const keys = Object.keys(item).sort(compareCodePoints).join(",");
+    if (item.disposition === "pending") {
+      if (keys !== "disposition,identityDigest,resource") throw new RepositoryError("INVALID_STATE");
+      return { resource, identityDigest: item.identityDigest, disposition: "pending" as const };
+    }
+    if (typeof item.timestamp !== "string" || !Number.isFinite(Date.parse(item.timestamp))
+      || new Date(item.timestamp).toISOString() !== item.timestamp) throw new RepositoryError("INVALID_STATE");
+    if (item.disposition === "failed") {
+      if (keys !== "disposition,errorCode,identityDigest,resource,timestamp"
+        || typeof item.errorCode !== "string" || !/^[A-Z][A-Z0-9_]{0,63}$/.test(item.errorCode)) {
+        throw new RepositoryError("INVALID_STATE");
+      }
+      return { resource, identityDigest: item.identityDigest, disposition: "failed" as const,
+        timestamp: item.timestamp, errorCode: item.errorCode };
+    }
+    if (keys !== "disposition,identityDigest,resource,timestamp") throw new RepositoryError("INVALID_STATE");
+    return { resource, identityDigest: item.identityDigest, disposition, timestamp: item.timestamp };
+  }).sort((left, right) => compareCodePoints(left.resource, right.resource));
+  if (new Set(normalized.map(({ resource }) => resource)).size !== 7) throw new RepositoryError("INVALID_STATE");
+  if (expected) {
+    const identities = new Map(expected.map(({ resource, identityDigest }) => [resource, identityDigest]));
+    if (normalized.some(({ resource, identityDigest }) => identities.get(resource) !== identityDigest)) {
+      throw new RepositoryError("INVALID_STATE");
+    }
+  }
+  return normalized;
+}
+
+export function advanceWebsiteCleanupResources(
+  stored: readonly WebsiteAuthenticationCleanupResourceEvidence[],
+  updates: readonly WebsiteAuthenticationCleanupResourceEvidence[],
+): WebsiteAuthenticationCleanupResourceEvidence[] {
+  const normalizedStored = normalizeWebsiteCleanupResources(stored);
+  if (!Array.isArray(updates) || updates.length > 7) throw new RepositoryError("INVALID_STATE");
+  const byResource = new Map(normalizedStored.map((item) => [item.resource, item]));
+  for (const update of updates) {
+    const existing = byResource.get(update.resource);
+    if (!existing) throw new RepositoryError("INVALID_STATE");
+    const normalizedUpdate = normalizeWebsiteCleanupResources([
+      ...normalizedStored.filter(({ resource }) => resource !== update.resource), update,
+    ], normalizedStored).find(({ resource }) => resource === update.resource)!;
+    if (existing.disposition !== "pending" && existing.disposition !== "failed") {
+      if (canonicalJson(existing) !== canonicalJson(normalizedUpdate)) throw new RepositoryError("INVALID_STATE");
+      continue;
+    }
+    if (normalizedUpdate.disposition === "pending"
+      || existing.timestamp && normalizedUpdate.timestamp
+        && Date.parse(normalizedUpdate.timestamp) < Date.parse(existing.timestamp)) {
+      throw new RepositoryError("INVALID_STATE");
+    }
+    byResource.set(update.resource, normalizedUpdate);
+  }
+  return [...byResource.values()].sort((left, right) => compareCodePoints(left.resource, right.resource));
+}
+
+export function acknowledgeWebsiteAuthenticationCompletion(
+  evidence: WebsiteLiveReceiptEvidence,
+  workerId: string,
+  leaseGeneration: number,
+  acknowledgedAt: string,
+): WebsiteLiveReceiptEvidence {
+  assertWorkerId(workerId);
+  if (!Number.isSafeInteger(leaseGeneration) || leaseGeneration < 1
+    || !Number.isFinite(Date.parse(acknowledgedAt))
+    || new Date(acknowledgedAt).toISOString() !== acknowledgedAt
+    || !evidence.resumedWorkerIdentityDigest || !evidence.resumeLeaseGeneration
+    || evidence.resumeAcknowledgedAt || evidence.completionWorkerIdentityDigest
+    || evidence.completionLeaseGeneration) {
+    throw new RepositoryError("INVALID_STATE");
+  }
+  const completionWorkerIdentityDigest = websiteWorkerIdentityDigest(workerId);
+  return {
+    ...evidence,
+    completionWorkerIdentityDigest,
+    completionLeaseGeneration: leaseGeneration,
+    resumeAcknowledgedAt: acknowledgedAt,
+    restartVerified: completionWorkerIdentityDigest !== evidence.suspendedWorkerIdentityDigest,
+  };
+}
+
+export function websiteAuthenticationResultCheckpoint(
+  evidence: WebsiteLiveReceiptEvidence,
+): WebsiteAuthenticationResultCheckpoint | undefined {
+  const values = [evidence.resultCheckpointHash, evidence.resultCheckpointOutputReference,
+    evidence.resultCheckpointWorkerIdentityDigest, evidence.resultCheckpointLeaseGeneration,
+    evidence.resultCheckpointedAt];
+  if (values.every((value) => value === undefined)) return undefined;
+  if (!/^[0-9a-f]{64}$/.test(evidence.resultCheckpointHash ?? "")
+    || !/^urn:sha256:[0-9a-f]{64}$/.test(evidence.resultCheckpointOutputReference ?? "")
+    || !/^[0-9a-f]{64}$/.test(evidence.resultCheckpointWorkerIdentityDigest ?? "")
+    || !Number.isSafeInteger(evidence.resultCheckpointLeaseGeneration)
+    || (evidence.resultCheckpointLeaseGeneration ?? 0) < 1
+    || typeof evidence.resultCheckpointedAt !== "string"
+    || !Number.isFinite(Date.parse(evidence.resultCheckpointedAt))
+    || new Date(evidence.resultCheckpointedAt).toISOString() !== evidence.resultCheckpointedAt) {
+    throw new RepositoryError("INVALID_STATE");
+  }
+  return {
+    resultHash: evidence.resultCheckpointHash!,
+    outputReference: evidence.resultCheckpointOutputReference!,
+    leaseGeneration: evidence.resultCheckpointLeaseGeneration!,
+    checkpointedAt: evidence.resultCheckpointedAt,
+  };
+}
+
+export function websiteSuspensionEvidenceMatches(
+  stored: WebsiteLiveReceiptEvidence,
+  expected: WebsiteAuthenticationSuspensionEvidence,
+): boolean {
+  const suspension = copy(stored) as Record<string, unknown>;
+  for (const key of ["authenticationEvidenceReferenceDigest", "authenticationConsumedAt",
+    "resumedWorkerIdentityDigest", "resumeLeaseGeneration", "resumeClaimedAt", "resumeAcknowledgedAt",
+    "resultCheckpointHash", "resultCheckpointOutputReference", "resultCheckpointWorkerIdentityDigest",
+    "resultCheckpointLeaseGeneration", "resultCheckpointedAt", "completionWorkerIdentityDigest",
+    "completionLeaseGeneration", "restartVerified", "cleanupResources"]) delete suspension[key];
+  return canonicalJson(suspension) === canonicalJson(expected);
+}
+
+export function websiteAuthenticationWaitCommandHash(
+  inputHash: string,
+  suspensionEvidence: WebsiteAuthenticationSuspensionEvidence,
+): string {
+  return stableHash(canonicalJson({
+    inputHash: stableHash(inputHash),
+    suspensionEvidence: normalizeWebsiteSuspensionEvidence(suspensionEvidence),
+  }));
 }
 
 function normalizeWebsiteAuthenticationResumeInput(

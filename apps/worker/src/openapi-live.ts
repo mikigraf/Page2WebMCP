@@ -6,7 +6,10 @@ import {
 import { createNodeOpenApiResolver, createNodeOpenApiTransport } from "./node-network.ts";
 import { createOpenApiAnalysisAdapter, type AnalysisAdapter } from "./workflow.ts";
 import { parsePersistedSourceConfiguration } from "../../../packages/database/src/control-plane.ts";
-import type { SelectedProviderProbeContext } from "../../../packages/operations/src/readiness.ts";
+import {
+  normalizeFrozenOpenApiSourceIdentity,
+  type SelectedProviderProbeContext,
+} from "../../../packages/operations/src/readiness.ts";
 
 type RuntimeEnvironment = Readonly<Record<string, string | undefined>>;
 const HOSTED_PUBLIC_ORIGIN =
@@ -55,14 +58,27 @@ export function createConfiguredOpenApiProductionAdapter(
       }
       try {
         parsePersistedSourceConfiguration("openapi", context.sourceConfiguration);
-        await fetchOpenApiSource(context.sourceUrl, {
+        let expected: ReturnType<typeof normalizeFrozenOpenApiSourceIdentity>;
+        try { expected = normalizeFrozenOpenApiSourceIdentity(context.sourceArtifact); }
+        catch { throw new Error("OPENAPI_SOURCE_CHANGED_AFTER_FREEZE"); }
+        const fetched = await fetchOpenApiSource(context.sourceUrl, {
           resolver,
           transport,
-          maxBytes: 65_536,
-          maxRedirects: 0,
           signal,
         });
-      } catch {
+        const actual = {
+          contentHash: fetched.evidenceReference.slice("urn:sha256:".length),
+          artifactReference: fetched.evidenceReference,
+          finalUrl: fetched.finalUrl ?? context.sourceUrl,
+          mimeType: fetched.contentType,
+          sizeBytes: fetched.sizeBytes,
+        };
+        if (Object.keys(expected).some((key) => expected[key as keyof typeof expected]
+          !== actual[key as keyof typeof actual])) {
+          throw new Error("OPENAPI_SOURCE_CHANGED_AFTER_FREEZE");
+        }
+      } catch (error) {
+        if (error instanceof Error && error.message === "OPENAPI_SOURCE_CHANGED_AFTER_FREEZE") throw error;
         throw new Error("OPENAPI_PROVIDER_PROBE_FAILED");
       }
     },

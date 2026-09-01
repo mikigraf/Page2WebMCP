@@ -256,6 +256,78 @@ test("reconciles only pinned current and documented legacy typed object-exists e
   }
 });
 
+test("reconciles an ambiguous upload response loss only through both exact public byte identities", async () => {
+  const responseLoss = Object.assign(new TypeError("fetch failed"), {
+    cause: Object.assign(new Error("socket closed after request body"), { code: "ECONNRESET" }),
+  });
+  const fixture = harness({
+    uploadResult: async () => { throw responseLoss; },
+  });
+
+  const published = await fixture.store.publish(input(), new AbortController().signal);
+  assert.equal(published.contentHash, CONTENT_HASH);
+  assert.equal(fixture.uploadCalls.length, 1);
+  assert.deepEqual(fixture.fetchCalls.map(({ url }) => url), [ARTIFACT_URL, DOWNLOAD_URL]);
+
+  const mismatch = harness({
+    uploadResult: async () => { throw responseLoss; },
+    responses: [exactResponse(ARTIFACT_URL, "export const wrong = true;\n")],
+  });
+  await assert.rejects(
+    mismatch.store.publish(input(), new AbortController().signal),
+    /^Error: RELEASE_ARTIFACT_MISMATCH$/,
+  );
+});
+
+test("reconciles the pinned Supabase SDK StorageUnknownError response-loss shape", async () => {
+  const calls: string[] = [];
+  const responseLoss = Object.assign(new TypeError("fetch failed"), {
+    cause: Object.assign(new Error("socket closed after durable upload"), { code: "UND_ERR_SOCKET" }),
+  });
+  const store = createConfiguredReleaseArtifactStore(environment(), {
+    fetch: async (resource, init) => {
+      const url = typeof resource === "string" ? resource : resource instanceof URL
+        ? resource.toString() : resource.url;
+      calls.push(url);
+      if (init?.method === "POST") throw responseLoss;
+      if (url === ARTIFACT_URL) return exactResponse(ARTIFACT_URL);
+      if (url === DOWNLOAD_URL) return exactResponse(DOWNLOAD_URL, CODE, {
+        disposition: `attachment; filename="page2webmcp-${CONTENT_HASH}.js"`,
+      });
+      throw new Error("unexpected request");
+    },
+  });
+
+  const published = await store.publish(input(), new AbortController().signal);
+  assert.equal(published.contentHash, CONTENT_HASH);
+  assert.equal(calls.length, 3);
+  assert.match(calls[0]!, new RegExp(`${CONTENT_HASH}\\.js$`));
+  assert.deepEqual(calls.slice(1), [ARTIFACT_URL, DOWNLOAD_URL]);
+});
+
+test("does not treat arbitrary upload exceptions as response loss", async () => {
+  const errors = [
+    Object.assign(new Error("database rejected upload"), { code: "ECONNRESET" }),
+    Object.assign(new TypeError("fetch failed"), {
+      cause: Object.assign(new Error("name resolution failed"), { code: "ENOTFOUND" }),
+    }),
+    Object.assign(new Error("wrapped"), {
+      name: "StorageUnknownError",
+      originalError: Object.assign(new TypeError("fetch failed"), {
+        cause: Object.assign(new Error("certificate rejected"), { code: "CERT_HAS_EXPIRED" }),
+      }),
+    }),
+  ];
+  for (const error of errors) {
+    const fixture = harness({ uploadResult: async () => { throw error; } });
+    await assert.rejects(
+      fixture.store.publish(input(), new AbortController().signal),
+      /^Error: RELEASE_ARTIFACT_UPLOAD_FAILED$/,
+    );
+    assert.equal(fixture.fetchCalls.length, 0);
+  }
+});
+
 test("rejects unrelated typed and untyped conflicts without message parsing or public reconciliation", async () => {
   const rejected = [
     new StorageApiError("ResourceAlreadyExists in a message", 409, "Duplicate"),

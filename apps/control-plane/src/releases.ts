@@ -5,8 +5,10 @@ import { CapabilityPlanSchema, type CapabilityPlan } from "../../../packages/cap
 import {
   capabilityPlanDigest,
   capabilityStateDigest,
+  deriveInstallationOperationId,
   normalizeReleaseArtifactIdentity,
   persistedReleaseArtifactIdentity,
+  verifierEnvironmentForSource,
   type AnalysisResult,
   type CandidateRelease,
   type CapabilityRecord,
@@ -76,7 +78,7 @@ export async function publishPersistedRelease(
     sourceCandidate,
   );
   const verificationRequest = await deriveTrustedVerification(
-    analysisRunId, target.targetOrigin, result, capabilities, signal
+    project.id, analysisRunId, target, result, capabilities, signal
   );
   const verification = await repository.saveVerification(actor, project.id, verificationRequest);
   if (!verification.eligible) {
@@ -315,12 +317,20 @@ function verifierChainMatches(
 ): boolean {
   const candidateIdentity = candidate.verifierIdentity;
   const installationIdentity = installation?.verifierIdentity;
+  const candidateAttestation = candidate.observation?.verifierAttestation;
+  const installationAttestation = installation?.attestation.verifierAttestation;
   return candidate.verificationMode === "live"
     && candidateIdentity?.mode === "live"
     && installationIdentity?.mode === "live"
+    && candidateIdentity.protocolVersion === 2
+    && installationIdentity.protocolVersion === 2
     && candidateIdentity.protocolVersion === installationIdentity.protocolVersion
     && candidateIdentity.webMcpImplementation === installationIdentity.webMcpImplementation
-    && candidateIdentity.verifierOriginDigest === installationIdentity.verifierOriginDigest;
+    && candidateIdentity.verifierOriginDigest === installationIdentity.verifierOriginDigest
+    && candidateAttestation?.operation === "candidate"
+    && installationAttestation?.operation === "installation"
+    && candidateAttestation.attestationId !== installationAttestation.attestationId
+    && candidateAttestation.requestId !== installationAttestation.requestId;
 }
 
 function releaseInstallationProjection(
@@ -387,7 +397,7 @@ export async function verifyPersistedRelease(
     sourceCandidate,
   );
   return repository.saveVerification(actor, project.id,
-    await deriveTrustedVerification(run.id, target.targetOrigin, result, capabilities, signal));
+    await deriveTrustedVerification(project.id, run.id, target, result, capabilities, signal));
 }
 
 export async function verifyInstalledRelease(
@@ -409,16 +419,8 @@ export async function verifyInstalledRelease(
   const artifactIdentity = persistedReleaseArtifactIdentity(release);
   if (!artifactIdentity) throw new ApiError("INVALID_STATE", 409);
   const expectedTools = manifest.data.plans.map(({ tool }) => tool.name).sort(compareStrings);
-  const attestation = await attestReleaseInstallation({
-    pageUrl,
-    ...artifactIdentity,
-    contentHash: release.contentHash,
-    integrity: release.sri,
-    manifest: manifest.data,
-    targetOrigin: release.allowedOrigin,
-    expectedTools,
-    ...(selfHostedUrl ? { selfHostedUrl } : {}),
-  }, releaseVerificationPort(), signal);
+  const target = await resolveReleaseTarget(repository, actor, projectId, release.analysisRunId, release);
+  if (target.targetOrigin !== release.allowedOrigin) throw new ApiError("INVALID_STATE", 409);
   const inputHash = createHash("sha256").update(JSON.stringify({
     releaseId,
     pageUrl,
@@ -429,6 +431,26 @@ export async function verifyInstalledRelease(
     contentHash: release.contentHash,
     integrity: release.sri,
   })).digest("hex");
+  const port = releaseVerificationPort();
+  const attestation = await attestReleaseInstallation({
+    pageUrl,
+    ...artifactIdentity,
+    contentHash: release.contentHash,
+    integrity: release.sri,
+    manifest: manifest.data,
+    targetOrigin: release.allowedOrigin,
+    expectedTools,
+    ...(selfHostedUrl ? { selfHostedUrl } : {}),
+    ...(port.mode === "live" ? {
+      liveContext: {
+        projectId,
+        releaseId,
+        installationOperationId: deriveInstallationOperationId({ projectId, releaseId, idempotencyKey, inputHash }),
+        sourceIdentityHash: target.sourceIdentityHash,
+        environment: target.environment,
+      },
+    } : {}),
+  }, port, signal);
   return repository.saveReleaseInstallation(actor, projectId, {
     releaseId,
     pageUrl,
@@ -445,7 +467,10 @@ export async function verifyInstalledRelease(
     csp: attestation.csp,
     webMcpImplementation: attestation.webMcpImplementation,
     verifierIdentity: attestation.verifierIdentity,
-    attestation: attestation.report,
+    attestation: {
+      ...attestation.report,
+      ...(attestation.verifierAttestation ? { verifierAttestation: attestation.verifierAttestation } : {}),
+    },
     idempotencyKey,
     inputHash,
   });
@@ -457,7 +482,12 @@ async function resolveReleaseTarget(
   projectId: string,
   analysisRunId: string,
   candidate: CandidateRelease,
-): Promise<Readonly<{ targetOrigin: string; verificationPageUrl: string }>> {
+): Promise<Readonly<{
+  targetOrigin: string;
+  verificationPageUrl: string;
+  sourceIdentityHash: string;
+  environment: "test" | "staging" | "production";
+}>> {
   const workflow = await repository.getWorkflowRun(actor, analysisRunId);
   const snapshots = await repository.listSourceSnapshots(actor, projectId);
   const snapshot = snapshots.find(({ id }) => id === workflow.sourceSnapshotId);
@@ -477,6 +507,8 @@ async function resolveReleaseTarget(
     return {
       targetOrigin: source.sourceConfiguration.targetOrigin,
       verificationPageUrl: source.sourceConfiguration.testPageUrl,
+      sourceIdentityHash: snapshot.sourceIdentityHash,
+      environment: verifierEnvironmentForSource(source.sourceConfiguration),
     };
   }
   if (source.sourceType === "website") {
@@ -485,7 +517,12 @@ async function resolveReleaseTarget(
       if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash) {
         throw new Error("INVALID_SOURCE_URL");
       }
-      return { targetOrigin: url.origin, verificationPageUrl: url.toString() };
+      return {
+        targetOrigin: url.origin,
+        verificationPageUrl: url.toString(),
+        sourceIdentityHash: snapshot.sourceIdentityHash,
+        environment: verifierEnvironmentForSource(source.sourceConfiguration),
+      };
     } catch {
       throw new ApiError("INVALID_STATE", 409);
     }
@@ -494,16 +531,28 @@ async function resolveReleaseTarget(
   const origin = safeOrigin(candidate.allowedOrigin);
   if (!manifest.success || !origin || origin !== candidate.allowedOrigin
     || manifest.data.targetOrigin !== origin) throw new ApiError("INVALID_STATE", 409);
-  return { targetOrigin: origin, verificationPageUrl: `${origin}/` };
+  return {
+    targetOrigin: origin,
+    verificationPageUrl: `${origin}/`,
+    sourceIdentityHash: snapshot.sourceIdentityHash,
+    environment: verifierEnvironmentForSource(source.sourceConfiguration),
+  };
 }
 
 async function deriveTrustedVerification(
+  projectId: string,
   analysisRunId: string,
-  targetOrigin: string,
+  target: Readonly<{
+    targetOrigin: string;
+    verificationPageUrl: string;
+    sourceIdentityHash: string;
+    environment: "test" | "staging" | "production";
+  }>,
   result: AnalysisResult,
   capabilities: CapabilityRecord[],
   signal: AbortSignal,
 ): Promise<VerificationRequest> {
+  const { targetOrigin } = target;
   const prepared = deriveVerification(analysisRunId, targetOrigin, result, capabilities);
   const manifest = ManifestSchema.safeParse(prepared.candidate.manifest);
   if (!manifest.success || safeOrigin(targetOrigin) !== targetOrigin) {
@@ -512,6 +561,7 @@ async function deriveTrustedVerification(
   const integrity = `sha384-${createHash("sha384").update(prepared.candidate.code).digest("base64")}`;
   const expectedTools = capabilities.filter(({ status }) => status !== "blocked")
     .map(({ stableName }) => stableName).sort(compareStrings);
+  const port = releaseVerificationPort();
   const attestation = await attestReleaseCandidate({
     code: prepared.candidate.code,
     contentHash: prepared.candidate.contentHash,
@@ -519,7 +569,15 @@ async function deriveTrustedVerification(
     manifest: manifest.data,
     targetOrigin,
     expectedTools,
-  }, releaseVerificationPort(), signal);
+    ...(port.mode === "live" ? {
+      liveContext: {
+        projectId,
+        analysisRunId,
+        sourceIdentityHash: target.sourceIdentityHash,
+        environment: target.environment,
+      },
+    } : {}),
+  }, port, signal);
   return applyAttestation(prepared, attestation);
 }
 
@@ -547,6 +605,7 @@ function applyAttestation(prepared: PreparedVerification, attestation: Candidate
       trustedLoader: { ...attestation.report.trustedLoader },
       controlPlaneRequestsDuringExecution: attestation.report.controlPlaneRequestsDuringExecution,
       modelRequestsDuringExecution: attestation.report.modelRequestsDuringExecution,
+      ...(attestation.verifierAttestation ? { verifierAttestation: attestation.verifierAttestation } : {}),
     },
   };
 }

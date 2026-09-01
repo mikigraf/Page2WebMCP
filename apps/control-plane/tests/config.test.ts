@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { validateRuntimeConfiguration, validateWorkerRuntimeConfiguration } from "../src/config.ts";
+import {
+  validateRuntimeConfiguration as validateRuntimeConfigurationWithoutBuildIdentity,
+  validateWorkerRuntimeConfiguration as validateWorkerRuntimeConfigurationWithoutBuildIdentity,
+} from "../src/config.ts";
+import { buildDeploymentIdentity } from "../src/deployment-identity.ts";
 
 const production = {
   NODE_ENV: "production",
@@ -8,12 +12,26 @@ const production = {
   NEXT_PUBLIC_SUPABASE_URL: "https://auth.example",
   NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: "sb_publishable_safe-public-key-value",
   PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN: "https://control.example",
+  PAGE2WEBMCP_GIT_COMMIT_SHA: "c".repeat(40),
+  PAGE2WEBMCP_APPLICATION_RELEASE_ID: "control-plane-test-1",
   PAGE2WEBMCP_SUPABASE_URL: "https://bimqgiedckdurqiywctl.supabase.co",
   PAGE2WEBMCP_SUPABASE_SECRET_KEY: "sb_secret_test-only-artifact-storage-key",
   PAGE2WEBMCP_PUBLIC_ORIGIN: "https://bimqgiedckdurqiywctl.supabase.co/storage/v1/object/public/page2webmcp-releases",
   PAGE2WEBMCP_STORAGE_MODE: "postgres",
   DATABASE_URL: "postgresql://database.example/page2webmcp"
 };
+
+const embeddedIdentity = buildDeploymentIdentity({
+  gitCommitSha: production.PAGE2WEBMCP_GIT_COMMIT_SHA,
+  applicationReleaseId: production.PAGE2WEBMCP_APPLICATION_RELEASE_ID,
+  controlPlaneOrigin: production.PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN,
+  sourceTreeSha256: "a".repeat(64),
+});
+const deploymentIdentity = { loadBuildIdentity: () => embeddedIdentity };
+const validateRuntimeConfiguration = (environment: Record<string, string | undefined>) =>
+  validateRuntimeConfigurationWithoutBuildIdentity(environment, deploymentIdentity);
+const validateWorkerRuntimeConfiguration = (environment: Record<string, string | undefined>) =>
+  validateWorkerRuntimeConfigurationWithoutBuildIdentity(environment, deploymentIdentity);
 
 const localProduction = {
   ...production,
@@ -34,6 +52,14 @@ test("production configuration requires a strong session secret and durable data
     /DATABASE_URL_REQUIRED/
   );
   assert.doesNotThrow(() => validateRuntimeConfiguration(production));
+  assert.throws(
+    () => validateRuntimeConfiguration({ ...production, PAGE2WEBMCP_GIT_COMMIT_SHA: "" }),
+    /DEPLOYMENT_IDENTITY_CONFIGURATION_REQUIRED/,
+  );
+  assert.throws(
+    () => validateRuntimeConfiguration({ ...production, PAGE2WEBMCP_APPLICATION_RELEASE_ID: "" }),
+    /DEPLOYMENT_IDENTITY_CONFIGURATION_REQUIRED/,
+  );
 });
 
 test("production memory storage is restricted to an explicit ephemeral-test override", () => {
@@ -205,16 +231,30 @@ test("the standalone worker fails before polling without durable storage", () =>
   assert.doesNotThrow(() => validateWorkerRuntimeConfiguration({
     PAGE2WEBMCP_STORAGE_MODE: "postgres",
     PAGE2WEBMCP_PROVIDER_MODE: "openapi",
-    DATABASE_URL: "postgresql://database.example/page2webmcp"
+    DATABASE_URL: "postgresql://database.example/page2webmcp",
+    PAGE2WEBMCP_GIT_COMMIT_SHA: production.PAGE2WEBMCP_GIT_COMMIT_SHA,
+    PAGE2WEBMCP_APPLICATION_RELEASE_ID: production.PAGE2WEBMCP_APPLICATION_RELEASE_ID,
+    PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN: production.PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN,
   }));
   assert.doesNotThrow(() => validateWorkerRuntimeConfiguration({
     PAGE2WEBMCP_STORAGE_MODE: "postgres",
     PAGE2WEBMCP_PROVIDER_MODE: "website",
-    DATABASE_URL: "postgresql://database.example/page2webmcp"
+    DATABASE_URL: "postgresql://database.example/page2webmcp",
+    PAGE2WEBMCP_GIT_COMMIT_SHA: production.PAGE2WEBMCP_GIT_COMMIT_SHA,
+    PAGE2WEBMCP_APPLICATION_RELEASE_ID: production.PAGE2WEBMCP_APPLICATION_RELEASE_ID,
+    PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN: production.PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN,
   }));
   assert.doesNotThrow(() => validateWorkerRuntimeConfiguration({
     PAGE2WEBMCP_STORAGE_MODE: "postgres",
     PAGE2WEBMCP_PROVIDER_MODE: "github",
-    DATABASE_URL: "postgresql://database.example/page2webmcp"
+    DATABASE_URL: "postgresql://database.example/page2webmcp",
+    PAGE2WEBMCP_GIT_COMMIT_SHA: production.PAGE2WEBMCP_GIT_COMMIT_SHA,
+    PAGE2WEBMCP_APPLICATION_RELEASE_ID: production.PAGE2WEBMCP_APPLICATION_RELEASE_ID,
+    PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN: production.PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN,
   }));
+  assert.throws(() => validateWorkerRuntimeConfiguration({
+    PAGE2WEBMCP_STORAGE_MODE: "postgres",
+    PAGE2WEBMCP_PROVIDER_MODE: "openapi",
+    DATABASE_URL: "postgresql://database.example/page2webmcp",
+  }), /DEPLOYMENT_IDENTITY_CONFIGURATION_REQUIRED$/);
 });

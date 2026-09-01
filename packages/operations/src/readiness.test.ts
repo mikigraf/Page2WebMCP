@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import {
@@ -64,9 +65,28 @@ const selectedHash = "a".repeat(64);
 const verifierDigest = "b".repeat(64);
 const toolDigest = "c".repeat(64);
 const releaseIntegrity = "sha384-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+const evaluatedAt = "2026-09-01T12:00:30.000Z";
+const projectId = "22222222-2222-4222-8222-222222222222";
+const analysisRunId = "33333333-3333-4333-8333-333333333333";
+const releaseId = "44444444-4444-4444-8444-444444444444";
+const sourceIdentityHash = "d".repeat(64);
+const targetOrigin = "https://widgets.example";
+const pageUrl = "https://widgets.example/account";
+const installationOperationId = "e".repeat(64);
+
+function digest(value: unknown): string {
+  const canonical = (item: unknown): string => {
+    if (item === null || typeof item === "string" || typeof item === "boolean") return JSON.stringify(item);
+    if (typeof item === "number" && Number.isFinite(item)) return JSON.stringify(item);
+    if (Array.isArray(item)) return `[${item.map(canonical).join(",")}]`;
+    const record = item as Record<string, unknown>;
+    return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${canonical(record[key])}`).join(",")}}`;
+  };
+  return createHash("sha256").update(canonical(value)).digest("hex");
+}
 
 function nativeProof(overrides: Record<string, unknown> = {}) {
-  return {
+  const proof = {
     selectedReleaseHash: selectedHash,
     releaseContentHash: selectedHash,
     releaseIntegrity,
@@ -79,8 +99,8 @@ function nativeProof(overrides: Record<string, unknown> = {}) {
     candidateVerificationRunId: "11111111-1111-4111-8111-111111111111",
     candidateMode: "live" as const,
     installationMode: "live" as const,
-    candidateProtocolVersion: 1,
-    installationProtocolVersion: 1,
+    candidateProtocolVersion: 2,
+    installationProtocolVersion: 2,
     candidateVerifierOriginDigest: verifierDigest,
     installationVerifierOriginDigest: verifierDigest,
     candidateWebMcpImplementation: "native" as const,
@@ -113,8 +133,41 @@ function nativeProof(overrides: Record<string, unknown> = {}) {
     zeroModelCalls: true,
     trustedLoaderEnforced: true,
     candidateChecksPassed: true,
-    ...overrides,
+    projectId,
+    analysisRunId,
+    releaseId,
+    sourceIdentityHash,
+    targetOrigin,
+    environment: "production" as const,
+    installationPageUrl: pageUrl,
+    installationOperationId,
+    candidateAttestationId: "55555555-5555-4555-8555-555555555555",
+    candidateAttestationRequestId: "66666666-6666-4666-8666-666666666666",
+    candidateAttestationNonceDigest: "f".repeat(64),
+    candidateAttestationOperation: "candidate" as const,
+    candidateAttestationScopeDigest: digest({
+      operation: "candidate", projectId, analysisRunId, sourceIdentityHash,
+      targetOrigin, environment: "production", contentHash: selectedHash,
+    }),
+    candidateAttestationPayloadDigest: "1".repeat(64),
+    candidateAttestationIssuedAt: "2026-09-01T11:59:00.000Z",
+    candidateAttestationExpiresAt: "2026-09-01T12:00:00.000Z",
+    candidateAttestationAttestedAt: "2026-09-01T11:59:01.000Z",
+    installationAttestationId: "77777777-7777-4777-8777-777777777777",
+    installationAttestationRequestId: "88888888-8888-4888-8888-888888888888",
+    installationAttestationNonceDigest: "2".repeat(64),
+    installationAttestationOperation: "installation" as const,
+    installationAttestationScopeDigest: digest({
+      operation: "installation", projectId, releaseId, installationOperationId, sourceIdentityHash,
+      pageUrl, targetOrigin, environment: "production", selectedHash,
+    }),
+    installationAttestationPayloadDigest: "3".repeat(64),
+    installationAttestationIssuedAt: "2026-09-01T12:00:00.000Z",
+    installationAttestationExpiresAt: "2026-09-01T12:01:00.000Z",
+    installationAttestationAttestedAt: "2026-09-01T12:00:01.000Z",
+    installationVerifiedAt: "2026-09-01T12:00:02.000Z",
   };
+  return { ...proof, ...overrides };
 }
 
 function liveReadiness(overrides: Record<string, unknown> = {}) {
@@ -141,12 +194,13 @@ function liveReadiness(overrides: Record<string, unknown> = {}) {
       publicOrigin: "https://bimqgiedckdurqiywctl.supabase.co/storage/v1/object/public/page2webmcp-releases",
     },
     verifier: {
-      protocolVersion: 1,
+      protocolVersion: 2,
       mode: "live" as const,
       webMcpImplementation: "native" as const,
       verifierOriginDigest: verifierDigest,
     },
     installationProof: nativeProof(),
+    evaluatedAt,
     ...overrides,
   };
 }
@@ -181,8 +235,13 @@ test("only one exact selected-hash native installation proof constructs liveSucc
     ["verification binding", { installationProof: nativeProof({ candidateVerificationRunId: "22222222-2222-4222-8222-222222222222" }) }],
     ["candidate mode", { installationProof: nativeProof({ candidateMode: "hermetic" }) }],
     ["installation mode", { installationProof: nativeProof({ installationMode: "local_live" }) }],
-    ["candidate protocol", { installationProof: nativeProof({ candidateProtocolVersion: 2 }) }],
-    ["protocol", { installationProof: nativeProof({ installationProtocolVersion: 2 }) }],
+    ["candidate protocol", { installationProof: nativeProof({ candidateProtocolVersion: 1 }) }],
+    ["protocol", { installationProof: nativeProof({ installationProtocolVersion: 1 }) }],
+    ["candidate scope", { installationProof: nativeProof({ candidateAttestationScopeDigest: "4".repeat(64) }) }],
+    ["installation scope", { installationProof: nativeProof({ installationAttestationScopeDigest: "4".repeat(64) }) }],
+    ["attestation replay", { installationProof: nativeProof({
+      installationAttestationId: "55555555-5555-4555-8555-555555555555",
+    }) }],
     ["candidate verifier digest", { installationProof: nativeProof({ candidateVerifierOriginDigest: "d".repeat(64) }) }],
     ["verifier digest", { installationProof: nativeProof({ installationVerifierOriginDigest: "d".repeat(64) }) }],
     ["candidate native implementation", { installationProof: nativeProof({ candidateWebMcpImplementation: "compatibility_shim" }) }],
@@ -225,7 +284,7 @@ test("only one exact selected-hash native installation proof constructs liveSucc
     liveReadiness({ storage: { ...liveReadiness().storage, integrity: "sha384-BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB" } }),
     liveReadiness({ storage: { ...liveReadiness().storage, localOnly: true } }),
     liveReadiness({ storage: { ...liveReadiness().storage, publicOrigin: "https://storage.attacker.example" } }),
-    liveReadiness({ verifier: { ...liveReadiness().verifier, protocolVersion: 2 } }),
+    liveReadiness({ verifier: { ...liveReadiness().verifier, protocolVersion: 1 } }),
     liveReadiness({ verifier: { ...liveReadiness().verifier, verifierOriginDigest: "d".repeat(64) } }),
     liveReadiness({ verifier: { ...liveReadiness().verifier, webMcpImplementation: "compatibility_shim" } }),
     liveReadiness({ provider: {
@@ -246,6 +305,21 @@ test("only one exact selected-hash native installation proof constructs liveSucc
       status: "skipped", code: "LIVE_INSTALLATION_EVIDENCE_REQUIRED", liveSuccess: false,
     });
   }
+});
+
+test("live readiness rejects stale, exact-expiry, future, and malformed installation attestations", () => {
+  const staleCases = [
+    { evaluatedAt: "2026-09-01T12:01:00.000Z" },
+    { evaluatedAt: "2026-09-01T12:01:01.000Z" },
+    { evaluatedAt: "2026-09-01T11:59:59.999Z" },
+    { installationProof: nativeProof({ installationAttestationIssuedAt: "2026-09-01T12:00:31.000Z" }) },
+    { installationProof: nativeProof({ installationAttestationAttestedAt: "2026-09-01T12:00:31.000Z" }) },
+    { installationProof: nativeProof({ installationVerifiedAt: "2026-09-01T12:00:31.000Z" }) },
+    { installationProof: nativeProof({ installationAttestationExpiresAt: "2026-09-01T12:02:01.000Z" }) },
+  ];
+  for (const override of staleCases) assert.deepEqual(evaluateDeploymentReadiness(liveReadiness(override)), {
+    status: "skipped", code: "LIVE_INSTALLATION_EVIDENCE_REQUIRED", liveSuccess: false,
+  });
 });
 
 test("hermetic and local-live can pass diagnostics but can never claim live success", () => {

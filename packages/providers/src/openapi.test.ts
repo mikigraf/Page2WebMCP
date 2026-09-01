@@ -58,6 +58,7 @@ test("fetches bounded OpenAPI bytes through pinned public DNS and same-origin ma
     finalUrl: "https://specs.widgets.example/canonical/openapi.json",
     contentType: "application/json",
     evidenceReference: `urn:sha256:${createHash("sha256").update(source).digest("hex")}`,
+    sizeBytes: Buffer.byteLength(source),
   });
 });
 
@@ -281,6 +282,7 @@ test("private upload abstraction accepts only bounded JSON/YAML bytes and hashes
     format: "yaml",
     contentType: "application/yaml",
     evidenceReference: `urn:sha256:${createHash("sha256").update(bytes).digest("hex")}`,
+    sizeBytes: bytes.byteLength,
   });
   assert.throws(() => loadPrivateOpenApiUpload(bytes, "text/plain"), /^Error: OPENAPI_CONTENT_TYPE_BLOCKED$/);
   assert.throws(() => loadPrivateOpenApiUpload(new Uint8Array(1_000_001), "application/json"), /^Error: OPENAPI_RESPONSE_TOO_LARGE$/);

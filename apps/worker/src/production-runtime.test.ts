@@ -1,8 +1,15 @@
 import assert from "node:assert/strict";
 import { createHash, generateKeyPairSync } from "node:crypto";
 import test from "node:test";
-import { InMemoryControlPlaneRepository, type AnalysisResult, type RepositoryActor } from "../../../packages/database/src/control-plane.ts";
+import {
+  InMemoryControlPlaneRepository,
+  type AnalysisResult,
+  type RepositoryActor,
+  type WebsiteAuthenticationCleanupDisposition,
+  type WebsiteLiveReceiptEvidence,
+} from "../../../packages/database/src/control-plane.ts";
 import { WorkflowController } from "../../../packages/database/src/workflow.ts";
+import { websiteSuspensionEvidenceFixture } from "../../../test-support/website-suspension-evidence.ts";
 import {
   createProductionWorkerRuntime,
   createProductionWorkerRuntimeFromProvider,
@@ -11,6 +18,7 @@ import {
   processProductionWorkerIteration,
   type ProductionWorkerRuntime,
 } from "./production-runtime.ts";
+import type { AnalysisSource } from "./workflow.ts";
 
 const owner: RepositoryActor = {
   id: "11111111-1111-4111-8111-111111111111",
@@ -129,6 +137,11 @@ test("provider-only construction returns an exact non-fixture provenance tuple w
   }).provenance, {
     mode: "website", adapter: "browser-use-v4", adapterVersion: 4, fixture: false,
   });
+  const website = createProductionProvider(configuredWebsiteEnvironment(), {
+    fetch: async () => { throw new Error("NO_NETWORK_DURING_CONSTRUCTION"); },
+  });
+  assert.equal(typeof website.analyze.finalizeAuthenticationCheckpoint, "function");
+  assert.equal(typeof website.analyze.reconcileAuthenticationCheckpoint, "function");
 });
 
 test("GitHub provider construction rejects controls that fail canonical inspection", () => {
@@ -253,12 +266,17 @@ test("website runtime expires and durably cleans an authentication checkpoint be
   const claimed = await repository.claimAnalysis("runtime-cleanup-analysis-worker", 60_000, ["website"]);
   assert.ok(claimed);
   const checkpointReference = `urn:sha256:${"9".repeat(64)}`;
+  const targetOriginDigest = createHash("sha256").update("https://widgets.example", "utf8").digest("hex");
+  const expiresAt = "2026-09-01T12:01:00.000Z";
   await repository.waitAnalysisForAuthentication("runtime-cleanup-analysis-worker", run.id, {
     checkpointReference,
     sourceSnapshotId: snapshot.id,
     sourceIdentityHash: snapshot.sourceIdentityHash,
-    targetOriginDigest: createHash("sha256").update("https://widgets.example", "utf8").digest("hex"),
-    expiresAt: "2026-09-01T12:01:00.000Z",
+    targetOriginDigest,
+    expiresAt,
+    suspensionEvidence: websiteSuspensionEvidenceFixture({ checkpointReference, sourceSnapshotId: snapshot.id,
+      sourceIdentityHash: snapshot.sourceIdentityHash, targetOriginDigest, expiresAt,
+      workerId: "runtime-cleanup-analysis-worker", leaseGeneration: claimed.leaseGeneration }),
     idempotencyKey: "runtime-cleanup-wait",
     inputHash: "runtime-cleanup-wait",
   }, claimed.leaseGeneration);
@@ -266,6 +284,7 @@ test("website runtime expires and durably cleans an authentication checkpoint be
 
   let analysisCalls = 0;
   const cleanupCalls: unknown[] = [];
+  let cleanupReceipt: WebsiteLiveReceiptEvidence | undefined;
   const analyze = Object.assign(
     async () => {
       analysisCalls += 1;
@@ -273,11 +292,30 @@ test("website runtime expires and durably cleans an authentication checkpoint be
     },
     {
       reconcileAuthenticationCheckpoint: async (
-        source: Record<string, unknown>,
+        source: AnalysisSource,
         waiting: Record<string, unknown>,
         _signal: AbortSignal,
         outcome?: "failed" | "cancelled",
-      ) => { cleanupCalls.push({ source, waiting, outcome }); },
+      ) => {
+        const { liveReceiptEvidence, ...publicSource } = source;
+        assert.ok(liveReceiptEvidence);
+        cleanupReceipt = liveReceiptEvidence;
+        cleanupCalls.push({ source: publicSource, waiting, outcome });
+        const disposition: Readonly<Record<string, WebsiteAuthenticationCleanupDisposition>> = {
+          authentication_handoff_checkpoint: "destroyed",
+          browser_lease: "released",
+          browser_session: "destroyed",
+          cdp_observation_lease: "released",
+          egress_policy_proxy: "revoked",
+          evidence_lease: "retained_immutable",
+          ttl_secrets: "destroyed",
+        };
+        return liveReceiptEvidence.cleanupResources.map((resource) => ({
+          ...resource,
+          disposition: disposition[resource.resource]!,
+          timestamp: "2026-09-01T12:01:00.001Z",
+        }));
+      },
     },
   );
   const runtime: ProductionWorkerRuntime = {
@@ -312,6 +350,8 @@ test("website runtime expires and durably cleans an authentication checkpoint be
     },
     outcome: "failed",
   }]);
+  assert.equal(cleanupReceipt?.cleanupResources.length, 7);
+  assert.doesNotMatch(JSON.stringify(cleanupReceipt), /https:\/\/|wss:\/\/|secretref:|runtime-cleanup-worker/);
   assert.equal(await repository.claimWebsiteAuthenticationCleanup("runtime-cleanup-replay", 1_000), undefined);
 });
 
