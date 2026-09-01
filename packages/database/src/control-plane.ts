@@ -118,7 +118,7 @@ export type AnalysisRunRecord = {
   organizationId: string;
   projectId: string;
   requestedBy: string;
-  status: "queued" | "running" | "succeeded" | "failed" | "cancelled";
+  status: "queued" | "running" | "waiting" | "succeeded" | "failed" | "cancelled";
   attempts: number;
   leaseOwner?: string;
   leaseExpiresAt?: string;
@@ -128,12 +128,55 @@ export type AnalysisRunRecord = {
   updatedAt: string;
 };
 
+export type WebsiteAuthenticationCheckpointState =
+  | "waiting"
+  | "consumed"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "expired";
+
+export type WebsiteAuthenticationCheckpointRecord = Readonly<{
+  organizationId: string;
+  projectId: string;
+  analysisRunId: string;
+  workflowTaskId: string;
+  sourceSnapshotId: string;
+  sourceIdentityHash: string;
+  targetOriginDigest: string;
+  checkpointReference: string;
+  authenticationEvidenceReference?: string;
+  state: WebsiteAuthenticationCheckpointState;
+  expiresAt: string;
+  consumedAt?: string;
+  terminalAt?: string;
+  createdAt: string;
+  updatedAt: string;
+}>;
+
+export type WebsiteAuthenticationClaimCheckpoint = Readonly<{
+  checkpointReference: string;
+  authenticationEvidenceReference: string;
+  sourceSnapshotId: string;
+  sourceIdentityHash: string;
+  targetOriginDigest: string;
+  expiresAt: string;
+}>;
+
+type StoredWebsiteAuthenticationCheckpoint = WebsiteAuthenticationCheckpointRecord & Readonly<{
+  waitIdempotencyKey: string;
+  waitInputHash: string;
+  resumeIdempotencyKey?: string;
+  resumeInputHash?: string;
+}>;
+
 export type ClaimedAnalysisRunRecord = Readonly<AnalysisRunRecord & {
   sourceType: SourceType;
   sourceUrl: string;
   sourceConfiguration: SourceConfiguration;
   workflowTaskId: string;
   leaseGeneration: number;
+  authenticationCheckpoint?: WebsiteAuthenticationClaimCheckpoint;
 }>;
 
 export type CapabilityRecord = {
@@ -363,6 +406,21 @@ export type AuditEventRecord = {
 
 export type ReviewInput = { action: "approve" | "block" | "reject"; expectedVersion: number };
 export type IdempotencyInput = { idempotencyKey: string; inputHash: string };
+export type WaitAnalysisForAuthenticationInput = IdempotencyInput & Readonly<{
+  checkpointReference: string;
+  sourceSnapshotId: string;
+  sourceIdentityHash: string;
+  targetOriginDigest: string;
+  expiresAt: string;
+}>;
+export type ResumeAnalysisAfterAuthenticationInput = IdempotencyInput & Readonly<{
+  runId: string;
+  checkpointReference: string;
+  authenticationEvidenceReference: string;
+  sourceSnapshotId: string;
+  sourceIdentityHash: string;
+  targetOriginDigest: string;
+}>;
 export type ExpectedAnalysisSource = Readonly<{
   projectSourceId: string;
   sourceSnapshotId: string;
@@ -434,6 +492,20 @@ export interface ControlPlaneRepository extends WorkflowRepository {
     sourceTypes?: readonly SourceType[],
   ): Promise<ClaimedAnalysisRunRecord | undefined>;
   heartbeatAnalysis(workerId: string, runId: string, leaseMs: number, leaseGeneration?: number): Promise<void>;
+  waitAnalysisForAuthentication(
+    workerId: string,
+    runId: string,
+    input: WaitAnalysisForAuthenticationInput,
+    leaseGeneration?: number,
+  ): Promise<WebsiteAuthenticationCheckpointRecord>;
+  getWebsiteAuthenticationWait(
+    actor: RepositoryActor,
+    runId: string,
+  ): Promise<WebsiteAuthenticationCheckpointRecord | undefined>;
+  resumeAnalysisAfterAuthentication(
+    actor: RepositoryActor,
+    input: ResumeAnalysisAfterAuthenticationInput,
+  ): Promise<WebsiteAuthenticationCheckpointRecord>;
   completeAnalysis(workerId: string, runId: string, result: AnalysisResult, leaseGeneration?: number): Promise<AnalysisRunRecord>;
   failAnalysis(workerId: string, runId: string, code: string, retryable: boolean, leaseGeneration?: number): Promise<AnalysisRunRecord>;
   getAnalysisResult(actor: RepositoryActor, runId: string): Promise<AnalysisResult | undefined>;
@@ -772,6 +844,7 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
   readonly #gitHubDraftPullRequests = new Map<string, GitHubDraftPullRequestRecord>();
   readonly #idempotency = new Map<string, IdempotencyRecord>();
   readonly #analysisAvailableAt = new Map<string, string>();
+  readonly #websiteAuthenticationCheckpoints = new Map<string, StoredWebsiteAuthenticationCheckpoint>();
   readonly #analysisSources = new Map<string, Readonly<{
     sourceType: SourceType;
     sourceUrl: string;
@@ -797,6 +870,21 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
 
   #now(): string {
     return this.clock().toISOString();
+  }
+
+  #closeWebsiteAuthenticationCheckpoint(
+    runId: string,
+    state: Extract<WebsiteAuthenticationCheckpointState, "completed" | "failed" | "cancelled" | "expired">,
+    at: string,
+  ): void {
+    const checkpoint = this.#websiteAuthenticationCheckpoints.get(runId);
+    if (!checkpoint || !["waiting", "consumed"].includes(checkpoint.state)) return;
+    this.#websiteAuthenticationCheckpoints.set(runId, {
+      ...checkpoint,
+      state,
+      terminalAt: at,
+      updatedAt: at,
+    });
   }
 
   async provisionPersonalOrganization(identity: AuthenticatedIdentity): Promise<RepositoryActor> {
@@ -1659,11 +1747,12 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
     this.#workflowRuns.set(run.id, cancelled);
     this.#appendWorkflowEvent(run.id, "workflow.cancelled");
     const analysis = run.analysisRunId ? this.#runs.get(run.analysisRunId) : undefined;
-    if (analysis && ["queued", "running"].includes(analysis.status)) {
+    if (analysis && ["queued", "running", "waiting"].includes(analysis.status)) {
       this.#runs.set(analysis.id, {
         ...analysis, status: "cancelled", leaseOwner: undefined, leaseExpiresAt: undefined, updatedAt: now,
       });
       this.#analysisAvailableAt.delete(analysis.id);
+      this.#closeWebsiteAuthenticationCheckpoint(analysis.id, "cancelled", now);
     }
     this.#recordCommand(`cancel:${run.id}`, input.idempotencyKey, input.inputHash, cancelled);
     return copy(this.#workflowRuns.get(run.id)!);
@@ -1673,6 +1762,46 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
     assertWorkerId(workerId);
     const now = this.clock();
     let repaired = 0;
+    for (const checkpoint of [...this.#websiteAuthenticationCheckpoints.values()]) {
+      if (!["waiting", "consumed"].includes(checkpoint.state) || new Date(checkpoint.expiresAt) > now) continue;
+      const analysis = this.#runs.get(checkpoint.analysisRunId);
+      const run = this.#workflowRuns.get(checkpoint.analysisRunId);
+      const task = this.#workflowTasks.get(checkpoint.workflowTaskId);
+      if (!analysis || !run || !task || !["waiting", "queued"].includes(analysis.status)
+        || !["waiting", "queued"].includes(run.status) || !["waiting", "queued"].includes(task.status)) continue;
+      const timestamp = now.toISOString();
+      this.#closeWebsiteAuthenticationCheckpoint(analysis.id, "expired", timestamp);
+      this.#runs.set(analysis.id, {
+        ...analysis,
+        status: "failed",
+        leaseOwner: undefined,
+        leaseExpiresAt: undefined,
+        errorCode: "AUTHENTICATION_WAIT_EXPIRED",
+        updatedAt: timestamp,
+      });
+      this.#analysisAvailableAt.delete(analysis.id);
+      this.#workflowTasks.set(task.id, {
+        ...task,
+        status: "failed",
+        leaseOwner: undefined,
+        leaseExpiresAt: undefined,
+        retryClassification: "permanent",
+        errorCode: "AUTHENTICATION_WAIT_EXPIRED",
+        reconciledAt: timestamp,
+        updatedAt: timestamp,
+      });
+      this.#workflowRuns.set(run.id, {
+        ...run,
+        status: "failed",
+        errorCode: "AUTHENTICATION_WAIT_EXPIRED",
+        updatedAt: timestamp,
+      });
+      const project = this.#projects.get(run.projectId);
+      if (project) this.#projects.set(project.id, { ...project, status: "failed" });
+      this.#appendWorkflowEvent(run.id, "task.reconciled", task.id, "AUTHENTICATION_WAIT_EXPIRED");
+      this.#appendWorkflowEvent(run.id, "workflow.reconciled");
+      repaired += 1;
+    }
     for (const task of [...this.#workflowTasks.values()]) {
       if (task.phase === "analysis" || task.status !== "running" || !task.leaseExpiresAt
         || new Date(task.leaseExpiresAt) > now) continue;
@@ -1745,11 +1874,23 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
       const expired = run.status === "running" && run.leaseExpiresAt !== undefined && new Date(run.leaseExpiresAt) <= now;
       if (run.status !== "queued" && !expired) continue;
       if (run.status === "queued" && new Date(this.#analysisAvailableAt.get(run.id) ?? run.createdAt) > now) continue;
+      const authenticationCheckpoint = this.#websiteAuthenticationCheckpoints.get(run.id);
+      if (authenticationCheckpoint && (authenticationCheckpoint.state !== "consumed"
+        || !authenticationCheckpoint.authenticationEvidenceReference
+        || new Date(authenticationCheckpoint.expiresAt) <= now)) continue;
       if (run.attempts >= 3) {
         this.#runs.set(run.id, { ...run, status: "failed", errorCode: "ATTEMPTS_EXHAUSTED", updatedAt: now.toISOString() });
         const project = this.#projects.get(run.projectId);
         if (project) this.#projects.set(project.id, { ...project, status: "failed" });
         this.#analysisAvailableAt.delete(run.id);
+        if (authenticationCheckpoint && ["waiting", "consumed"].includes(authenticationCheckpoint.state)) {
+          this.#websiteAuthenticationCheckpoints.set(run.id, {
+            ...authenticationCheckpoint,
+            state: "failed",
+            terminalAt: now.toISOString(),
+            updatedAt: now.toISOString(),
+          });
+        }
         const workflow = this.#workflowRuns.get(run.id);
         const task = [...this.#workflowTasks.values()].find((candidate) => candidate.workflowRunId === run.id && candidate.phase === "analysis");
         if (workflow && task && workflow.status !== "failed") {
@@ -1775,6 +1916,16 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
       const workflow = this.#workflowRuns.get(run.id);
       const task = [...this.#workflowTasks.values()].find((candidate) => candidate.workflowRunId === run.id && candidate.phase === "analysis");
       if (!workflow || !task || !["queued", "running"].includes(task.status)) throw new RepositoryError("INVALID_STATE");
+      const sourceSnapshot = this.#sourceSnapshots.get(workflow.sourceSnapshotId);
+      if (authenticationCheckpoint && (!sourceSnapshot
+        || authenticationCheckpoint.organizationId !== run.organizationId
+        || authenticationCheckpoint.projectId !== run.projectId
+        || authenticationCheckpoint.workflowTaskId !== task.id
+        || authenticationCheckpoint.sourceSnapshotId !== sourceSnapshot.id
+        || authenticationCheckpoint.sourceIdentityHash !== sourceSnapshot.sourceIdentityHash
+        || authenticationCheckpoint.targetOriginDigest !== websiteTargetOriginDigest(source.sourceUrl))) {
+        throw new RepositoryError("INVALID_STATE");
+      }
       const workflowTask: WorkflowTaskRecord = {
         ...task,
         status: "running",
@@ -1793,6 +1944,16 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
         ...source,
         workflowTaskId: workflowTask.id,
         leaseGeneration: workflowTask.leaseGeneration,
+        ...(authenticationCheckpoint ? {
+          authenticationCheckpoint: {
+            checkpointReference: authenticationCheckpoint.checkpointReference,
+            authenticationEvidenceReference: authenticationCheckpoint.authenticationEvidenceReference!,
+            sourceSnapshotId: authenticationCheckpoint.sourceSnapshotId,
+            sourceIdentityHash: authenticationCheckpoint.sourceIdentityHash,
+            targetOriginDigest: authenticationCheckpoint.targetOriginDigest,
+            expiresAt: authenticationCheckpoint.expiresAt,
+          },
+        } : {}),
       });
     }
     return undefined;
@@ -1817,6 +1978,166 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
     });
     this.#workflowTasks.set(task.id, { ...task, leaseExpiresAt, updatedAt: now.toISOString() });
     this.#appendWorkflowEvent(task.workflowRunId, "task.heartbeat", task.id);
+  }
+
+  async waitAnalysisForAuthentication(
+    workerId: string,
+    runId: string,
+    input: WaitAnalysisForAuthenticationInput,
+    leaseGeneration?: number,
+  ): Promise<WebsiteAuthenticationCheckpointRecord> {
+    assertWorkerId(workerId);
+    const normalized = normalizeWebsiteAuthenticationWaitInput(input, this.clock());
+    const inputHash = stableHash(input.inputHash);
+    const existing = this.#websiteAuthenticationCheckpoints.get(runId);
+    if (existing) {
+      if (existing.waitIdempotencyKey !== input.idempotencyKey || existing.waitInputHash !== inputHash
+        || !websiteAuthenticationWaitMatches(existing, normalized)) throw new RepositoryError("IDEMPOTENCY_CONFLICT");
+      return publicWebsiteAuthenticationCheckpoint(existing);
+    }
+    const workflow = this.#workflowRuns.get(runId);
+    const run = this.#runs.get(runId);
+    const source = this.#analysisSources.get(runId);
+    const task = [...this.#workflowTasks.values()]
+      .find((candidate) => candidate.workflowRunId === runId && candidate.phase === "analysis");
+    if (!workflow || !run || !source || !task) throw new RepositoryError("INVALID_STATE");
+    if (workflow.cancelRequestedAt || workflow.status === "cancelled") throw new RepositoryError("CANCELLED");
+    if (source.sourceType !== "website") throw new RepositoryError("INVALID_STATE");
+    if (run.status !== "running" || run.leaseOwner !== workerId || !run.leaseExpiresAt
+      || new Date(run.leaseExpiresAt) <= this.clock()) throw new RepositoryError("LEASE_LOST");
+    this.#assertWorkflowLease(workerId, task, leaseGeneration ?? task.leaseGeneration);
+    const snapshot = this.#sourceSnapshots.get(workflow.sourceSnapshotId);
+    if (!snapshot || snapshot.organizationId !== run.organizationId || snapshot.projectId !== run.projectId
+      || normalized.sourceSnapshotId !== snapshot.id
+      || normalized.sourceIdentityHash !== snapshot.sourceIdentityHash) {
+      throw new RepositoryError("SOURCE_SNAPSHOT_STALE");
+    }
+    if (normalized.targetOriginDigest !== websiteTargetOriginDigest(source.sourceUrl)) {
+      throw new RepositoryError("INVALID_STATE");
+    }
+    const now = this.#now();
+    const checkpoint: StoredWebsiteAuthenticationCheckpoint = {
+      organizationId: run.organizationId,
+      projectId: run.projectId,
+      analysisRunId: run.id,
+      workflowTaskId: task.id,
+      sourceSnapshotId: snapshot.id,
+      sourceIdentityHash: snapshot.sourceIdentityHash,
+      targetOriginDigest: normalized.targetOriginDigest,
+      checkpointReference: normalized.checkpointReference,
+      state: "waiting",
+      expiresAt: normalized.expiresAt,
+      waitIdempotencyKey: input.idempotencyKey,
+      waitInputHash: inputHash,
+      createdAt: now,
+      updatedAt: now,
+    };
+    if ([...this.#websiteAuthenticationCheckpoints.values()]
+      .some((candidate) => candidate.checkpointReference === checkpoint.checkpointReference)) {
+      throw new RepositoryError("INVALID_STATE");
+    }
+    this.#websiteAuthenticationCheckpoints.set(run.id, checkpoint);
+    this.#runs.set(run.id, {
+      ...run,
+      status: "waiting",
+      leaseOwner: undefined,
+      leaseExpiresAt: undefined,
+      errorCode: undefined,
+      updatedAt: now,
+    });
+    this.#analysisAvailableAt.delete(run.id);
+    this.#workflowTasks.set(task.id, {
+      ...task,
+      status: "waiting",
+      checkpointReference: checkpoint.checkpointReference,
+      waitKeyHash: stableHash(`${input.idempotencyKey}\0${inputHash}`),
+      waitReason: "external_authentication",
+      waitExpiresAt: checkpoint.expiresAt,
+      leaseOwner: undefined,
+      leaseExpiresAt: undefined,
+      errorCode: undefined,
+      updatedAt: now,
+    });
+    this.#workflowRuns.set(workflow.id, { ...workflow, status: "waiting", errorCode: undefined, updatedAt: now });
+    this.#appendWorkflowEvent(workflow.id, "task.waiting", task.id);
+    return publicWebsiteAuthenticationCheckpoint(checkpoint);
+  }
+
+  async getWebsiteAuthenticationWait(
+    actor: RepositoryActor,
+    runId: string,
+  ): Promise<WebsiteAuthenticationCheckpointRecord | undefined> {
+    this.#workflowRunForActor(actor, runId);
+    const checkpoint = this.#websiteAuthenticationCheckpoints.get(runId);
+    return checkpoint ? publicWebsiteAuthenticationCheckpoint(checkpoint) : undefined;
+  }
+
+  async resumeAnalysisAfterAuthentication(
+    actor: RepositoryActor,
+    input: ResumeAnalysisAfterAuthenticationInput,
+  ): Promise<WebsiteAuthenticationCheckpointRecord> {
+    if (actor.role === "viewer") throw new RepositoryError("FORBIDDEN");
+    const normalized = normalizeWebsiteAuthenticationResumeInput(input);
+    const run = this.#workflowRunForActor(actor, input.runId);
+    const checkpoint = this.#websiteAuthenticationCheckpoints.get(run.id);
+    if (!checkpoint) throw new RepositoryError("INVALID_STATE");
+    const inputHash = stableHash(input.inputHash);
+    if (checkpoint.resumeIdempotencyKey !== undefined) {
+      if (checkpoint.resumeIdempotencyKey !== input.idempotencyKey || checkpoint.resumeInputHash !== inputHash
+        || !websiteAuthenticationResumeMatches(checkpoint, normalized)) {
+        throw new RepositoryError("IDEMPOTENCY_CONFLICT");
+      }
+      return publicWebsiteAuthenticationCheckpoint(checkpoint);
+    }
+    if (run.cancelRequestedAt || run.status === "cancelled") throw new RepositoryError("CANCELLED");
+    if (checkpoint.state !== "waiting" || run.status !== "waiting") throw new RepositoryError("INVALID_STATE");
+    if (new Date(checkpoint.expiresAt) <= this.clock()) throw new RepositoryError("WAIT_EXPIRED");
+    if (checkpoint.sourceSnapshotId !== normalized.sourceSnapshotId
+      || checkpoint.sourceIdentityHash !== normalized.sourceIdentityHash) {
+      throw new RepositoryError("SOURCE_SNAPSHOT_STALE");
+    }
+    if (!websiteAuthenticationResumeMatches(checkpoint, normalized)) throw new RepositoryError("INVALID_STATE");
+    const snapshot = this.#sourceSnapshots.get(run.sourceSnapshotId);
+    if (!snapshot || snapshot.id !== checkpoint.sourceSnapshotId
+      || snapshot.sourceIdentityHash !== checkpoint.sourceIdentityHash) throw new RepositoryError("SOURCE_SNAPSHOT_STALE");
+    const task = [...this.#workflowTasks.values()]
+      .find((candidate) => candidate.workflowRunId === run.id && candidate.phase === "analysis");
+    const analysis = this.#runs.get(run.id);
+    if (!task || !analysis || task.status !== "waiting" || task.checkpointReference !== checkpoint.checkpointReference
+      || task.waitReason !== "external_authentication" || analysis.status !== "waiting") {
+      throw new RepositoryError("INVALID_STATE");
+    }
+    const now = this.#now();
+    const consumed: StoredWebsiteAuthenticationCheckpoint = {
+      ...checkpoint,
+      authenticationEvidenceReference: normalized.authenticationEvidenceReference,
+      state: "consumed",
+      consumedAt: now,
+      resumeIdempotencyKey: input.idempotencyKey,
+      resumeInputHash: inputHash,
+      updatedAt: now,
+    };
+    this.#websiteAuthenticationCheckpoints.set(run.id, consumed);
+    this.#runs.set(analysis.id, {
+      ...analysis,
+      status: "queued",
+      errorCode: undefined,
+      leaseOwner: undefined,
+      leaseExpiresAt: undefined,
+      updatedAt: now,
+    });
+    this.#analysisAvailableAt.set(analysis.id, now);
+    this.#workflowTasks.set(task.id, {
+      ...task,
+      status: "queued",
+      resumedAt: now,
+      availableAt: now,
+      errorCode: undefined,
+      updatedAt: now,
+    });
+    this.#workflowRuns.set(run.id, { ...run, status: "queued", errorCode: undefined, updatedAt: now });
+    this.#appendWorkflowEvent(run.id, "task.resumed", task.id);
+    return publicWebsiteAuthenticationCheckpoint(consumed);
   }
 
   async completeAnalysis(
@@ -1919,6 +2240,7 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
       updatedAt: now
     };
     this.#runs.set(run.id, completed);
+    this.#closeWebsiteAuthenticationCheckpoint(run.id, "completed", now);
     this.#analysisAvailableAt.delete(run.id);
     const project = this.#projects.get(run.projectId);
     if (project) this.#projects.set(project.id, { ...project, status: "analyzed" });
@@ -1993,6 +2315,7 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
       updatedAt: this.#now()
     };
     this.#runs.set(run.id, failed);
+    if (terminal) this.#closeWebsiteAuthenticationCheckpoint(run.id, "failed", failed.updatedAt);
     if (terminal) this.#analysisAvailableAt.delete(run.id);
     else this.#analysisAvailableAt.set(run.id, new Date(this.clock().getTime()
       + workflowRetryDelayMs(run.attempts, undefined, this.workflowOptions.random)).toISOString());
@@ -2872,6 +3195,108 @@ function validateWorkflowReference(value: string | undefined): void {
   if (value !== undefined && !/^urn:sha256:[0-9a-f]{64}$/.test(value)) {
     throw new RepositoryError("INVALID_STATE");
   }
+}
+
+function normalizeWebsiteAuthenticationReference(value: string): string {
+  if (typeof value !== "string" || !/^urn:sha256:[0-9a-f]{64}$/.test(value)) {
+    throw new RepositoryError("INVALID_STATE");
+  }
+  return value;
+}
+
+function normalizeWebsiteAuthenticationDigest(value: string): string {
+  if (typeof value !== "string" || !/^[0-9a-f]{64}$/.test(value)) {
+    throw new RepositoryError("INVALID_STATE");
+  }
+  return value;
+}
+
+function normalizeWebsiteAuthenticationWaitInput(
+  input: WaitAnalysisForAuthenticationInput,
+  now: Date,
+): WaitAnalysisForAuthenticationInput {
+  assertIdempotencyKey(input.idempotencyKey);
+  stableHash(input.inputHash);
+  const expiry = Date.parse(input.expiresAt);
+  if (!Number.isFinite(expiry) || expiry <= now.getTime() || expiry - now.getTime() > 10 * 60_000) {
+    throw new RepositoryError("INVALID_STATE");
+  }
+  return {
+    ...input,
+    checkpointReference: normalizeWebsiteAuthenticationReference(input.checkpointReference),
+    sourceIdentityHash: normalizeWebsiteAuthenticationDigest(input.sourceIdentityHash),
+    targetOriginDigest: normalizeWebsiteAuthenticationDigest(input.targetOriginDigest),
+    expiresAt: new Date(expiry).toISOString(),
+  };
+}
+
+function normalizeWebsiteAuthenticationResumeInput(
+  input: ResumeAnalysisAfterAuthenticationInput,
+): ResumeAnalysisAfterAuthenticationInput {
+  assertIdempotencyKey(input.idempotencyKey);
+  stableHash(input.inputHash);
+  return {
+    ...input,
+    checkpointReference: normalizeWebsiteAuthenticationReference(input.checkpointReference),
+    authenticationEvidenceReference: normalizeWebsiteAuthenticationReference(input.authenticationEvidenceReference),
+    sourceIdentityHash: normalizeWebsiteAuthenticationDigest(input.sourceIdentityHash),
+    targetOriginDigest: normalizeWebsiteAuthenticationDigest(input.targetOriginDigest),
+  };
+}
+
+function websiteTargetOriginDigest(sourceUrl: string): string {
+  let origin: string;
+  try { origin = new URL(sourceUrl).origin; }
+  catch { throw new RepositoryError("INVALID_STATE"); }
+  return createHash("sha256").update(origin, "utf8").digest("hex");
+}
+
+function websiteAuthenticationWaitMatches(
+  checkpoint: WebsiteAuthenticationCheckpointRecord,
+  input: WaitAnalysisForAuthenticationInput,
+): boolean {
+  return checkpoint.checkpointReference === input.checkpointReference
+    && checkpoint.sourceSnapshotId === input.sourceSnapshotId
+    && checkpoint.sourceIdentityHash === input.sourceIdentityHash
+    && checkpoint.targetOriginDigest === input.targetOriginDigest
+    && checkpoint.expiresAt === input.expiresAt;
+}
+
+function websiteAuthenticationResumeMatches(
+  checkpoint: WebsiteAuthenticationCheckpointRecord,
+  input: ResumeAnalysisAfterAuthenticationInput,
+): boolean {
+  return checkpoint.analysisRunId === input.runId
+    && checkpoint.checkpointReference === input.checkpointReference
+    && checkpoint.sourceSnapshotId === input.sourceSnapshotId
+    && checkpoint.sourceIdentityHash === input.sourceIdentityHash
+    && checkpoint.targetOriginDigest === input.targetOriginDigest
+    && (checkpoint.authenticationEvidenceReference === undefined
+      || checkpoint.authenticationEvidenceReference === input.authenticationEvidenceReference);
+}
+
+function publicWebsiteAuthenticationCheckpoint(
+  checkpoint: StoredWebsiteAuthenticationCheckpoint,
+): WebsiteAuthenticationCheckpointRecord {
+  return copy({
+    organizationId: checkpoint.organizationId,
+    projectId: checkpoint.projectId,
+    analysisRunId: checkpoint.analysisRunId,
+    workflowTaskId: checkpoint.workflowTaskId,
+    sourceSnapshotId: checkpoint.sourceSnapshotId,
+    sourceIdentityHash: checkpoint.sourceIdentityHash,
+    targetOriginDigest: checkpoint.targetOriginDigest,
+    checkpointReference: checkpoint.checkpointReference,
+    ...(checkpoint.authenticationEvidenceReference
+      ? { authenticationEvidenceReference: checkpoint.authenticationEvidenceReference }
+      : {}),
+    state: checkpoint.state,
+    expiresAt: checkpoint.expiresAt,
+    ...(checkpoint.consumedAt ? { consumedAt: checkpoint.consumedAt } : {}),
+    ...(checkpoint.terminalAt ? { terminalAt: checkpoint.terminalAt } : {}),
+    createdAt: checkpoint.createdAt,
+    updatedAt: checkpoint.updatedAt,
+  });
 }
 
 function copy<T>(value: T): T {

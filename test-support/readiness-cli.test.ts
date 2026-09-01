@@ -230,11 +230,11 @@ test("local-live databases require exact IP-literal loopback port 58322", async 
     "LIVE_INSTALLATION_EVIDENCE_REQUIRED");
 });
 
-test("source readiness requires the complete migration ledger through the alternate topology", async () => {
+test("source readiness requires the complete migration ledger through website authentication wait", async () => {
   const migrations = await readdir(new URL("../supabase/migrations/", import.meta.url));
   assert.equal(sourceMigrationLedgerCurrent(migrations), true);
   assert.equal(sourceMigrationLedgerCurrent(
-    migrations.filter((name) => name !== "20260901060852_alternate_canonical_local_supabase_topology.sql"),
+    migrations.filter((name) => name !== "20260901064232_website_authentication_wait.sql"),
   ), false);
   assert.equal(sourceMigrationLedgerCurrent([
     "20260831211329_installed_execution_evidence.sql",
