@@ -5,6 +5,8 @@ export const BROWSER_USE_CLOUD_API_VERSION = "v4" as const;
 export const BROWSER_USE_CLOUD_MODEL = "browser-use-2.0" as const;
 const MAX_SESSION_TTL_MS = 10 * 60 * 1_000;
 const secretReferencePattern = /^secretref:[A-Za-z0-9._:-]{1,200}$/;
+const sha256Pattern = /^[a-f0-9]{64}$/;
+const sha256ReferencePattern = /^urn:sha256:[a-f0-9]{64}$/;
 
 export type BrowserUseCloudV4Request = Readonly<{
   apiVersion: typeof BROWSER_USE_CLOUD_API_VERSION;
@@ -42,6 +44,42 @@ export type BrowserUseSession = Readonly<{
   liveReference: string;
   cdpReference: string;
   policyDigest: string;
+  suspend(binding: BrowserUseSuspensionBinding): Promise<BrowserUseSuspendedSession>;
+}>;
+
+export type BrowserUseSuspensionBinding = Readonly<{
+  sourceSnapshotId: string;
+  sourceIdentityHash: string;
+  targetOriginDigest: string;
+  publicEvidenceReference: string;
+  egressPolicyReference: string;
+  egressPolicyDigest: string;
+}>;
+
+export type BrowserUseSuspensionAttestation = Readonly<{
+  authenticationCheckpointProtocolVersion: 1;
+  suspended: true;
+  checkpointReference: string;
+  organizationId: string;
+  projectId: string;
+  runId: string;
+  sourceSnapshotId: string;
+  sourceIdentityHash: string;
+  targetOriginDigest: string;
+  publicEvidenceReference: string;
+  providerSessionIdDigest: string;
+  liveReference: string;
+  cdpReference: string;
+  leaseId: string;
+  egressPolicyReference: string;
+  egressPolicyDigest: string;
+  browserPolicyDigest: string;
+  expiresAt: string;
+}>;
+
+export type BrowserUseSuspendedSession = Readonly<{
+  disposition: "suspended";
+  checkpoint: BrowserUseSuspensionAttestation;
 }>;
 
 export type BrowserUseCloudV4Controls = Readonly<{
@@ -76,6 +114,25 @@ export type BrowserUseCloudV4Controls = Readonly<{
     stop(providerSessionId: string, reason: "completed" | "failed" | "cancelled"): Promise<void>;
     reconcile(providerSessionId: string): Promise<void>;
   };
+  suspension?: {
+    create(input: BrowserUseSuspensionAttestationInput, signal: AbortSignal): Promise<BrowserUseSuspensionAttestation>;
+    abort(
+      input: BrowserUseSuspensionAttestationInput,
+      checkpointReference: string | undefined,
+    ): Promise<Readonly<{ reconciled: true; checkpointOwned: boolean; terminated: boolean }>>;
+  };
+}>;
+
+export type BrowserUseSuspensionAttestationInput = BrowserUseSuspensionBinding & Readonly<{
+  organizationId: string;
+  projectId: string;
+  runId: string;
+  providerSessionId: string;
+  liveReference: string;
+  cdpReference: string;
+  leaseId: string;
+  browserPolicyDigest: string;
+  expiresAt: string;
 }>;
 
 function compareCodePoints(left: string, right: string): number {
@@ -204,6 +261,50 @@ function assertRawSession(result: Awaited<ReturnType<BrowserUseCloudV4Controls["
   }
 }
 
+function assertSuspensionBinding(binding: BrowserUseSuspensionBinding): void {
+  if (!binding || !validateIdentifier(binding.sourceSnapshotId)
+    || !sha256Pattern.test(binding.sourceIdentityHash)
+    || !sha256Pattern.test(binding.targetOriginDigest)
+    || !sha256ReferencePattern.test(binding.publicEvidenceReference)
+    || !secretReferencePattern.test(binding.egressPolicyReference)
+    || !sha256Pattern.test(binding.egressPolicyDigest)) {
+    throw new Error("AUTH_CHECKPOINT_INPUT_INVALID");
+  }
+}
+
+function assertSuspensionAttestation(
+  value: BrowserUseSuspensionAttestation,
+  expected: BrowserUseSuspensionAttestationInput,
+): BrowserUseSuspensionAttestation {
+  const providerSessionIdDigest = createHash("sha256").update(expected.providerSessionId, "utf8").digest("hex");
+  const exact: Omit<BrowserUseSuspensionAttestation, "checkpointReference"> = {
+    authenticationCheckpointProtocolVersion: 1,
+    suspended: true,
+    organizationId: expected.organizationId,
+    projectId: expected.projectId,
+    runId: expected.runId,
+    sourceSnapshotId: expected.sourceSnapshotId,
+    sourceIdentityHash: expected.sourceIdentityHash,
+    targetOriginDigest: expected.targetOriginDigest,
+    publicEvidenceReference: expected.publicEvidenceReference,
+    providerSessionIdDigest,
+    liveReference: expected.liveReference,
+    cdpReference: expected.cdpReference,
+    leaseId: expected.leaseId,
+    egressPolicyReference: expected.egressPolicyReference,
+    egressPolicyDigest: expected.egressPolicyDigest,
+    browserPolicyDigest: expected.browserPolicyDigest,
+    expiresAt: expected.expiresAt,
+  };
+  if (!value || !sha256ReferencePattern.test(value.checkpointReference ?? "")
+    || canonicalJson({ ...value, checkpointReference: undefined })
+      !== canonicalJson({ ...exact, checkpointReference: undefined })
+    || JSON.stringify(value).includes(expected.providerSessionId)) {
+    throw new Error("AUTH_CHECKPOINT_ATTESTATION_INVALID");
+  }
+  return value;
+}
+
 async function captureReference(
   controls: BrowserUseCloudV4Controls,
   value: string,
@@ -246,6 +347,9 @@ export async function withBrowserUseCloudV4Session<T>(
   const references: string[] = [];
   let primaryError: unknown;
   let outcome: "completed" | "failed" | "cancelled" = "failed";
+  let suspended = false;
+  let suspensionAttempt: BrowserUseSuspensionAttestationInput | undefined;
+  let suspensionAttestation: BrowserUseSuspensionAttestation | undefined;
   try {
     if (deadline.signal.aborted) throw deadline.signal.reason;
     providerStartAttempted = true;
@@ -258,7 +362,7 @@ export async function withBrowserUseCloudV4Session<T>(
     references.push(liveReference);
     const cdpReference = await captureReference(controls, started.cdpUrl, "browser_cdp_url", input.expiresAt);
     references.push(cdpReference);
-    const session: BrowserUseSession = {
+    const session = {
       apiVersion: BROWSER_USE_CLOUD_API_VERSION,
       model: BROWSER_USE_CLOUD_MODEL,
       targetOrigin: input.targetOrigin,
@@ -267,9 +371,45 @@ export async function withBrowserUseCloudV4Session<T>(
       liveReference,
       cdpReference,
       policyDigest,
-    };
+    } as BrowserUseSession;
+    Object.defineProperty(session, "suspend", {
+      enumerable: false,
+      value: async (binding: BrowserUseSuspensionBinding): Promise<BrowserUseSuspendedSession> => {
+        if (suspensionAttestation) return { disposition: "suspended", checkpoint: suspensionAttestation };
+        assertSuspensionBinding(binding);
+        if (!controls.suspension || typeof controls.suspension.create !== "function"
+          || typeof controls.suspension.abort !== "function") {
+          throw new Error("AUTH_CHECKPOINT_CONTROLS_REQUIRED");
+        }
+        const checkpointInput: BrowserUseSuspensionAttestationInput = {
+          ...binding,
+          organizationId: input.organizationId,
+          projectId: input.projectId,
+          runId: input.runId,
+          providerSessionId: providerSessionId!,
+          liveReference,
+          cdpReference,
+          leaseId: lease.leaseId,
+          browserPolicyDigest: policyDigest,
+          expiresAt: input.expiresAt,
+        };
+        suspensionAttempt = checkpointInput;
+        const attested = await controls.suspension.create(checkpointInput, deadline.signal);
+        suspensionAttestation = assertSuspensionAttestation(attested, checkpointInput);
+        return { disposition: "suspended", checkpoint: suspensionAttestation };
+      },
+    });
     const value = await Promise.race([action(session, deadline.signal), deadline.stopped]);
     if (deadline.signal.aborted) throw deadline.signal.reason;
+    if (suspensionAttestation) {
+      if (!value || typeof value !== "object"
+        || (value as unknown as BrowserUseSuspendedSession).disposition !== "suspended"
+        || (value as unknown as BrowserUseSuspendedSession).checkpoint.checkpointReference !== suspensionAttestation.checkpointReference) {
+        throw new Error("AUTH_CHECKPOINT_ATTESTATION_INVALID");
+      }
+      suspended = true;
+      return value;
+    }
     outcome = "completed";
     return value;
   } catch (error) {
@@ -282,25 +422,44 @@ export async function withBrowserUseCloudV4Session<T>(
     throw normalized;
   } finally {
     const cleanupErrors: unknown[] = [];
-    let terminationProven = !providerStartAttempted;
-    for (const reference of references.reverse()) {
-      try { await controls.secretReferences.revoke(reference); } catch (error) { cleanupErrors.push(error); }
-    }
-    if (providerSessionId) {
-      try {
-        await controls.transport.stop(providerSessionId, outcome);
-        terminationProven = true;
-      } catch (error) { cleanupErrors.push(error); }
-      try {
-        await controls.transport.reconcile(providerSessionId);
-        terminationProven = true;
-      } catch (error) { cleanupErrors.push(error); }
-    }
-    // An attempted start may have reached the provider even when its response was
-    // lost. Keep the exclusive durable lease until its TTL unless a terminal
-    // stop/reconciliation result was positively attested by the transport.
-    if (terminationProven) {
-      try { await controls.leases.release(lease.leaseId); } catch (error) { cleanupErrors.push(error); }
+    if (!suspended) {
+      let gatewayTerminationProven = false;
+      if (suspensionAttempt && controls.suspension) {
+        try {
+          const reconciled = await controls.suspension.abort(
+            suspensionAttempt,
+            suspensionAttestation?.checkpointReference,
+          );
+          if (!reconciled || reconciled.reconciled !== true
+            || typeof reconciled.checkpointOwned !== "boolean" || typeof reconciled.terminated !== "boolean"
+            || reconciled.checkpointOwned !== reconciled.terminated) {
+            throw new Error("AUTH_CHECKPOINT_RECONCILIATION_INVALID");
+          }
+          gatewayTerminationProven = reconciled.checkpointOwned && reconciled.terminated;
+        } catch (error) { cleanupErrors.push(error); }
+      }
+      let terminationProven = !providerStartAttempted;
+      if (!gatewayTerminationProven) {
+        for (const reference of references.reverse()) {
+          try { await controls.secretReferences.revoke(reference); } catch (error) { cleanupErrors.push(error); }
+        }
+        if (providerSessionId) {
+          try {
+            await controls.transport.stop(providerSessionId, outcome);
+            terminationProven = true;
+          } catch (error) { cleanupErrors.push(error); }
+          try {
+            await controls.transport.reconcile(providerSessionId);
+            terminationProven = true;
+          } catch (error) { cleanupErrors.push(error); }
+        }
+        // An attempted start may have reached the provider even when its response was
+        // lost. Keep the exclusive durable lease until its TTL unless a terminal
+        // stop/reconciliation result was positively attested by the transport.
+        if (terminationProven) {
+          try { await controls.leases.release(lease.leaseId); } catch (error) { cleanupErrors.push(error); }
+        }
+      }
     }
     deadline.dispose();
     if (primaryError === undefined && cleanupErrors.length > 0) throw new Error("BROWSER_SESSION_CLEANUP_FAILED");

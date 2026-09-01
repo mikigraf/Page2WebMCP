@@ -90,6 +90,12 @@ export type WebsiteEvidence = Readonly<{
 
 export type WebsiteEvidenceStore = Readonly<{
   put(record: WebsiteEvidence): Promise<Readonly<{ reference: string }>>;
+  get?(input: Readonly<{
+    reference: string;
+    organizationId: string;
+    projectId: string;
+    analysisRunId: string;
+  }>): Promise<WebsiteEvidence | undefined>;
 }>;
 
 export type WebsiteProposalDiagnostic = Readonly<{
@@ -408,6 +414,40 @@ export async function captureWebsiteEvidence(
   const stored = await store.put(evidence);
   if (!stored || stored.reference !== evidence.reference) throw new Error("WEBSITE_EVIDENCE_STORE_MISMATCH");
   return evidence;
+}
+
+export async function readWebsiteEvidence(
+  input: Readonly<{
+    reference: string;
+    organizationId: string;
+    projectId: string;
+    analysisRunId: string;
+  }>,
+  store: WebsiteEvidenceStore,
+): Promise<WebsiteEvidence> {
+  if (!store || typeof store.get !== "function") throw new Error("WEBSITE_EVIDENCE_STORE_REQUIRED");
+  if (!/^urn:sha256:[a-f0-9]{64}$/.test(input?.reference ?? "")
+    || ![input?.organizationId, input?.projectId, input?.analysisRunId]
+      .every((value) => typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value))) {
+    throw new Error("WEBSITE_EVIDENCE_OWNERSHIP_INVALID");
+  }
+  const evidence = await store.get(input);
+  if (!evidence || evidence.reference !== input.reference
+    || evidence.organizationId !== input.organizationId
+    || evidence.projectId !== input.projectId
+    || evidence.analysisRunId !== input.analysisRunId) {
+    throw new Error("WEBSITE_EVIDENCE_OWNERSHIP_INVALID");
+  }
+  if (typeof evidence.content !== "string" || Buffer.byteLength(evidence.content, "utf8") > MAX_CONTENT_BYTES) {
+    throw new Error("WEBSITE_EVIDENCE_BOUNDS_EXCEEDED");
+  }
+  // verifiedSnapshot checks the content hash, parse shape, and embedded owner.
+  verifiedSnapshot(evidence);
+  return evidence;
+}
+
+export function websiteObservationsFromEvidence(evidence: WebsiteEvidence): WebsiteObservationInput {
+  return structuredClone(verifiedSnapshot(evidence).observations);
 }
 
 type Candidate =

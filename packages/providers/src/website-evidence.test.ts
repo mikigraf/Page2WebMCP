@@ -5,6 +5,7 @@ import type { SemanticLocator } from "../../capability-ir/src/plan.ts";
 import {
   captureWebsiteEvidence,
   proposeWebsiteCapabilityPlans,
+  readWebsiteEvidence,
   type WebsiteObservationInput,
 } from "./website-evidence.ts";
 
@@ -245,4 +246,35 @@ test("website evidence rejects URL fragments across navigation, semantic, and fo
       observations: observed,
     }, { put: async ({ reference }) => ({ reference }) }), /WEBSITE_EVIDENCE_URL_FRAGMENT_BLOCKED/);
   }
+});
+
+test("website evidence resumes only from the exact bounded content-addressed ownership record", async () => {
+  const stored = await captureWebsiteEvidence({
+    ...ownership, targetOrigin,
+    provider: { apiVersion: "v4", model: "browser-use-2.0", policyDigest: "a".repeat(64) },
+    observations: observations(),
+  }, { put: async (record) => ({ reference: record.reference }) });
+  const loaded = await readWebsiteEvidence({
+    reference: stored.reference,
+    organizationId: ownership.organizationId,
+    projectId: ownership.projectId,
+    analysisRunId: ownership.runId,
+  }, { put: async () => ({ reference: stored!.reference }), get: async () => stored! });
+  assert.deepEqual(loaded, stored);
+
+  await assert.rejects(readWebsiteEvidence({
+    reference: stored.reference,
+    organizationId: ownership.organizationId,
+    projectId: "other-project",
+    analysisRunId: ownership.runId,
+  }, { put: async () => ({ reference: stored!.reference }), get: async () => stored! }), /WEBSITE_EVIDENCE_OWNERSHIP_INVALID/);
+  await assert.rejects(readWebsiteEvidence({
+    reference: stored.reference,
+    organizationId: ownership.organizationId,
+    projectId: ownership.projectId,
+    analysisRunId: ownership.runId,
+  }, {
+    put: async () => ({ reference: stored!.reference }),
+    get: async () => ({ ...stored!, content: `${stored!.content} ` }),
+  }), /WEBSITE_EVIDENCE_INTEGRITY_FAILED/);
 });

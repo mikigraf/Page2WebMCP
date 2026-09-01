@@ -748,7 +748,7 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
       if (!candidate.rows[0]) return undefined;
       await client.query("select pg_advisory_xact_lock(hashtextextended($1, 0))", [String(candidate.rows[0].organization_id)]);
       const runLock = await client.query(
-        "select id from public.workflow_runs where id = $1 and cancel_requested_at is null " +
+        "select id, source_snapshot_id from public.workflow_runs where id = $1 and cancel_requested_at is null " +
         "and status not in ('succeeded','failed','cancelled') for update",
         [candidate.rows[0].workflow_run_id]
       );
@@ -1617,13 +1617,13 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
         "select ar.id, ar.organization_id, ar.project_id, ar.requested_by, ar.status, ar.attempts, " +
         "ar.error_code, ar.created_at, ar.updated_at, $2::text as lease_owner, $3::timestamptz as lease_expires_at, " +
         "$4::text as source_type, $5::text as source_url, $6::jsonb as source_configuration, $7::uuid as workflow_task_id, " +
-        "$8::bigint as lease_generation " +
+        "$8::bigint as lease_generation, $9::uuid as source_snapshot_id " +
         "from public.analysis_runs ar where ar.id = $1 limit 1",
         [runId, job.rows[0].lease_owner, job.rows[0].lease_expires_at, job.rows[0].source_type,
           job.rows[0].source_url, JSON.stringify(parsePersistedSourceConfiguration(
             job.rows[0].source_type as SourceType,
             job.rows[0].source_configuration as SourceConfiguration,
-          )), workflowTask.id, workflowTask.leaseGeneration]
+          )), workflowTask.id, workflowTask.leaseGeneration, runLock.rows[0].source_snapshot_id]
       );
       if (!result.rows[0]) throw new RepositoryError("INVALID_STATE");
       if (authenticationCheckpoint) {
@@ -2774,6 +2774,7 @@ function mapClaimedAnalysis(row: QueryResultRow): ClaimedAnalysisRunRecord {
       row.source_configuration as SourceConfiguration,
     ),
     workflowTaskId: String(row.workflow_task_id),
+    sourceSnapshotId: String(row.source_snapshot_id),
     leaseGeneration: Number(row.lease_generation),
     ...(checkpoint ? { authenticationCheckpoint: checkpoint } : {}),
   };

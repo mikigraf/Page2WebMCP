@@ -14,7 +14,12 @@ import {
   type NodePinnedJsonResponse,
   type NodePinnedJsonTransport,
 } from "./node-network.ts";
-import { createWebsiteAnalysisAdapter, type AnalysisAdapter } from "./workflow.ts";
+import {
+  createWebsiteAnalysisAdapter,
+  resumeWebsiteAuthenticationAnalysis,
+  type AnalysisAdapter,
+  type WebsiteAnalysisConfiguration,
+} from "./workflow.ts";
 import type { SelectedProviderProbeContext } from "../../../packages/operations/src/readiness.ts";
 import { computeSourceIdentityHash } from "../../../packages/database/src/source-identity.ts";
 
@@ -36,10 +41,16 @@ export const WEBSITE_LIVE_CONTROL_PATHS = Object.freeze({
   authClose: "/v1/auth-handoffs/close",
   authOpen: "/v1/auth-handoffs/open",
   authWait: "/v1/auth-handoffs/wait",
+  authenticationCheckpointCreate: "/v1/authentication/checkpoints/create",
+  authenticationCheckpointStatus: "/v1/authentication/checkpoints/status",
+  authenticationCheckpointResume: "/v1/authentication/checkpoints/resume",
+  authenticationCheckpointFinalize: "/v1/authentication/checkpoints/finalize",
+  authenticationCheckpointReconcile: "/v1/authentication/checkpoints/reconcile",
   browserReconcile: "/v1/browser-use-v4/sessions/reconcile",
   browserStart: "/v1/browser-use-v4/sessions/start",
   browserStop: "/v1/browser-use-v4/sessions/stop",
   evidencePut: "/v1/website-evidence/put",
+  evidenceGet: "/v1/website-evidence/get",
   leaseClaim: "/v1/browser-leases/claim",
   leaseRelease: "/v1/browser-leases/release",
   observe: "/v1/website-observations/observe",
@@ -437,7 +448,7 @@ async function probeWebsiteControlServices(
     .update(environment.PAGE2WEBMCP_SECRET_STORE_KMS_KEY_ID, "utf8").digest("hex");
   const probes = [
     ["authentication-handoff", environment.PAGE2WEBMCP_AUTH_HANDOFF_ORIGIN,
-      bearer(environment.PAGE2WEBMCP_AUTH_HANDOFF_TOKEN), {}],
+      bearer(environment.PAGE2WEBMCP_AUTH_HANDOFF_TOKEN), { authenticationCheckpointProtocolVersion: 1 }],
     ["browser-lease-store", environment.PAGE2WEBMCP_BROWSER_LEASE_STORE_ORIGIN,
       bearer(environment.PAGE2WEBMCP_BROWSER_LEASE_STORE_TOKEN), {}],
     ["browser-use-v4", environment.PAGE2WEBMCP_BROWSER_USE_API_ORIGIN,
@@ -485,7 +496,7 @@ async function probeWebsiteControlServices(
         ...expectedExtra,
       };
       if (!same(actual, expected)) {
-        if (control === "ownership-store" && actual && same(actual, {
+        if ((control === "ownership-store" || control === "authentication-handoff") && actual && same(actual, {
           gatewayProtocolVersion: WEBSITE_LIVE_GATEWAY_PROTOCOL_VERSION,
           status: "ready",
           readOnly: true,
@@ -536,7 +547,7 @@ export function createConfiguredWebsiteAnalysisAdapter(
     "x-page2webmcp-browser-gateway-version": String(WEBSITE_LIVE_GATEWAY_PROTOCOL_VERSION),
   });
 
-  return async (source, signal) => {
+  const configuredAdapter: AnalysisAdapter = async (source, signal) => {
     if (source.sourceType !== "website") throw new Error("SOURCE_TYPE_UNSUPPORTED");
     if (!source.organizationId || !source.projectId || !source.id
       || ![source.organizationId, source.projectId, source.id].every((value) => identifierPattern.test(value))) {
@@ -566,6 +577,12 @@ export function createConfiguredWebsiteAnalysisAdapter(
       ownership: ownershipIdentity,
       ...payload,
     });
+    const checkpointEnvelope = (operation: string, payload: Record<string, unknown>) => ({
+      gatewayProtocolVersion: WEBSITE_LIVE_GATEWAY_PROTOCOL_VERSION,
+      idempotencyKey: `website:${source.id}:authentication:${operation}:${createHash("sha256").update(canonicalJson(payload), "utf8").digest("hex")}`,
+      ownership: ownershipIdentity,
+      ...payload,
+    });
     const validResponseMetadata = (response: Record<string, unknown>, request: ReturnType<typeof envelope>) =>
       response.gatewayProtocolVersion === WEBSITE_LIVE_GATEWAY_PROTOCOL_VERSION
       && response.idempotencyKey === request.idempotencyKey && same(response.ownership, ownershipIdentity);
@@ -583,11 +600,126 @@ export function createConfiguredWebsiteAnalysisAdapter(
       }
       return { request, response };
     };
+    const checkpointStateful = async (
+      path: string,
+      operation: string,
+      payload: Record<string, unknown>,
+      requestSignal: AbortSignal,
+    ) => {
+      const request = checkpointEnvelope(operation, payload);
+      const response = await auth.request(path, request, requestSignal);
+      if (response.gatewayProtocolVersion !== WEBSITE_LIVE_GATEWAY_PROTOCOL_VERSION
+        || response.idempotencyKey !== request.idempotencyKey || !same(response.ownership, ownershipIdentity)) {
+        throw new Error("WEBSITE_CONTROL_RESPONSE_INVALID");
+      }
+      return { request, response };
+    };
+    const authentication: WebsiteAnalysisConfiguration["authentication"] = {
+      status: async (input) => {
+        const { response } = await checkpointStateful(
+          WEBSITE_LIVE_CONTROL_PATHS.authenticationCheckpointStatus, "checkpoint-status", input, signal,
+        );
+        if (response.status !== "ready" || Object.entries(input).some(([key, value]) => !same(response[key], value))) {
+          throw new Error("WEBSITE_CONTROL_RESPONSE_INVALID");
+        }
+        return { ...input, status: "ready" };
+      },
+      resume: async (input) => {
+        const { response } = await checkpointStateful(
+          WEBSITE_LIVE_CONTROL_PATHS.authenticationCheckpointResume, "checkpoint-resume", input, signal,
+        );
+        if (response.resumed !== true || Object.entries(input).some(([key, value]) => !same(response[key], value))
+          || !referencePattern.test(String(response.cdpReference ?? ""))
+          || !/^urn:sha256:[a-f0-9]{64}$/.test(String(response.publicEvidenceReference ?? ""))
+          || !response.authentication || typeof response.authentication !== "object" || Array.isArray(response.authentication)
+          || "providerSessionId" in response || "liveUrl" in response || "cdpUrl" in response) {
+          throw new Error("WEBSITE_CONTROL_RESPONSE_INVALID");
+        }
+        return {
+          ...input,
+          resumed: true,
+          cdpReference: String(response.cdpReference),
+          publicEvidenceReference: String(response.publicEvidenceReference),
+          authentication: response.authentication as never,
+        };
+      },
+      finalize: async (input) => {
+        const { response } = await checkpointStateful(
+          WEBSITE_LIVE_CONTROL_PATHS.authenticationCheckpointFinalize, "checkpoint-finalize", input, cleanupSignal(),
+        );
+        if (response.finalized !== true || Object.entries(input).some(([key, value]) => !same(response[key], value))) {
+          throw new Error("WEBSITE_CONTROL_RESPONSE_INVALID");
+        }
+        return { finalized: true };
+      },
+      reconcile: async (input) => {
+        const { response } = await checkpointStateful(
+          WEBSITE_LIVE_CONTROL_PATHS.authenticationCheckpointReconcile, "checkpoint-reconcile", input, cleanupSignal(),
+        );
+        if (response.reconciled !== true || response.terminated !== true
+          || Object.entries(input).some(([key, value]) => !same(response[key], value))) {
+          throw new Error("WEBSITE_CONTROL_RESPONSE_INVALID");
+        }
+        return { reconciled: true, terminated: true };
+      },
+    };
+    const explorer: WebsiteAnalysisConfiguration["explorer"] = {
+      observe: async (input) => {
+        const enforcedPolicy = routePolicy(input.targetOrigin);
+        const request = {
+          phase: input.phase,
+          targetOrigin: input.targetOrigin,
+          sourceUrl: input.sourceUrl,
+          cdpReference: input.cdpReference,
+          routePolicy: enforcedPolicy,
+          routePolicyDigest: policyDigest(enforcedPolicy),
+        };
+        const { response } = await stateful(observer, WEBSITE_LIVE_CONTROL_PATHS.observe, `observe-${input.phase}`, request, input.signal);
+        if (response.phase !== input.phase || response.targetOrigin !== input.targetOrigin
+          || response.cdpReference !== input.cdpReference || response.routePolicyDigest !== request.routePolicyDigest
+          || response.enforced !== true || typeof response.requiresAuthentication !== "boolean") {
+          throw new Error("WEBSITE_CONTROL_RESPONSE_INVALID");
+        }
+        return {
+          observations: response.observations as WebsiteObservationInput,
+          requiresAuthentication: response.requiresAuthentication,
+        };
+      },
+    };
+    const evidenceStore: WebsiteAnalysisConfiguration["evidenceStore"] = {
+      put: async (record: WebsiteEvidence) => {
+        const { response } = await stateful(evidence, WEBSITE_LIVE_CONTROL_PATHS.evidencePut, "evidence-put", { record }, signal);
+        if (response.reference !== record.reference || response.organizationId !== record.organizationId
+          || response.projectId !== record.projectId || response.analysisRunId !== record.analysisRunId) {
+          throw new Error("WEBSITE_CONTROL_RESPONSE_INVALID");
+        }
+        return { reference: record.reference };
+      },
+      get: async (input) => {
+        const { response } = await stateful(evidence, WEBSITE_LIVE_CONTROL_PATHS.evidenceGet, "evidence-get", input, signal);
+        const record = response.record;
+        if (!record || typeof record !== "object" || Array.isArray(record)
+          || (record as Record<string, unknown>).reference !== input.reference
+          || (record as Record<string, unknown>).organizationId !== input.organizationId
+          || (record as Record<string, unknown>).projectId !== input.projectId
+          || (record as Record<string, unknown>).analysisRunId !== input.analysisRunId) {
+          throw new Error("WEBSITE_CONTROL_RESPONSE_INVALID");
+        }
+        return record as WebsiteEvidence;
+      },
+    };
+    if (source.authenticationCheckpoint) {
+      return resumeWebsiteAuthenticationAnalysis({
+        ...source,
+        sourceIdentityHash: computeSourceIdentityHash(source.sourceType, source.sourceUrl, source.sourceConfiguration),
+      }, signal, { clock, authentication, explorer, evidenceStore });
+    }
     const routes = routePolicy(targetOrigin).routes;
     const policyInput = { denyByDefault: true, ttlSeconds: SESSION_TTL_MS / 1_000, routes, targetOrigin } as const;
     let reference: string | undefined;
     let expiresAt: string | undefined;
     let primaryError: unknown;
+    let suspended = false;
     try {
       const issuedRequest = envelope("policy-issue", policyInput);
       const issuedResponse = await policy.request(WEBSITE_LIVE_CONTROL_PATHS.policyIssue, issuedRequest, signal);
@@ -669,6 +801,7 @@ export function createConfiguredWebsiteAnalysisAdapter(
         browser: {
           expiresAt,
           proxyPolicyReference: { reference, expiresAt },
+          egressPolicyDigest: createHash("sha256").update(canonicalJson({ ...policyInput, expiresAt, reference }), "utf8").digest("hex"),
           controls: {
             clock,
             leases: {
@@ -737,32 +870,89 @@ export function createConfiguredWebsiteAnalysisAdapter(
               stop: stopGateway,
               reconcile: reconcileGateway,
             },
+            suspension: {
+              create: async (input, checkpointSignal) => {
+                const { response } = await checkpointStateful(
+                  WEBSITE_LIVE_CONTROL_PATHS.authenticationCheckpointCreate,
+                  "checkpoint-create",
+                  { binding: input },
+                  checkpointSignal,
+                );
+                const attestation = response.attestation;
+                if (!attestation || typeof attestation !== "object" || Array.isArray(attestation)
+                  || "providerSessionId" in response || "liveUrl" in response || "cdpUrl" in response) {
+                  throw new Error("AUTH_CHECKPOINT_ATTESTATION_INVALID");
+                }
+                return attestation as never;
+              },
+              abort: async (input, checkpointReference) => {
+                const { response } = await checkpointStateful(
+                  WEBSITE_LIVE_CONTROL_PATHS.authenticationCheckpointReconcile,
+                  "checkpoint-abort",
+                  { binding: input, ...(checkpointReference ? { checkpointReference } : {}), outcome: "failed" },
+                  cleanupSignal(),
+                );
+                if (response.reconciled !== true || typeof response.checkpointOwned !== "boolean"
+                  || typeof response.terminated !== "boolean"
+                  || response.checkpointOwned !== response.terminated) {
+                  throw new Error("AUTH_CHECKPOINT_RECONCILIATION_INVALID");
+                }
+                return {
+                  reconciled: true,
+                  checkpointOwned: response.checkpointOwned,
+                  terminated: response.terminated,
+                };
+              },
+            },
           },
         },
         authentication: {
-          store: {
-            open: async (input) => {
-              const { response } = await stateful(auth, WEBSITE_LIVE_CONTROL_PATHS.authOpen, "auth-open", input, signal);
-              assertIdentifier(response.handoffId);
-              if (response.targetOrigin !== input.targetOrigin || response.liveReference !== input.liveReference
-                || response.expiresAt !== input.expiresAt) throw new Error("WEBSITE_CONTROL_RESPONSE_INVALID");
-              return { handoffId: response.handoffId };
-            },
-            wait: async (handoffId, waitSignal) => {
-              const { response } = await stateful(auth, WEBSITE_LIVE_CONTROL_PATHS.authWait, "auth-wait", { handoffId }, waitSignal);
-              if (response.handoffId !== handoffId || !same(response.ownership, ownershipIdentity)) {
-                throw new Error("WEBSITE_CONTROL_RESPONSE_INVALID");
-              }
-              return response.completion;
-            },
-            close: async (handoffId, outcome) => {
-              const { response } = await stateful(auth, WEBSITE_LIVE_CONTROL_PATHS.authClose, "auth-close", {
-                handoffId, outcome,
-              }, cleanupSignal());
-              if (response.handoffId !== handoffId || response.outcome !== outcome || response.closed !== true) {
-                throw new Error("WEBSITE_CONTROL_RESPONSE_INVALID");
-              }
-            },
+          status: async (input) => {
+            const { response } = await checkpointStateful(
+              WEBSITE_LIVE_CONTROL_PATHS.authenticationCheckpointStatus, "checkpoint-status", input, signal,
+            );
+            if (response.status !== "ready" || Object.entries(input).some(([key, value]) => !same(response[key], value))) {
+              throw new Error("WEBSITE_CONTROL_RESPONSE_INVALID");
+            }
+            return { ...input, status: "ready" };
+          },
+          resume: async (input) => {
+            const { response } = await checkpointStateful(
+              WEBSITE_LIVE_CONTROL_PATHS.authenticationCheckpointResume, "checkpoint-resume", input, signal,
+            );
+            if (response.resumed !== true || Object.entries(input).some(([key, value]) => !same(response[key], value))
+              || !referencePattern.test(String(response.cdpReference ?? ""))
+              || !/^urn:sha256:[a-f0-9]{64}$/.test(String(response.publicEvidenceReference ?? ""))
+              || !response.authentication || typeof response.authentication !== "object" || Array.isArray(response.authentication)
+              || "providerSessionId" in response || "liveUrl" in response || "cdpUrl" in response) {
+              throw new Error("WEBSITE_CONTROL_RESPONSE_INVALID");
+            }
+            return {
+              ...input,
+              resumed: true,
+              cdpReference: String(response.cdpReference),
+              publicEvidenceReference: String(response.publicEvidenceReference),
+              authentication: response.authentication as never,
+            };
+          },
+          finalize: async (input) => {
+            const { response } = await checkpointStateful(
+              WEBSITE_LIVE_CONTROL_PATHS.authenticationCheckpointFinalize, "checkpoint-finalize", input, cleanupSignal(),
+            );
+            if (response.finalized !== true || Object.entries(input).some(([key, value]) => !same(response[key], value))) {
+              throw new Error("WEBSITE_CONTROL_RESPONSE_INVALID");
+            }
+            return { finalized: true };
+          },
+          reconcile: async (input) => {
+            const { response } = await checkpointStateful(
+              WEBSITE_LIVE_CONTROL_PATHS.authenticationCheckpointReconcile, "checkpoint-reconcile", input, cleanupSignal(),
+            );
+            if (response.reconciled !== true || response.terminated !== true
+              || Object.entries(input).some(([key, value]) => !same(response[key], value))) {
+              throw new Error("WEBSITE_CONTROL_RESPONSE_INVALID");
+            }
+            return { reconciled: true, terminated: true };
           },
         },
         explorer: {
@@ -797,9 +987,21 @@ export function createConfiguredWebsiteAnalysisAdapter(
             }
             return { reference: record.reference };
           },
+          get: async (input) => {
+            const { response } = await stateful(evidence, WEBSITE_LIVE_CONTROL_PATHS.evidenceGet, "evidence-get", input, signal);
+            const record = response.record;
+            if (!record || typeof record !== "object" || Array.isArray(record)
+              || (record as Record<string, unknown>).reference !== input.reference
+              || (record as Record<string, unknown>).organizationId !== input.organizationId
+              || (record as Record<string, unknown>).projectId !== input.projectId
+              || (record as Record<string, unknown>).analysisRunId !== input.analysisRunId) {
+              throw new Error("WEBSITE_CONTROL_RESPONSE_INVALID");
+            }
+            return record as WebsiteEvidence;
+          },
         },
       });
-      return await adapter({
+      const result = await adapter({
         ...source,
         sourceIdentityHash: computeSourceIdentityHash(
           source.sourceType,
@@ -807,19 +1009,56 @@ export function createConfiguredWebsiteAnalysisAdapter(
           source.sourceConfiguration,
         ),
       }, signal);
+      suspended = "disposition" in result && result.disposition === "waiting_for_authentication";
+      return result;
     } catch (error) {
       primaryError = error;
       throw error;
     } finally {
       const cleanupErrors: unknown[] = [];
-      for (const [client, operation] of [[proxy, "policy-proxy-revoke"], [policy, "policy-store-revoke"]] as const) {
-        if (!reference) continue;
-        try {
-          const { response } = await stateful(client, WEBSITE_LIVE_CONTROL_PATHS.policyRevoke, operation, { reference }, cleanupSignal());
-          if (response.reference !== reference || response.revoked !== true) throw new Error("WEBSITE_CONTROL_RESPONSE_INVALID");
-        } catch (error) { cleanupErrors.push(error); }
+      if (!suspended) {
+        for (const [client, operation] of [[proxy, "policy-proxy-revoke"], [policy, "policy-store-revoke"]] as const) {
+          if (!reference) continue;
+          try {
+            const { response } = await stateful(client, WEBSITE_LIVE_CONTROL_PATHS.policyRevoke, operation, { reference }, cleanupSignal());
+            if (response.reference !== reference || response.revoked !== true) throw new Error("WEBSITE_CONTROL_RESPONSE_INVALID");
+          } catch (error) { cleanupErrors.push(error); }
+        }
       }
       if (primaryError === undefined && cleanupErrors.length > 0) throw new Error("WEBSITE_EGRESS_POLICY_CLEANUP_FAILED");
     }
   };
+  configuredAdapter.reconcileAuthenticationCheckpoint = async (source, waiting, reconcileSignal) => {
+    if (!source.id || !source.organizationId || !source.projectId) {
+      throw new Error("WEBSITE_SOURCE_OWNERSHIP_REQUIRED");
+    }
+    const ownershipIdentity = {
+      organizationId: source.organizationId,
+      projectId: source.projectId,
+      runId: source.id,
+    };
+    const payload = {
+      checkpointReference: waiting.checkpointReference,
+      ...ownershipIdentity,
+      sourceSnapshotId: waiting.sourceSnapshotId,
+      sourceIdentityHash: waiting.sourceIdentityHash,
+      targetOriginDigest: waiting.targetOriginDigest,
+      expiresAt: waiting.expiresAt,
+      outcome: "failed",
+    };
+    const request = {
+      gatewayProtocolVersion: WEBSITE_LIVE_GATEWAY_PROTOCOL_VERSION,
+      idempotencyKey: `website:${source.id}:authentication:checkpoint-reconcile:${createHash("sha256").update(canonicalJson(payload), "utf8").digest("hex")}`,
+      ownership: ownershipIdentity,
+      ...payload,
+    };
+    const response = await auth.request(WEBSITE_LIVE_CONTROL_PATHS.authenticationCheckpointReconcile, request, reconcileSignal);
+    if (response.gatewayProtocolVersion !== WEBSITE_LIVE_GATEWAY_PROTOCOL_VERSION
+      || response.idempotencyKey !== request.idempotencyKey || !same(response.ownership, ownershipIdentity)
+      || response.reconciled !== true || response.terminated !== true
+      || Object.entries(payload).some(([key, value]) => !same(response[key], value))) {
+      throw new Error("WEBSITE_AUTHENTICATION_RECONCILE_FAILED");
+    }
+  };
+  return configuredAdapter;
 }

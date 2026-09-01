@@ -175,6 +175,7 @@ export type ClaimedAnalysisRunRecord = Readonly<AnalysisRunRecord & {
   sourceUrl: string;
   sourceConfiguration: SourceConfiguration;
   workflowTaskId: string;
+  sourceSnapshotId: string;
   leaseGeneration: number;
   authenticationCheckpoint?: WebsiteAuthenticationClaimCheckpoint;
 }>;
@@ -218,6 +219,7 @@ export type AnalysisDiagnostic = Readonly<{
 }>;
 
 export type AnalysisResult = {
+  disposition?: "completed";
   capabilities: Array<{ plan: CapabilityPlan; status: Pick<CapabilityRecord, "status">["status"] }>;
   diagnostics: AnalysisDiagnostic[];
   evidence: AnalysisEvidence[];
@@ -1917,8 +1919,8 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
       const task = [...this.#workflowTasks.values()].find((candidate) => candidate.workflowRunId === run.id && candidate.phase === "analysis");
       if (!workflow || !task || !["queued", "running"].includes(task.status)) throw new RepositoryError("INVALID_STATE");
       const sourceSnapshot = this.#sourceSnapshots.get(workflow.sourceSnapshotId);
-      if (authenticationCheckpoint && (!sourceSnapshot
-        || authenticationCheckpoint.organizationId !== run.organizationId
+      if (!sourceSnapshot) throw new RepositoryError("INVALID_STATE");
+      if (authenticationCheckpoint && (authenticationCheckpoint.organizationId !== run.organizationId
         || authenticationCheckpoint.projectId !== run.projectId
         || authenticationCheckpoint.workflowTaskId !== task.id
         || authenticationCheckpoint.sourceSnapshotId !== sourceSnapshot.id
@@ -1943,6 +1945,7 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
         ...claimed,
         ...source,
         workflowTaskId: workflowTask.id,
+        sourceSnapshotId: sourceSnapshot.id,
         leaseGeneration: workflowTask.leaseGeneration,
         ...(authenticationCheckpoint ? {
           authenticationCheckpoint: {

@@ -21,11 +21,12 @@ import {
 import {
   withBrowserUseCloudV4Session,
   type BrowserUseCloudV4Controls,
-  type WebsiteAuthControls,
 } from "../../../packages/providers/src/browser-use-v4.ts";
 import {
   captureWebsiteEvidence,
   proposeWebsiteCapabilityPlans,
+  readWebsiteEvidence,
+  websiteObservationsFromEvidence,
   type WebsiteEvidenceStore,
   type WebsiteObservationInput,
 } from "../../../packages/providers/src/website-evidence.ts";
@@ -49,9 +50,33 @@ export type OpenApiAnalysisConfiguration = Readonly<{
 
 export type AnalysisSource = Pick<ClaimedAnalysisRunRecord, "sourceType" | "sourceUrl">
   & Partial<Pick<ClaimedAnalysisRunRecord,
-    "id" | "organizationId" | "projectId" | "sourceConfiguration" | "leaseGeneration">>
+    "id" | "organizationId" | "projectId" | "sourceConfiguration" | "leaseGeneration"
+    | "sourceSnapshotId" | "authenticationCheckpoint">>
   & Readonly<{ sourceIdentityHash?: string }>;
-export type AnalysisAdapter = (source: AnalysisSource, signal: AbortSignal) => Promise<AnalysisResult>;
+
+export type WebsiteAuthenticationWaitingOutcome = Readonly<{
+  disposition: "waiting_for_authentication";
+  capabilities: [];
+  diagnostics: [];
+  evidence: [];
+  release?: undefined;
+  draftPullRequest?: undefined;
+  providerProvenance?: undefined;
+  checkpointReference: string;
+  sourceSnapshotId: string;
+  sourceIdentityHash: string;
+  targetOriginDigest: string;
+  expiresAt: string;
+}>;
+
+export type AnalysisAdapterOutcome = AnalysisResult | WebsiteAuthenticationWaitingOutcome;
+export type AnalysisAdapter = ((source: AnalysisSource, signal: AbortSignal) => Promise<AnalysisAdapterOutcome>) & {
+  reconcileAuthenticationCheckpoint?(
+    source: AnalysisSource,
+    waiting: WebsiteAuthenticationWaitingOutcome,
+    signal: AbortSignal,
+  ): Promise<void>;
+};
 
 export type GitHubAnalysisConfiguration = Readonly<{
   targetOrigin: string;
@@ -96,9 +121,29 @@ export type WebsiteAnalysisConfiguration = Readonly<{
   browser: Readonly<{
     expiresAt: string;
     proxyPolicyReference: Readonly<{ reference: string; expiresAt: string }>;
+    egressPolicyDigest: string;
     controls: Omit<BrowserUseCloudV4Controls, "signal">;
   }>;
-  authentication?: Readonly<{ store: WebsiteAuthControls["store"] }>;
+  authentication: Readonly<{
+    status(input: WebsiteAuthenticationCheckpointRequest): Promise<Readonly<WebsiteAuthenticationCheckpointRequest & {
+      status: "ready";
+    }>>;
+    resume(input: WebsiteAuthenticationCheckpointRequest & Readonly<{
+      authenticationEvidenceReference: string;
+    }>): Promise<Readonly<WebsiteAuthenticationCheckpointRequest & {
+      authenticationEvidenceReference: string;
+      resumed: true;
+      cdpReference: string;
+      publicEvidenceReference: string;
+      authentication: Readonly<{
+        authenticatedOrigin: string;
+        observedAt: string;
+        signals: readonly string[];
+      }>;
+    }>>;
+    finalize(input: WebsiteAuthenticationTerminalRequest): Promise<Readonly<{ finalized: true }>>;
+    reconcile(input: WebsiteAuthenticationTerminalRequest): Promise<Readonly<{ reconciled: true; terminated: true }>>;
+  }>;
   explorer: {
     observe(input: Readonly<{
       phase: "public" | "authenticated";
@@ -112,7 +157,31 @@ export type WebsiteAnalysisConfiguration = Readonly<{
   evidenceStore: WebsiteEvidenceStore;
 }>;
 
+type WebsiteAuthenticationCheckpointRequest = Readonly<{
+  checkpointReference: string;
+  organizationId: string;
+  projectId: string;
+  runId: string;
+  sourceSnapshotId: string;
+  sourceIdentityHash: string;
+  targetOriginDigest: string;
+  expiresAt: string;
+}>;
+
+type WebsiteAuthenticationTerminalRequest = WebsiteAuthenticationCheckpointRequest & Readonly<{
+  outcome: "completed" | "failed" | "cancelled";
+}>;
+
 type OpenApiVerificationConfiguration = Extract<ClaimedAnalysisRunRecord["sourceConfiguration"], { kind: "openapi" }>;
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
 
 function verificationContext(source: AnalysisSource): OpenApiVerificationConfiguration {
   return parsePersistedSourceConfiguration("openapi", source.sourceConfiguration) as OpenApiVerificationConfiguration;
@@ -268,10 +337,95 @@ function assertWebsiteControls(configuration: WebsiteAnalysisConfiguration): voi
     || !configuration.ownership.challenges || typeof configuration.ownership.challenges.load !== "function"
     || !configuration.ownership.replayStore || typeof configuration.ownership.replayStore.consume !== "function"
     || !configuration.browser?.controls || !configuration.browser.proxyPolicyReference || !configuration.browser.expiresAt
+    || !/^[a-f0-9]{64}$/.test(configuration.browser.egressPolicyDigest ?? "")
+    || !configuration.authentication || typeof configuration.authentication.status !== "function"
+    || typeof configuration.authentication.resume !== "function" || typeof configuration.authentication.finalize !== "function"
+    || typeof configuration.authentication.reconcile !== "function"
     || !configuration.explorer || typeof configuration.explorer.observe !== "function"
-    || !configuration.evidenceStore || typeof configuration.evidenceStore.put !== "function") {
+    || !configuration.evidenceStore || typeof configuration.evidenceStore.put !== "function"
+    || typeof configuration.evidenceStore.get !== "function") {
     throw new Error("WEBSITE_ANALYSIS_CONTROLS_REQUIRED");
   }
+}
+
+function websiteTargetOriginDigest(targetOrigin: string): string {
+  return createHash("sha256").update(targetOrigin, "utf8").digest("hex");
+}
+
+function checkpointRequest(
+  source: AnalysisSource,
+  targetOrigin: string,
+): WebsiteAuthenticationCheckpointRequest {
+  const checkpoint = source.authenticationCheckpoint;
+  if (!checkpoint || !source.id || !source.organizationId || !source.projectId || !source.sourceSnapshotId
+    || source.sourceSnapshotId !== checkpoint.sourceSnapshotId
+    || source.sourceIdentityHash !== checkpoint.sourceIdentityHash
+    || checkpoint.targetOriginDigest !== websiteTargetOriginDigest(targetOrigin)
+    || !/^urn:sha256:[a-f0-9]{64}$/.test(checkpoint.checkpointReference)
+    || !/^urn:sha256:[a-f0-9]{64}$/.test(checkpoint.authenticationEvidenceReference)
+    || !Number.isFinite(Date.parse(checkpoint.expiresAt))) {
+    throw new Error("WEBSITE_AUTHENTICATION_CHECKPOINT_INVALID");
+  }
+  return {
+    checkpointReference: checkpoint.checkpointReference,
+    organizationId: source.organizationId,
+    projectId: source.projectId,
+    runId: source.id,
+    sourceSnapshotId: checkpoint.sourceSnapshotId,
+    sourceIdentityHash: checkpoint.sourceIdentityHash,
+    targetOriginDigest: checkpoint.targetOriginDigest,
+    expiresAt: checkpoint.expiresAt,
+  };
+}
+
+function authenticatedSignal(
+  value: Readonly<{ authenticatedOrigin: string; observedAt: string; signals: readonly string[] }>,
+  targetOrigin: string,
+  expiresAt: string,
+): WebsiteObservationInput["authSignals"][number] {
+  const allowed = new Set(["account_control", "authenticated_status", "logout_control"]);
+  if (!value || value.authenticatedOrigin !== targetOrigin || !Number.isFinite(Date.parse(value.observedAt))
+    || Date.parse(value.observedAt) > Date.parse(expiresAt)
+    || !Array.isArray(value.signals) || value.signals.length < 1 || value.signals.length > 3
+    || value.signals.some((signal) => typeof signal !== "string" || !allowed.has(signal))
+    || /authorization|cookie|password|token|secret|csrf|otp|credential|api[-_]?key/i.test(JSON.stringify(value))) {
+    throw new Error("AUTH_STATE_UNVERIFIED");
+  }
+  return {
+    origin: targetOrigin,
+    observedAt: value.observedAt,
+    signals: [...new Set(value.signals)].sort(),
+  };
+}
+
+function compileWebsiteAnalysis(
+  evidence: Awaited<ReturnType<typeof captureWebsiteEvidence>>,
+  beforeEvidence: AnalysisResult["evidence"],
+  sourceUrl: string,
+  hostedScriptAllowed = true,
+  afterEvidence: AnalysisResult["evidence"] = [],
+): AnalysisResult {
+  const proposed = proposeWebsiteCapabilityPlans(evidence);
+  const release = proposed.plans.length > 0 ? compileWebMcpRelease([...proposed.plans]) : undefined;
+  const diagnostics = [
+    ...proposed.diagnostics.map((diagnostic) => ({ ...diagnostic })),
+    ...(!hostedScriptAllowed
+      ? [{ code: "HOSTED_SCRIPT_CSP_BLOCKED", operationKey: sourceUrl, reason: "script_origin_not_allowed" }]
+      : []),
+  ];
+  return {
+    capabilities: release?.manifest.plans.map((plan) => ({ plan, status: "proposed" as const })) ?? [],
+    diagnostics,
+    evidence: [...beforeEvidence, evidence, ...afterEvidence],
+    ...(release ? {
+      release: {
+        code: release.code,
+        contentHash: release.contentHash,
+        allowedOrigin: release.allowedOrigin,
+        manifest: release.manifest,
+      },
+    } : {}),
+  };
 }
 
 function mergedObservations(
@@ -305,6 +459,105 @@ function preflightEvidenceContent(sourceUrl: string, preflight: Awaited<ReturnTy
   });
 }
 
+export type WebsiteAuthenticationResumeConfiguration = Pick<
+  WebsiteAnalysisConfiguration,
+  "clock" | "authentication" | "explorer" | "evidenceStore"
+>;
+
+export async function resumeWebsiteAuthenticationAnalysis(
+  source: AnalysisSource,
+  signal: AbortSignal,
+  configuration: WebsiteAuthenticationResumeConfiguration,
+): Promise<AnalysisResult> {
+  if (source.sourceType !== "website" || !source.organizationId || !source.projectId || !source.id
+    || !source.sourceIdentityHash || !/^[a-f0-9]{64}$/.test(source.sourceIdentityHash)
+    || !source.authenticationCheckpoint || typeof configuration?.authentication?.status !== "function"
+    || typeof configuration.authentication.resume !== "function" || typeof configuration.authentication.finalize !== "function"
+    || typeof configuration.authentication.reconcile !== "function" || typeof configuration.explorer?.observe !== "function"
+    || typeof configuration.evidenceStore?.get !== "function" || typeof configuration.evidenceStore.put !== "function") {
+    throw new Error("WEBSITE_AUTHENTICATION_CHECKPOINT_INVALID");
+  }
+  let parsedSource: URL;
+  try { parsedSource = new URL(source.sourceUrl); } catch { throw new Error("WEBSITE_URL_BLOCKED"); }
+  const targetOrigin = parsedSource.origin;
+  const request = checkpointRequest(source, targetOrigin);
+  let outcome: WebsiteAuthenticationTerminalRequest["outcome"] = "failed";
+  try {
+    if (Date.parse(request.expiresAt) <= (configuration.clock ?? (() => new Date()))().getTime()) {
+      throw new Error("WEBSITE_AUTHENTICATION_CHECKPOINT_EXPIRED");
+    }
+    const status = await configuration.authentication.status(request);
+    if (status.status !== "ready" || canonicalJson(status) !== canonicalJson({ ...request, status: "ready" })) {
+      throw new Error("WEBSITE_AUTHENTICATION_CHECKPOINT_INVALID");
+    }
+    const resumed = await configuration.authentication.resume({
+      ...request,
+      authenticationEvidenceReference: source.authenticationCheckpoint.authenticationEvidenceReference,
+    });
+    if (resumed.resumed !== true || resumed.checkpointReference !== request.checkpointReference
+      || resumed.authenticationEvidenceReference !== source.authenticationCheckpoint.authenticationEvidenceReference
+      || !/^secretref:[A-Za-z0-9._:-]{1,200}$/.test(resumed.cdpReference)
+      || !/^urn:sha256:[a-f0-9]{64}$/.test(resumed.publicEvidenceReference)
+      || Object.entries(request).some(([key, value]) => canonicalJson(resumed[key as keyof typeof resumed]) !== canonicalJson(value))) {
+      throw new Error("WEBSITE_AUTHENTICATION_CHECKPOINT_INVALID");
+    }
+    const authentication = authenticatedSignal(resumed.authentication, targetOrigin, request.expiresAt);
+    const publicEvidence = await readWebsiteEvidence({
+      reference: resumed.publicEvidenceReference,
+      organizationId: source.organizationId,
+      projectId: source.projectId,
+      analysisRunId: source.id,
+    }, configuration.evidenceStore);
+    const authenticated = await configuration.explorer.observe({
+      phase: "authenticated",
+      targetOrigin,
+      sourceUrl: source.sourceUrl,
+      cdpReference: resumed.cdpReference,
+      firewall: createDiscoveryFirewall([targetOrigin]),
+      signal,
+    });
+    if (!authenticated || !authenticated.observations || authenticated.requiresAuthentication !== false) {
+      throw new Error("WEBSITE_EXPLORER_RESPONSE_INVALID");
+    }
+    const authenticatedObservations: WebsiteObservationInput = {
+      ...authenticated.observations,
+      authSignals: [...authenticated.observations.authSignals, authentication],
+    };
+    const provider = JSON.parse(publicEvidence.content).provider as Record<string, unknown>;
+    if (provider.apiVersion !== "v4" || provider.model !== "browser-use-2.0"
+      || typeof provider.policyDigest !== "string" || !/^[a-f0-9]{64}$/.test(provider.policyDigest)) {
+      throw new Error("WEBSITE_EVIDENCE_PROVIDER_INVALID");
+    }
+    const evidence = await captureWebsiteEvidence({
+      organizationId: source.organizationId,
+      projectId: source.projectId,
+      runId: source.id,
+      targetOrigin,
+      provider: { apiVersion: "v4", model: "browser-use-2.0", policyDigest: provider.policyDigest },
+      observations: mergedObservations(websiteObservationsFromEvidence(publicEvidence), authenticatedObservations),
+    }, configuration.evidenceStore);
+    outcome = "completed";
+    return compileWebsiteAnalysis(evidence, [publicEvidence], source.sourceUrl);
+  } catch (error) {
+    if (signal.aborted) outcome = "cancelled";
+    throw error;
+  } finally {
+    const terminal = { ...request, outcome };
+    const errors: unknown[] = [];
+    try {
+      const finalized = await configuration.authentication.finalize(terminal);
+      if (finalized.finalized !== true) errors.push(new Error("WEBSITE_AUTHENTICATION_FINALIZE_FAILED"));
+    } catch (error) { errors.push(error); }
+    try {
+      const reconciled = await configuration.authentication.reconcile(terminal);
+      if (reconciled.reconciled !== true || reconciled.terminated !== true) {
+        errors.push(new Error("WEBSITE_AUTHENTICATION_RECONCILE_FAILED"));
+      }
+    } catch (error) { errors.push(error); }
+    if (errors.length > 0) throw new Error("WEBSITE_AUTHENTICATION_CLEANUP_FAILED");
+  }
+}
+
 /**
  * Creates the website analysis adapter only from explicit network, ownership,
  * browser, durable-auth, explorer, and immutable-evidence ports. No live
@@ -312,7 +565,7 @@ function preflightEvidenceContent(sourceUrl: string, preflight: Awaited<ReturnTy
  */
 export function createWebsiteAnalysisAdapter(configuration: WebsiteAnalysisConfiguration): AnalysisAdapter {
   assertWebsiteControls(configuration);
-  return async (source, signal) => {
+  const analyze: AnalysisAdapter = async (source: AnalysisSource, signal: AbortSignal): Promise<AnalysisAdapterOutcome> => {
     if (source.sourceType !== "website") throw new Error("SOURCE_TYPE_UNSUPPORTED");
     if (!source.organizationId || !source.projectId || !source.id) throw new Error("WEBSITE_SOURCE_OWNERSHIP_REQUIRED");
     if (!source.sourceIdentityHash || !/^[0-9a-f]{64}$/.test(source.sourceIdentityHash)) {
@@ -321,6 +574,10 @@ export function createWebsiteAnalysisAdapter(configuration: WebsiteAnalysisConfi
     const organizationId = source.organizationId;
     const projectId = source.projectId;
     const runId = source.id;
+    if (source.authenticationCheckpoint) {
+      return resumeWebsiteAuthenticationAnalysis(source, signal, configuration);
+    }
+
     const preflight = await preflightWebsiteSource(source.sourceUrl, { ...configuration.provider, signal });
     const attestation = await configuration.ownership.attestations.consume({
       organizationId,
@@ -351,7 +608,7 @@ export function createWebsiteAnalysisAdapter(configuration: WebsiteAnalysisConfi
     const preflightContent = preflightEvidenceContent(source.sourceUrl, preflight);
     const preflightReference = `urn:sha256:${createHash("sha256").update(preflightContent, "utf8").digest("hex")}`;
     const firewall = createDiscoveryFirewall([preflight.targetOrigin]);
-    return withBrowserUseCloudV4Session({
+    const browserResult = await withBrowserUseCloudV4Session({
       organizationId,
       projectId,
       runId,
@@ -371,11 +628,24 @@ export function createWebsiteAnalysisAdapter(configuration: WebsiteAnalysisConfi
         throw new Error("WEBSITE_EXPLORER_RESPONSE_INVALID");
       }
       if (first.requiresAuthentication) {
-        // The current analysis job is monolithic and cannot release its worker
-        // lease/browser session at a durable human boundary. Fail closed until
-        // authentication is a checkpointed workflow phase; never expose a
-        // short-lived URL that the control plane cannot safely resume.
-        throw new Error("WEBSITE_DURABLE_AUTHENTICATION_HANDOFF_REQUIRED");
+        if (!source.sourceSnapshotId) throw new Error("WEBSITE_SOURCE_SNAPSHOT_REQUIRED");
+        const publicEvidence = await captureWebsiteEvidence({
+          organizationId,
+          projectId,
+          runId,
+          targetOrigin: preflight.targetOrigin,
+          provider: { apiVersion: session.apiVersion, model: session.model, policyDigest: session.policyDigest },
+          observations: first.observations,
+        }, configuration.evidenceStore);
+        const suspended = await session.suspend({
+          sourceSnapshotId: source.sourceSnapshotId!,
+          sourceIdentityHash: source.sourceIdentityHash!,
+          targetOriginDigest: websiteTargetOriginDigest(preflight.targetOrigin),
+          publicEvidenceReference: publicEvidence.reference,
+          egressPolicyReference: configuration.browser.proxyPolicyReference.reference,
+          egressPolicyDigest: configuration.browser.egressPolicyDigest,
+        });
+        return suspended;
       }
       const evidence = await captureWebsiteEvidence({
         organizationId,
@@ -385,31 +655,45 @@ export function createWebsiteAnalysisAdapter(configuration: WebsiteAnalysisConfi
         provider: { apiVersion: session.apiVersion, model: session.model, policyDigest: session.policyDigest },
         observations: mergedObservations(first.observations),
       }, configuration.evidenceStore);
-      const proposed = proposeWebsiteCapabilityPlans(evidence);
-      const release = proposed.plans.length > 0 ? compileWebMcpRelease([...proposed.plans]) : undefined;
-      const diagnostics = [
-        ...proposed.diagnostics.map((diagnostic) => ({ ...diagnostic })),
-        ...(!preflight.csp.allowsHostedScript
-          ? [{ code: "HOSTED_SCRIPT_CSP_BLOCKED", operationKey: source.sourceUrl, reason: "script_origin_not_allowed" }]
-          : []),
-      ];
-      return {
-        capabilities: release?.manifest.plans.map((plan) => ({ plan, status: "proposed" as const })) ?? [],
-        diagnostics,
-        evidence: [
-          { source: ownership.source, content: ownership.content, reference: ownership.reference },
-          evidence,
-          { source: "source" as const, content: preflightContent, reference: preflightReference },
-        ],
-        ...(release ? {
-          release: {
-            code: release.code,
-            contentHash: release.contentHash,
-            allowedOrigin: release.allowedOrigin,
-            manifest: release.manifest,
-          },
-        } : {}),
-      };
+      return compileWebsiteAnalysis(evidence, [
+        { source: ownership.source, content: ownership.content, reference: ownership.reference },
+      ], source.sourceUrl, preflight.csp.allowsHostedScript, [
+        { source: "source" as const, content: preflightContent, reference: preflightReference },
+      ]);
     });
+    if ("disposition" in browserResult && browserResult.disposition === "suspended") {
+      const checkpoint = browserResult.checkpoint;
+      return {
+        disposition: "waiting_for_authentication",
+        capabilities: [],
+        diagnostics: [],
+        evidence: [],
+        checkpointReference: checkpoint.checkpointReference,
+        sourceSnapshotId: checkpoint.sourceSnapshotId,
+        sourceIdentityHash: checkpoint.sourceIdentityHash,
+        targetOriginDigest: checkpoint.targetOriginDigest,
+        expiresAt: checkpoint.expiresAt,
+      };
+    }
+    return browserResult as AnalysisResult;
   };
+  analyze.reconcileAuthenticationCheckpoint = async (source, waiting) => {
+    if (!source.organizationId || !source.projectId || !source.id) throw new Error("WEBSITE_SOURCE_OWNERSHIP_REQUIRED");
+    const request: WebsiteAuthenticationTerminalRequest = {
+      checkpointReference: waiting.checkpointReference,
+      organizationId: source.organizationId,
+      projectId: source.projectId,
+      runId: source.id,
+      sourceSnapshotId: waiting.sourceSnapshotId,
+      sourceIdentityHash: waiting.sourceIdentityHash,
+      targetOriginDigest: waiting.targetOriginDigest,
+      expiresAt: waiting.expiresAt,
+      outcome: "failed",
+    };
+    const reconciled = await configuration.authentication.reconcile(request);
+    if (reconciled.reconciled !== true || reconciled.terminated !== true) {
+      throw new Error("WEBSITE_AUTHENTICATION_RECONCILE_FAILED");
+    }
+  };
+  return analyze;
 }

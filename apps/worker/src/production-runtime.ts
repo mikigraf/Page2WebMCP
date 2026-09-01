@@ -1,5 +1,4 @@
 import type {
-  AnalysisResult,
   ControlPlaneRepository,
   ProviderProvenance,
   SourceType,
@@ -172,10 +171,13 @@ function stampProviderProvenance(
   analyze: AnalysisAdapter,
   provenance: Exclude<ProviderProvenance, { mode: "local" }>,
 ): AnalysisAdapter {
-  return async (source, signal): Promise<AnalysisResult> => ({
-    ...await analyze(source, signal),
-    providerProvenance: provenance,
-  });
+  const stamped: AnalysisAdapter = async (source, signal) => {
+    const outcome = await analyze(source, signal);
+    if ("disposition" in outcome && outcome.disposition === "waiting_for_authentication") return outcome;
+    return { ...outcome, providerProvenance: provenance };
+  };
+  stamped.reconcileAuthenticationCheckpoint = analyze.reconcileAuthenticationCheckpoint?.bind(analyze);
+  return stamped;
 }
 
 export async function processProductionWorkerIteration(

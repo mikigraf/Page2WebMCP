@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
 import {
   awaitWebsiteAuthentication,
@@ -378,4 +379,108 @@ test("Browser Use session expiry aborts a stalled action and reconciles provider
   }), /BROWSER_SESSION_EXPIRED/);
   assert.equal(actionCompleted, false);
   assert.deepEqual(events, ["stop:cancelled", "reconcile", "release"]);
+});
+
+test("Browser Use suspends only after an exact durable gateway attestation", async () => {
+  const events: string[] = [];
+  const checkpointReference = `urn:sha256:${"a".repeat(64)}`;
+  const result = await withBrowserUseCloudV4Session({
+    organizationId: "org-1", projectId: "project-1", runId: "run-suspend", targetOrigin, expiresAt,
+    proxyPolicyReference: { reference: "secretref:proxy-policy", expiresAt },
+  }, controls({
+    leases: {
+      claim: async () => ({ leaseId: "lease-suspend" }),
+      release: async () => { events.push("release"); },
+    },
+    secretReferences: {
+      put: async ({ purpose, expiresAt: expiry }) => ({ reference: `secretref:${purpose}`, expiresAt: expiry }),
+      revoke: async (reference) => { events.push(`revoke:${reference}`); },
+    },
+    transport: {
+      start: async (request) => ({
+        providerSessionId: "provider-session-suspend",
+        liveUrl: "https://live.invalid/suspend",
+        cdpUrl: "wss://cdp.invalid/suspend",
+        appliedPolicyDigest: browserUseCloudV4PolicyDigest(request),
+      }),
+      stop: async () => { events.push("stop"); },
+      reconcile: async () => { events.push("reconcile"); },
+    },
+    suspension: {
+      create: async (input) => ({
+        authenticationCheckpointProtocolVersion: 1,
+        suspended: true,
+        checkpointReference,
+        organizationId: input.organizationId,
+        projectId: input.projectId,
+        runId: input.runId,
+        sourceSnapshotId: input.sourceSnapshotId,
+        sourceIdentityHash: input.sourceIdentityHash,
+        targetOriginDigest: input.targetOriginDigest,
+        publicEvidenceReference: input.publicEvidenceReference,
+        providerSessionIdDigest: createHash("sha256").update(input.providerSessionId).digest("hex"),
+        liveReference: input.liveReference,
+        cdpReference: input.cdpReference,
+        leaseId: input.leaseId,
+        egressPolicyReference: input.egressPolicyReference,
+        egressPolicyDigest: input.egressPolicyDigest,
+        browserPolicyDigest: input.browserPolicyDigest,
+        expiresAt: input.expiresAt,
+      }),
+      abort: async () => ({ reconciled: true, checkpointOwned: false, terminated: false }),
+    },
+  }), async (session) => session.suspend({
+    sourceSnapshotId: "snapshot-1",
+    sourceIdentityHash: "b".repeat(64),
+    targetOriginDigest: "c".repeat(64),
+    publicEvidenceReference: `urn:sha256:${"d".repeat(64)}`,
+    egressPolicyReference: "secretref:proxy-policy",
+    egressPolicyDigest: "e".repeat(64),
+  }));
+
+  assert.equal(result.disposition, "suspended");
+  assert.equal(result.checkpoint.checkpointReference, checkpointReference);
+  assert.equal(JSON.stringify(result).includes("provider-session-suspend"), false);
+  assert.deepEqual(events, []);
+});
+
+test("Browser Use cleans normally when suspension attestation is malformed or checkpoint creation is ambiguous", async () => {
+  for (const [create, gatewayOwnsCheckpoint] of [
+    [async () => ({ suspended: true }), false],
+    [async () => { throw new Error("AUTH_CHECKPOINT_CREATE_AMBIGUOUS"); }, true],
+  ] as const) {
+    const events: string[] = [];
+    await assert.rejects(withBrowserUseCloudV4Session({
+      organizationId: "org-1", projectId: "project-1", runId: "run-bad-suspend", targetOrigin, expiresAt,
+      proxyPolicyReference: { reference: "secretref:proxy-policy", expiresAt },
+    }, controls({
+      leases: { claim: async () => ({ leaseId: "lease-bad" }), release: async () => { events.push("release"); } },
+      secretReferences: {
+        put: async ({ purpose, expiresAt: expiry }) => ({ reference: `secretref:${purpose}`, expiresAt: expiry }),
+        revoke: async () => { events.push("revoke"); },
+      },
+      transport: {
+        start: async (request) => ({
+          providerSessionId: "provider-session-bad", liveUrl: "https://live.invalid/bad", cdpUrl: "wss://cdp.invalid/bad",
+          appliedPolicyDigest: browserUseCloudV4PolicyDigest(request),
+        }),
+        stop: async () => { events.push("stop"); },
+        reconcile: async () => { events.push("reconcile"); },
+      },
+      suspension: {
+        create: create as never,
+        abort: async () => {
+          events.push("checkpoint-abort");
+          return { reconciled: true, checkpointOwned: gatewayOwnsCheckpoint, terminated: gatewayOwnsCheckpoint };
+        },
+      },
+    }), async (session) => session.suspend({
+      sourceSnapshotId: "snapshot-1", sourceIdentityHash: "b".repeat(64), targetOriginDigest: "c".repeat(64),
+      publicEvidenceReference: `urn:sha256:${"d".repeat(64)}`,
+      egressPolicyReference: "secretref:proxy-policy", egressPolicyDigest: "e".repeat(64),
+    })), /AUTH_CHECKPOINT_(?:ATTESTATION_INVALID|CREATE_AMBIGUOUS)/);
+    assert.deepEqual(events, gatewayOwnsCheckpoint
+      ? ["checkpoint-abort"]
+      : ["checkpoint-abort", "revoke", "revoke", "stop", "reconcile", "release"]);
+  }
 });

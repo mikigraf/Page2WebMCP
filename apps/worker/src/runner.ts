@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type {
   AnalysisResult,
   AnalysisRunRecord,
@@ -7,6 +7,7 @@ import type {
   SourceType,
 } from "../../../packages/database/src/control-plane.ts";
 import { getObservability } from "../../../packages/observability/src/server.ts";
+import type { AnalysisAdapter, AnalysisAdapterOutcome, WebsiteAuthenticationWaitingOutcome } from "./workflow.ts";
 
 const LEASE_MS = 60_000;
 const HEARTBEAT_MS = 15_000;
@@ -18,11 +19,14 @@ export type ProcessAnalysisOptions = {
   deadlineMs?: number;
   heartbeatMs?: number;
   sourceTypes?: readonly SourceType[];
-  analyze?: (source: ClaimedAnalysisRunRecord, signal: AbortSignal) => Promise<AnalysisResult>;
+  analyze?: RunnerAnalysisAdapter;
 };
 
-type AnalysisAdapter = NonNullable<ProcessAnalysisOptions["analyze"]>;
-let testAnalysisAdapter: AnalysisAdapter | undefined;
+type RunnerAnalysisAdapter = ((source: ClaimedAnalysisRunRecord, signal: AbortSignal) => Promise<AnalysisAdapterOutcome>) & {
+  reconcileAuthenticationCheckpoint?: AnalysisAdapter["reconcileAuthenticationCheckpoint"];
+};
+
+let testAnalysisAdapter: RunnerAnalysisAdapter | undefined;
 
 export function setAnalysisAdapterForTest(adapter: AnalysisAdapter | undefined): void {
   if (process.env.NODE_ENV === "production") throw new Error("TEST_ADAPTER_FORBIDDEN");
@@ -57,13 +61,42 @@ export async function processNextAnalysis(
 
   try {
     const analyze = options.analyze ?? testAnalysisAdapter;
-    const result = await withDeadline(
+    const outcome = await withDeadline(
       (signal) => analyze ? analyze(run, signal) : Promise.reject(new Error("ANALYZER_NOT_CONFIGURED")),
       deadlineMs
     );
     heartbeatController.abort();
     await heartbeat;
     if (heartbeatFailure) throw heartbeatFailure;
+    if (isAuthenticationWait(outcome)) {
+      try {
+        await repository.waitAnalysisForAuthentication(workerId, run.id, {
+          checkpointReference: outcome.checkpointReference,
+          sourceSnapshotId: outcome.sourceSnapshotId,
+          sourceIdentityHash: outcome.sourceIdentityHash,
+          targetOriginDigest: outcome.targetOriginDigest,
+          expiresAt: outcome.expiresAt,
+          idempotencyKey: `website-auth-wait:${outcome.checkpointReference.slice("urn:sha256:".length)}`,
+          inputHash: createHash("sha256").update(JSON.stringify({
+            checkpointReference: outcome.checkpointReference,
+            expiresAt: outcome.expiresAt,
+            sourceIdentityHash: outcome.sourceIdentityHash,
+            sourceSnapshotId: outcome.sourceSnapshotId,
+            targetOriginDigest: outcome.targetOriginDigest,
+          }), "utf8").digest("hex"),
+        }, run.leaseGeneration);
+        await recordAnalysisOutcome(run.id, "success", run.sourceType, "WAITING_FOR_AUTHENTICATION", startedAt, run.attempts);
+        return undefined;
+      } catch (error) {
+        try {
+          await analyze?.reconcileAuthenticationCheckpoint?.(run, outcome, new AbortController().signal);
+        } catch {
+          throw new Error("WEBSITE_AUTHENTICATION_RECONCILE_FAILED");
+        }
+        throw error;
+      }
+    }
+    const result = completedResult(outcome);
     const completed = await repository.completeAnalysis(workerId, run.id, result, run.leaseGeneration);
     await recordAnalysisOutcome(run.id, "success", run.sourceType, undefined, startedAt, run.attempts);
     return completed;
@@ -87,6 +120,15 @@ export async function processNextAnalysis(
     await heartbeat;
   }
 
+}
+
+function isAuthenticationWait(value: AnalysisAdapterOutcome): value is WebsiteAuthenticationWaitingOutcome {
+  return Boolean(value && typeof value === "object"
+    && "disposition" in value && value.disposition === "waiting_for_authentication");
+}
+
+function completedResult(value: AnalysisAdapterOutcome): AnalysisResult {
+  return value as AnalysisResult;
 }
 
 async function recordAnalysisOutcome(

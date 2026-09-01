@@ -96,12 +96,15 @@ function controlHarness(input: Readonly<{
   ambiguousBrowserStartOnce?: boolean;
   rejectedReadinessControl?: string;
   legacyReadinessControl?: "ownership-store";
+  legacyAuthenticationProtocol?: boolean;
 }> = {}) {
   const calls: ControlCall[] = [];
   let currentExpiry = new Date(now.getTime() + 9 * 60_000).toISOString();
   const issuedPolicies = new Map<string, { active: boolean; expiresAt: string; reference: string }>();
   const issuedLeases = new Map<string, string>();
   const issuedBrowserSessions = new Map<string, string>();
+  const evidenceRecords = new Map<string, Record<string, unknown>>();
+  const authenticationCheckpoints = new Map<string, Record<string, unknown>>();
   const activeLeaseByRun = new Map<string, string>();
   let browserStartAttempts = 0;
   let observationCount = 0;
@@ -130,6 +133,9 @@ function controlHarness(input: Readonly<{
           : {}),
         ...(control === "ownership-store" && input.legacyReadinessControl !== control
           ? { sourceAttestationProtocolVersion: 1 }
+          : {}),
+        ...(control === "authentication-handoff" && !input.legacyAuthenticationProtocol
+          ? { authenticationCheckpointProtocolVersion: 1 }
           : {}),
         ...(control === "browser-use-v4"
           ? {
@@ -291,8 +297,74 @@ function controlHarness(input: Readonly<{
     if (url.endsWith("/v1/auth-handoffs/close")) {
       return jsonResponse(url, { ...body, closed: true });
     }
+    if (url.endsWith(WEBSITE_LIVE_CONTROL_PATHS.authenticationCheckpointCreate)) {
+      const binding = body.binding as Record<string, unknown>;
+      const checkpointReference = `urn:sha256:${createHash("sha256").update(String(binding.publicEvidenceReference)).digest("hex")}`;
+      const attestation = {
+        authenticationCheckpointProtocolVersion: 1,
+        suspended: true,
+        checkpointReference,
+        organizationId: binding.organizationId,
+        projectId: binding.projectId,
+        runId: binding.runId,
+        sourceSnapshotId: binding.sourceSnapshotId,
+        sourceIdentityHash: binding.sourceIdentityHash,
+        targetOriginDigest: binding.targetOriginDigest,
+        publicEvidenceReference: binding.publicEvidenceReference,
+        providerSessionIdDigest: createHash("sha256").update(String(binding.providerSessionId)).digest("hex"),
+        liveReference: binding.liveReference,
+        cdpReference: binding.cdpReference,
+        leaseId: binding.leaseId,
+        egressPolicyReference: binding.egressPolicyReference,
+        egressPolicyDigest: binding.egressPolicyDigest,
+        browserPolicyDigest: binding.browserPolicyDigest,
+        expiresAt: binding.expiresAt,
+      };
+      authenticationCheckpoints.set(checkpointReference, attestation);
+      return jsonResponse(url, {
+        gatewayProtocolVersion: body.gatewayProtocolVersion,
+        idempotencyKey: body.idempotencyKey,
+        ownership: body.ownership,
+        attestation,
+      });
+    }
+    if (url.endsWith(WEBSITE_LIVE_CONTROL_PATHS.authenticationCheckpointStatus)) {
+      return jsonResponse(url, { ...body, status: authenticationCheckpoints.has(String(body.checkpointReference)) ? "ready" : "missing" });
+    }
+    if (url.endsWith(WEBSITE_LIVE_CONTROL_PATHS.authenticationCheckpointResume)) {
+      const checkpoint = authenticationCheckpoints.get(String(body.checkpointReference));
+      return jsonResponse(url, {
+        ...body,
+        resumed: Boolean(checkpoint),
+        cdpReference: checkpoint?.cdpReference,
+        publicEvidenceReference: checkpoint?.publicEvidenceReference,
+        authentication: {
+          authenticatedOrigin: "https://widgets.example",
+          observedAt: "2026-08-31T12:01:00.000Z",
+          signals: ["account_control"],
+        },
+      });
+    }
+    if (url.endsWith(WEBSITE_LIVE_CONTROL_PATHS.authenticationCheckpointFinalize)) {
+      return jsonResponse(url, { ...body, finalized: true });
+    }
+    if (url.endsWith(WEBSITE_LIVE_CONTROL_PATHS.authenticationCheckpointReconcile)) {
+      if (body.binding && typeof body.binding === "object") {
+        const binding = body.binding as Record<string, unknown>;
+        const resolvedReference = typeof body.checkpointReference === "string"
+          ? body.checkpointReference
+          : [...authenticationCheckpoints.entries()].find(([, checkpoint]) =>
+            checkpoint.publicEvidenceReference === binding.publicEvidenceReference)?.[0];
+        const checkpointOwned = resolvedReference !== undefined && authenticationCheckpoints.has(resolvedReference);
+        if (resolvedReference) authenticationCheckpoints.delete(resolvedReference);
+        return jsonResponse(url, { ...body, reconciled: true, checkpointOwned, terminated: checkpointOwned });
+      }
+      authenticationCheckpoints.delete(String(body.checkpointReference));
+      return jsonResponse(url, { ...body, reconciled: true, terminated: true });
+    }
     if (url.endsWith("/v1/website-evidence/put")) {
       const record = body.record as Record<string, unknown>;
+      evidenceRecords.set(String(record.reference), record);
       return jsonResponse(url, {
         gatewayProtocolVersion: body.gatewayProtocolVersion,
         idempotencyKey: body.idempotencyKey,
@@ -302,6 +374,9 @@ function controlHarness(input: Readonly<{
         projectId: record.projectId,
         analysisRunId: record.analysisRunId,
       });
+    }
+    if (url.endsWith(WEBSITE_LIVE_CONTROL_PATHS.evidenceGet)) {
+      return jsonResponse(url, { ...body, record: evidenceRecords.get(String(body.reference)) });
     }
     throw new Error(`UNEXPECTED_CONTROL_REQUEST:${url}`);
   };
@@ -426,6 +501,14 @@ test("website startup rejects an ownership store without the additive source-att
   }, new AbortController().signal), /^Error: WEBSITE_HANDOFF_PROTOCOL_UNSUPPORTED$/);
   assert.equal(harness.calls.filter(({ url }) => url.endsWith(WEBSITE_LIVE_READINESS_PATH)).length, 9);
   assert.equal(harness.calls.some(({ url }) => url.endsWith(WEBSITE_LIVE_CONTROL_PATHS.policyIssue)), false);
+  assert.equal(harness.calls.some(({ url }) => url.endsWith(WEBSITE_LIVE_CONTROL_PATHS.browserStart)), false);
+});
+
+test("website startup rejects authentication handoff without the durable checkpoint protocol", async () => {
+  const harness = controlHarness({ legacyAuthenticationProtocol: true });
+  await assert.rejects(probeConfiguredWebsiteControlStartup(environment(), {
+    controlTransport: harness.transport,
+  }, new AbortController().signal), /^Error: WEBSITE_HANDOFF_PROTOCOL_UNSUPPORTED$/);
   assert.equal(harness.calls.some(({ url }) => url.endsWith(WEBSITE_LIVE_CONTROL_PATHS.browserStart)), false);
 });
 
@@ -695,20 +778,54 @@ test("website default controls never fall back to the injected loose fetch funct
   assert.equal(looseFetchCalls, 0);
 });
 
-test("website TTL secrets stay exact and authenticated sites fail before opening a non-durable handoff", async () => {
+test("website TTL secrets stay exact and authenticated sites return only a durable checkpoint", async () => {
   const harness = controlHarness({ requiresAuthentication: true });
   const adapter = createConfiguredWebsiteAnalysisAdapter(environment(), {
     controlTransport: harness.transport, clock: () => now, ...networkControls(harness.expiresAt),
   });
-  await assert.rejects(adapter({
+  const waiting = await adapter({
     id: "analysis-run-auth", organizationId: "organization-1", projectId: "project-1",
-    sourceType: "website", sourceUrl: "https://widgets.example/app", sourceConfiguration: { kind: "website" }, leaseGeneration: 1,
-  }, new AbortController().signal), /^Error: WEBSITE_DURABLE_AUTHENTICATION_HANDOFF_REQUIRED$/);
+    sourceType: "website", sourceUrl: "https://widgets.example/app", sourceConfiguration: { kind: "website" },
+    sourceSnapshotId: "snapshot-auth", leaseGeneration: 1,
+  }, new AbortController().signal);
+  assert.equal(waiting.disposition, "waiting_for_authentication");
+  assert.match(waiting.checkpointReference, /^urn:sha256:[a-f0-9]{64}$/);
+  assert.doesNotMatch(JSON.stringify(waiting), /provider-session|browser-live|browser-cdp|secretref:/);
   for (const call of harness.calls.filter(({ url }) => url.endsWith(WEBSITE_LIVE_CONTROL_PATHS.secretPut))) {
     assert.equal(call.body.valueDigest, createHash("sha256").update(String(call.body.value), "utf8").digest("hex"));
   }
   const open = harness.calls.find(({ url }) => url.endsWith(WEBSITE_LIVE_CONTROL_PATHS.authOpen));
   assert.equal(open, undefined);
+  assert.equal(harness.calls.filter(({ url }) => url.endsWith(WEBSITE_LIVE_CONTROL_PATHS.authenticationCheckpointCreate)).length, 1);
+  assert.equal(harness.calls.filter(({ url }) => url.endsWith(WEBSITE_LIVE_CONTROL_PATHS.browserStop)).length, 0);
+  assert.equal(harness.calls.filter(({ url }) => url.endsWith(WEBSITE_LIVE_CONTROL_PATHS.leaseRelease)).length, 0);
+  assert.equal(harness.calls.filter(({ url }) => url.endsWith(WEBSITE_LIVE_CONTROL_PATHS.policyRevoke)).length, 0);
+  if (waiting.disposition !== "waiting_for_authentication") throw new Error("WAITING_OUTCOME_REQUIRED");
+  const completed = await adapter({
+    id: "analysis-run-auth", organizationId: "organization-1", projectId: "project-1",
+    sourceType: "website", sourceUrl: "https://widgets.example/app", sourceConfiguration: { kind: "website" },
+    sourceSnapshotId: "snapshot-auth", leaseGeneration: 2,
+    authenticationCheckpoint: {
+      checkpointReference: waiting.checkpointReference,
+      authenticationEvidenceReference: `urn:sha256:${"b".repeat(64)}`,
+      sourceSnapshotId: waiting.sourceSnapshotId,
+      sourceIdentityHash: waiting.sourceIdentityHash,
+      targetOriginDigest: waiting.targetOriginDigest,
+      expiresAt: waiting.expiresAt,
+    },
+  }, new AbortController().signal);
+  assert.equal(completed.disposition, undefined);
+  assert.equal(harness.calls.filter(({ url }) => url.endsWith(WEBSITE_LIVE_CONTROL_PATHS.policyIssue)).length, 1);
+  assert.equal(harness.calls.filter(({ url }) => url.endsWith(WEBSITE_LIVE_CONTROL_PATHS.browserStart)).length, 1);
+  assert.equal(harness.calls.filter(({ url }) => url.endsWith(WEBSITE_LIVE_CONTROL_PATHS.authenticationCheckpointStatus)).length, 1);
+  assert.equal(harness.calls.filter(({ url }) => url.endsWith(WEBSITE_LIVE_CONTROL_PATHS.authenticationCheckpointResume)).length, 1);
+  assert.equal(harness.calls.filter(({ url }) => url.endsWith(WEBSITE_LIVE_CONTROL_PATHS.authenticationCheckpointFinalize)).length, 1);
+  assert.equal(harness.calls.filter(({ url }) => url.endsWith(WEBSITE_LIVE_CONTROL_PATHS.authenticationCheckpointReconcile)).length, 1);
+  for (const call of harness.calls.filter(({ url }) => url.includes("/v1/authentication/checkpoints/")
+    && !url.endsWith(WEBSITE_LIVE_CONTROL_PATHS.authenticationCheckpointCreate))) {
+    assert.match(String(call.body.idempotencyKey), /^website:analysis-run-auth:authentication:/);
+    assert.doesNotMatch(String(call.body.idempotencyKey), /:2:/);
+  }
 
   const malformedSecret = controlHarness({ badSecretDigest: true });
   const malformedSecretAdapter = createConfiguredWebsiteAnalysisAdapter(environment(), {
