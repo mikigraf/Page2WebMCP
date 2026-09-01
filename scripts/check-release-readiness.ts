@@ -55,7 +55,7 @@ const CURRENT_MIGRATION_LEDGER = [
   "20260901030000_analysis_source_lock.sql",
   "20260901040000_analysis_source_lock_readiness.sql",
   "20260901060852_alternate_canonical_local_supabase_topology.sql",
-  "20260901064232_website_authentication_wait.sql",
+  "20260901071658_website_authentication_wait.sql",
 ] as const;
 
 type Environment = Readonly<Record<string, string | undefined>>;

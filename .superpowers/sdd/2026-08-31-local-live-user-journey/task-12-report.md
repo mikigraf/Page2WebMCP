@@ -4,11 +4,13 @@
 
 Implemented and committed in `531f391ddc01de3efd79658947350a3e8b8cbade` (`feat(database): persist website authentication waits`). The worker repository can now atomically release a running website analysis into a durable authentication wait, and an owner/editor can atomically resume the exact run only with a bounded gateway-attested evidence reference.
 
+Fix round 1 subsequently replaced the unapplied manually timestamped migration with the exact pinned-CLI-created `20260901071658_website_authentication_wait.sql`. The reviewed SQL is byte-for-byte identical after substituting only the required migration version references.
+
 No Docker database was modified. Inspection found no Page2WebMCP-owned `5832x` task database; all running databases belonged to unrelated projects. PostgreSQL integration tests therefore remain explicitly gated on `PAGE2WEBMCP_TEST_DATABASE_URL` and `PAGE2WEBMCP_TEST_ADMIN_DATABASE_URL` for the controller's clean-stack replay.
 
 ## Schema and API decisions
 
-- Added forward migration `20260901064232_website_authentication_wait.sql`; no historical migration was edited.
+- Added forward migration `20260901071658_website_authentication_wait.sql`; no migration predating Task 12 was edited.
 - Added `waiting` to the public analysis-run and private analysis-job state constraints and updated the private job-state projection so the public run becomes `waiting` while the project remains `analyzing`.
 - Added private, forced-RLS `website_authentication_checkpoints`, bound by composite foreign keys to organization, project, analysis run, workflow analysis task, and source snapshot. The record additionally binds the source identity hash, target-origin digest, a maximum ten-minute expiry, and exact lowercase SHA-256 URNs.
 - The table stores no Browser Use URL, CDP URL, provider session ID, cookie, credential, token, OTP, target-page content, or KMS secret. App reads are tenant scoped; owner/editor may perform the evidence-backed resume transition; the worker owns wait and terminal transitions. `PUBLIC`, `anon`, `authenticated`, `service_role`, and maintenance retain no table privilege.
@@ -24,7 +26,7 @@ No Docker database was modified. Inspection found no Page2WebMCP-owned `5832x` t
 
 - Repository contract and in-memory implementation: `packages/database/src/control-plane.ts`
 - PostgreSQL implementation: `packages/database/src/postgres.ts`
-- Migration: `supabase/migrations/20260901064232_website_authentication_wait.sql`
+- Migration: `supabase/migrations/20260901071658_website_authentication_wait.sql`
 - Tests: `packages/database/src/website-authentication-wait.test.ts`, `packages/database/src/website-authentication-wait-migration.test.ts`, `packages/database/src/website-authentication-wait.integration.test.ts`
 - Ledger/lifecycle: `scripts/check-release-readiness.ts`, `scripts/local-supabase.mjs`, `test-support/readiness-cli.test.ts`, `test-support/local-supabase.test.ts`
 
@@ -95,6 +97,14 @@ exit 124; no output; no migration file created
 ```
 
 The host CLI stalled as anticipated. The migration was then created with `apply_patch` using the captured UTC attempt timestamp `20260901064232`. This is not reported as successful CLI generation.
+
+Fix round 1 addressed that historical limitation through the prepared Linux Node 24 boundary. Pinned `supabase@2.116.0` reported:
+
+```text
+Created new migration at supabase/migrations/20260901071658_website_authentication_wait.sql
+```
+
+The unapplied manual file was removed, and all active ledger/sentinel/test references now use the CLI-created version.
 
 ## Concerns
 

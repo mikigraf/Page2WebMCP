@@ -247,7 +247,7 @@ begin
       ('20260901030000'),
       ('20260901040000'),
       ('20260901060852'),
-      ('20260901064232')
+      ('20260901071658')
   ), applied_migrations(version) as (
     select migration.version::text
     from supabase_migrations.schema_migrations migration

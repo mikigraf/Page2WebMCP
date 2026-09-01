@@ -234,7 +234,7 @@ test("source readiness requires the complete migration ledger through website au
   const migrations = await readdir(new URL("../supabase/migrations/", import.meta.url));
   assert.equal(sourceMigrationLedgerCurrent(migrations), true);
   assert.equal(sourceMigrationLedgerCurrent(
-    migrations.filter((name) => name !== "20260901064232_website_authentication_wait.sql"),
+    migrations.filter((name) => name !== "20260901071658_website_authentication_wait.sql"),
   ), false);
   assert.equal(sourceMigrationLedgerCurrent([
     "20260831211329_installed_execution_evidence.sql",

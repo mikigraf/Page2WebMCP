@@ -8,6 +8,11 @@ async function migration() {
   const matches = (await readdir(migrationsDirectory))
     .filter((name) => /^\d{14}_website_authentication_wait\.sql$/.test(name));
   assert.equal(matches.length, 1, "one CLI-generated website authentication wait migration must exist");
+  assert.notEqual(
+    matches[0],
+    "20260901064232_website_authentication_wait.sql",
+    "the manually timestamped migration must be replaced by the pinned CLI output",
+  );
   return {
     name: matches[0]!,
     sql: await readFile(new URL(matches[0]!, migrationsDirectory), "utf8"),
