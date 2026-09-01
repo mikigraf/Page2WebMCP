@@ -16,7 +16,7 @@ const script = fileURLToPath(new URL("../scripts/check-release-readiness.ts", im
 const artifactBytes = Buffer.from("export const selected = true;", "utf8");
 const selectedHash = createHash("sha256").update(artifactBytes).digest("hex");
 const hosted = "https://bimqgiedckdurqiywctl.supabase.co/storage/v1/object/public/page2webmcp-releases";
-const local = "http://127.0.0.1:54321/storage/v1/object/public/page2webmcp-releases";
+const local = "http://127.0.0.1:58321/storage/v1/object/public/page2webmcp-releases";
 const selectedContext = {
   sourceType: "openapi" as const,
   sourceUrl: "https://specs.widgets.example/openapi.json",
@@ -47,10 +47,10 @@ function completeEnvironment(mode: "live" | "local-live" = "live") {
     PAGE2WEBMCP_READINESS_RELEASE_HASH: selectedHash,
     DATABASE_URL: mode === "live"
       ? "postgresql://app:secret@database.example/page2webmcp"
-      : "postgresql://app:secret@127.0.0.1:54322/page2webmcp",
+      : "postgresql://app:secret@127.0.0.1:58322/page2webmcp",
     PAGE2WEBMCP_MAINTENANCE_DATABASE_URL: mode === "live"
       ? "postgresql://readiness:secret@database.example/page2webmcp"
-      : "postgresql://readiness:secret@127.0.0.1:54322/page2webmcp",
+      : "postgresql://readiness:secret@127.0.0.1:58322/page2webmcp",
     PAGE2WEBMCP_RELEASE_VERIFIER_TOKEN: "v".repeat(32),
     ...(mode === "live" ? {
       PAGE2WEBMCP_RELEASE_VERIFIER_ORIGIN: "https://verifier.example",

@@ -13,7 +13,7 @@ const INTEGRITY = "sha384-YmsCfxJaZ5VLqWgfoZRSpRyZb7wZQCLa10orEGxrKN/qSZ5ScDRDKV
 const TARGET_ORIGIN = "https://widgets.example";
 const HOSTED_SERVER = "https://bimqgiedckdurqiywctl.supabase.co";
 const HOSTED_PREFIX = `${HOSTED_SERVER}/storage/v1/object/public/page2webmcp-releases`;
-const LOCAL_SERVER = "http://127.0.0.1:54321";
+const LOCAL_SERVER = "http://127.0.0.1:58321";
 const LOCAL_PREFIX = `${LOCAL_SERVER}/storage/v1/object/public/page2webmcp-releases`;
 const SECRET = "sb_secret_test-only-artifact-storage-key";
 const ARTIFACT_URL = `${HOSTED_PREFIX}/${CONTENT_HASH}.js`;
@@ -211,8 +211,13 @@ test("rejects missing, aliased, browser-exposed, and mismatched Storage configur
     environment({ PAGE2WEBMCP_LOCAL_STACK: "true", PAGE2WEBMCP_PUBLIC_ORIGIN: LOCAL_PREFIX }),
     environment({
       PAGE2WEBMCP_LOCAL_STACK: "true",
-      PAGE2WEBMCP_SUPABASE_URL: "http://localhost:54321",
-      PAGE2WEBMCP_PUBLIC_ORIGIN: "http://localhost:54321/storage/v1/object/public/page2webmcp-releases",
+      PAGE2WEBMCP_SUPABASE_URL: "http://127.0.0.1:54321",
+      PAGE2WEBMCP_PUBLIC_ORIGIN: "http://127.0.0.1:54321/storage/v1/object/public/page2webmcp-releases",
+    }),
+    environment({
+      PAGE2WEBMCP_LOCAL_STACK: "true",
+      PAGE2WEBMCP_SUPABASE_URL: "http://localhost:58321",
+      PAGE2WEBMCP_PUBLIC_ORIGIN: "http://localhost:58321/storage/v1/object/public/page2webmcp-releases",
     }),
     environment({ NEXT_PUBLIC_PAGE2WEBMCP_SUPABASE_URL: HOSTED_SERVER }),
     environment({ NEXT_PUBLIC_SUPABASE_SERVICE_ROLE_KEY: SECRET }),

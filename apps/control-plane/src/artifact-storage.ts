@@ -7,7 +7,7 @@ const PUBLIC_READ_BUDGET = 3;
 const PUBLICATION_DEADLINE_MS = 30_000;
 const HOSTED_SUPABASE_URL = "https://bimqgiedckdurqiywctl.supabase.co";
 const HOSTED_PUBLIC_ORIGIN = `${HOSTED_SUPABASE_URL}/storage/v1/object/public/${RELEASE_BUCKET}`;
-const LOCAL_SUPABASE_URL = "http://127.0.0.1:54321";
+const LOCAL_SUPABASE_URL = "http://127.0.0.1:58321";
 const LOCAL_PUBLIC_ORIGIN = `${LOCAL_SUPABASE_URL}/storage/v1/object/public/${RELEASE_BUCKET}`;
 const HASH = /^[0-9a-f]{64}$/;
 const SRI = /^sha384-[A-Za-z0-9+/]+={0,2}$/;

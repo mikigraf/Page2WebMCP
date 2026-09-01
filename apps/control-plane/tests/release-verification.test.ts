@@ -734,7 +734,7 @@ test("CSP blocked hosted delivery remains uninstalled and requires exact-hash se
 });
 
 test("local artifact verification is hermetic-only and bound to the canonical Docker identity", async () => {
-  const localArtifactUrl = `http://127.0.0.1:54321/storage/v1/object/public/page2webmcp-releases/${release.contentHash}.js`;
+  const localArtifactUrl = `http://127.0.0.1:58321/storage/v1/object/public/page2webmcp-releases/${release.contentHash}.js`;
   const localDownloadUrl = `${localArtifactUrl}?download=page2webmcp-${release.contentHash}.js`;
   const report = {
     observedArtifactUrl: localArtifactUrl,

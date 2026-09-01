@@ -2608,7 +2608,7 @@ function plainRecordWithKeys(value: unknown, keys: readonly string[]): value is 
 const HOSTED_RELEASE_ARTIFACT_PREFIX =
   "https://bimqgiedckdurqiywctl.supabase.co/storage/v1/object/public/page2webmcp-releases";
 const LOCAL_RELEASE_ARTIFACT_PREFIX =
-  "http://127.0.0.1:54321/storage/v1/object/public/page2webmcp-releases";
+  "http://127.0.0.1:58321/storage/v1/object/public/page2webmcp-releases";
 
 export function normalizeReleaseArtifactIdentity(
   input: Readonly<{ artifactUrl: string; downloadUrl: string; localOnly: boolean }>,

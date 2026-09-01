@@ -26,7 +26,7 @@ import {
 const HOSTED_PUBLIC_ORIGIN =
   "https://bimqgiedckdurqiywctl.supabase.co/storage/v1/object/public/page2webmcp-releases";
 const LOCAL_PUBLIC_ORIGIN =
-  "http://127.0.0.1:54321/storage/v1/object/public/page2webmcp-releases";
+  "http://127.0.0.1:58321/storage/v1/object/public/page2webmcp-releases";
 const HASH = /^[0-9a-f]{64}$/;
 const MAX_ARTIFACT_BYTES = 65_536;
 const ARTIFACT_TIMEOUT_MS = 10_000;

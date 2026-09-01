@@ -26,7 +26,7 @@ const SESSION_TTL_MS = 9 * 60_000;
 const HOSTED_PUBLIC_ORIGIN =
   "https://bimqgiedckdurqiywctl.supabase.co/storage/v1/object/public/page2webmcp-releases";
 const LOCAL_PUBLIC_ORIGIN =
-  "http://127.0.0.1:54321/storage/v1/object/public/page2webmcp-releases";
+  "http://127.0.0.1:58321/storage/v1/object/public/page2webmcp-releases";
 const referencePattern = /^secretref:[A-Za-z0-9._:-]{1,200}$/;
 const identifierPattern = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 

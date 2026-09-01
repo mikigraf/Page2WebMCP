@@ -43,7 +43,7 @@ import {
 const HOSTED_ARTIFACT_PREFIX =
   "https://bimqgiedckdurqiywctl.supabase.co/storage/v1/object/public/page2webmcp-releases";
 const LOCAL_ARTIFACT_PREFIX =
-  "http://127.0.0.1:54321/storage/v1/object/public/page2webmcp-releases";
+  "http://127.0.0.1:58321/storage/v1/object/public/page2webmcp-releases";
 
 function artifactPublication(
   input: Readonly<{ contentHash: string; integrity: string }>,
@@ -935,7 +935,7 @@ test("release guides preserve local-only and the previous persisted Storage URL"
   assert.equal(local.installation.localOnly, true);
   assert.equal(local.installation.selfHost.required, true);
   assert.match(local.installation.selfHost.guidance, /Loopback delivery validates bytes only/);
-  assert.match(local.installation.moduleScriptTag, /^<script type="module" src="http:\/\/127\.0\.0\.1:54321\//);
+  assert.match(local.installation.moduleScriptTag, /^<script type="module" src="http:\/\/127\.0\.0\.1:58321\//);
 });
 
 test("publication rejects caller reports, non-owners, and serves immutable exact bytes", async () => {

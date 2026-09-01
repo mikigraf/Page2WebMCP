@@ -520,7 +520,7 @@ function assertInstalledInput(input: InstalledVerificationInput, mode: ReleaseVe
     throw new Error("INSTALLED_VERIFICATION_INVALID");
   }
   const prefix = input.localOnly
-    ? "http://127.0.0.1:54321/storage/v1/object/public/page2webmcp-releases"
+    ? "http://127.0.0.1:58321/storage/v1/object/public/page2webmcp-releases"
     : "https://bimqgiedckdurqiywctl.supabase.co/storage/v1/object/public/page2webmcp-releases";
   const artifactUrl = `${prefix}/${input.contentHash}.js`;
   const downloadUrl = `${artifactUrl}?download=page2webmcp-${input.contentHash}.js`;

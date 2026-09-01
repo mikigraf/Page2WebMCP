@@ -37,7 +37,7 @@ export async function bootstrapLocalRuntimeRoles(
 
 function validateLocalStatus(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)
-    || value.apiUrl !== "http://127.0.0.1:54321"
+    || value.apiUrl !== "http://127.0.0.1:58321"
     || !safeBrowserKey(value.publishableKey)
     || !boundedSecret(value.serviceKey)
     || value.publishableKey === value.serviceKey) {
@@ -115,7 +115,7 @@ export function validateOwnerDatabaseUrl(value) {
   }
   if (parsed.protocol !== "postgresql:"
     || !["127.0.0.1", "[::1]"].includes(parsed.hostname)
-    || parsed.port !== "54322"
+    || parsed.port !== "58322"
     || parsed.pathname !== "/postgres"
     || parsed.username !== "postgres"
     || !parsed.password

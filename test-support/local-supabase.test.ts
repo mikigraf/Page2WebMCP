@@ -11,7 +11,7 @@ import { bootstrapLocalRuntimeRoles, validateOwnerDatabaseUrl } from "../scripts
 
 const workspaceRoot = fileURLToPath(new URL("../", import.meta.url));
 const localStatus = {
-  apiUrl: "http://127.0.0.1:54321",
+  apiUrl: "http://127.0.0.1:58321",
   publishableKey: "sb_publishable_local-browser-safe-key",
   serviceKey: "sb_secret_local-server-only-key-value"
 };
@@ -32,6 +32,17 @@ test("local Supabase lifecycle is pinned, uses the pnpm CLI boundary, and declar
   assert.match(config, /^\[storage\.buckets\.page2webmcp-releases\]\npublic = true$/m);
   assert.match(config, /^\[auth\]\n[\s\S]*?^site_url = "http:\/\/127\.0\.0\.1:3100"$/m);
   assert.match(config, /^additional_redirect_urls = \["http:\/\/127\.0\.0\.1:3100"\]$/m);
+  assert.match(config, /^\[api\]\n[\s\S]*?^port = 58321$/m);
+  assert.match(config, /^\[db\]\n[\s\S]*?^port = 58322$/m);
+  assert.match(config, /^shadow_port = 58320$/m);
+  assert.match(config, /^\[db\.pooler\]\n[\s\S]*?^port = 58329$/m);
+  assert.match(config, /^\[studio\]\n[\s\S]*?^port = 58323$/m);
+  assert.match(config, /^\[inbucket\]\n[\s\S]*?^port = 58324$/m);
+  assert.match(config, /^# smtp_port = 58325$/m);
+  assert.match(config, /^# pop3_port = 58326$/m);
+  assert.match(config, /^\[analytics\]\n[\s\S]*?^port = 58327$/m);
+  assert.match(config, /^inspector_port = 8083$/m);
+  assert.doesNotMatch(config, /\b5432[0-9]\b/);
   assert.match(ignore, /^\.page2webmcp\/$/m);
   assert.equal(await exists(join(workspaceRoot, "scripts/local-supabase.mjs")), true);
 });
@@ -66,11 +77,11 @@ printf '%s\\n' -- >> "$PAGE2WEBMCP_PNPM_LOG"
 if [ "$*" = "exec supabase --version" ]; then
   printf '%s\\n' '2.116.0'
 else
-  printf '%s\\n' 'API_URL="http://127.0.0.1:54321"'
-  printf '%s\\n' 'DB_URL="postgresql://postgres:owner-secret@127.0.0.1:54322/postgres"'
+  printf '%s\\n' 'API_URL="http://127.0.0.1:58321"'
+  printf '%s\\n' 'DB_URL="postgresql://postgres:owner-secret@127.0.0.1:58322/postgres"'
   printf '%s\\n' 'ANON_KEY="sb_publishable_local-browser-safe-key"'
   printf '%s\\n' 'SERVICE_ROLE_KEY="service-secret"'
-  printf '%s\\n' 'STUDIO_URL="http://127.0.0.1:54323"'
+  printf '%s\\n' 'STUDIO_URL="http://127.0.0.1:58323"'
 fi
 `);
     await chmod(fakePnpm, 0o755);
@@ -85,8 +96,8 @@ fi
       "exec", "supabase", "--version", "--",
       "exec", "supabase", "status", "-o", "env", "--"
     ].join("\n") + "\n");
-    assert.match(result.stdout, /API_URL: http:\/\/127\.0\.0\.1:54321/);
-    assert.match(result.stdout, /STUDIO_URL: http:\/\/127\.0\.0\.1:54323/);
+    assert.match(result.stdout, /API_URL: http:\/\/127\.0\.0\.1:58321/);
+    assert.match(result.stdout, /STUDIO_URL: http:\/\/127\.0\.0\.1:58323/);
     assert.doesNotMatch(`${result.stdout}\n${result.stderr}`, /owner-secret|service-secret/);
   } finally {
     await rm(directory, { recursive: true, force: true });
@@ -128,7 +139,7 @@ test("runtime role bootstrap writes one atomic mode-0600 environment with fresh 
   const firstClient = fakeBootstrapClient(migrationVersions);
   try {
     const result = await bootstrapLocalRuntimeRoles(
-      "postgresql://postgres:owner-secret@127.0.0.1:54322/postgres",
+      "postgresql://postgres:owner-secret@127.0.0.1:58322/postgres",
       destination,
       { createClient: () => firstClient },
       { localStatus, expectedMigrationVersions: migrationVersions }
@@ -150,7 +161,7 @@ test("runtime role bootstrap writes one atomic mode-0600 environment with fresh 
     for (const [index, value] of urls.entries()) {
       const parsed = new URL(value!);
       assert.equal(parsed.hostname, "127.0.0.1");
-      assert.equal(parsed.port, "54322");
+      assert.equal(parsed.port, "58322");
       assert.equal(parsed.pathname, "/postgres");
       assert.equal(parsed.username, expectedLogins[index]);
       assert.match(parsed.password, /^[A-Za-z0-9_-]{43}$/);
@@ -174,7 +185,7 @@ test("runtime role bootstrap writes one atomic mode-0600 environment with fresh 
 
     const secondClient = fakeBootstrapClient(migrationVersions);
     await bootstrapLocalRuntimeRoles(
-      "postgresql://postgres:owner-secret@127.0.0.1:54322/postgres",
+      "postgresql://postgres:owner-secret@127.0.0.1:58322/postgres",
       destination,
       { createClient: () => secondClient },
       { localStatus, expectedMigrationVersions: migrationVersions }
@@ -199,7 +210,7 @@ test("runtime role bootstrap refuses to persist credentials until every committe
   const client = fakeBootstrapClient([migrationVersions[0]!]);
   try {
     await assert.rejects(bootstrapLocalRuntimeRoles(
-      "postgresql://postgres:owner-secret@127.0.0.1:54322/postgres",
+      "postgresql://postgres:owner-secret@127.0.0.1:58322/postgres",
       destination,
       { createClient: () => client },
       { localStatus, expectedMigrationVersions: migrationVersions }
@@ -224,7 +235,7 @@ test("runtime role bootstrap requires the exact sorted committed migration histo
       const destination = join(directory, `.page2webmcp/local-${index}.env`);
       const client = fakeBootstrapClient(appliedMigrationVersions);
       await assert.rejects(bootstrapLocalRuntimeRoles(
-        "postgresql://postgres:owner-secret@127.0.0.1:54322/postgres",
+        "postgresql://postgres:owner-secret@127.0.0.1:58322/postgres",
         destination,
         { createClient: () => client },
         { localStatus, expectedMigrationVersions: migrationVersions }
@@ -239,18 +250,19 @@ test("runtime role bootstrap requires the exact sorted committed migration histo
 
 test("owner bootstrap accepts only the canonical local Postgres endpoints", () => {
   assert.equal(
-    validateOwnerDatabaseUrl("postgresql://postgres:secret@127.0.0.1:54322/postgres").hostname,
+    validateOwnerDatabaseUrl("postgresql://postgres:secret@127.0.0.1:58322/postgres").hostname,
     "127.0.0.1"
   );
   assert.equal(
-    validateOwnerDatabaseUrl("postgresql://postgres:secret@[::1]:54322/postgres").hostname,
+    validateOwnerDatabaseUrl("postgresql://postgres:secret@[::1]:58322/postgres").hostname,
     "[::1]"
   );
   for (const value of [
-    "postgresql://postgres:secret@localhost:54322/postgres",
-    "postgresql://postgres:secret@127.0.0.2:54322/postgres",
-    "postgresql://postgres:secret@127.0.0.1:54323/postgres",
-    "postgresql://postgres:secret@127.0.0.1:54322/other"
+    "postgresql://postgres:secret@localhost:58322/postgres",
+    "postgresql://postgres:secret@127.0.0.2:58322/postgres",
+    "postgresql://postgres:secret@127.0.0.1:54322/postgres",
+    "postgresql://postgres:secret@127.0.0.1:58323/postgres",
+    "postgresql://postgres:secret@127.0.0.1:58322/other"
   ]) assert.throws(() => validateOwnerDatabaseUrl(value), /^Error: LOCAL_OWNER_DATABASE_URL_LOOPBACK_REQUIRED$/);
 });
 
@@ -284,9 +296,9 @@ while :; do sleep 1; done
 `);
     await chmod(fakePnpm, 0o755);
     const localEnv = [
-      "PAGE2WEBMCP_APP_DATABASE_URL=postgresql://page2webmcp_app_local:app-password@127.0.0.1:54322/postgres?options=-c+role%3Dpage2webmcp_app",
-      "PAGE2WEBMCP_WORKER_DATABASE_URL=postgresql://page2webmcp_worker_local:worker-password@127.0.0.1:54322/postgres?options=-c+role%3Dpage2webmcp_worker",
-      "PAGE2WEBMCP_MAINTENANCE_DATABASE_URL=postgresql://page2webmcp_maintenance_local:maintenance-password@127.0.0.1:54322/postgres?options=-c+role%3Dpage2webmcp_maintenance",
+      "PAGE2WEBMCP_APP_DATABASE_URL=postgresql://page2webmcp_app_local:app-password@127.0.0.1:58322/postgres?options=-c+role%3Dpage2webmcp_app",
+      "PAGE2WEBMCP_WORKER_DATABASE_URL=postgresql://page2webmcp_worker_local:worker-password@127.0.0.1:58322/postgres?options=-c+role%3Dpage2webmcp_worker",
+      "PAGE2WEBMCP_MAINTENANCE_DATABASE_URL=postgresql://page2webmcp_maintenance_local:maintenance-password@127.0.0.1:58322/postgres?options=-c+role%3Dpage2webmcp_maintenance",
       `NEXT_PUBLIC_SUPABASE_URL=${localStatus.apiUrl}`,
       `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=${localStatus.publishableKey}`,
       `PAGE2WEBMCP_SUPABASE_URL=${localStatus.apiUrl}`,
@@ -318,19 +330,19 @@ while :; do sleep 1; done
     assert.equal(app[1], "--filter @page2webmcp/control-plane dev -- --port 3100");
     assert.equal(worker[1], "exec tsx apps/worker/src/main.ts");
     assert.deepEqual(app.slice(2), [
-      "postgresql://page2webmcp_app_local:app-password@127.0.0.1:54322/postgres?options=-c+role%3Dpage2webmcp_app",
+      "postgresql://page2webmcp_app_local:app-password@127.0.0.1:58322/postgres?options=-c+role%3Dpage2webmcp_app",
       "true", "postgres", "", "", "",
       localStatus.apiUrl, localStatus.publishableKey, localStatus.apiUrl, localStatus.serviceKey,
       "local-session-secret-with-more-than-32-bytes",
       "http://127.0.0.1:3100",
-      "http://127.0.0.1:54321/storage/v1/object/public/page2webmcp-releases",
+      "http://127.0.0.1:58321/storage/v1/object/public/page2webmcp-releases",
       "openapi"
     ]);
     assert.deepEqual(worker.slice(2), [
-      "postgresql://page2webmcp_worker_local:worker-password@127.0.0.1:54322/postgres?options=-c+role%3Dpage2webmcp_worker",
+      "postgresql://page2webmcp_worker_local:worker-password@127.0.0.1:58322/postgres?options=-c+role%3Dpage2webmcp_worker",
       "true", "postgres", "", "", "", "", "", "", "", "",
       "http://127.0.0.1:3100",
-      "http://127.0.0.1:54321/storage/v1/object/public/page2webmcp-releases",
+      "http://127.0.0.1:58321/storage/v1/object/public/page2webmcp-releases",
       "openapi"
     ]);
   } finally {

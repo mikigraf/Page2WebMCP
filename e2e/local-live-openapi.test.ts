@@ -138,7 +138,7 @@ test("Docker local-live persists a non-Acme OpenAPI release with exact Storage i
   assert.equal(release.contentHash, release.installation.contentHash);
   assert.equal(release.sri, release.installation.integrity);
   assert.equal(release.installation.localOnly, true);
-  assert.match(release.url, /^http:\/\/(?:127\.0\.0\.1|\[::1\]):54321\/storage\/v1\/object\/public\/page2webmcp-releases\/[a-f0-9]{64}\.js$/);
+  assert.match(release.url, /^http:\/\/(?:127\.0\.0\.1|\[::1\]):58321\/storage\/v1\/object\/public\/page2webmcp-releases\/[a-f0-9]{64}\.js$/);
   assert.equal(release.installation.moduleScriptTag,
     `<script type="module" src="${release.url}" integrity="${release.sri}" crossorigin="anonymous"></script>`);
 
@@ -243,9 +243,9 @@ async function assertDocumentedDockerTopology(): Promise<void> {
   const version = await runBoundedCommand(["exec", "supabase", "--version"]);
   assert.equal(version.trim(), "2.116.0", "LOCAL_DOCKER_TOPOLOGY_REQUIRED");
   const values = parseSupabaseStatus(await runBoundedCommand(["exec", "supabase", "status", "-o", "env"]));
-  assert.equal(values.get("API_URL"), "http://127.0.0.1:54321", "LOCAL_DOCKER_TOPOLOGY_REQUIRED");
-  assert.equal(values.get("STUDIO_URL"), "http://127.0.0.1:54323", "LOCAL_DOCKER_TOPOLOGY_REQUIRED");
-  assert.equal(values.get("INBUCKET_URL"), "http://127.0.0.1:54324", "LOCAL_DOCKER_TOPOLOGY_REQUIRED");
+  assert.equal(values.get("API_URL"), "http://127.0.0.1:58321", "LOCAL_DOCKER_TOPOLOGY_REQUIRED");
+  assert.equal(values.get("STUDIO_URL"), "http://127.0.0.1:58323", "LOCAL_DOCKER_TOPOLOGY_REQUIRED");
+  assert.equal(values.get("INBUCKET_URL"), "http://127.0.0.1:58324", "LOCAL_DOCKER_TOPOLOGY_REQUIRED");
   let database: URL;
   try {
     database = new URL(requiredStatusValue(values, "DB_URL"));
@@ -254,7 +254,7 @@ async function assertDocumentedDockerTopology(): Promise<void> {
   }
   assert.equal(database.protocol, "postgresql:", "LOCAL_DOCKER_TOPOLOGY_REQUIRED");
   assert.equal(database.hostname, "127.0.0.1", "LOCAL_DOCKER_TOPOLOGY_REQUIRED");
-  assert.equal(database.port, "54322", "LOCAL_DOCKER_TOPOLOGY_REQUIRED");
+  assert.equal(database.port, "58322", "LOCAL_DOCKER_TOPOLOGY_REQUIRED");
   assert.equal(database.pathname, "/postgres", "LOCAL_DOCKER_TOPOLOGY_REQUIRED");
   assert.equal(database.username, "postgres", "LOCAL_DOCKER_TOPOLOGY_REQUIRED");
   assert.equal(database.search, "", "LOCAL_DOCKER_TOPOLOGY_REQUIRED");

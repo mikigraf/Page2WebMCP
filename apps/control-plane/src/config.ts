@@ -51,7 +51,7 @@ function validateSupabaseConfiguration(environment: RuntimeEnvironment): void {
     ?? environment.NEXT_PUBLIC_SUPABASE_ANON_KEY
     ?? "";
   if (!url || !exactOrigin(url)
-    || (url.protocol !== "https:" && !localStackHttpOrigin(url, environment, "54321"))
+    || (url.protocol !== "https:" && !localStackHttpOrigin(url, environment, "58321"))
     || key.length < 20 || unsafeSupabaseBrowserKey(key)) {
     throw new Error("SUPABASE_CONFIGURATION_REQUIRED");
   }

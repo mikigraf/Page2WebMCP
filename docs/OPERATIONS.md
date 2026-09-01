@@ -47,10 +47,16 @@ PAGE2WEBMCP_STORAGE_MODE=postgres
 
 | Service | Local address |
 | --- | --- |
-| Supabase API, Auth, and Storage | `http://127.0.0.1:54321` |
-| PostgreSQL owner URL (bootstrap/reset only) | `postgresql://postgres:postgres@127.0.0.1:54322/postgres` |
-| Studio | `http://127.0.0.1:54323` |
-| Inbucket | `http://127.0.0.1:54324` |
+| Shadow database | `127.0.0.1:58320` |
+| Supabase API, Auth, and Storage | `http://127.0.0.1:58321` |
+| PostgreSQL owner URL (bootstrap/reset only) | `postgresql://postgres:postgres@127.0.0.1:58322/postgres` |
+| Studio | `http://127.0.0.1:58323` |
+| Inbucket HTTP | `http://127.0.0.1:58324` |
+| Optional Inbucket SMTP | `127.0.0.1:58325` |
+| Optional Inbucket POP3 | `127.0.0.1:58326` |
+| Analytics | `127.0.0.1:58327` |
+| Optional database pooler | `127.0.0.1:58329` |
+| Edge-runtime inspector (unchanged) | `127.0.0.1:8083` |
 
 The bootstrap accepts only the exact IP-literal loopback database host. It creates `page2webmcp_app_local`, `page2webmcp_worker_local`, and `page2webmcp_maintenance_local`. Each login can assume exactly one matching NOLOGIN authorization role and must remain non-owner, non-superuser, and non-bypass-RLS. Fresh bounded passwords and three distinct connection URLs are written atomically to gitignored `.page2webmcp/local.env` with mode 0600. The owner URL is neither stored there nor passed to a long-running process.
 
@@ -128,13 +134,13 @@ PAGE2WEBMCP_STORAGE_MODE=postgres
 DATABASE_URL=<app login URL>
 PAGE2WEBMCP_WORKER_DATABASE_URL=<worker login URL>
 PAGE2WEBMCP_MAINTENANCE_DATABASE_URL=<maintenance login URL>
-NEXT_PUBLIC_SUPABASE_URL=http://127.0.0.1:54321
+NEXT_PUBLIC_SUPABASE_URL=http://127.0.0.1:58321
 NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=<browser-safe local key>
-PAGE2WEBMCP_SUPABASE_URL=http://127.0.0.1:54321
+PAGE2WEBMCP_SUPABASE_URL=http://127.0.0.1:58321
 PAGE2WEBMCP_SUPABASE_SECRET_KEY=<server-only local Storage key>
 PAGE2WEBMCP_SESSION_SECRET=<fresh bounded secret>
 PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN=http://127.0.0.1:3100
-PAGE2WEBMCP_PUBLIC_ORIGIN=http://127.0.0.1:54321/storage/v1/object/public/page2webmcp-releases
+PAGE2WEBMCP_PUBLIC_ORIGIN=http://127.0.0.1:58321/storage/v1/object/public/page2webmcp-releases
 ```
 
 Production uses distinct managed app, worker, and maintenance login secrets and verified-TLS database URLs. Never deploy with the migration owner URL or give one login multiple authorization memberships.

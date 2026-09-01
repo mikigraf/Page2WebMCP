@@ -36,9 +36,9 @@ test("production Auth permits HTTP only for the explicit canonical IP-literal lo
   assert.throws(() => createConfiguredSupabaseAuthService({
     ...base,
     PAGE2WEBMCP_TEST_MODE: "true",
-    NEXT_PUBLIC_SUPABASE_URL: "http://127.0.0.1:54321"
+    NEXT_PUBLIC_SUPABASE_URL: "http://127.0.0.1:58321"
   }), /^AuthError: SUPABASE_CONFIGURATION_REQUIRED$/);
-  for (const url of ["http://127.0.0.1:54321", "http://[::1]:54321"]) {
+  for (const url of ["http://127.0.0.1:58321", "http://[::1]:58321"]) {
     assert.doesNotThrow(() => createConfiguredSupabaseAuthService({
       ...base,
       PAGE2WEBMCP_LOCAL_STACK: "true",
@@ -46,13 +46,14 @@ test("production Auth permits HTTP only for the explicit canonical IP-literal lo
     }));
   }
   for (const url of [
-    "http://localhost:54321",
-    "http://127.0.0.2:54321",
-    "http://127.0.0.1:54322",
-    "http://[::1]:54322",
-    "http://127.0.0.1:54321/auth/v1",
-    "http://127.0.0.1:54321?unsafe=true",
-    "http://user@127.0.0.1:54321"
+    "http://localhost:58321",
+    "http://127.0.0.2:58321",
+    "http://127.0.0.1:54321",
+    "http://127.0.0.1:58322",
+    "http://[::1]:58322",
+    "http://127.0.0.1:58321/auth/v1",
+    "http://127.0.0.1:58321?unsafe=true",
+    "http://user@127.0.0.1:58321"
   ]) assert.throws(() => createConfiguredSupabaseAuthService({
     ...base,
     PAGE2WEBMCP_LOCAL_STACK: "true",

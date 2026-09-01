@@ -105,7 +105,7 @@ function parseLocalStatus(output) {
   const ownerDatabaseUrl = values.get("DB_URL");
   const publishableKey = values.get("PUBLISHABLE_KEY") ?? values.get("ANON_KEY");
   const serviceKey = values.get("SECRET_KEY") ?? values.get("SERVICE_ROLE_KEY");
-  if (apiUrl !== "http://127.0.0.1:54321"
+  if (apiUrl !== "http://127.0.0.1:58321"
     || typeof ownerDatabaseUrl !== "string"
     || typeof publishableKey !== "string"
     || typeof serviceKey !== "string") {
@@ -117,8 +117,8 @@ function parseLocalStatus(output) {
     ownerDatabaseUrl,
     publishableKey,
     serviceKey,
-    studioUrl: safeLoopbackServiceUrl(values.get("STUDIO_URL"), "54323"),
-    inbucketUrl: safeLoopbackServiceUrl(values.get("INBUCKET_URL"), "54324")
+    studioUrl: safeLoopbackServiceUrl(values.get("STUDIO_URL"), "58323"),
+    inbucketUrl: safeLoopbackServiceUrl(values.get("INBUCKET_URL"), "58324")
   };
 }
 

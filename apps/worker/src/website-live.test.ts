@@ -355,7 +355,7 @@ test("website control inventory is exact, sorted, validates values, and never re
   assert.deepEqual(websiteMissingControls({
     ...environment(),
     PAGE2WEBMCP_LOCAL_STACK: "true",
-    PAGE2WEBMCP_PUBLIC_ORIGIN: "http://127.0.0.1:54321/storage/v1/object/public/page2webmcp-releases",
+    PAGE2WEBMCP_PUBLIC_ORIGIN: "http://127.0.0.1:58321/storage/v1/object/public/page2webmcp-releases",
   }), []);
   assert.deepEqual(websiteMissingControls({
     ...environment(),

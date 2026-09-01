@@ -288,7 +288,7 @@ function configuredValues(environment: Record<string, string | undefined> = proc
     ?? "";
   let url: URL;
   try { url = new URL(rawUrl); } catch { throw new AuthError("SUPABASE_CONFIGURATION_REQUIRED"); }
-  if ((url.protocol !== "https:" && !localStackHttpOrigin(url, environment, "54321"))
+  if ((url.protocol !== "https:" && !localStackHttpOrigin(url, environment, "58321"))
     || url.username || url.password || url.search || url.hash || url.pathname !== "/"
     || publishableKey.length < 20
     || unsafeSupabaseBrowserKey(publishableKey)) {

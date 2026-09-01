@@ -18,10 +18,10 @@ const production = {
 const localProduction = {
   ...production,
   PAGE2WEBMCP_LOCAL_STACK: "true",
-  NEXT_PUBLIC_SUPABASE_URL: "http://127.0.0.1:54321",
+  NEXT_PUBLIC_SUPABASE_URL: "http://127.0.0.1:58321",
   PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN: "http://127.0.0.1:3100",
-  PAGE2WEBMCP_SUPABASE_URL: "http://127.0.0.1:54321",
-  PAGE2WEBMCP_PUBLIC_ORIGIN: "http://127.0.0.1:54321/storage/v1/object/public/page2webmcp-releases"
+  PAGE2WEBMCP_SUPABASE_URL: "http://127.0.0.1:58321",
+  PAGE2WEBMCP_PUBLIC_ORIGIN: "http://127.0.0.1:58321/storage/v1/object/public/page2webmcp-releases"
 };
 
 test("production configuration requires a strong session secret and durable database", () => {
@@ -104,13 +104,13 @@ test("production permits HTTP Auth and control origins only for the explicit IP-
   assert.throws(() => validateRuntimeConfiguration({
     ...production,
     PAGE2WEBMCP_TEST_MODE: "true",
-    NEXT_PUBLIC_SUPABASE_URL: "http://127.0.0.1:54321",
+    NEXT_PUBLIC_SUPABASE_URL: "http://127.0.0.1:58321",
     PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN: "http://127.0.0.1:3100"
   }), /SUPABASE_CONFIGURATION_REQUIRED|INVALID_CONTROL_PLANE_PUBLIC_ORIGIN/);
   assert.doesNotThrow(() => validateRuntimeConfiguration(localProduction));
   assert.doesNotThrow(() => validateRuntimeConfiguration({
     ...localProduction,
-    NEXT_PUBLIC_SUPABASE_URL: "http://[::1]:54321",
+    NEXT_PUBLIC_SUPABASE_URL: "http://[::1]:58321",
     PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN: "http://[::1]:3100"
   }));
   for (const overrides of [
@@ -120,12 +120,13 @@ test("production permits HTTP Auth and control origins only for the explicit IP-
     { PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN: "http://[::1]:3101" },
     { PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN: "http://127.0.0.1:3100/path" },
     { PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN: "http://user@127.0.0.1:3100" },
-    { NEXT_PUBLIC_SUPABASE_URL: "http://localhost:54321" },
-    { NEXT_PUBLIC_SUPABASE_URL: "http://127.0.0.2:54321" },
-    { NEXT_PUBLIC_SUPABASE_URL: "http://127.0.0.1:54322" },
-    { NEXT_PUBLIC_SUPABASE_URL: "http://[::1]:54322" },
-    { NEXT_PUBLIC_SUPABASE_URL: "http://127.0.0.1:54321/auth/v1" },
-    { NEXT_PUBLIC_SUPABASE_URL: "http://127.0.0.1:54321?unsafe=true" }
+    { NEXT_PUBLIC_SUPABASE_URL: "http://localhost:58321" },
+    { NEXT_PUBLIC_SUPABASE_URL: "http://127.0.0.2:58321" },
+    { NEXT_PUBLIC_SUPABASE_URL: "http://127.0.0.1:54321" },
+    { NEXT_PUBLIC_SUPABASE_URL: "http://127.0.0.1:58322" },
+    { NEXT_PUBLIC_SUPABASE_URL: "http://[::1]:58322" },
+    { NEXT_PUBLIC_SUPABASE_URL: "http://127.0.0.1:58321/auth/v1" },
+    { NEXT_PUBLIC_SUPABASE_URL: "http://127.0.0.1:58321?unsafe=true" }
   ]) assert.throws(
     () => validateRuntimeConfiguration({ ...localProduction, ...overrides }),
     /SUPABASE_CONFIGURATION_REQUIRED|INVALID_CONTROL_PLANE_PUBLIC_ORIGIN/

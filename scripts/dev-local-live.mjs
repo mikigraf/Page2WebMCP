@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { readFile, stat } from "node:fs/promises";
 import { resolve } from "node:path";
 
-const LOCAL_API_ORIGIN = "http://127.0.0.1:54321";
+const LOCAL_API_ORIGIN = "http://127.0.0.1:58321";
 const LOCAL_CONTROL_ORIGIN = "http://127.0.0.1:3100";
 const LOCAL_ARTIFACT_ORIGIN = `${LOCAL_API_ORIGIN}/storage/v1/object/public/page2webmcp-releases`;
 const LOCAL_ENVIRONMENT_PATH = ".page2webmcp/local.env";
@@ -182,7 +182,7 @@ function validateRuntimeDatabaseUrl(value, expectedLogin, expectedRole) {
     throw new Error("LOCAL_RUNTIME_ENVIRONMENT_REQUIRED");
   }
   if (url.protocol !== "postgresql:" || !["127.0.0.1", "[::1]"].includes(url.hostname)
-    || url.port !== "54322" || url.pathname !== "/postgres" || url.username !== expectedLogin
+    || url.port !== "58322" || url.pathname !== "/postgres" || url.username !== expectedLogin
     || !url.password || url.hash || url.searchParams.size !== 1
     || url.searchParams.get("options") !== `-c role=${expectedRole}`) {
     throw new Error("LOCAL_RUNTIME_ENVIRONMENT_REQUIRED");

@@ -53,7 +53,7 @@ pnpm dev:local-live
 pnpm local:down
 ```
 
-Local services are Supabase API/Auth/Storage at `http://127.0.0.1:54321`, Postgres at `postgresql://postgres:postgres@127.0.0.1:54322/postgres`, Studio at `http://127.0.0.1:54323`, and Inbucket at `http://127.0.0.1:54324`. The bootstrap creates distinct `page2webmcp_app_local`, `page2webmcp_worker_local`, and `page2webmcp_maintenance_local` logins and writes their bounded credentials to the gitignored mode-0600 `.page2webmcp/local.env` file.
+Local services are Supabase API/Auth/Storage at `http://127.0.0.1:58321`, Postgres at `postgresql://postgres:postgres@127.0.0.1:58322/postgres`, Studio at `http://127.0.0.1:58323`, and Inbucket at `http://127.0.0.1:58324`; the complete shadow, optional mail, analytics, pooler, and unchanged inspector port map is in [operations](docs/OPERATIONS.md). The bootstrap creates distinct `page2webmcp_app_local`, `page2webmcp_worker_local`, and `page2webmcp_maintenance_local` logins and writes their bounded credentials to the gitignored mode-0600 `.page2webmcp/local.env` file.
 
 Select exactly one real worker adapter with `PAGE2WEBMCP_PROVIDER_MODE=openapi`, `website`, or `github`. The UI continues to offer all three paths even though one worker process claims only the selected source type. See [operations](docs/OPERATIONS.md) for the full control matrix and truthful stop conditions.
 
