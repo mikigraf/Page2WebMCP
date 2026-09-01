@@ -7,6 +7,11 @@ const MAX_SESSION_TTL_MS = 10 * 60 * 1_000;
 const secretReferencePattern = /^secretref:[A-Za-z0-9._:-]{1,200}$/;
 const sha256Pattern = /^[a-f0-9]{64}$/;
 const sha256ReferencePattern = /^urn:sha256:[a-f0-9]{64}$/;
+const gatewayOwnedCleanupErrors = new WeakSet<object>();
+
+export function browserUseGatewayOwnsTerminalCleanup(error: unknown): boolean {
+  return typeof error === "object" && error !== null && gatewayOwnedCleanupErrors.has(error);
+}
 
 export type BrowserUseCloudV4Request = Readonly<{
   apiVersion: typeof BROWSER_USE_CLOUD_API_VERSION;
@@ -506,6 +511,9 @@ export async function withBrowserUseCloudV4Session<T>(
             throw new Error("AUTH_CHECKPOINT_RECONCILIATION_INVALID");
           }
           gatewayTerminationProven = reconciled.checkpointOwned && reconciled.terminated;
+          if (gatewayTerminationProven && typeof primaryError === "object" && primaryError !== null) {
+            gatewayOwnedCleanupErrors.add(primaryError);
+          }
         } catch (error) { cleanupErrors.push(error); }
       }
       let terminationProven = !providerStartAttempted;

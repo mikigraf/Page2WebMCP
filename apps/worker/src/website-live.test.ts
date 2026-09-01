@@ -102,6 +102,7 @@ function controlHarness(input: Readonly<{
   legacyReadinessControl?: "ownership-store";
   legacyAuthenticationProtocol?: boolean;
   swappedResumeCdpReference?: boolean;
+  loseAuthenticationCheckpointCreateResponse?: boolean;
 }> = {}) {
   const calls: ControlCall[] = [];
   let currentExpiry = new Date(now.getTime() + 9 * 60_000).toISOString();
@@ -326,6 +327,9 @@ function controlHarness(input: Readonly<{
       const checkpointReference = browserUseSuspensionCheckpointReference(content as never);
       const attestation = { ...content, checkpointReference };
       authenticationCheckpoints.set(checkpointReference, attestation);
+      if (input.loseAuthenticationCheckpointCreateResponse) {
+        throw new Error("AUTH_CHECKPOINT_CREATE_RESPONSE_LOST");
+      }
       return jsonResponse(url, {
         gatewayProtocolVersion: body.gatewayProtocolVersion,
         idempotencyKey: body.idempotencyKey,
@@ -867,6 +871,25 @@ test("website live resume rejects a CDP reference outside the content-addressed 
       expiresAt: waiting.expiresAt,
     },
   }, new AbortController().signal), /^Error: WEBSITE_CONTROL_RESPONSE_INVALID$/);
+});
+
+test("gateway-owned ambiguous checkpoint cleanup prevents outer egress double revocation", async () => {
+  const harness = controlHarness({
+    requiresAuthentication: true,
+    loseAuthenticationCheckpointCreateResponse: true,
+  });
+  const adapter = createConfiguredWebsiteAnalysisAdapter(environment(), {
+    controlTransport: harness.transport, clock: () => now, ...networkControls(harness.expiresAt),
+  });
+  const error = await adapter({
+    id: "analysis-run-ambiguous-checkpoint", organizationId: "organization-1", projectId: "project-1",
+    sourceType: "website", sourceUrl: "https://widgets.example/app", sourceConfiguration: { kind: "website" },
+    sourceSnapshotId: "snapshot-ambiguous-checkpoint", leaseGeneration: 1,
+  }, new AbortController().signal).catch((reason: unknown) => reason);
+  assert.ok(error instanceof Error);
+  assert.equal(harness.calls.filter(({ url }) =>
+    url.endsWith(WEBSITE_LIVE_CONTROL_PATHS.authenticationCheckpointReconcile)).length, 1);
+  assert.equal(harness.calls.filter(({ url }) => url.endsWith(WEBSITE_LIVE_CONTROL_PATHS.policyRevoke)).length, 0);
 });
 
 test("website control status classification retries only 429 and 5xx", async () => {

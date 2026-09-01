@@ -1,7 +1,10 @@
 import { createHash, randomBytes } from "node:crypto";
 import { Resolver } from "node:dns/promises";
 import type { WebsiteEvidence, WebsiteObservationInput } from "../../../packages/providers/src/website-evidence.ts";
-import { assertBrowserUseResumeAttestation } from "../../../packages/providers/src/browser-use-v4.ts";
+import {
+  assertBrowserUseResumeAttestation,
+  browserUseGatewayOwnsTerminalCleanup,
+} from "../../../packages/providers/src/browser-use-v4.ts";
 import {
   preflightWebsiteSource,
   type WebsiteOwnershipChallenge,
@@ -736,6 +739,7 @@ export function createConfiguredWebsiteAnalysisAdapter(
     let expiresAt: string | undefined;
     let primaryError: unknown;
     let suspended = false;
+    let gatewayOwnsTerminalCleanup = false;
     try {
       const issuedRequest = envelope("policy-issue", policyInput);
       const issuedResponse = await policy.request(WEBSITE_LIVE_CONTROL_PATHS.policyIssue, issuedRequest, signal);
@@ -1043,10 +1047,11 @@ export function createConfiguredWebsiteAnalysisAdapter(
       return result;
     } catch (error) {
       primaryError = error;
+      gatewayOwnsTerminalCleanup = browserUseGatewayOwnsTerminalCleanup(error);
       throw error;
     } finally {
       const cleanupErrors: unknown[] = [];
-      if (!suspended) {
+      if (!suspended && !gatewayOwnsTerminalCleanup) {
         for (const [client, operation] of [[proxy, "policy-proxy-revoke"], [policy, "policy-store-revoke"]] as const) {
           if (!reference) continue;
           try {
