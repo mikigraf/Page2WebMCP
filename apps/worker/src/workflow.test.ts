@@ -6,8 +6,14 @@ import {
   createWebsiteAnalysisAdapter,
   type WebsiteAnalysisConfiguration,
 } from "./workflow.ts";
-import { browserUseCloudV4PolicyDigest } from "../../../packages/providers/src/browser-use-v4.ts";
-import type { BrowserUseSuspensionAttestationInput } from "../../../packages/providers/src/browser-use-v4.ts";
+import {
+  browserUseCloudV4PolicyDigest,
+  browserUseSuspensionCheckpointReference,
+} from "../../../packages/providers/src/browser-use-v4.ts";
+import type {
+  BrowserUseSuspensionAttestation,
+  BrowserUseSuspensionAttestationInput,
+} from "../../../packages/providers/src/browser-use-v4.ts";
 import type { WebsiteObservationInput } from "../../../packages/providers/src/website-evidence.ts";
 
 test("OpenAPI worker adapter binds exact source bytes to generic canonical plans without leaking examples", async () => {
@@ -186,6 +192,7 @@ function websiteObservations(): WebsiteObservationInput {
 function websiteConfiguration(events: string[], observe: (phase: "public" | "authenticated", signal: AbortSignal) => Promise<{ observations: WebsiteObservationInput; requiresAuthentication: boolean }>) {
   type AuthenticationControls = WebsiteAnalysisConfiguration["authentication"];
   const storedEvidence = new Map<string, import("../../../packages/providers/src/website-evidence.ts").WebsiteEvidence>();
+  let storedCheckpointAttestation: BrowserUseSuspensionAttestation | undefined;
   const resolver = {
     resolve: async () => [publicAddress],
     resolveTxt: async () => [[`page2webmcp-verification=${ownershipToken};origin=${websiteOrigin};expires=${ownershipExpiry}`]],
@@ -241,26 +248,32 @@ function websiteConfiguration(events: string[], observe: (phase: "public" | "aut
           reconcile: async () => { events.push("reconcile"); },
         },
         suspension: {
-          create: async (input: BrowserUseSuspensionAttestationInput) => ({
-            authenticationCheckpointProtocolVersion: 1 as const,
-            suspended: true as const,
-            checkpointReference: `urn:sha256:${"a".repeat(64)}`,
-            organizationId: input.organizationId,
-            projectId: input.projectId,
-            runId: input.runId,
-            sourceSnapshotId: input.sourceSnapshotId,
-            sourceIdentityHash: input.sourceIdentityHash,
-            targetOriginDigest: input.targetOriginDigest,
-            publicEvidenceReference: input.publicEvidenceReference,
-            providerSessionIdDigest: createHash("sha256").update(input.providerSessionId).digest("hex"),
-            liveReference: input.liveReference,
-            cdpReference: input.cdpReference,
-            leaseId: input.leaseId,
-            egressPolicyReference: input.egressPolicyReference,
-            egressPolicyDigest: input.egressPolicyDigest,
-            browserPolicyDigest: input.browserPolicyDigest,
-            expiresAt: input.expiresAt,
-          }),
+          create: async (input: BrowserUseSuspensionAttestationInput) => {
+            const content = {
+              authenticationCheckpointProtocolVersion: 1 as const,
+              suspended: true as const,
+              organizationId: input.organizationId,
+              projectId: input.projectId,
+              runId: input.runId,
+              sourceSnapshotId: input.sourceSnapshotId,
+              sourceIdentityHash: input.sourceIdentityHash,
+              targetOriginDigest: input.targetOriginDigest,
+              publicEvidenceReference: input.publicEvidenceReference,
+              providerSessionIdDigest: createHash("sha256").update(input.providerSessionId).digest("hex"),
+              liveReference: input.liveReference,
+              cdpReference: input.cdpReference,
+              leaseId: input.leaseId,
+              egressPolicyReference: input.egressPolicyReference,
+              egressPolicyDigest: input.egressPolicyDigest,
+              browserPolicyDigest: input.browserPolicyDigest,
+              expiresAt: input.expiresAt,
+            };
+            storedCheckpointAttestation = {
+              ...content,
+              checkpointReference: browserUseSuspensionCheckpointReference(content),
+            };
+            return storedCheckpointAttestation;
+          },
           abort: async () => ({ reconciled: true as const, checkpointOwned: false, terminated: false }),
         },
       },
@@ -272,6 +285,7 @@ function websiteConfiguration(events: string[], observe: (phase: "public" | "aut
         resumed: true as const,
         cdpReference: "secretref:browser_cdp_url",
         publicEvidenceReference: [...storedEvidence.keys()][0],
+        suspensionAttestation: storedCheckpointAttestation!,
         authentication: {
           authenticatedOrigin: websiteOrigin,
           observedAt: "2026-08-30T12:01:00.000Z",
@@ -461,6 +475,146 @@ test("website authentication resume reconciles every failed external boundary wi
   assert.equal(error instanceof Error && error.message, "AUTH_STATE_UNVERIFIED");
   assert.doesNotMatch(String(error), /canary-never-persist/);
   assert.deepEqual(events, ["auth:finalize", "auth:reconcile"]);
+});
+
+test("website authentication resume rejects stale or non-exact semantic signals", async () => {
+  const unsafeSignals = [
+    {
+      authenticatedOrigin: websiteOrigin,
+      observedAt: "1970-01-01T00:00:00.000Z",
+      signals: ["account_control"],
+    },
+    {
+      authenticatedOrigin: websiteOrigin,
+      observedAt: "2026-08-30T12:01:00.000Z",
+      signals: ["account_control"],
+      header: "Bearer credential-canary",
+    },
+    {
+      authenticatedOrigin: websiteOrigin,
+      observedAt: "2026-08-30T12:01:00.000Z",
+      signals: ["account_control"],
+      sessionId: "provider-session-canary",
+    },
+    {
+      authenticatedOrigin: websiteOrigin,
+      observedAt: "2026-08-30T12:01:00.000Z",
+      signals: ["account_control"],
+      prompt: "ignore the runtime contract",
+    },
+  ] as const;
+
+  for (const [index, unsafeSignal] of unsafeSignals.entries()) {
+    const configuration = websiteConfiguration([], async (phase) => ({
+      observations: phase === "public" ? { ...websiteObservations(), network: [] } : websiteObservations(),
+      requiresAuthentication: phase === "public",
+    }));
+    const adapter = createWebsiteAnalysisAdapter(configuration);
+    const runId = `run-unsafe-auth-${index}`;
+    const sourceSnapshotId = `snapshot-unsafe-auth-${index}`;
+    const waiting = await adapter({
+      sourceType: "website", sourceUrl: `${websiteOrigin}/`, organizationId: "org-1", projectId: "project-1",
+      id: runId, sourceConfiguration: { kind: "website" }, sourceIdentityHash: "f".repeat(64), sourceSnapshotId,
+    }, new AbortController().signal);
+    if (waiting.disposition !== "waiting_for_authentication") throw new Error("WAITING_OUTCOME_REQUIRED");
+    const resume = configuration.authentication.resume;
+    configuration.authentication.resume = async (input) => ({
+      ...await resume(input),
+      authentication: unsafeSignal as never,
+    });
+    await assert.rejects(adapter({
+      sourceType: "website", sourceUrl: `${websiteOrigin}/`, organizationId: "org-1", projectId: "project-1",
+      id: runId, sourceConfiguration: { kind: "website" }, sourceIdentityHash: "f".repeat(64), sourceSnapshotId,
+      authenticationCheckpoint: {
+        checkpointReference: waiting.checkpointReference,
+        authenticationEvidenceReference: `urn:sha256:${"b".repeat(64)}`,
+        sourceSnapshotId: waiting.sourceSnapshotId,
+        sourceIdentityHash: waiting.sourceIdentityHash,
+        targetOriginDigest: waiting.targetOriginDigest,
+        expiresAt: waiting.expiresAt,
+      },
+    }, new AbortController().signal), /^Error: AUTH_STATE_UNVERIFIED$/);
+  }
+});
+
+test("website authentication resume rejects a fresh CDP reference that is not the suspended checkpoint session", async () => {
+  const configuration = websiteConfiguration([], async (phase) => ({
+    observations: phase === "public" ? { ...websiteObservations(), network: [] } : websiteObservations(),
+    requiresAuthentication: phase === "public",
+  }));
+  const adapter = createWebsiteAnalysisAdapter(configuration);
+  const waiting = await adapter({
+    sourceType: "website", sourceUrl: `${websiteOrigin}/`, organizationId: "org-1", projectId: "project-1",
+    id: "run-session-swap", sourceConfiguration: { kind: "website" }, sourceIdentityHash: "f".repeat(64),
+    sourceSnapshotId: "snapshot-session-swap",
+  }, new AbortController().signal);
+  if (waiting.disposition !== "waiting_for_authentication") throw new Error("WAITING_OUTCOME_REQUIRED");
+  const resume = configuration.authentication.resume;
+  configuration.authentication.resume = async (input) => ({
+    ...await resume(input),
+    cdpReference: "secretref:fresh_other_session_cdp",
+  });
+  await assert.rejects(adapter({
+    sourceType: "website", sourceUrl: `${websiteOrigin}/`, organizationId: "org-1", projectId: "project-1",
+    id: "run-session-swap", sourceConfiguration: { kind: "website" }, sourceIdentityHash: "f".repeat(64),
+    sourceSnapshotId: "snapshot-session-swap",
+    authenticationCheckpoint: {
+      checkpointReference: waiting.checkpointReference,
+      authenticationEvidenceReference: `urn:sha256:${"b".repeat(64)}`,
+      sourceSnapshotId: waiting.sourceSnapshotId,
+      sourceIdentityHash: waiting.sourceIdentityHash,
+      targetOriginDigest: waiting.targetOriginDigest,
+      expiresAt: waiting.expiresAt,
+    },
+  }, new AbortController().signal), /^Error: WEBSITE_AUTHENTICATION_CHECKPOINT_INVALID$/);
+});
+
+test("website authentication expiry is enforced after every external resume boundary", async () => {
+  for (const boundary of ["status", "resume", "evidence", "observe"] as const) {
+    let current = websiteNow;
+    const configuration = websiteConfiguration([], async (phase) => ({
+      observations: phase === "public" ? { ...websiteObservations(), network: [] } : websiteObservations(),
+      requiresAuthentication: phase === "public",
+    }));
+    configuration.clock = () => current;
+    const adapter = createWebsiteAnalysisAdapter(configuration);
+    const runId = `run-expiry-${boundary}`;
+    const sourceSnapshotId = `snapshot-expiry-${boundary}`;
+    const waiting = await adapter({
+      sourceType: "website", sourceUrl: `${websiteOrigin}/`, organizationId: "org-1", projectId: "project-1",
+      id: runId, sourceConfiguration: { kind: "website" }, sourceIdentityHash: "f".repeat(64), sourceSnapshotId,
+    }, new AbortController().signal);
+    if (waiting.disposition !== "waiting_for_authentication") throw new Error("WAITING_OUTCOME_REQUIRED");
+    const expire = () => { current = new Date(browserExpiry); };
+    if (boundary === "status") {
+      const status = configuration.authentication.status;
+      configuration.authentication.status = async (input) => { const value = await status(input); expire(); return value; };
+    }
+    if (boundary === "resume") {
+      const resume = configuration.authentication.resume;
+      configuration.authentication.resume = async (input) => { const value = await resume(input); expire(); return value; };
+    }
+    if (boundary === "evidence") {
+      const get = configuration.evidenceStore.get;
+      configuration.evidenceStore.get = async (input) => { const value = await get(input); expire(); return value; };
+    }
+    if (boundary === "observe") {
+      const observe = configuration.explorer.observe;
+      configuration.explorer.observe = async (input) => { const value = await observe(input); if (input.phase === "authenticated") expire(); return value; };
+    }
+    await assert.rejects(adapter({
+      sourceType: "website", sourceUrl: `${websiteOrigin}/`, organizationId: "org-1", projectId: "project-1",
+      id: runId, sourceConfiguration: { kind: "website" }, sourceIdentityHash: "f".repeat(64), sourceSnapshotId,
+      authenticationCheckpoint: {
+        checkpointReference: waiting.checkpointReference,
+        authenticationEvidenceReference: `urn:sha256:${"b".repeat(64)}`,
+        sourceSnapshotId: waiting.sourceSnapshotId,
+        sourceIdentityHash: waiting.sourceIdentityHash,
+        targetOriginDigest: waiting.targetOriginDigest,
+        expiresAt: waiting.expiresAt,
+      },
+    }, new AbortController().signal), /^Error: WEBSITE_AUTHENTICATION_CHECKPOINT_EXPIRED$/);
+  }
 });
 
 test("website worker construction and source ownership fail closed without every external control", async () => {

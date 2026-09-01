@@ -1,6 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import { Resolver } from "node:dns/promises";
 import type { WebsiteEvidence, WebsiteObservationInput } from "../../../packages/providers/src/website-evidence.ts";
+import { assertBrowserUseResumeAttestation } from "../../../packages/providers/src/browser-use-v4.ts";
 import {
   preflightWebsiteSource,
   type WebsiteOwnershipChallenge,
@@ -17,6 +18,7 @@ import {
 import {
   createWebsiteAnalysisAdapter,
   resumeWebsiteAuthenticationAnalysis,
+  assertWebsiteAuthenticationSignal,
   type AnalysisAdapter,
   type WebsiteAnalysisConfiguration,
 } from "./workflow.ts";
@@ -625,14 +627,27 @@ export function createConfiguredWebsiteAnalysisAdapter(
         return { ...input, status: "ready" };
       },
       resume: async (input) => {
-        const { response } = await checkpointStateful(
+        const { request, response } = await checkpointStateful(
           WEBSITE_LIVE_CONTROL_PATHS.authenticationCheckpointResume, "checkpoint-resume", input, signal,
         );
+        const exactKeys = [...Object.keys(request), "resumed", "cdpReference", "publicEvidenceReference",
+          "suspensionAttestation", "authentication"].sort();
         if (response.resumed !== true || Object.entries(input).some(([key, value]) => !same(response[key], value))
           || !referencePattern.test(String(response.cdpReference ?? ""))
           || !/^urn:sha256:[a-f0-9]{64}$/.test(String(response.publicEvidenceReference ?? ""))
           || !response.authentication || typeof response.authentication !== "object" || Array.isArray(response.authentication)
-          || "providerSessionId" in response || "liveUrl" in response || "cdpUrl" in response) {
+          || Object.keys(response).sort().join("\0") !== exactKeys.join("\0")) {
+          throw new Error("WEBSITE_CONTROL_RESPONSE_INVALID");
+        }
+        let attestation;
+        try {
+          attestation = assertBrowserUseResumeAttestation(response.suspensionAttestation, input);
+          assertWebsiteAuthenticationSignal(response.authentication as never, targetOrigin, input.expiresAt, clock());
+        } catch {
+          throw new Error("WEBSITE_CONTROL_RESPONSE_INVALID");
+        }
+        if (attestation.cdpReference !== response.cdpReference
+          || attestation.publicEvidenceReference !== response.publicEvidenceReference) {
           throw new Error("WEBSITE_CONTROL_RESPONSE_INVALID");
         }
         return {
@@ -640,6 +655,7 @@ export function createConfiguredWebsiteAnalysisAdapter(
           resumed: true,
           cdpReference: String(response.cdpReference),
           publicEvidenceReference: String(response.publicEvidenceReference),
+          suspensionAttestation: attestation,
           authentication: response.authentication as never,
         };
       },
@@ -917,14 +933,27 @@ export function createConfiguredWebsiteAnalysisAdapter(
             return { ...input, status: "ready" };
           },
           resume: async (input) => {
-            const { response } = await checkpointStateful(
+            const { request, response } = await checkpointStateful(
               WEBSITE_LIVE_CONTROL_PATHS.authenticationCheckpointResume, "checkpoint-resume", input, signal,
             );
+            const exactKeys = [...Object.keys(request), "resumed", "cdpReference", "publicEvidenceReference",
+              "suspensionAttestation", "authentication"].sort();
             if (response.resumed !== true || Object.entries(input).some(([key, value]) => !same(response[key], value))
               || !referencePattern.test(String(response.cdpReference ?? ""))
               || !/^urn:sha256:[a-f0-9]{64}$/.test(String(response.publicEvidenceReference ?? ""))
               || !response.authentication || typeof response.authentication !== "object" || Array.isArray(response.authentication)
-              || "providerSessionId" in response || "liveUrl" in response || "cdpUrl" in response) {
+              || Object.keys(response).sort().join("\0") !== exactKeys.join("\0")) {
+              throw new Error("WEBSITE_CONTROL_RESPONSE_INVALID");
+            }
+            let attestation;
+            try {
+              attestation = assertBrowserUseResumeAttestation(response.suspensionAttestation, input);
+              assertWebsiteAuthenticationSignal(response.authentication as never, targetOrigin, input.expiresAt, clock());
+            } catch {
+              throw new Error("WEBSITE_CONTROL_RESPONSE_INVALID");
+            }
+            if (attestation.cdpReference !== response.cdpReference
+              || attestation.publicEvidenceReference !== response.publicEvidenceReference) {
               throw new Error("WEBSITE_CONTROL_RESPONSE_INVALID");
             }
             return {
@@ -932,6 +961,7 @@ export function createConfiguredWebsiteAnalysisAdapter(
               resumed: true,
               cdpReference: String(response.cdpReference),
               publicEvidenceReference: String(response.publicEvidenceReference),
+              suspensionAttestation: attestation,
               authentication: response.authentication as never,
             };
           },

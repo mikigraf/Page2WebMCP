@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import test from "node:test";
-import { browserUseCloudV4PolicyDigest, type BrowserUseCloudV4Request } from "../../../packages/providers/src/browser-use-v4.ts";
+import {
+  browserUseCloudV4PolicyDigest,
+  browserUseSuspensionCheckpointReference,
+  type BrowserUseCloudV4Request,
+} from "../../../packages/providers/src/browser-use-v4.ts";
 import type { WebsiteProviderControls } from "../../../packages/providers/src/website.ts";
 import type { NodePinnedJsonTransport } from "./node-network.ts";
 import {
@@ -97,6 +101,7 @@ function controlHarness(input: Readonly<{
   rejectedReadinessControl?: string;
   legacyReadinessControl?: "ownership-store";
   legacyAuthenticationProtocol?: boolean;
+  swappedResumeCdpReference?: boolean;
 }> = {}) {
   const calls: ControlCall[] = [];
   let currentExpiry = new Date(now.getTime() + 9 * 60_000).toISOString();
@@ -299,11 +304,9 @@ function controlHarness(input: Readonly<{
     }
     if (url.endsWith(WEBSITE_LIVE_CONTROL_PATHS.authenticationCheckpointCreate)) {
       const binding = body.binding as Record<string, unknown>;
-      const checkpointReference = `urn:sha256:${createHash("sha256").update(String(binding.publicEvidenceReference)).digest("hex")}`;
-      const attestation = {
+      const content = {
         authenticationCheckpointProtocolVersion: 1,
         suspended: true,
-        checkpointReference,
         organizationId: binding.organizationId,
         projectId: binding.projectId,
         runId: binding.runId,
@@ -320,6 +323,8 @@ function controlHarness(input: Readonly<{
         browserPolicyDigest: binding.browserPolicyDigest,
         expiresAt: binding.expiresAt,
       };
+      const checkpointReference = browserUseSuspensionCheckpointReference(content as never);
+      const attestation = { ...content, checkpointReference };
       authenticationCheckpoints.set(checkpointReference, attestation);
       return jsonResponse(url, {
         gatewayProtocolVersion: body.gatewayProtocolVersion,
@@ -336,8 +341,9 @@ function controlHarness(input: Readonly<{
       return jsonResponse(url, {
         ...body,
         resumed: Boolean(checkpoint),
-        cdpReference: checkpoint?.cdpReference,
+        cdpReference: input.swappedResumeCdpReference ? "secretref:fresh_other_session_cdp" : checkpoint?.cdpReference,
         publicEvidenceReference: checkpoint?.publicEvidenceReference,
+        suspensionAttestation: checkpoint,
         authentication: {
           authenticatedOrigin: "https://widgets.example",
           observedAt: "2026-08-31T12:01:00.000Z",
@@ -834,6 +840,32 @@ test("website TTL secrets stay exact and authenticated sites return only a durab
   await assert.rejects(malformedSecretAdapter({
     id: "analysis-run-secret-drift", organizationId: "organization-1", projectId: "project-1",
     sourceType: "website", sourceUrl: "https://widgets.example/app", sourceConfiguration: { kind: "website" }, leaseGeneration: 1,
+  }, new AbortController().signal), /^Error: WEBSITE_CONTROL_RESPONSE_INVALID$/);
+});
+
+test("website live resume rejects a CDP reference outside the content-addressed suspension attestation", async () => {
+  const harness = controlHarness({ requiresAuthentication: true, swappedResumeCdpReference: true });
+  const adapter = createConfiguredWebsiteAnalysisAdapter(environment(), {
+    controlTransport: harness.transport, clock: () => now, ...networkControls(harness.expiresAt),
+  });
+  const source = {
+    id: "analysis-run-session-swap", organizationId: "organization-1", projectId: "project-1",
+    sourceType: "website" as const, sourceUrl: "https://widgets.example/app",
+    sourceConfiguration: { kind: "website" as const }, sourceSnapshotId: "snapshot-session-swap", leaseGeneration: 1,
+  };
+  const waiting = await adapter(source, new AbortController().signal);
+  if (waiting.disposition !== "waiting_for_authentication") throw new Error("WAITING_OUTCOME_REQUIRED");
+  await assert.rejects(adapter({
+    ...source,
+    leaseGeneration: 2,
+    authenticationCheckpoint: {
+      checkpointReference: waiting.checkpointReference,
+      authenticationEvidenceReference: `urn:sha256:${"b".repeat(64)}`,
+      sourceSnapshotId: waiting.sourceSnapshotId,
+      sourceIdentityHash: waiting.sourceIdentityHash,
+      targetOriginDigest: waiting.targetOriginDigest,
+      expiresAt: waiting.expiresAt,
+    },
   }, new AbortController().signal), /^Error: WEBSITE_CONTROL_RESPONSE_INVALID$/);
 });
 

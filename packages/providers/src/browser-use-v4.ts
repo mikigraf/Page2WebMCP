@@ -82,6 +82,17 @@ export type BrowserUseSuspendedSession = Readonly<{
   checkpoint: BrowserUseSuspensionAttestation;
 }>;
 
+export type BrowserUseResumeAttestationBinding = Readonly<{
+  checkpointReference: string;
+  organizationId: string;
+  projectId: string;
+  runId: string;
+  sourceSnapshotId: string;
+  sourceIdentityHash: string;
+  targetOriginDigest: string;
+  expiresAt: string;
+}>;
+
 export type BrowserUseCloudV4Controls = Readonly<{
   clock?: () => Date;
   signal?: AbortSignal;
@@ -146,6 +157,14 @@ function canonicalJson(value: unknown): string {
     return `{${Object.keys(record).sort(compareCodePoints).map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`).join(",")}}`;
   }
   return JSON.stringify(value);
+}
+
+type BrowserUseSuspensionAttestationContent = Omit<BrowserUseSuspensionAttestation, "checkpointReference">;
+
+export function browserUseSuspensionCheckpointReference(
+  content: BrowserUseSuspensionAttestationContent,
+): string {
+  return `urn:sha256:${createHash("sha256").update(canonicalJson(content), "utf8").digest("hex")}`;
 }
 
 export function browserUseCloudV4PolicyDigest(request: BrowserUseCloudV4Request): string {
@@ -296,13 +315,64 @@ function assertSuspensionAttestation(
     browserPolicyDigest: expected.browserPolicyDigest,
     expiresAt: expected.expiresAt,
   };
-  if (!value || !sha256ReferencePattern.test(value.checkpointReference ?? "")
+  const checkpointReference = browserUseSuspensionCheckpointReference(exact);
+  if (!value || value.checkpointReference !== checkpointReference
     || canonicalJson({ ...value, checkpointReference: undefined })
       !== canonicalJson({ ...exact, checkpointReference: undefined })
     || JSON.stringify(value).includes(expected.providerSessionId)) {
     throw new Error("AUTH_CHECKPOINT_ATTESTATION_INVALID");
   }
   return value;
+}
+
+export function assertBrowserUseResumeAttestation(
+  value: unknown,
+  expected: BrowserUseResumeAttestationBinding,
+): BrowserUseSuspensionAttestation {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("AUTH_CHECKPOINT_ATTESTATION_INVALID");
+  }
+  const record = value as Record<string, unknown>;
+  const content: BrowserUseSuspensionAttestationContent = {
+    authenticationCheckpointProtocolVersion: record.authenticationCheckpointProtocolVersion as 1,
+    suspended: record.suspended as true,
+    organizationId: String(record.organizationId ?? ""),
+    projectId: String(record.projectId ?? ""),
+    runId: String(record.runId ?? ""),
+    sourceSnapshotId: String(record.sourceSnapshotId ?? ""),
+    sourceIdentityHash: String(record.sourceIdentityHash ?? ""),
+    targetOriginDigest: String(record.targetOriginDigest ?? ""),
+    publicEvidenceReference: String(record.publicEvidenceReference ?? ""),
+    providerSessionIdDigest: String(record.providerSessionIdDigest ?? ""),
+    liveReference: String(record.liveReference ?? ""),
+    cdpReference: String(record.cdpReference ?? ""),
+    leaseId: String(record.leaseId ?? ""),
+    egressPolicyReference: String(record.egressPolicyReference ?? ""),
+    egressPolicyDigest: String(record.egressPolicyDigest ?? ""),
+    browserPolicyDigest: String(record.browserPolicyDigest ?? ""),
+    expiresAt: String(record.expiresAt ?? ""),
+  };
+  const exact: BrowserUseSuspensionAttestation = {
+    ...content,
+    checkpointReference: browserUseSuspensionCheckpointReference(content),
+  };
+  if (canonicalJson(value) !== canonicalJson(exact)
+    || exact.authenticationCheckpointProtocolVersion !== 1 || exact.suspended !== true
+    || exact.checkpointReference !== expected.checkpointReference
+    || exact.organizationId !== expected.organizationId || exact.projectId !== expected.projectId
+    || exact.runId !== expected.runId || exact.sourceSnapshotId !== expected.sourceSnapshotId
+    || exact.sourceIdentityHash !== expected.sourceIdentityHash
+    || exact.targetOriginDigest !== expected.targetOriginDigest || exact.expiresAt !== expected.expiresAt
+    || ![exact.organizationId, exact.projectId, exact.runId, exact.sourceSnapshotId, exact.leaseId].every(validateIdentifier)
+    || !sha256Pattern.test(exact.sourceIdentityHash) || !sha256Pattern.test(exact.targetOriginDigest)
+    || !sha256Pattern.test(exact.providerSessionIdDigest) || !sha256Pattern.test(exact.egressPolicyDigest)
+    || !sha256Pattern.test(exact.browserPolicyDigest) || !sha256ReferencePattern.test(exact.publicEvidenceReference)
+    || !secretReferencePattern.test(exact.liveReference) || !secretReferencePattern.test(exact.cdpReference)
+    || !secretReferencePattern.test(exact.egressPolicyReference)
+    || !Number.isFinite(Date.parse(exact.expiresAt))) {
+    throw new Error("AUTH_CHECKPOINT_ATTESTATION_INVALID");
+  }
+  return exact;
 }
 
 async function captureReference(

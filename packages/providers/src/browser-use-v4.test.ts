@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   awaitWebsiteAuthentication,
   browserUseCloudV4PolicyDigest,
+  browserUseSuspensionCheckpointReference,
   withBrowserUseCloudV4Session,
   type BrowserUseCloudV4Controls,
   type BrowserUseCloudV4Request,
@@ -383,7 +384,7 @@ test("Browser Use session expiry aborts a stalled action and reconciles provider
 
 test("Browser Use suspends only after an exact durable gateway attestation", async () => {
   const events: string[] = [];
-  const checkpointReference = `urn:sha256:${"a".repeat(64)}`;
+  let checkpointReference = "";
   const result = await withBrowserUseCloudV4Session({
     organizationId: "org-1", projectId: "project-1", runId: "run-suspend", targetOrigin, expiresAt,
     proxyPolicyReference: { reference: "secretref:proxy-policy", expiresAt },
@@ -407,26 +408,29 @@ test("Browser Use suspends only after an exact durable gateway attestation", asy
       reconcile: async () => { events.push("reconcile"); },
     },
     suspension: {
-      create: async (input) => ({
-        authenticationCheckpointProtocolVersion: 1,
-        suspended: true,
-        checkpointReference,
-        organizationId: input.organizationId,
-        projectId: input.projectId,
-        runId: input.runId,
-        sourceSnapshotId: input.sourceSnapshotId,
-        sourceIdentityHash: input.sourceIdentityHash,
-        targetOriginDigest: input.targetOriginDigest,
-        publicEvidenceReference: input.publicEvidenceReference,
-        providerSessionIdDigest: createHash("sha256").update(input.providerSessionId).digest("hex"),
-        liveReference: input.liveReference,
-        cdpReference: input.cdpReference,
-        leaseId: input.leaseId,
-        egressPolicyReference: input.egressPolicyReference,
-        egressPolicyDigest: input.egressPolicyDigest,
-        browserPolicyDigest: input.browserPolicyDigest,
-        expiresAt: input.expiresAt,
-      }),
+      create: async (input) => {
+        const content = {
+          authenticationCheckpointProtocolVersion: 1 as const,
+          suspended: true as const,
+          organizationId: input.organizationId,
+          projectId: input.projectId,
+          runId: input.runId,
+          sourceSnapshotId: input.sourceSnapshotId,
+          sourceIdentityHash: input.sourceIdentityHash,
+          targetOriginDigest: input.targetOriginDigest,
+          publicEvidenceReference: input.publicEvidenceReference,
+          providerSessionIdDigest: createHash("sha256").update(input.providerSessionId).digest("hex"),
+          liveReference: input.liveReference,
+          cdpReference: input.cdpReference,
+          leaseId: input.leaseId,
+          egressPolicyReference: input.egressPolicyReference,
+          egressPolicyDigest: input.egressPolicyDigest,
+          browserPolicyDigest: input.browserPolicyDigest,
+          expiresAt: input.expiresAt,
+        };
+        checkpointReference = browserUseSuspensionCheckpointReference(content);
+        return { ...content, checkpointReference };
+      },
       abort: async () => ({ reconciled: true, checkpointOwned: false, terminated: false }),
     },
   }), async (session) => session.suspend({

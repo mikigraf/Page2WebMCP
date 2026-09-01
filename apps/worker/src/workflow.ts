@@ -19,8 +19,10 @@ import {
   type WebsiteProviderControls,
 } from "../../../packages/providers/src/website.ts";
 import {
+  assertBrowserUseResumeAttestation,
   withBrowserUseCloudV4Session,
   type BrowserUseCloudV4Controls,
+  type BrowserUseSuspensionAttestation,
 } from "../../../packages/providers/src/browser-use-v4.ts";
 import {
   captureWebsiteEvidence,
@@ -135,6 +137,7 @@ export type WebsiteAnalysisConfiguration = Readonly<{
       resumed: true;
       cdpReference: string;
       publicEvidenceReference: string;
+      suspensionAttestation: BrowserUseSuspensionAttestation;
       authentication: Readonly<{
         authenticatedOrigin: string;
         observedAt: string;
@@ -378,17 +381,23 @@ function checkpointRequest(
   };
 }
 
-function authenticatedSignal(
+export function assertWebsiteAuthenticationSignal(
   value: Readonly<{ authenticatedOrigin: string; observedAt: string; signals: readonly string[] }>,
   targetOrigin: string,
   expiresAt: string,
+  now: Date,
 ): WebsiteObservationInput["authSignals"][number] {
   const allowed = new Set(["account_control", "authenticated_status", "logout_control"]);
-  if (!value || value.authenticatedOrigin !== targetOrigin || !Number.isFinite(Date.parse(value.observedAt))
-    || Date.parse(value.observedAt) > Date.parse(expiresAt)
+  const exactKeys = ["authenticatedOrigin", "observedAt", "signals"];
+  const observedAt = Date.parse(value?.observedAt);
+  if (!value || typeof value !== "object" || Array.isArray(value)
+    || Object.keys(value).sort().join("\0") !== exactKeys.sort().join("\0")
+    || value.authenticatedOrigin !== targetOrigin || !Number.isFinite(observedAt)
+    || observedAt < now.getTime() - 5 * 60_000 || observedAt > Date.parse(expiresAt)
     || !Array.isArray(value.signals) || value.signals.length < 1 || value.signals.length > 3
     || value.signals.some((signal) => typeof signal !== "string" || !allowed.has(signal))
-    || /authorization|cookie|password|token|secret|csrf|otp|credential|api[-_]?key/i.test(JSON.stringify(value))) {
+    || /authorization|bearer|cookie|password|token|secret|csrf|otp|session|credential|api[-_]?key|prompt/i
+      .test(JSON.stringify(value))) {
     throw new Error("AUTH_STATE_UNVERIFIED");
   }
   return {
@@ -396,6 +405,17 @@ function authenticatedSignal(
     observedAt: value.observedAt,
     signals: [...new Set(value.signals)].sort(),
   };
+}
+
+function assertAuthenticationCheckpointUnexpired(
+  request: WebsiteAuthenticationCheckpointRequest,
+  clock: () => Date,
+): Date {
+  const now = clock();
+  if (!(now instanceof Date) || !Number.isFinite(now.getTime()) || Date.parse(request.expiresAt) <= now.getTime()) {
+    throw new Error("WEBSITE_AUTHENTICATION_CHECKPOINT_EXPIRED");
+  }
+  return now;
 }
 
 function compileWebsiteAnalysis(
@@ -481,33 +501,57 @@ export async function resumeWebsiteAuthenticationAnalysis(
   try { parsedSource = new URL(source.sourceUrl); } catch { throw new Error("WEBSITE_URL_BLOCKED"); }
   const targetOrigin = parsedSource.origin;
   const request = checkpointRequest(source, targetOrigin);
+  const clock = configuration.clock ?? (() => new Date());
   let outcome: WebsiteAuthenticationTerminalRequest["outcome"] = "failed";
   try {
-    if (Date.parse(request.expiresAt) <= (configuration.clock ?? (() => new Date()))().getTime()) {
-      throw new Error("WEBSITE_AUTHENTICATION_CHECKPOINT_EXPIRED");
-    }
+    assertAuthenticationCheckpointUnexpired(request, clock);
     const status = await configuration.authentication.status(request);
+    assertAuthenticationCheckpointUnexpired(request, clock);
     if (status.status !== "ready" || canonicalJson(status) !== canonicalJson({ ...request, status: "ready" })) {
       throw new Error("WEBSITE_AUTHENTICATION_CHECKPOINT_INVALID");
     }
-    const resumed = await configuration.authentication.resume({
+    const resumeInput = {
       ...request,
       authenticationEvidenceReference: source.authenticationCheckpoint.authenticationEvidenceReference,
+    };
+    const resumed = await configuration.authentication.resume({
+      ...resumeInput,
     });
+    const resumeNow = assertAuthenticationCheckpointUnexpired(request, clock);
+    const exactResumeKeys = [
+      ...Object.keys(resumeInput),
+      "resumed",
+      "cdpReference",
+      "publicEvidenceReference",
+      "suspensionAttestation",
+      "authentication",
+    ].sort();
     if (resumed.resumed !== true || resumed.checkpointReference !== request.checkpointReference
       || resumed.authenticationEvidenceReference !== source.authenticationCheckpoint.authenticationEvidenceReference
       || !/^secretref:[A-Za-z0-9._:-]{1,200}$/.test(resumed.cdpReference)
       || !/^urn:sha256:[a-f0-9]{64}$/.test(resumed.publicEvidenceReference)
+      || Object.keys(resumed).sort().join("\0") !== exactResumeKeys.join("\0")
       || Object.entries(request).some(([key, value]) => canonicalJson(resumed[key as keyof typeof resumed]) !== canonicalJson(value))) {
       throw new Error("WEBSITE_AUTHENTICATION_CHECKPOINT_INVALID");
     }
-    const authentication = authenticatedSignal(resumed.authentication, targetOrigin, request.expiresAt);
+    let suspensionAttestation: BrowserUseSuspensionAttestation;
+    try {
+      suspensionAttestation = assertBrowserUseResumeAttestation(resumed.suspensionAttestation, request);
+    } catch {
+      throw new Error("WEBSITE_AUTHENTICATION_CHECKPOINT_INVALID");
+    }
+    if (suspensionAttestation.cdpReference !== resumed.cdpReference
+      || suspensionAttestation.publicEvidenceReference !== resumed.publicEvidenceReference) {
+      throw new Error("WEBSITE_AUTHENTICATION_CHECKPOINT_INVALID");
+    }
+    const authentication = assertWebsiteAuthenticationSignal(resumed.authentication, targetOrigin, request.expiresAt, resumeNow);
     const publicEvidence = await readWebsiteEvidence({
       reference: resumed.publicEvidenceReference,
       organizationId: source.organizationId,
       projectId: source.projectId,
       analysisRunId: source.id,
     }, configuration.evidenceStore);
+    assertAuthenticationCheckpointUnexpired(request, clock);
     const authenticated = await configuration.explorer.observe({
       phase: "authenticated",
       targetOrigin,
@@ -516,6 +560,7 @@ export async function resumeWebsiteAuthenticationAnalysis(
       firewall: createDiscoveryFirewall([targetOrigin]),
       signal,
     });
+    assertAuthenticationCheckpointUnexpired(request, clock);
     if (!authenticated || !authenticated.observations || authenticated.requiresAuthentication !== false) {
       throw new Error("WEBSITE_EXPLORER_RESPONSE_INVALID");
     }
@@ -536,6 +581,7 @@ export async function resumeWebsiteAuthenticationAnalysis(
       provider: { apiVersion: "v4", model: "browser-use-2.0", policyDigest: provider.policyDigest },
       observations: mergedObservations(websiteObservationsFromEvidence(publicEvidence), authenticatedObservations),
     }, configuration.evidenceStore);
+    assertAuthenticationCheckpointUnexpired(request, clock);
     outcome = "completed";
     return compileWebsiteAnalysis(evidence, [publicEvidence], source.sourceUrl);
   } catch (error) {
