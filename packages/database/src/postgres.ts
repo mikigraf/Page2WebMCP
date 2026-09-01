@@ -1557,28 +1557,6 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
         [runId],
       );
       if (!workflowTaskLock.rows[0]) return undefined;
-      const authenticationResult = await client.query(
-        "select authentication.*, workflow.source_snapshot_id as workflow_source_snapshot_id, " +
-        "snapshot.source_identity_hash as persisted_source_identity_hash " +
-        "from private.website_authentication_checkpoints authentication " +
-        "join public.workflow_runs workflow on workflow.id = authentication.analysis_run_id " +
-        "join public.source_snapshots snapshot on snapshot.id = authentication.source_snapshot_id " +
-        "and snapshot.project_id = authentication.project_id and snapshot.organization_id = authentication.organization_id " +
-        "where authentication.analysis_run_id = $1 for update of authentication",
-        [runId],
-      );
-      const authenticationCheckpoint = authenticationResult.rows[0]
-        ? mapWebsiteAuthenticationCheckpoint(authenticationResult.rows[0])
-        : undefined;
-      if (authenticationCheckpoint && (authenticationCheckpoint.state !== "consumed"
-        || !authenticationCheckpoint.authenticationEvidenceReference
-        || new Date(authenticationCheckpoint.expiresAt) <= new Date()
-        || authenticationCheckpoint.workflowTaskId !== String(workflowTaskLock.rows[0].id)
-        || authenticationCheckpoint.sourceSnapshotId !== String(authenticationResult.rows[0].workflow_source_snapshot_id)
-        || authenticationCheckpoint.sourceIdentityHash !== String(authenticationResult.rows[0].persisted_source_identity_hash)
-        || authenticationCheckpoint.targetOriginDigest !== websiteTargetOriginDigest(String(jobLock.rows[0].source_url)))) {
-        throw new RepositoryError("INVALID_STATE");
-      }
       const active = await client.query(
         "select count(*)::integer as count from private.workflow_tasks where organization_id = $1 " +
         "and status = 'running' and lease_expires_at > now()",
@@ -1606,6 +1584,34 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
         "where id = $1 and cancel_requested_at is null",
         [runId]
       );
+      await setWorkerWorkflowLeaseContext(
+        client,
+        workerId,
+        workflowTask.id,
+        workflowTask.leaseGeneration,
+      );
+      const authenticationResult = await client.query(
+        "select authentication.*, workflow.source_snapshot_id as workflow_source_snapshot_id, " +
+        "snapshot.source_identity_hash as persisted_source_identity_hash " +
+        "from private.website_authentication_checkpoints authentication " +
+        "join public.workflow_runs workflow on workflow.id = authentication.analysis_run_id " +
+        "join public.source_snapshots snapshot on snapshot.id = authentication.source_snapshot_id " +
+        "and snapshot.project_id = authentication.project_id and snapshot.organization_id = authentication.organization_id " +
+        "where authentication.analysis_run_id = $1 for update of authentication",
+        [runId],
+      );
+      const authenticationCheckpoint = authenticationResult.rows[0]
+        ? mapWebsiteAuthenticationCheckpoint(authenticationResult.rows[0])
+        : undefined;
+      if (authenticationCheckpoint && (authenticationCheckpoint.state !== "consumed"
+        || !authenticationCheckpoint.authenticationEvidenceReference
+        || new Date(authenticationCheckpoint.expiresAt) <= new Date()
+        || authenticationCheckpoint.workflowTaskId !== workflowTask.id
+        || authenticationCheckpoint.sourceSnapshotId !== String(authenticationResult.rows[0].workflow_source_snapshot_id)
+        || authenticationCheckpoint.sourceIdentityHash !== String(authenticationResult.rows[0].persisted_source_identity_hash)
+        || authenticationCheckpoint.targetOriginDigest !== websiteTargetOriginDigest(String(job.rows[0].source_url)))) {
+        throw new RepositoryError("INVALID_STATE");
+      }
       await client.query("select private.append_workflow_event($1, $2, 'task.claimed', null)", [runId, workflowTask.id]);
       const result = await client.query(
         "select ar.id, ar.organization_id, ar.project_id, ar.requested_by, ar.status, ar.attempts, " +
@@ -1717,6 +1723,7 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
         || workflow.projectId !== String(job.project_id)) {
         throw new RepositoryError("SOURCE_SNAPSHOT_STALE");
       }
+      await setWorkerWorkflowLeaseContext(client, workerId, task.id, task.leaseGeneration);
       const snapshotResult = await client.query(
         "select id, organization_id, project_id, source_identity_hash from public.source_snapshots " +
         "where id = $1 and organization_id = $2 and project_id = $3 limit 1",
@@ -1862,7 +1869,7 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
       if (!consumed.rows[0]) throw new RepositoryError("INVALID_STATE");
       const updatedTask = await client.query(
         "update private.workflow_tasks set status = 'queued', resumed_at = now(), available_at = now(), " +
-        "error_code = null, lease_owner = null, lease_expires_at = null, updated_at = now() " +
+        "lease_owner = null, lease_expires_at = null, updated_at = now() " +
         "where id = $1 and status = 'waiting' returning id",
         [task.id],
       );

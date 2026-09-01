@@ -229,6 +229,28 @@ test("runtime role bootstrap writes one atomic mode-0600 environment with fresh 
   }
 });
 
+test("runtime role bootstrap uses typed format parameters and tenant-safe replay clauses", async () => {
+  const source = await readFile(join(workspaceRoot, "scripts/local-runtime-roles.mjs"), "utf8");
+  const createFormat = source.match(/select format\('create role[\s\S]*?\[credential\.login, credential\.limit, credential\.password\]/i)?.[0];
+  const alterFormat = source.match(/select format\('alter role[\s\S]*?\[credential\.login, credential\.limit, credential\.password\]/i)?.[0];
+
+  assert.ok(createFormat, "create-role formatter must remain explicit");
+  assert.match(createFormat, /\$1::text/);
+  assert.match(createFormat, /\$2::int/);
+  assert.match(createFormat, /\$3::text/);
+  assert.match(createFormat, /nosuperuser[\s\S]*noreplication[\s\S]*nobypassrls/i);
+
+  assert.ok(alterFormat, "replay formatter must remain explicit");
+  assert.match(alterFormat, /\$1::text/);
+  assert.match(alterFormat, /\$2::int/);
+  assert.match(alterFormat, /\$3::text/);
+  assert.doesNotMatch(alterFormat, /nosuperuser|noreplication|nobypassrls/i);
+  assert.match(source, /select 1 from pg_roles where rolname = \$1::text/i);
+  assert.match(source, /pg_advisory_lock\(hashtextextended\(\$1::text, 0\)\)/i);
+  assert.doesNotMatch(source, /error\?\.code\s*!==\s*"42710"/i);
+  assert.match(source, /member\.rolcanlogin[\s\S]*member\.rolcreatedb[\s\S]*member\.rolcreaterole[\s\S]*member\.rolreplication/i);
+});
+
 test("runtime role bootstrap refuses to persist credentials until every committed migration is applied", async () => {
   const directory = await mkdtemp(join(tmpdir(), "page2webmcp-local-migrations-"));
   const destination = join(directory, ".page2webmcp/local.env");
@@ -404,7 +426,17 @@ function fakeBootstrapClient(appliedMigrationVersions: readonly string[] = []) {
             const role = login.replace(/_(?:app|worker|maintenance)_local$/, (suffix) =>
               `_${suffix.slice(1, -6)}`);
             membershipAssertions.push([login, role]);
-            return { login, application_role: role, rolinherit: false, rolsuper: false, rolbypassrls: false };
+            return {
+              login,
+              application_role: role,
+              rolcanlogin: true,
+              rolinherit: false,
+              rolsuper: false,
+              rolcreatedb: false,
+              rolcreaterole: false,
+              rolreplication: false,
+              rolbypassrls: false,
+            };
           })
         };
       }

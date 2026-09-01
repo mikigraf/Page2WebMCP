@@ -26,6 +26,10 @@ export async function bootstrapLocalRuntimeRoles(
     await client.connect();
     await assertAppliedMigrationHistory(client, expectedMigrationVersions);
     await assertBoundedApplicationRoles(client);
+    await client.query(
+      "select pg_advisory_lock(hashtextextended($1::text, 0))",
+      ["page2webmcp-local-runtime-role-bootstrap"],
+    );
     for (const credential of credentials) await configureLogin(client, credential);
     await assertRuntimeLoginMemberships(client, credentials);
   } finally {
@@ -93,15 +97,20 @@ async function assertAppliedMigrationHistory(client, expectedMigrationVersions) 
 async function assertRuntimeLoginMemberships(client, credentials) {
   const expected = new Map(credentials.map(({ login, role }) => [login, role]));
   const result = await client.query(
-    "select member.rolname as login, role.rolname as application_role, member.rolinherit, member.rolsuper, member.rolbypassrls " +
+    "select member.rolname as login, role.rolname as application_role, member.rolcanlogin, member.rolinherit, " +
+    "member.rolsuper, member.rolcreatedb, member.rolcreaterole, member.rolreplication, member.rolbypassrls " +
     "from pg_auth_members membership join pg_roles member on member.oid = membership.member " +
     "join pg_roles role on role.oid = membership.roleid where member.rolname = any($1::text[])",
     [credentials.map(({ login }) => login)]
   );
   if (result.rows.length !== expected.size || result.rows.some((row) =>
     expected.get(row.login) !== row.application_role
+    || !row.rolcanlogin
     || row.rolinherit
     || row.rolsuper
+    || row.rolcreatedb
+    || row.rolcreaterole
+    || row.rolreplication
     || row.rolbypassrls
   )) throw new Error("LOCAL_RUNTIME_ROLE_MEMBERSHIP_REQUIRED");
 }
@@ -136,19 +145,22 @@ async function assertBoundedApplicationRoles(client) {
 }
 
 async function configureLogin(client, credential) {
-  const statement = await client.query(
-    "select format('create role %I login noinherit nosuperuser nocreatedb nocreaterole noreplication nobypassrls connection limit %s password %L', $1, $2, $3) as sql",
-    [credential.login, credential.limit, credential.password]
+  const existing = await client.query(
+    "select 1 from pg_roles where rolname = $1::text",
+    [credential.login],
   );
-  try {
-    await client.query(statement.rows[0].sql);
-  } catch (error) {
-    if (error?.code !== "42710") throw error;
-    const alter = await client.query(
-      "select format('alter role %I login noinherit nosuperuser nocreatedb nocreaterole noreplication nobypassrls connection limit %s password %L', $1, $2, $3) as sql",
+  if (existing.rows[0]) {
+    const statement = await client.query(
+      "select format('alter role %I login noinherit nocreatedb nocreaterole connection limit %s password %L', $1::text, $2::int, $3::text) as sql",
       [credential.login, credential.limit, credential.password]
     );
-    await client.query(alter.rows[0].sql);
+    await client.query(statement.rows[0].sql);
+  } else {
+    const statement = await client.query(
+      "select format('create role %I login noinherit nosuperuser nocreatedb nocreaterole noreplication nobypassrls connection limit %s password %L', $1::text, $2::int, $3::text) as sql",
+      [credential.login, credential.limit, credential.password]
+    );
+    await client.query(statement.rows[0].sql);
   }
   for (const runtimeRole of RUNTIME_ROLES) {
     if (runtimeRole.role !== credential.role) await client.query(`revoke ${runtimeRole.role} from ${credential.login}`);

@@ -86,7 +86,15 @@ migration-contract sweep in Node 24 produced:
 46 passed, 0 failed; exit 0
 ```
 
+## Runtime replay acceptance
+
+The controller subsequently ran the required clean replay with pinned
+`supabase@2.116.0`. All 24 migrations applied in lexical order on the isolated
+Supabase PostgreSQL 17 container, including both repaired historical migrations
+and `20260901071658_website_authentication_wait.sql`. The stack reached ready
+state on API `58321` and database `58322`. No unrelated container was stopped or
+reused.
+
 ## Concerns
 
-- The controller still owns the required clean pinned `supabase@2.116.0` replay on the canonical topology. This task intentionally did not start/reset/apply Docker, so the repaired migrations are not claimed as database-executed evidence yet.
-- The repaired SQL still requires the controller's clean pinned-CLI database replay before it is treated as runtime evidence.
+None for this compatibility repair.

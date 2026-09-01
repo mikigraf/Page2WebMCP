@@ -6,7 +6,10 @@ Implemented and committed in `531f391ddc01de3efd79658947350a3e8b8cbade` (`feat(d
 
 Fix round 1 subsequently replaced the unapplied manually timestamped migration with the exact pinned-CLI-created `20260901071658_website_authentication_wait.sql`. The reviewed SQL is byte-for-byte identical after substituting only the required migration version references.
 
-No Docker database was modified. Inspection found no Page2WebMCP-owned `5832x` task database; all running databases belonged to unrelated projects. PostgreSQL integration tests therefore remain explicitly gated on `PAGE2WEBMCP_TEST_DATABASE_URL` and `PAGE2WEBMCP_TEST_ADMIN_DATABASE_URL` for the controller's clean-stack replay.
+The controller subsequently created the isolated Page2WebMCP stack on the
+canonical `5832x` ports with pinned CLI `2.116.0`, replayed all 24 migrations,
+and ran the PostgreSQL tests through distinct least-privilege app and worker
+login URLs plus the local owner cleanup URL. All three database/RLS tests pass.
 
 ## Schema and API decisions
 
@@ -108,7 +111,31 @@ The unapplied manual file was removed, and all active ledger/sentinel/test refer
 
 ## Concerns
 
-- PostgreSQL execution/RLS behavior has not yet run against a disposable migrated database. No task-owned Page2WebMCP stack existed, and unrelated Fullbeam, SaaS-kit, and other databases were deliberately left untouched. The controller must run the env-gated tests during its clean `5832x` replay.
 - The broader readiness/local lifecycle runner did not complete because its existing fake executable stalled on this host. Its partial passes are recorded only as partial evidence.
 - Host `node`/`pnpm` shebang resolution stalls; successful focused tests and static checks used `/usr/local/bin/node` 22.14.0 directly. The controller still needs the requested Node 24 Docker verification.
 - No external gateway or Browser Use session is created by this substrate task. The checkpoint accepts only an opaque digest-bound reference and exact gateway evidence reference; gateway production integration remains a follow-up consumer.
+
+## Docker PostgreSQL acceptance — 2026-09-01
+
+- Pinned `supabase@2.116.0` replayed all 24 migrations through
+  `20260901071658_website_authentication_wait.sql` on API `58321` and database
+  `58322`.
+- The role bootstrap now uses typed `format` parameters, a serialized catalog
+  existence check instead of a duplicate-role exception, tenant-safe replay
+  clauses, and exhaustive postcondition checks. It succeeded twice
+  consecutively. Credentials that appeared in the local database's expected
+  duplicate-error log were immediately rotated and are no longer valid; no
+  credential value is recorded here.
+- Worker snapshot reads bind the exact workflow lease context before RLS
+  evaluation. Resumed claims activate the task, bind its new lease generation,
+  and only then revalidate the checkpoint's immutable snapshot.
+- App resume no longer writes the ungranted workflow-task `error_code` column;
+  that field was already cleared by the wait transition.
+- The integration harness accepts separate app and worker URLs, matching the
+  real process topology.
+
+```text
+PostgreSQL website authentication integration: 3 passed, 0 skipped, 0 failed
+Focused local/auth/migration tests: 24 passed, 0 failed
+Typecheck, targeted ESLint, source lint, security policy, diff check: passed
+```
