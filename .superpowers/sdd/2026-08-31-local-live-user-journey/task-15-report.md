@@ -67,7 +67,7 @@ git diff --check
 all exit 0
 ```
 
-The broad static migration-contract sweep also ran:
+The broad static migration-contract sweep initially exposed one stale contract:
 
 ```text
 /usr/local/bin/node --experimental-transform-types --test \
@@ -76,9 +76,17 @@ The broad static migration-contract sweep also ran:
 45 passed, 1 failed; exit 1
 ```
 
-The sole failure is outside this task: `local-artifact-topology-migration.test.ts` expects `20260901071658_website_authentication_wait.sql` in the active source-readiness migration ledger, while the current readiness source reports only the preceding 23 versions. The new Task 15 contract passed within that sweep.
+`local-artifact-topology-migration.test.ts` was comparing an earlier forward-only
+migration with migrations created after it. Its ledger comparison now uses only
+versions at or before that migration's own timestamp. The later authentication
+migration retains its separate exact-ledger assertion. Re-running the complete
+migration-contract sweep in Node 24 produced:
+
+```text
+46 passed, 0 failed; exit 0
+```
 
 ## Concerns
 
 - The controller still owns the required clean pinned `supabase@2.116.0` replay on the canonical topology. This task intentionally did not start/reset/apply Docker, so the repaired migrations are not claimed as database-executed evidence yet.
-- The unrelated active-ledger contract failure described above remains on the branch and was not changed because Task 15 permits edits only to the two historical role migrations plus its regression test/report.
+- The repaired SQL still requires the controller's clean pinned-CLI database replay before it is treated as runtime evidence.

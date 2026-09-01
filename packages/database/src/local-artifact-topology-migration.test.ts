@@ -15,7 +15,9 @@ async function migration(): Promise<{ name: string; sql: string; versions: strin
   return {
     name,
     sql: await readFile(new URL(name, migrationsDirectory), "utf8"),
-    versions: names.map((entry) => entry.slice(0, 14)),
+    versions: names
+      .filter((entry) => entry <= name)
+      .map((entry) => entry.slice(0, 14)),
   };
 }
 
