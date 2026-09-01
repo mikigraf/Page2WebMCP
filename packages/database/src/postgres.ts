@@ -26,6 +26,7 @@ import {
   type CandidateRelease,
   type CapabilityRecord,
   type ClaimedAnalysisRunRecord,
+  type ClaimedWebsiteAuthenticationCleanupRecord,
   type ControlPlaneRepository,
   type CreateProjectRequest,
   type EnqueueAnalysisRequest,
@@ -1442,6 +1443,98 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
     });
   }
 
+  async claimWebsiteAuthenticationCleanup(
+    workerId: string,
+    leaseMs: number,
+  ): Promise<ClaimedWebsiteAuthenticationCleanupRecord | undefined> {
+    assertWorkflowWorkerId(workerId);
+    const boundedLease = Math.max(1_000, Math.min(leaseMs, 300_000));
+    return this.#transaction({ kind: "worker" }, async (client) => {
+      await client.query(
+        "update private.website_authentication_checkpoints set cleanup_status = 'failed', " +
+        "cleanup_available_at = null, cleanup_lease_owner = null, cleanup_lease_expires_at = null, " +
+        "cleanup_last_error_code = coalesce(cleanup_last_error_code, " +
+        "'WEBSITE_AUTHENTICATION_CLEANUP_ATTEMPTS_EXHAUSTED'), updated_at = now() " +
+        "where cleanup_attempts >= 3 and (cleanup_status = 'pending' and cleanup_available_at <= now() " +
+        "or cleanup_status = 'running' and cleanup_lease_expires_at <= now())",
+      );
+      const result = await client.query(
+        "with candidate as (" +
+        "select authentication.analysis_run_id " +
+        "from private.website_authentication_checkpoints authentication " +
+        "where authentication.state in ('failed','cancelled','expired') " +
+        "and authentication.cleanup_attempts < 3 and (" +
+        "authentication.cleanup_status = 'pending' and authentication.cleanup_available_at <= now() or " +
+        "authentication.cleanup_status = 'running' and authentication.cleanup_lease_expires_at <= now()) " +
+        "order by authentication.cleanup_available_at, authentication.analysis_run_id " +
+        "for update skip locked limit 1" +
+        "), claimed as (" +
+        "update private.website_authentication_checkpoints authentication set cleanup_status = 'running', " +
+        "cleanup_attempts = authentication.cleanup_attempts + 1, cleanup_lease_owner = $1, " +
+        "cleanup_lease_expires_at = now() + ($2::integer * interval '1 millisecond'), " +
+        "cleanup_lease_generation = authentication.cleanup_lease_generation + 1, " +
+        "cleanup_last_error_code = null, updated_at = now() from candidate " +
+        "where authentication.analysis_run_id = candidate.analysis_run_id returning authentication.*" +
+        ") select claimed.*, job.source_url from claimed " +
+        "join private.analysis_jobs job on job.analysis_run_id = claimed.analysis_run_id",
+        [workerId, boundedLease],
+      );
+      return result.rows[0] ? mapClaimedWebsiteAuthenticationCleanup(result.rows[0]) : undefined;
+    });
+  }
+
+  async completeWebsiteAuthenticationCleanup(
+    workerId: string,
+    runId: string,
+    leaseGeneration: number,
+  ): Promise<void> {
+    assertWorkflowWorkerId(workerId);
+    return this.#transaction({ kind: "worker" }, async (client) => {
+      const completed = await client.query(
+        "update private.website_authentication_checkpoints set cleanup_status = 'succeeded', " +
+        "cleanup_lease_owner = null, cleanup_lease_expires_at = null, cleanup_completed_at = now(), " +
+        "cleanup_last_error_code = null, updated_at = now() where analysis_run_id = $1 " +
+        "and cleanup_status = 'running' and cleanup_lease_owner = $2 " +
+        "and cleanup_lease_expires_at > now() and cleanup_lease_generation = $3 returning analysis_run_id",
+        [runId, workerId, leaseGeneration],
+      );
+      if (!completed.rows[0]) throw new RepositoryError("LEASE_LOST");
+    });
+  }
+
+  async retryWebsiteAuthenticationCleanup(
+    workerId: string,
+    runId: string,
+    leaseGeneration: number,
+    errorCode: string,
+    retryable = true,
+  ): Promise<void> {
+    assertWorkflowWorkerId(workerId);
+    validateWorkflowErrorCode(errorCode);
+    return this.#transaction({ kind: "worker" }, async (client) => {
+      const locked = await client.query(
+        "select cleanup_attempts from private.website_authentication_checkpoints where analysis_run_id = $1 " +
+        "and cleanup_status = 'running' and cleanup_lease_owner = $2 " +
+        "and cleanup_lease_expires_at > now() and cleanup_lease_generation = $3 for update",
+        [runId, workerId, leaseGeneration],
+      );
+      if (!locked.rows[0]) throw new RepositoryError("LEASE_LOST");
+      const attempts = Number(locked.rows[0].cleanup_attempts);
+      const exhausted = !retryable || attempts >= 3;
+      const retryDelayMs = workflowRetryDelayMs(attempts, undefined, this.#random);
+      const retried = await client.query(
+        "update private.website_authentication_checkpoints set cleanup_status = $4, " +
+        "cleanup_available_at = case when $4 = 'failed' then null " +
+        "else now() + ($5::integer * interval '1 millisecond') end, " +
+        "cleanup_lease_owner = null, cleanup_lease_expires_at = null, cleanup_last_error_code = $6, " +
+        "updated_at = now() where analysis_run_id = $1 and cleanup_status = 'running' " +
+        "and cleanup_lease_owner = $2 and cleanup_lease_generation = $3 returning analysis_run_id",
+        [runId, workerId, leaseGeneration, exhausted ? "failed" : "pending", retryDelayMs, errorCode],
+      );
+      if (!retried.rows[0]) throw new RepositoryError("LEASE_LOST");
+    });
+  }
+
   async #workerAnalysis(db: Db, id: string): Promise<AnalysisRunRecord> {
     const result = await db.query(
       "select ar.id, ar.organization_id, ar.project_id, ar.requested_by, ar.status, ar.attempts, " +
@@ -2797,8 +2890,39 @@ function mapWebsiteAuthenticationCheckpoint(row: QueryResultRow): WebsiteAuthent
     expiresAt: iso(row.expires_at),
     ...(row.consumed_at ? { consumedAt: iso(row.consumed_at) } : {}),
     ...(row.terminal_at ? { terminalAt: iso(row.terminal_at) } : {}),
+    ...(row.cleanup_status ? {
+      cleanupStatus: String(row.cleanup_status) as NonNullable<WebsiteAuthenticationCheckpointRecord["cleanupStatus"]>,
+      cleanupAttempts: Number(row.cleanup_attempts),
+      ...(row.cleanup_completed_at ? { cleanupCompletedAt: iso(row.cleanup_completed_at) } : {}),
+      ...(row.cleanup_last_error_code ? { cleanupErrorCode: String(row.cleanup_last_error_code) } : {}),
+    } : {}),
     createdAt: iso(row.created_at),
     updatedAt: iso(row.updated_at),
+  };
+}
+
+function mapClaimedWebsiteAuthenticationCleanup(
+  row: QueryResultRow,
+): ClaimedWebsiteAuthenticationCleanupRecord {
+  const terminalState = row.state as ClaimedWebsiteAuthenticationCleanupRecord["terminalState"];
+  return {
+    organizationId: String(row.organization_id),
+    projectId: String(row.project_id),
+    analysisRunId: String(row.analysis_run_id),
+    workflowTaskId: String(row.workflow_task_id),
+    sourceSnapshotId: String(row.source_snapshot_id),
+    sourceIdentityHash: String(row.source_identity_hash),
+    sourceUrl: String(row.source_url),
+    targetOriginDigest: String(row.target_origin_digest),
+    checkpointReference: String(row.checkpoint_reference),
+    expiresAt: iso(row.expires_at),
+    terminalState,
+    outcome: terminalState === "cancelled" ? "cancelled" : "failed",
+    cleanupIdempotencyKey: String(row.cleanup_idempotency_key),
+    attempts: Number(row.cleanup_attempts),
+    leaseOwner: String(row.cleanup_lease_owner),
+    leaseExpiresAt: iso(row.cleanup_lease_expires_at),
+    leaseGeneration: Number(row.cleanup_lease_generation),
   };
 }
 

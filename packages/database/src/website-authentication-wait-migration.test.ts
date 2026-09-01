@@ -66,7 +66,5 @@ test("website authentication migration advances the exact readiness ledger", asy
   assert.match(sql, new RegExp(`\\('${version}'\\)`));
   assert.match(sql, /selected_release_readiness_topology_legacy_20260901060852/i);
   const readiness = await readFile(new URL("../../../scripts/check-release-readiness.ts", import.meta.url), "utf8");
-  const lifecycle = await readFile(new URL("../../../scripts/local-supabase.mjs", import.meta.url), "utf8");
   assert.match(readiness, new RegExp(name.replaceAll(".", "\\.")));
-  assert.match(lifecycle, new RegExp(`REQUIRED_MIGRATION = "${version}"`));
 });

@@ -302,3 +302,183 @@ test("completion, permanent failure, cancellation, and expiry close authenticati
   assert.equal((await repository.listWorkflowEvents(owner, expiredSource.runId))
     .filter(({ type }) => type === "task.reconciled").length, 1);
 });
+
+test("terminal website authentication cleanup is leased, restart-safe, and idempotent", async () => {
+  let now = new Date("2026-09-01T12:00:00.000Z");
+  const repository = new InMemoryControlPlaneRepository(() => now, { random: () => 0 });
+  const source = await runningWebsite(repository, "durable-cleanup");
+  const checkpointReference = `urn:sha256:${"f".repeat(64)}`;
+  await repository.waitAnalysisForAuthentication(
+    "authentication-worker-durable-cleanup",
+    source.runId,
+    waitInput(source, "2026-09-01T12:05:00.000Z", {
+      checkpointReference,
+      idempotencyKey: "authentication-wait-durable-cleanup",
+      inputHash: "authentication-wait-durable-cleanup",
+    }),
+    source.claim.leaseGeneration,
+  );
+  await repository.cancelWorkflow(owner, {
+    runId: source.runId,
+    idempotencyKey: "authentication-cancel-durable-cleanup",
+    inputHash: "authentication-cancel-durable-cleanup",
+  });
+
+  const first = await repository.claimWebsiteAuthenticationCleanup("cleanup-worker-a", 1_000);
+  assert.ok(first);
+  assert.deepEqual({
+    analysisRunId: first.analysisRunId,
+    checkpointReference: first.checkpointReference,
+    cleanupIdempotencyKey: first.cleanupIdempotencyKey,
+    terminalState: first.terminalState,
+    outcome: first.outcome,
+    attempts: first.attempts,
+    leaseGeneration: first.leaseGeneration,
+  }, {
+    analysisRunId: source.runId,
+    checkpointReference,
+    cleanupIdempotencyKey: `website-auth-cleanup:${"f".repeat(64)}`,
+    terminalState: "cancelled",
+    outcome: "cancelled",
+    attempts: 1,
+    leaseGeneration: 1,
+  });
+  assert.equal(await repository.claimWebsiteAuthenticationCleanup("cleanup-worker-b", 1_000), undefined);
+
+  now = new Date("2026-09-01T12:00:01.001Z");
+  const recovered = await repository.claimWebsiteAuthenticationCleanup("cleanup-worker-b", 1_000);
+  assert.ok(recovered);
+  assert.equal(recovered.cleanupIdempotencyKey, first.cleanupIdempotencyKey);
+  assert.equal(recovered.attempts, 2);
+  assert.equal(recovered.leaseGeneration, 2);
+  await assert.rejects(
+    repository.completeWebsiteAuthenticationCleanup(
+      "cleanup-worker-a", source.runId, first.leaseGeneration,
+    ),
+    (error: unknown) => error instanceof RepositoryError && error.code === "LEASE_LOST",
+  );
+
+  await repository.retryWebsiteAuthenticationCleanup(
+    "cleanup-worker-b", source.runId, recovered.leaseGeneration, "GATEWAY_TIMEOUT",
+  );
+  const retried = await repository.claimWebsiteAuthenticationCleanup("cleanup-worker-c", 1_000);
+  assert.ok(retried);
+  assert.equal(retried.cleanupIdempotencyKey, first.cleanupIdempotencyKey);
+  assert.equal(retried.attempts, 3);
+  await repository.completeWebsiteAuthenticationCleanup(
+    "cleanup-worker-c", source.runId, retried.leaseGeneration,
+  );
+  assert.equal(await repository.claimWebsiteAuthenticationCleanup("cleanup-worker-d", 1_000), undefined);
+});
+
+test("an exhausted resumed analysis lease queues terminal authentication cleanup", async () => {
+  let now = new Date("2026-09-01T12:00:00.000Z");
+  const repository = new InMemoryControlPlaneRepository(() => now, { random: () => 0 });
+  const source = await runningWebsite(repository, "exhausted-cleanup");
+  const checkpointReference = `urn:sha256:${"0".repeat(64)}`;
+  await repository.waitAnalysisForAuthentication(
+    "authentication-worker-exhausted-cleanup",
+    source.runId,
+    waitInput(source, "2026-09-01T12:05:00.000Z", {
+      checkpointReference,
+      idempotencyKey: "authentication-wait-exhausted-cleanup",
+      inputHash: "authentication-wait-exhausted-cleanup",
+    }),
+    source.claim.leaseGeneration,
+  );
+  await repository.resumeAnalysisAfterAuthentication(owner, resumeInput(source, {
+    checkpointReference,
+    idempotencyKey: "authentication-resume-exhausted-cleanup",
+    inputHash: "authentication-resume-exhausted-cleanup",
+  }));
+  const second = await repository.claimAnalysis("authentication-exhausted-second", 1_000, ["website"]);
+  assert.ok(second);
+  await repository.failAnalysis(
+    "authentication-exhausted-second", source.runId, "TRANSIENT", true, second.leaseGeneration,
+  );
+  now = new Date("2026-09-01T12:00:01.000Z");
+  const third = await repository.claimAnalysis("authentication-exhausted-third", 1_000, ["website"]);
+  assert.ok(third);
+  now = new Date("2026-09-01T12:00:02.001Z");
+  assert.equal(await repository.claimAnalysis("authentication-exhausted-reconciler", 1_000, ["website"]), undefined);
+  assert.equal((await repository.getWebsiteAuthenticationWait(owner, source.runId))?.state, "failed");
+  const cleanup = await repository.claimWebsiteAuthenticationCleanup("authentication-exhausted-cleanup", 1_000);
+  assert.ok(cleanup);
+  assert.equal(cleanup.analysisRunId, source.runId);
+  assert.equal(cleanup.terminalState, "failed");
+  assert.equal(cleanup.outcome, "failed");
+});
+
+test("terminal authentication cleanup stops after three failures and remains diagnosable", async () => {
+  const now = new Date("2026-09-01T12:00:00.000Z");
+  const repository = new InMemoryControlPlaneRepository(() => now, { random: () => 0 });
+  const source = await runningWebsite(repository, "cleanup-budget");
+  await repository.waitAnalysisForAuthentication(
+    "authentication-worker-cleanup-budget",
+    source.runId,
+    waitInput(source, "2026-09-01T12:05:00.000Z", {
+      checkpointReference: `urn:sha256:${"1".repeat(64)}`,
+      idempotencyKey: "authentication-wait-cleanup-budget",
+      inputHash: "authentication-wait-cleanup-budget",
+    }),
+    source.claim.leaseGeneration,
+  );
+  await repository.cancelWorkflow(owner, {
+    runId: source.runId,
+    idempotencyKey: "authentication-cancel-cleanup-budget",
+    inputHash: "authentication-cancel-cleanup-budget",
+  });
+
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    const cleanup = await repository.claimWebsiteAuthenticationCleanup(`cleanup-budget-${attempt}`, 1_000);
+    assert.ok(cleanup);
+    assert.equal(cleanup.attempts, attempt);
+    await repository.retryWebsiteAuthenticationCleanup(
+      `cleanup-budget-${attempt}`,
+      source.runId,
+      cleanup.leaseGeneration,
+      "GATEWAY_TIMEOUT",
+    );
+  }
+  assert.equal(await repository.claimWebsiteAuthenticationCleanup("cleanup-budget-4", 1_000), undefined);
+  const checkpoint = await repository.getWebsiteAuthenticationWait(owner, source.runId);
+  assert.equal(checkpoint?.cleanupStatus, "failed");
+  assert.equal(checkpoint?.cleanupAttempts, 3);
+  assert.equal(checkpoint?.cleanupErrorCode, "GATEWAY_TIMEOUT");
+  assert.equal(checkpoint?.cleanupCompletedAt, undefined);
+});
+
+test("a permanent authentication cleanup failure is terminal on its first attempt", async () => {
+  const now = new Date("2026-09-01T12:00:00.000Z");
+  const repository = new InMemoryControlPlaneRepository(() => now, { random: () => 0 });
+  const source = await runningWebsite(repository, "cleanup-permanent");
+  await repository.waitAnalysisForAuthentication(
+    "authentication-worker-cleanup-permanent",
+    source.runId,
+    waitInput(source, "2026-09-01T12:05:00.000Z", {
+      checkpointReference: `urn:sha256:${"2".repeat(64)}`,
+      idempotencyKey: "authentication-wait-cleanup-permanent",
+      inputHash: "authentication-wait-cleanup-permanent",
+    }),
+    source.claim.leaseGeneration,
+  );
+  await repository.cancelWorkflow(owner, {
+    runId: source.runId,
+    idempotencyKey: "authentication-cancel-cleanup-permanent",
+    inputHash: "authentication-cancel-cleanup-permanent",
+  });
+  const cleanup = await repository.claimWebsiteAuthenticationCleanup("cleanup-permanent-1", 1_000);
+  assert.ok(cleanup);
+  await repository.retryWebsiteAuthenticationCleanup(
+    "cleanup-permanent-1",
+    source.runId,
+    cleanup.leaseGeneration,
+    "WEBSITE_CONTROL_REJECTED",
+    false,
+  );
+  assert.equal(await repository.claimWebsiteAuthenticationCleanup("cleanup-permanent-2", 1_000), undefined);
+  const checkpoint = await repository.getWebsiteAuthenticationWait(owner, source.runId);
+  assert.equal(checkpoint?.cleanupStatus, "failed");
+  assert.equal(checkpoint?.cleanupAttempts, 1);
+  assert.equal(checkpoint?.cleanupErrorCode, "WEBSITE_CONTROL_REJECTED");
+});

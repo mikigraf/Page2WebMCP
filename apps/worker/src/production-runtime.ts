@@ -1,4 +1,5 @@
 import type {
+  ClaimedWebsiteAuthenticationCleanupRecord,
   ControlPlaneRepository,
   ProviderProvenance,
   SourceType,
@@ -19,7 +20,11 @@ import {
   GITHUB_PRODUCTION_EFFECT_KINDS,
 } from "./github-workflow.ts";
 import { processNextAnalysis } from "./runner.ts";
-import type { AnalysisAdapter } from "./workflow.ts";
+import type {
+  AnalysisAdapter,
+  AnalysisSource,
+  WebsiteAuthenticationWaitingOutcome,
+} from "./workflow.ts";
 import type { SelectedProviderProbeContext } from "../../../packages/operations/src/readiness.ts";
 
 type RuntimeEnvironment = Record<string, string | undefined>;
@@ -186,6 +191,14 @@ export async function processProductionWorkerIteration(
   workerId: string,
   signal: AbortSignal,
 ): Promise<boolean> {
+  await repository.reconcileWorkflows(`${workerId}-reconcile`);
+  if (runtime.analysisSourceTypes.includes("website")) {
+    const cleanup = await repository.claimWebsiteAuthenticationCleanup(workerId, 60_000);
+    if (cleanup) {
+      await reconcileTerminalWebsiteAuthentication(repository, runtime.analyze, workerId, cleanup, signal);
+      return true;
+    }
+  }
   const analysis = await processNextAnalysis(repository, {
     workerId,
     analyze: runtime.analyze,
@@ -193,6 +206,68 @@ export async function processProductionWorkerIteration(
   });
   if (analysis !== undefined) return true;
   if (!runtime.workflows) return false;
-  await repository.reconcileWorkflows(`${workerId}-reconcile`);
   return await runtime.workflows.runNext(workerId, signal) !== undefined;
+}
+
+async function reconcileTerminalWebsiteAuthentication(
+  repository: ControlPlaneRepository,
+  analyze: AnalysisAdapter,
+  workerId: string,
+  cleanup: ClaimedWebsiteAuthenticationCleanupRecord,
+  signal: AbortSignal,
+): Promise<void> {
+  try {
+    if (!analyze.reconcileAuthenticationCheckpoint) {
+      throw new Error("WEBSITE_AUTHENTICATION_RECONCILE_NOT_CONFIGURED");
+    }
+    const source: AnalysisSource = {
+      id: cleanup.analysisRunId,
+      organizationId: cleanup.organizationId,
+      projectId: cleanup.projectId,
+      sourceType: "website",
+      sourceUrl: cleanup.sourceUrl,
+      sourceSnapshotId: cleanup.sourceSnapshotId,
+      sourceIdentityHash: cleanup.sourceIdentityHash,
+    };
+    const waiting: WebsiteAuthenticationWaitingOutcome = {
+      disposition: "waiting_for_authentication",
+      capabilities: [],
+      diagnostics: [],
+      evidence: [],
+      checkpointReference: cleanup.checkpointReference,
+      sourceSnapshotId: cleanup.sourceSnapshotId,
+      sourceIdentityHash: cleanup.sourceIdentityHash,
+      targetOriginDigest: cleanup.targetOriginDigest,
+      expiresAt: cleanup.expiresAt,
+    };
+    await analyze.reconcileAuthenticationCheckpoint(source, waiting, signal, cleanup.outcome);
+    await repository.completeWebsiteAuthenticationCleanup(
+      workerId,
+      cleanup.analysisRunId,
+      cleanup.leaseGeneration,
+    );
+  } catch (error) {
+    const failureCode = authenticationCleanupFailureCode(error);
+    await repository.retryWebsiteAuthenticationCleanup(
+      workerId,
+      cleanup.analysisRunId,
+      cleanup.leaseGeneration,
+      failureCode,
+      authenticationCleanupRetryable(failureCode),
+    );
+    throw error;
+  }
+}
+
+function authenticationCleanupRetryable(code: string): boolean {
+  return code === "WEBSITE_CONTROL_RETRYABLE"
+    || code === "WEBSITE_CONTROL_TIMEOUT"
+    || code === "WEBSITE_CONTROL_ABORTED";
+}
+
+function authenticationCleanupFailureCode(error: unknown): string {
+  const code = error instanceof Error ? error.message : "";
+  return /^[A-Z][A-Z0-9_]{0,63}$/.test(code)
+    ? code
+    : "WEBSITE_AUTHENTICATION_RECONCILE_FAILED";
 }

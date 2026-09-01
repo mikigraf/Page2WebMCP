@@ -77,6 +77,7 @@ export type AnalysisAdapter = ((source: AnalysisSource, signal: AbortSignal) => 
     source: AnalysisSource,
     waiting: WebsiteAuthenticationWaitingOutcome,
     signal: AbortSignal,
+    outcome?: "failed" | "cancelled",
   ): Promise<void>;
 };
 

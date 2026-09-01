@@ -323,6 +323,160 @@ test("Postgres terminal paths and expired reconciliation close authentication st
   }
 });
 
+test("Postgres terminal website authentication cleanup survives lease loss and retries exactly", {
+  skip: !applicationConnectionString || !workerConnectionString || !adminConnectionString,
+}, async () => {
+  const applicationRepository = createPostgresRepository({ connectionString: applicationConnectionString!, maxConnections: 2 });
+  const workerRepository = createPostgresRepository({ connectionString: workerConnectionString!, maxConnections: 2 });
+  const admin = new pg.Pool({ connectionString: adminConnectionString!, max: 1 });
+  let projectId: string | undefined;
+  try {
+    const source = await runningWebsite(applicationRepository, workerRepository, "cleanup-lease");
+    projectId = source.projectId;
+    const checkpointReference = `urn:sha256:${"8".repeat(64)}`;
+    await workerRepository.waitAnalysisForAuthentication(
+      source.workerId,
+      source.runId,
+      waitInput(source, checkpointReference, "cleanup-lease"),
+      source.claim.leaseGeneration,
+    );
+    await applicationRepository.cancelWorkflow(owner, {
+      runId: source.runId,
+      idempotencyKey: "authentication-postgres-cleanup-cancel",
+      inputHash: "authentication-postgres-cleanup-cancel",
+    });
+
+    const first = await workerRepository.claimWebsiteAuthenticationCleanup("postgres-cleanup-a", 1_000);
+    assert.ok(first);
+    assert.equal(first.analysisRunId, source.runId);
+    assert.equal(first.cleanupIdempotencyKey, `website-auth-cleanup:${"8".repeat(64)}`);
+    assert.equal(first.terminalState, "cancelled");
+    assert.equal(first.outcome, "cancelled");
+    assert.equal(first.leaseGeneration, 1);
+    assert.equal(await workerRepository.claimWebsiteAuthenticationCleanup("postgres-cleanup-b", 1_000), undefined);
+
+    await admin.query(
+      "update private.website_authentication_checkpoints " +
+      "set cleanup_lease_expires_at = now() - interval '1 millisecond' where analysis_run_id = $1",
+      [source.runId],
+    );
+    const recovered = await workerRepository.claimWebsiteAuthenticationCleanup("postgres-cleanup-b", 1_000);
+    assert.ok(recovered);
+    assert.equal(recovered.cleanupIdempotencyKey, first.cleanupIdempotencyKey);
+    assert.equal(recovered.attempts, 2);
+    assert.equal(recovered.leaseGeneration, 2);
+    await assert.rejects(
+      workerRepository.completeWebsiteAuthenticationCleanup(
+        "postgres-cleanup-a", source.runId, first.leaseGeneration,
+      ),
+      (error: unknown) => error instanceof RepositoryError && error.code === "LEASE_LOST",
+    );
+
+    await workerRepository.retryWebsiteAuthenticationCleanup(
+      "postgres-cleanup-b", source.runId, recovered.leaseGeneration, "GATEWAY_TIMEOUT",
+    );
+    const pending = await admin.query(
+      "select cleanup_status, cleanup_idempotency_key, cleanup_last_error_code " +
+      "from private.website_authentication_checkpoints where analysis_run_id = $1",
+      [source.runId],
+    );
+    assert.deepEqual(pending.rows[0], {
+      cleanup_status: "pending",
+      cleanup_idempotency_key: first.cleanupIdempotencyKey,
+      cleanup_last_error_code: "GATEWAY_TIMEOUT",
+    });
+    await admin.query(
+      "update private.website_authentication_checkpoints set cleanup_available_at = now() where analysis_run_id = $1",
+      [source.runId],
+    );
+    const retried = await workerRepository.claimWebsiteAuthenticationCleanup("postgres-cleanup-c", 1_000);
+    assert.ok(retried);
+    assert.equal(retried.cleanupIdempotencyKey, first.cleanupIdempotencyKey);
+    assert.equal(retried.attempts, 3);
+    await workerRepository.completeWebsiteAuthenticationCleanup(
+      "postgres-cleanup-c", source.runId, retried.leaseGeneration,
+    );
+    assert.equal(await workerRepository.claimWebsiteAuthenticationCleanup("postgres-cleanup-d", 1_000), undefined);
+    const completed = await admin.query(
+      "select cleanup_status, cleanup_completed_at, cleanup_lease_owner, cleanup_lease_expires_at " +
+      "from private.website_authentication_checkpoints where analysis_run_id = $1",
+      [source.runId],
+    );
+    assert.equal(completed.rows[0]?.cleanup_status, "succeeded");
+    assert.ok(completed.rows[0]?.cleanup_completed_at);
+    assert.equal(completed.rows[0]?.cleanup_lease_owner, null);
+    assert.equal(completed.rows[0]?.cleanup_lease_expires_at, null);
+  } finally {
+    if (projectId) await admin.query("delete from public.projects where id = $1", [projectId]);
+    await applicationRepository.close();
+    await workerRepository.close();
+    await admin.end();
+  }
+});
+
+test("Postgres authentication cleanup stops after three failures with a durable diagnostic", {
+  skip: !applicationConnectionString || !workerConnectionString || !adminConnectionString,
+}, async () => {
+  const applicationRepository = createPostgresRepository({ connectionString: applicationConnectionString!, maxConnections: 2 });
+  const workerRepository = createPostgresRepository({
+    connectionString: workerConnectionString!, maxConnections: 2, random: () => 0,
+  });
+  const admin = new pg.Pool({ connectionString: adminConnectionString!, max: 1 });
+  let projectId: string | undefined;
+  try {
+    const source = await runningWebsite(applicationRepository, workerRepository, "cleanup-budget");
+    projectId = source.projectId;
+    await workerRepository.waitAnalysisForAuthentication(
+      source.workerId,
+      source.runId,
+      waitInput(source, `urn:sha256:${"9".repeat(64)}`, "cleanup-budget"),
+      source.claim.leaseGeneration,
+    );
+    await applicationRepository.cancelWorkflow(owner, {
+      runId: source.runId,
+      idempotencyKey: "authentication-postgres-cleanup-budget-cancel",
+      inputHash: "authentication-postgres-cleanup-budget-cancel",
+    });
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      const cleanup = await workerRepository.claimWebsiteAuthenticationCleanup(
+        `postgres-cleanup-budget-${attempt}`, 1_000,
+      );
+      assert.ok(cleanup);
+      assert.equal(cleanup.attempts, attempt);
+      await workerRepository.retryWebsiteAuthenticationCleanup(
+        `postgres-cleanup-budget-${attempt}`,
+        source.runId,
+        cleanup.leaseGeneration,
+        "GATEWAY_TIMEOUT",
+      );
+    }
+    assert.equal(
+      await workerRepository.claimWebsiteAuthenticationCleanup("postgres-cleanup-budget-4", 1_000),
+      undefined,
+    );
+    const checkpoint = await applicationRepository.getWebsiteAuthenticationWait(owner, source.runId);
+    assert.equal(checkpoint?.cleanupStatus, "failed");
+    assert.equal(checkpoint?.cleanupAttempts, 3);
+    assert.equal(checkpoint?.cleanupErrorCode, "GATEWAY_TIMEOUT");
+    const durable = await admin.query(
+      "select cleanup_status, cleanup_attempts, cleanup_last_error_code, cleanup_available_at " +
+      "from private.website_authentication_checkpoints where analysis_run_id = $1",
+      [source.runId],
+    );
+    assert.deepEqual(durable.rows[0], {
+      cleanup_status: "failed",
+      cleanup_attempts: 3,
+      cleanup_last_error_code: "GATEWAY_TIMEOUT",
+      cleanup_available_at: null,
+    });
+  } finally {
+    if (projectId) await admin.query("delete from public.projects where id = $1", [projectId]);
+    await applicationRepository.close();
+    await workerRepository.close();
+    await admin.end();
+  }
+});
+
 test("Postgres website authentication checkpoint table denies public and maintenance roles", {
   skip: !adminConnectionString,
 }, async () => {

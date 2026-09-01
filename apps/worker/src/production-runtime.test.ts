@@ -228,9 +228,91 @@ test("OpenAPI and website runtimes expose one source and never enter GitHub work
       repository, runtime, `${mode}-worker`, new AbortController().signal,
     ), false);
     assert.deepEqual(claimedSourceTypes, [[mode]]);
-    assert.equal(workflowReconciles, 0);
+    assert.equal(workflowReconciles, 1);
     assert.equal(workflowClaims, 0);
   }
+});
+
+test("website runtime expires and durably cleans an authentication checkpoint before analysis", async () => {
+  let now = new Date("2026-09-01T12:00:00.000Z");
+  const repository = new InMemoryControlPlaneRepository(() => now);
+  const project = await repository.createProject(owner, {
+    name: "Expired authenticated website",
+    sourceType: "website",
+    url: "https://widgets.example/account",
+    idempotencyKey: "runtime-cleanup-project",
+    inputHash: "runtime-cleanup-project",
+  });
+  const run = await repository.enqueueAnalysis(owner, {
+    projectId: project.id,
+    idempotencyKey: "runtime-cleanup-analysis",
+    inputHash: "runtime-cleanup-analysis",
+  });
+  const [snapshot] = await repository.listSourceSnapshots(owner, project.id);
+  assert.ok(snapshot);
+  const claimed = await repository.claimAnalysis("runtime-cleanup-analysis-worker", 60_000, ["website"]);
+  assert.ok(claimed);
+  const checkpointReference = `urn:sha256:${"9".repeat(64)}`;
+  await repository.waitAnalysisForAuthentication("runtime-cleanup-analysis-worker", run.id, {
+    checkpointReference,
+    sourceSnapshotId: snapshot.id,
+    sourceIdentityHash: snapshot.sourceIdentityHash,
+    targetOriginDigest: createHash("sha256").update("https://widgets.example", "utf8").digest("hex"),
+    expiresAt: "2026-09-01T12:01:00.000Z",
+    idempotencyKey: "runtime-cleanup-wait",
+    inputHash: "runtime-cleanup-wait",
+  }, claimed.leaseGeneration);
+  now = new Date("2026-09-01T12:01:00.001Z");
+
+  let analysisCalls = 0;
+  const cleanupCalls: unknown[] = [];
+  const analyze = Object.assign(
+    async () => {
+      analysisCalls += 1;
+      throw new Error("TERMINAL_CLEANUP_MUST_RUN_FIRST");
+    },
+    {
+      reconcileAuthenticationCheckpoint: async (
+        source: Record<string, unknown>,
+        waiting: Record<string, unknown>,
+        _signal: AbortSignal,
+        outcome?: "failed" | "cancelled",
+      ) => { cleanupCalls.push({ source, waiting, outcome }); },
+    },
+  );
+  const runtime: ProductionWorkerRuntime = {
+    analysisSourceTypes: ["website"],
+    analyze,
+  };
+
+  assert.equal(await processProductionWorkerIteration(
+    repository, runtime, "runtime-cleanup-worker", new AbortController().signal,
+  ), true);
+  assert.equal(analysisCalls, 0);
+  assert.deepEqual(cleanupCalls, [{
+    source: {
+      id: run.id,
+      organizationId: owner.organizationId,
+      projectId: project.id,
+      sourceType: "website",
+      sourceUrl: "https://widgets.example/account",
+      sourceSnapshotId: snapshot.id,
+      sourceIdentityHash: snapshot.sourceIdentityHash,
+    },
+    waiting: {
+      disposition: "waiting_for_authentication",
+      capabilities: [],
+      diagnostics: [],
+      evidence: [],
+      checkpointReference,
+      sourceSnapshotId: snapshot.id,
+      sourceIdentityHash: snapshot.sourceIdentityHash,
+      targetOriginDigest: createHash("sha256").update("https://widgets.example", "utf8").digest("hex"),
+      expiresAt: "2026-09-01T12:01:00.000Z",
+    },
+    outcome: "failed",
+  }]);
+  assert.equal(await repository.claimWebsiteAuthenticationCleanup("runtime-cleanup-replay", 1_000), undefined);
 });
 
 test("production runtime validates GitHub controls before the repository can be claimed", () => {

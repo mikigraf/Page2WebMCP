@@ -150,8 +150,37 @@ export type WebsiteAuthenticationCheckpointRecord = Readonly<{
   expiresAt: string;
   consumedAt?: string;
   terminalAt?: string;
+  cleanupStatus?: "pending" | "running" | "succeeded" | "failed";
+  cleanupAttempts?: number;
+  cleanupCompletedAt?: string;
+  cleanupErrorCode?: string;
   createdAt: string;
   updatedAt: string;
+}>;
+
+export type WebsiteAuthenticationCleanupTerminalState = Extract<
+  WebsiteAuthenticationCheckpointState,
+  "failed" | "cancelled" | "expired"
+>;
+
+export type ClaimedWebsiteAuthenticationCleanupRecord = Readonly<{
+  organizationId: string;
+  projectId: string;
+  analysisRunId: string;
+  workflowTaskId: string;
+  sourceSnapshotId: string;
+  sourceIdentityHash: string;
+  sourceUrl: string;
+  targetOriginDigest: string;
+  checkpointReference: string;
+  expiresAt: string;
+  terminalState: WebsiteAuthenticationCleanupTerminalState;
+  outcome: "failed" | "cancelled";
+  cleanupIdempotencyKey: string;
+  attempts: number;
+  leaseOwner: string;
+  leaseExpiresAt: string;
+  leaseGeneration: number;
 }>;
 
 export type WebsiteAuthenticationClaimCheckpoint = Readonly<{
@@ -168,6 +197,15 @@ type StoredWebsiteAuthenticationCheckpoint = WebsiteAuthenticationCheckpointReco
   waitInputHash: string;
   resumeIdempotencyKey?: string;
   resumeInputHash?: string;
+  cleanupStatus?: "pending" | "running" | "succeeded" | "failed";
+  cleanupIdempotencyKey: string;
+  cleanupAttempts: number;
+  cleanupAvailableAt?: string;
+  cleanupLeaseOwner?: string;
+  cleanupLeaseExpiresAt?: string;
+  cleanupLeaseGeneration: number;
+  cleanupCompletedAt?: string;
+  cleanupErrorCode?: string;
 }>;
 
 export type ClaimedAnalysisRunRecord = Readonly<AnalysisRunRecord & {
@@ -508,6 +546,22 @@ export interface ControlPlaneRepository extends WorkflowRepository {
     actor: RepositoryActor,
     input: ResumeAnalysisAfterAuthenticationInput,
   ): Promise<WebsiteAuthenticationCheckpointRecord>;
+  claimWebsiteAuthenticationCleanup(
+    workerId: string,
+    leaseMs: number,
+  ): Promise<ClaimedWebsiteAuthenticationCleanupRecord | undefined>;
+  completeWebsiteAuthenticationCleanup(
+    workerId: string,
+    runId: string,
+    leaseGeneration: number,
+  ): Promise<void>;
+  retryWebsiteAuthenticationCleanup(
+    workerId: string,
+    runId: string,
+    leaseGeneration: number,
+    errorCode: string,
+    retryable?: boolean,
+  ): Promise<void>;
   completeAnalysis(workerId: string, runId: string, result: AnalysisResult, leaseGeneration?: number): Promise<AnalysisRunRecord>;
   failAnalysis(workerId: string, runId: string, code: string, retryable: boolean, leaseGeneration?: number): Promise<AnalysisRunRecord>;
   getAnalysisResult(actor: RepositoryActor, runId: string): Promise<AnalysisResult | undefined>;
@@ -885,6 +939,12 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
       ...checkpoint,
       state,
       terminalAt: at,
+      cleanupStatus: state === "completed" ? "succeeded" : "pending",
+      cleanupAvailableAt: state === "completed" ? undefined : at,
+      cleanupLeaseOwner: undefined,
+      cleanupLeaseExpiresAt: undefined,
+      cleanupCompletedAt: state === "completed" ? at : undefined,
+      cleanupErrorCode: undefined,
       updatedAt: at,
     });
   }
@@ -1847,6 +1907,141 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
     return repaired;
   }
 
+  async claimWebsiteAuthenticationCleanup(
+    workerId: string,
+    leaseMs: number,
+  ): Promise<ClaimedWebsiteAuthenticationCleanupRecord | undefined> {
+    assertWorkerId(workerId);
+    const now = this.clock();
+    const boundedLease = Math.max(1_000, Math.min(leaseMs, 300_000));
+    for (const checkpoint of this.#websiteAuthenticationCheckpoints.values()) {
+      const eligible = (checkpoint.cleanupStatus === "pending"
+        && new Date(checkpoint.cleanupAvailableAt ?? checkpoint.updatedAt) <= now)
+        || (checkpoint.cleanupStatus === "running" && checkpoint.cleanupLeaseExpiresAt !== undefined
+          && new Date(checkpoint.cleanupLeaseExpiresAt) <= now);
+      if (!eligible || checkpoint.cleanupAttempts < 3) continue;
+      this.#websiteAuthenticationCheckpoints.set(checkpoint.analysisRunId, {
+        ...checkpoint,
+        cleanupStatus: "failed",
+        cleanupAvailableAt: undefined,
+        cleanupLeaseOwner: undefined,
+        cleanupLeaseExpiresAt: undefined,
+        cleanupErrorCode: checkpoint.cleanupErrorCode
+          ?? "WEBSITE_AUTHENTICATION_CLEANUP_ATTEMPTS_EXHAUSTED",
+        updatedAt: now.toISOString(),
+      });
+    }
+    const candidates = [...this.#websiteAuthenticationCheckpoints.values()]
+      .filter((checkpoint): checkpoint is StoredWebsiteAuthenticationCheckpoint & Readonly<{
+        state: WebsiteAuthenticationCleanupTerminalState;
+      }> => ["failed", "cancelled", "expired"].includes(checkpoint.state))
+      .filter((checkpoint) => (checkpoint.cleanupStatus === "pending"
+        && new Date(checkpoint.cleanupAvailableAt ?? checkpoint.terminalAt ?? checkpoint.updatedAt) <= now)
+        || (checkpoint.cleanupStatus === "running" && checkpoint.cleanupLeaseExpiresAt !== undefined
+          && new Date(checkpoint.cleanupLeaseExpiresAt) <= now))
+      .filter((checkpoint) => checkpoint.cleanupAttempts < 3)
+      .sort((left, right) => compareCodePoints(
+        left.cleanupAvailableAt ?? left.terminalAt ?? left.updatedAt,
+        right.cleanupAvailableAt ?? right.terminalAt ?? right.updatedAt,
+      ) || compareCodePoints(left.analysisRunId, right.analysisRunId));
+    const checkpoint = candidates[0];
+    if (!checkpoint) return undefined;
+    const source = this.#analysisSources.get(checkpoint.analysisRunId);
+    if (!source || source.sourceType !== "website") throw new RepositoryError("INVALID_STATE");
+    const claimed: StoredWebsiteAuthenticationCheckpoint = {
+      ...checkpoint,
+      cleanupStatus: "running",
+      cleanupAttempts: checkpoint.cleanupAttempts + 1,
+      cleanupLeaseOwner: workerId,
+      cleanupLeaseExpiresAt: new Date(now.getTime() + boundedLease).toISOString(),
+      cleanupLeaseGeneration: checkpoint.cleanupLeaseGeneration + 1,
+      cleanupErrorCode: undefined,
+      updatedAt: now.toISOString(),
+    };
+    this.#websiteAuthenticationCheckpoints.set(checkpoint.analysisRunId, claimed);
+    const terminalState = claimed.state as WebsiteAuthenticationCleanupTerminalState;
+    return copy({
+      organizationId: claimed.organizationId,
+      projectId: claimed.projectId,
+      analysisRunId: claimed.analysisRunId,
+      workflowTaskId: claimed.workflowTaskId,
+      sourceSnapshotId: claimed.sourceSnapshotId,
+      sourceIdentityHash: claimed.sourceIdentityHash,
+      sourceUrl: source.sourceUrl,
+      targetOriginDigest: claimed.targetOriginDigest,
+      checkpointReference: claimed.checkpointReference,
+      expiresAt: claimed.expiresAt,
+      terminalState,
+      outcome: terminalState === "cancelled" ? "cancelled" : "failed",
+      cleanupIdempotencyKey: claimed.cleanupIdempotencyKey,
+      attempts: claimed.cleanupAttempts,
+      leaseOwner: workerId,
+      leaseExpiresAt: claimed.cleanupLeaseExpiresAt!,
+      leaseGeneration: claimed.cleanupLeaseGeneration,
+    });
+  }
+
+  async completeWebsiteAuthenticationCleanup(
+    workerId: string,
+    runId: string,
+    leaseGeneration: number,
+  ): Promise<void> {
+    assertWorkerId(workerId);
+    const checkpoint = this.#websiteAuthenticationCheckpoints.get(runId);
+    const now = this.clock();
+    if (!checkpoint || checkpoint.cleanupStatus !== "running"
+      || checkpoint.cleanupLeaseOwner !== workerId
+      || checkpoint.cleanupLeaseGeneration !== leaseGeneration
+      || !checkpoint.cleanupLeaseExpiresAt || new Date(checkpoint.cleanupLeaseExpiresAt) <= now) {
+      throw new RepositoryError("LEASE_LOST");
+    }
+    const timestamp = now.toISOString();
+    this.#websiteAuthenticationCheckpoints.set(runId, {
+      ...checkpoint,
+      cleanupStatus: "succeeded",
+      cleanupLeaseOwner: undefined,
+      cleanupLeaseExpiresAt: undefined,
+      cleanupCompletedAt: timestamp,
+      cleanupErrorCode: undefined,
+      updatedAt: timestamp,
+    });
+  }
+
+  async retryWebsiteAuthenticationCleanup(
+    workerId: string,
+    runId: string,
+    leaseGeneration: number,
+    errorCode: string,
+    retryable = true,
+  ): Promise<void> {
+    assertWorkerId(workerId);
+    if (!/^[A-Z][A-Z0-9_]{0,63}$/.test(errorCode)) throw new RepositoryError("INVALID_STATE");
+    const checkpoint = this.#websiteAuthenticationCheckpoints.get(runId);
+    const now = this.clock();
+    if (!checkpoint || checkpoint.cleanupStatus !== "running"
+      || checkpoint.cleanupLeaseOwner !== workerId
+      || checkpoint.cleanupLeaseGeneration !== leaseGeneration
+      || !checkpoint.cleanupLeaseExpiresAt || new Date(checkpoint.cleanupLeaseExpiresAt) <= now) {
+      throw new RepositoryError("LEASE_LOST");
+    }
+    const timestamp = now.toISOString();
+    const retryDelayMs = workflowRetryDelayMs(
+      checkpoint.cleanupAttempts,
+      undefined,
+      this.workflowOptions.random,
+    );
+    const exhausted = !retryable || checkpoint.cleanupAttempts >= 3;
+    this.#websiteAuthenticationCheckpoints.set(runId, {
+      ...checkpoint,
+      cleanupStatus: exhausted ? "failed" : "pending",
+      cleanupAvailableAt: exhausted ? undefined : new Date(now.getTime() + retryDelayMs).toISOString(),
+      cleanupLeaseOwner: undefined,
+      cleanupLeaseExpiresAt: undefined,
+      cleanupErrorCode: errorCode,
+      updatedAt: timestamp,
+    });
+  }
+
   async claimAnalysis(
     workerId: string,
     leaseMs: number,
@@ -1886,12 +2081,7 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
         if (project) this.#projects.set(project.id, { ...project, status: "failed" });
         this.#analysisAvailableAt.delete(run.id);
         if (authenticationCheckpoint && ["waiting", "consumed"].includes(authenticationCheckpoint.state)) {
-          this.#websiteAuthenticationCheckpoints.set(run.id, {
-            ...authenticationCheckpoint,
-            state: "failed",
-            terminalAt: now.toISOString(),
-            updatedAt: now.toISOString(),
-          });
+          this.#closeWebsiteAuthenticationCheckpoint(run.id, "failed", now.toISOString());
         }
         const workflow = this.#workflowRuns.get(run.id);
         const task = [...this.#workflowTasks.values()].find((candidate) => candidate.workflowRunId === run.id && candidate.phase === "analysis");
@@ -2032,6 +2222,9 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
       expiresAt: normalized.expiresAt,
       waitIdempotencyKey: input.idempotencyKey,
       waitInputHash: inputHash,
+      cleanupIdempotencyKey: `website-auth-cleanup:${normalized.checkpointReference.slice("urn:sha256:".length)}`,
+      cleanupAttempts: 0,
+      cleanupLeaseGeneration: 0,
       createdAt: now,
       updatedAt: now,
     };
@@ -3297,6 +3490,12 @@ function publicWebsiteAuthenticationCheckpoint(
     expiresAt: checkpoint.expiresAt,
     ...(checkpoint.consumedAt ? { consumedAt: checkpoint.consumedAt } : {}),
     ...(checkpoint.terminalAt ? { terminalAt: checkpoint.terminalAt } : {}),
+    ...(checkpoint.cleanupStatus ? {
+      cleanupStatus: checkpoint.cleanupStatus,
+      cleanupAttempts: checkpoint.cleanupAttempts,
+      ...(checkpoint.cleanupCompletedAt ? { cleanupCompletedAt: checkpoint.cleanupCompletedAt } : {}),
+      ...(checkpoint.cleanupErrorCode ? { cleanupErrorCode: checkpoint.cleanupErrorCode } : {}),
+    } : {}),
     createdAt: checkpoint.createdAt,
     updatedAt: checkpoint.updatedAt,
   });
