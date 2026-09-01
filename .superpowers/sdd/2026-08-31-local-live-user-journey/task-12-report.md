@@ -131,11 +131,18 @@ The unapplied manual file was removed, and all active ledger/sentinel/test refer
   and only then revalidate the checkpoint's immutable snapshot.
 - App resume no longer writes the ungranted workflow-task `error_code` column;
   that field was already cleared by the wait transition.
-- The integration harness accepts separate app and worker URLs, matching the
-  real process topology.
+- The integration harness requires and queries separate app, worker, and owner
+  sessions when split-role URLs are supplied. It asserts both `current_user`
+  and `session_user`, so an owner-capable connection cannot silently satisfy a
+  least-privilege test run.
+- Independent review found and closed three runtime-bootstrap gaps: base
+  application-role checks now reject `CREATEDB`, `CREATEROLE`, and
+  `REPLICATION`; the session advisory lock remains held through the atomic
+  credential-file rename; and the live integration proves the three database
+  identities rather than comparing connection-string text alone.
 
 ```text
-PostgreSQL website authentication integration: 3 passed, 0 skipped, 0 failed
-Focused local/auth/migration tests: 24 passed, 0 failed
+PostgreSQL website authentication integration: 4 passed, 0 skipped, 0 failed
+Focused runtime-role bootstrap tests: 5 passed, 0 skipped, 0 failed
 Typecheck, targeted ESLint, source lint, security policy, diff check: passed
 ```

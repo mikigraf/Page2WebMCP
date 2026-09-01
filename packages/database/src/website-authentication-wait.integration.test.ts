@@ -13,8 +13,10 @@ import {
 import { createPostgresRepository } from "./postgres.ts";
 
 const connectionString = process.env.PAGE2WEBMCP_TEST_DATABASE_URL;
-const applicationConnectionString = process.env.PAGE2WEBMCP_TEST_APP_DATABASE_URL ?? connectionString;
-const workerConnectionString = process.env.PAGE2WEBMCP_TEST_WORKER_DATABASE_URL ?? connectionString;
+const explicitApplicationConnectionString = process.env.PAGE2WEBMCP_TEST_APP_DATABASE_URL;
+const explicitWorkerConnectionString = process.env.PAGE2WEBMCP_TEST_WORKER_DATABASE_URL;
+const applicationConnectionString = explicitApplicationConnectionString ?? connectionString;
+const workerConnectionString = explicitWorkerConnectionString ?? connectionString;
 const adminConnectionString = process.env.PAGE2WEBMCP_TEST_ADMIN_DATABASE_URL;
 const owner: RepositoryActor = {
   id: "11111111-1111-1111-1111-111111111111",
@@ -38,6 +40,37 @@ const outsider: RepositoryActor = {
 };
 
 const TARGET_ORIGIN_DIGEST = "57522ad7956a69fe9a8100d7088fe09afc3a63de516de9f548c69862a5ff64ec";
+
+test("Postgres website authentication split-role topology cannot collapse to one login", {
+  skip: !explicitApplicationConnectionString && !explicitWorkerConnectionString,
+}, async () => {
+  assert.ok(explicitApplicationConnectionString);
+  assert.ok(explicitWorkerConnectionString);
+  assert.ok(adminConnectionString);
+  assert.notEqual(explicitApplicationConnectionString, explicitWorkerConnectionString);
+  const application = new pg.Client({ connectionString: explicitApplicationConnectionString });
+  const worker = new pg.Client({ connectionString: explicitWorkerConnectionString });
+  const admin = new pg.Client({ connectionString: adminConnectionString });
+  try {
+    await Promise.all([application.connect(), worker.connect(), admin.connect()]);
+    const [applicationIdentity, workerIdentity, adminIdentity] = await Promise.all([
+      application.query<{ current_user: string; session_user: string }>("select current_user, session_user"),
+      worker.query<{ current_user: string; session_user: string }>("select current_user, session_user"),
+      admin.query<{ current_user: string; session_user: string }>("select current_user, session_user"),
+    ]);
+    assert.deepEqual(applicationIdentity.rows[0], {
+      current_user: "page2webmcp_app",
+      session_user: "page2webmcp_app_local",
+    });
+    assert.deepEqual(workerIdentity.rows[0], {
+      current_user: "page2webmcp_worker",
+      session_user: "page2webmcp_worker_local",
+    });
+    assert.deepEqual(adminIdentity.rows[0], { current_user: "postgres", session_user: "postgres" });
+  } finally {
+    await Promise.allSettled([application.end(), worker.end(), admin.end()]);
+  }
+});
 
 async function runningWebsite(
   applicationRepository: ControlPlaneRepository,

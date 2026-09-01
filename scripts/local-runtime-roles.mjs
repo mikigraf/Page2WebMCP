@@ -32,10 +32,10 @@ export async function bootstrapLocalRuntimeRoles(
     );
     for (const credential of credentials) await configureLogin(client, credential);
     await assertRuntimeLoginMemberships(client, credentials);
+    await writeLocalEnvironment(destination, credentials, ownerUrl, localStatus);
   } finally {
     await client.end().catch(() => undefined);
   }
-  await writeLocalEnvironment(destination, credentials, ownerUrl, localStatus);
   return credentials.map(({ environmentKey, login, role }) => ({ environmentKey, login, role }));
 }
 
@@ -136,10 +136,18 @@ export function validateOwnerDatabaseUrl(value) {
 async function assertBoundedApplicationRoles(client) {
   const names = RUNTIME_ROLES.map(({ role }) => role);
   const result = await client.query(
-    "select rolname, rolcanlogin, rolinherit, rolsuper, rolbypassrls from pg_roles where rolname = any($1::text[])",
+    "select rolname, rolcanlogin, rolinherit, rolsuper, rolcreatedb, rolcreaterole, rolreplication, rolbypassrls from pg_roles where rolname = any($1::text[])",
     [names]
   );
-  if (result.rows.length !== names.length || result.rows.some((row) => row.rolcanlogin || row.rolinherit || row.rolsuper || row.rolbypassrls)) {
+  if (result.rows.length !== names.length || result.rows.some((row) =>
+    row.rolcanlogin
+    || row.rolinherit
+    || row.rolsuper
+    || row.rolcreatedb
+    || row.rolcreaterole
+    || row.rolreplication
+    || row.rolbypassrls
+  )) {
     throw new Error("LOCAL_APPLICATION_ROLE_BOUNDARY_REQUIRED");
   }
 }

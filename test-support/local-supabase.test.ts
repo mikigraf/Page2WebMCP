@@ -248,7 +248,9 @@ test("runtime role bootstrap uses typed format parameters and tenant-safe replay
   assert.match(source, /select 1 from pg_roles where rolname = \$1::text/i);
   assert.match(source, /pg_advisory_lock\(hashtextextended\(\$1::text, 0\)\)/i);
   assert.doesNotMatch(source, /error\?\.code\s*!==\s*"42710"/i);
+  assert.match(source, /select rolname, rolcanlogin, rolinherit, rolsuper, rolcreatedb, rolcreaterole, rolreplication, rolbypassrls from pg_roles/i);
   assert.match(source, /member\.rolcanlogin[\s\S]*member\.rolcreatedb[\s\S]*member\.rolcreaterole[\s\S]*member\.rolreplication/i);
+  assert.match(source, /await assertRuntimeLoginMemberships[\s\S]*await writeLocalEnvironment[\s\S]*finally\s*\{[\s\S]*await client\.end/i);
 });
 
 test("runtime role bootstrap refuses to persist credentials until every committed migration is applied", async () => {
@@ -264,6 +266,26 @@ test("runtime role bootstrap refuses to persist credentials until every committe
     ), /^Error: LOCAL_MIGRATION_HISTORY_INCOMPLETE$/);
     assert.equal(await exists(destination), false);
     assert.equal(client.ended, true);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("runtime role bootstrap rejects every privilege-bearing application-role flag", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "page2webmcp-local-unsafe-role-"));
+  try {
+    for (const flag of ["rolcreatedb", "rolcreaterole", "rolreplication"] as const) {
+      const destination = join(directory, `.page2webmcp/${flag}.env`);
+      const client = fakeBootstrapClient(migrationVersions, { [flag]: true });
+      await assert.rejects(bootstrapLocalRuntimeRoles(
+        "postgresql://postgres:owner-secret@127.0.0.1:58322/postgres",
+        destination,
+        { createClient: () => client },
+        { localStatus, expectedMigrationVersions: migrationVersions }
+      ), /^Error: LOCAL_APPLICATION_ROLE_BOUNDARY_REQUIRED$/);
+      assert.equal(await exists(destination), false);
+      assert.equal(client.ended, true);
+    }
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -401,7 +423,10 @@ async function exists(path: string) {
   return existsSync(path);
 }
 
-function fakeBootstrapClient(appliedMigrationVersions: readonly string[] = []) {
+function fakeBootstrapClient(
+  appliedMigrationVersions: readonly string[] = [],
+  unsafeApplicationRoleFlags: Partial<Record<"rolcreatedb" | "rolcreaterole" | "rolreplication", boolean>> = {},
+) {
   const applicationRoles = ["page2webmcp_app", "page2webmcp_worker", "page2webmcp_maintenance"];
   const membershipAssertions: string[][] = [];
   const migrationAssertions: string[] = [];
@@ -417,7 +442,17 @@ function fakeBootstrapClient(appliedMigrationVersions: readonly string[] = []) {
         return { rows: appliedMigrationVersions.map((version) => ({ version })) };
       }
       if (text.includes("from pg_roles")) return {
-        rows: applicationRoles.map((rolname) => ({ rolname, rolcanlogin: false, rolinherit: false, rolsuper: false, rolbypassrls: false }))
+        rows: applicationRoles.map((rolname) => ({
+          rolname,
+          rolcanlogin: false,
+          rolinherit: false,
+          rolsuper: false,
+          rolcreatedb: false,
+          rolcreaterole: false,
+          rolreplication: false,
+          rolbypassrls: false,
+          ...unsafeApplicationRoleFlags,
+        }))
       };
       if (text.includes("from pg_auth_members")) {
         const logins = values?.[0] as string[];
