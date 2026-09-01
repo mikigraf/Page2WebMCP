@@ -748,7 +748,7 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
       if (!candidate.rows[0]) return undefined;
       await client.query("select pg_advisory_xact_lock(hashtextextended($1, 0))", [String(candidate.rows[0].organization_id)]);
       const runLock = await client.query(
-        "select id, source_snapshot_id from public.workflow_runs where id = $1 and cancel_requested_at is null " +
+        "select id from public.workflow_runs where id = $1 and cancel_requested_at is null " +
         "and status not in ('succeeded','failed','cancelled') for update",
         [candidate.rows[0].workflow_run_id]
       );
@@ -1539,7 +1539,7 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
       if (!runId) return undefined;
       await client.query("select pg_advisory_xact_lock(hashtextextended($1, 0))", [String(candidate.rows[0].organization_id)]);
       const runLock = await client.query(
-        "select id from public.workflow_runs where id = $1 and cancel_requested_at is null " +
+        "select id, source_snapshot_id from public.workflow_runs where id = $1 and cancel_requested_at is null " +
         "and status not in ('succeeded','failed','cancelled') for update",
         [runId]
       );

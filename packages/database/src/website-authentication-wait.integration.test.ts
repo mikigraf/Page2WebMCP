@@ -101,6 +101,7 @@ async function runningWebsite(
   const workerId = `authentication-worker-${unique}`;
   const claim = await workerRepository.claimAnalysis(workerId, 60_000, ["website"]);
   assert.equal(claim?.id, run.id);
+  assert.equal(claim?.sourceSnapshotId, snapshot.id);
   return {
     projectId: project.id,
     runId: run.id,
