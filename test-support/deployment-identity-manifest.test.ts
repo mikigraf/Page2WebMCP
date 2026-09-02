@@ -163,3 +163,38 @@ test("production image inputs accept only an immutable sha256 base and the exact
     committedDockerfilePath,
   }), /DEPLOYMENT_BUILD_ARCHIVE_INVALID/);
 });
+
+test("build-context source mode trusts the pinned commit but still requires a clean synthetic tree", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "page2webmcp-deployment-identity-context-"));
+  const contextEnvironment = { ...environment, PAGE2WEBMCP_DEPLOYMENT_SOURCE: "build-context" };
+  const syntheticHead = Buffer.from(`${"d".repeat(40)}\n`);
+  const git = async (args: readonly string[]) => {
+    if (args[0] === "rev-parse") return syntheticHead;
+    if (args[0] === "status") return Buffer.alloc(0);
+    if (args[0] === "archive") return Buffer.from("archive of the render build context");
+    throw new Error("unexpected git call");
+  };
+  const identity = await generateDeploymentIdentityManifest(contextEnvironment, {
+    outputPath: join(directory, "context.json"), git,
+  });
+  assert.equal(identity.gitCommitSha, environment.PAGE2WEBMCP_GIT_COMMIT_SHA);
+  assert.match(identity.sourceTreeSha256, /^[0-9a-f]{64}$/);
+  await assert.rejects(
+    generateDeploymentIdentityManifest(environment, { outputPath: join(directory, "git-mode.json"), git }),
+    { message: "DEPLOYMENT_BUILD_COMMIT_MISMATCH" },
+  );
+  await assert.rejects(
+    generateDeploymentIdentityManifest(
+      { ...environment, PAGE2WEBMCP_DEPLOYMENT_SOURCE: "network" },
+      { outputPath: join(directory, "bad-mode.json"), git },
+    ),
+    { message: "DEPLOYMENT_BUILD_SOURCE_MODE_INVALID" },
+  );
+  await assert.rejects(
+    generateDeploymentIdentityManifest(contextEnvironment, {
+      outputPath: join(directory, "dirty.json"),
+      git: async (args: readonly string[]) => args[0] === "status" ? Buffer.from("?? stray\n") : git(args),
+    }),
+    { message: "DEPLOYMENT_BUILD_TREE_DIRTY" },
+  );
+});
