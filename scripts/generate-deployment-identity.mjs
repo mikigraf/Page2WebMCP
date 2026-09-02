@@ -12,20 +12,32 @@ const MAX_GIT_ARCHIVE_BYTES = 128 * 1024 * 1024;
 const MAX_GIT_TEXT_BYTES = 4 * 1024 * 1024;
 const MAX_MANIFEST_BYTES = 4_096;
 const MAX_DOCKERFILE_BYTES = 64 * 1024;
+const SOURCE_MODE_GIT = "git";
+const SOURCE_MODE_BUILD_CONTEXT = "build-context";
 
 export async function generateDeploymentIdentityManifest(environment = process.env, dependencies = {}) {
   const gitCommitSha = environment.PAGE2WEBMCP_GIT_COMMIT_SHA ?? "";
   const applicationReleaseId = environment.PAGE2WEBMCP_APPLICATION_RELEASE_ID ?? "";
   const controlPlaneOrigin = environment.PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN ?? "";
+  const sourceMode = environment.PAGE2WEBMCP_DEPLOYMENT_SOURCE ?? SOURCE_MODE_GIT;
   if (!COMMIT.test(gitCommitSha) || !RELEASE_ID.test(applicationReleaseId)
     || !exactHttpsOrigin(controlPlaneOrigin)) {
     throw new Error("DEPLOYMENT_BUILD_CONFIGURATION_REQUIRED");
   }
+  if (sourceMode !== SOURCE_MODE_GIT && sourceMode !== SOURCE_MODE_BUILD_CONTEXT) {
+    throw new Error("DEPLOYMENT_BUILD_SOURCE_MODE_INVALID");
+  }
 
+  // In git mode HEAD must be the deployed commit. In build-context mode (Render
+  // strips .git from the Docker context) HEAD is a deterministic synthetic
+  // commit of that context, so the pinned commit is trusted from the platform
+  // and only the clean-tree and archive checks bind the identity to the bytes.
   const git = dependencies.git ?? runGit;
   const actualCommitBytes = await git(["rev-parse", "--verify", "HEAD"]);
   const actualCommit = exactGitCommit(actualCommitBytes);
-  if (actualCommit !== gitCommitSha) throw new Error("DEPLOYMENT_BUILD_COMMIT_MISMATCH");
+  if (sourceMode === SOURCE_MODE_GIT && actualCommit !== gitCommitSha) {
+    throw new Error("DEPLOYMENT_BUILD_COMMIT_MISMATCH");
+  }
 
   const status = await git(["status", "--porcelain=v1", "--untracked-files=all"]);
   if (status.byteLength > MAX_GIT_TEXT_BYTES || status.byteLength !== 0) {
