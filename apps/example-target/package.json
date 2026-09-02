@@ -7,6 +7,11 @@
     "build": "next build",
     "start": "next start"
   },
+  "dependencies": {
+    "next": "16.3.3",
+    "react": "19.2.8",
+    "react-dom": "19.2.8"
+  },
   "devDependencies": {
     "@apidevtools/swagger-parser": "10.1.1",
     "@types/react": "19.2.18"
