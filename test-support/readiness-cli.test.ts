@@ -12,6 +12,7 @@ import {
   sourceMigrationLedgerCurrent,
   type ReadinessCliDependencies,
 } from "../scripts/check-release-readiness.ts";
+import { PRODUCTION_LIVE_COMMON_CONTROLS } from "../packages/operations/src/production-live.ts";
 
 const run = promisify(execFile);
 const root = fileURLToPath(new URL("../", import.meta.url));
@@ -70,6 +71,8 @@ function completeEnvironment(mode: "live" | "local-live" = "live") {
     PAGE2WEBMCP_RELEASE_VERIFIER_TOKEN: "v".repeat(32),
     ...(mode === "live" ? {
       PAGE2WEBMCP_RELEASE_VERIFIER_ORIGIN: "https://verifier.example",
+      PAGE2WEBMCP_SUPABASE_URL: "https://bimqgiedckdurqiywctl.supabase.co",
+      PAGE2WEBMCP_SUPABASE_SECRET_KEY: `sb_secret_${"s".repeat(32)}`,
       PAGE2WEBMCP_GIT_COMMIT_SHA: deployment.gitCommitSha,
       PAGE2WEBMCP_APPLICATION_RELEASE_ID: deployment.applicationReleaseId,
     } : {
@@ -195,19 +198,27 @@ test("missing live controls are sorted names only, never values", async () => {
     PAGE2WEBMCP_MAINTENANCE_DATABASE_URL: undefined,
     PAGE2WEBMCP_RELEASE_VERIFIER_ORIGIN: undefined,
     PAGE2WEBMCP_RELEASE_VERIFIER_TOKEN: undefined,
+    PAGE2WEBMCP_SUPABASE_URL: undefined,
+    PAGE2WEBMCP_SUPABASE_SECRET_KEY: undefined,
+    PAGE2WEBMCP_GIT_COMMIT_SHA: undefined,
+    PAGE2WEBMCP_APPLICATION_RELEASE_ID: undefined,
   }), (error: unknown) => {
     const failure = error as { code?: number; stdout?: string };
     assert.equal(failure.code, 2);
     const output = JSON.parse(failure.stdout ?? "{}");
     assert.deepEqual(output.missingKeys, [
       "DATABASE_URL",
+      "PAGE2WEBMCP_APPLICATION_RELEASE_ID",
       "PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN",
+      "PAGE2WEBMCP_GIT_COMMIT_SHA",
       "PAGE2WEBMCP_MAINTENANCE_DATABASE_URL",
       "PAGE2WEBMCP_PROVIDER_MODE",
       "PAGE2WEBMCP_PUBLIC_ORIGIN",
       "PAGE2WEBMCP_RELEASE_VERIFIER_ORIGIN",
       "PAGE2WEBMCP_RELEASE_VERIFIER_TOKEN",
       "PAGE2WEBMCP_STORAGE_MODE",
+      "PAGE2WEBMCP_SUPABASE_SECRET_KEY",
+      "PAGE2WEBMCP_SUPABASE_URL",
     ]);
     assert.equal(JSON.stringify(output).includes("secret"), false);
     assert.equal(output.liveSuccess, false);
@@ -453,4 +464,44 @@ test("local-live runs its selected-provider topology diagnostics but can never c
   assert.deepEqual(outcome, {
     output: { status: "passed", code: "LOCAL_LIVE_READINESS_PASSED", liveSuccess: false }, exitCode: 0,
   });
+});
+
+test("live readiness reports the same deployment-identity and hosted Storage controls as the journey preflight", async () => {
+  // Operator-only controls the readiness command never uses: it neither writes a
+  // receipt nor authenticates as the operator.
+  const operatorOnly = new Set([
+    "PAGE2WEBMCP_OPERATOR_CREDENTIALS_FILE",
+    "PAGE2WEBMCP_RECEIPT_SIGNING_KEY",
+  ]);
+  const shared = PRODUCTION_LIVE_COMMON_CONTROLS.filter((key) => !operatorOnly.has(key));
+  for (const key of shared) {
+    const environment: Record<string, string | undefined> = { ...completeEnvironment("live"), [key]: undefined };
+    const result = await runReadinessCli(["--live"], environment, dependencies([]));
+    assert.equal(result.output.code, "LIVE_CONTROLS_REQUIRED", key);
+    assert.ok(result.output.missingKeys?.includes(key), `${key} must be reported by name`);
+  }
+
+  for (const [key, value] of [
+    ["PAGE2WEBMCP_SUPABASE_URL", "https://another-project.supabase.co"],
+    ["PAGE2WEBMCP_SUPABASE_SECRET_KEY", "short"],
+    ["PAGE2WEBMCP_GIT_COMMIT_SHA", "not-a-commit"],
+    ["PAGE2WEBMCP_APPLICATION_RELEASE_ID", "release.with.dots"],
+  ] as const) {
+    const result = await runReadinessCli(
+      ["--live"], { ...completeEnvironment("live"), [key]: value }, dependencies([]),
+    );
+    assert.deepEqual(result.output.missingKeys, [key]);
+  }
+
+  // local-live keeps its narrower control set: the hosted Storage and deployment
+  // identity controls are live-only and must not appear there.
+  const local = await runReadinessCli(["--local-live"], {
+    ...completeEnvironment("local-live"),
+    PAGE2WEBMCP_SUPABASE_URL: undefined,
+    PAGE2WEBMCP_SUPABASE_SECRET_KEY: undefined,
+    PAGE2WEBMCP_GIT_COMMIT_SHA: undefined,
+    PAGE2WEBMCP_APPLICATION_RELEASE_ID: undefined,
+  }, dependencies([], true));
+  assert.notEqual(local.output.code, "LIVE_CONTROLS_REQUIRED");
+  assert.equal(local.output.missingKeys, undefined);
 });

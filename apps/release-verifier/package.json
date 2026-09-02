@@ -1,0 +1,9 @@
+{
+  "name": "@page2webmcp/release-verifier",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc --project tsconfig.build.json",
+    "start": "node ../../.dist/release-verifier/apps/release-verifier/src/main.js"
+  }
+}

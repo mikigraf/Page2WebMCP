@@ -68,6 +68,7 @@ export async function verifyDeploymentBuildContext(environment = process.env, de
     ?? environment.PAGE2WEBMCP_DEPLOYMENT_DOCKERFILE;
   if (committedDockerfile !== "deploy/Dockerfile.control-plane"
     && committedDockerfile !== "deploy/Dockerfile.worker"
+    && committedDockerfile !== "deploy/Dockerfile.release-verifier"
     && dependencies.committedDockerfilePath === undefined) {
     throw new Error("DEPLOYMENT_BUILD_DOCKERFILE_REQUIRED");
   }

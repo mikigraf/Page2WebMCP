@@ -1,0 +1,10 @@
+{
+  "name": "@page2webmcp/website-gateway",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc --project tsconfig.build.json",
+    "start": "node ../../.dist/website-gateway/apps/website-gateway/src/main.js",
+    "test": "tsx --test tests/*.test.ts"
+  }
+}

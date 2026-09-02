@@ -31,7 +31,10 @@ const HOSTED_PUBLIC_ORIGIN =
   "https://bimqgiedckdurqiywctl.supabase.co/storage/v1/object/public/page2webmcp-releases";
 const LOCAL_PUBLIC_ORIGIN =
   "http://127.0.0.1:58321/storage/v1/object/public/page2webmcp-releases";
+const HOSTED_SUPABASE_URL = "https://bimqgiedckdurqiywctl.supabase.co";
 const HASH = /^[0-9a-f]{64}$/;
+const COMMIT = /^[0-9a-f]{40}$/;
+const DEPLOYMENT_RELEASE_ID = /^[A-Za-z0-9_-]{1,128}$/;
 const MAX_ARTIFACT_BYTES = 65_536;
 const ARTIFACT_TIMEOUT_MS = 10_000;
 const PROVIDER_PROBE_TIMEOUT_MS = 10_000;
@@ -392,6 +395,17 @@ function inspectControls(environment: Environment, mode: Exclude<ReadinessMode, 
     }
     if (!exactHttpsOrigin(environment.PAGE2WEBMCP_RELEASE_VERIFIER_ORIGIN)) {
       invalid.add("PAGE2WEBMCP_RELEASE_VERIFIER_ORIGIN");
+    }
+    // Keep the reported set consistent with PRODUCTION_LIVE_COMMON_CONTROLS so a
+    // standalone --live run names every control instead of failing later as a
+    // DEPLOYMENT_IDENTITY_* or hosted Storage error.
+    if (environment.PAGE2WEBMCP_SUPABASE_URL !== HOSTED_SUPABASE_URL) invalid.add("PAGE2WEBMCP_SUPABASE_URL");
+    if (!boundedSecret(environment.PAGE2WEBMCP_SUPABASE_SECRET_KEY)) {
+      invalid.add("PAGE2WEBMCP_SUPABASE_SECRET_KEY");
+    }
+    if (!COMMIT.test(environment.PAGE2WEBMCP_GIT_COMMIT_SHA ?? "")) invalid.add("PAGE2WEBMCP_GIT_COMMIT_SHA");
+    if (!DEPLOYMENT_RELEASE_ID.test(environment.PAGE2WEBMCP_APPLICATION_RELEASE_ID ?? "")) {
+      invalid.add("PAGE2WEBMCP_APPLICATION_RELEASE_ID");
     }
   } else {
     if (environment.PAGE2WEBMCP_LOCAL_STACK !== "true") invalid.add("PAGE2WEBMCP_LOCAL_STACK");

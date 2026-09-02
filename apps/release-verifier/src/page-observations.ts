@@ -1,0 +1,128 @@
+import type { Page } from "@playwright/test";
+
+/**
+ * Read-only observations of a real page. Every function here reports what the page already is;
+ * none of them register a tool, define a WebMCP surface, or modify page state.
+ */
+
+export type ScriptTagObservation = Readonly<{
+  src: string;
+  integrity: string;
+  crossOrigin: string;
+  type: string;
+}>;
+
+export type WebMcpSurface = Readonly<{
+  present: boolean;
+  native: boolean;
+  ownProperty: boolean;
+  nativeRegisterTool: boolean;
+}>;
+
+export type ModuleExecution = Readonly<{
+  status: string;
+  registeredToolNames: readonly string[];
+}>;
+
+export async function observeScriptTag(page: Page, artifactUrl: string): Promise<ScriptTagObservation | undefined> {
+  const observed = await page.evaluate((url) => {
+    const scripts = [...document.querySelectorAll("script[src]")] as HTMLScriptElement[];
+    const match = scripts.find((script) => {
+      try {
+        return new URL(script.getAttribute("src") ?? "", document.baseURI).href === url;
+      } catch {
+        return false;
+      }
+    });
+    if (!match) return undefined;
+    return {
+      src: new URL(match.getAttribute("src") ?? "", document.baseURI).href,
+      integrity: match.getAttribute("integrity") ?? "",
+      crossOrigin: match.getAttribute("crossorigin") ?? "",
+      type: match.getAttribute("type") ?? "",
+    };
+  }, artifactUrl);
+  return observed ?? undefined;
+}
+
+export async function observeTargetOrigin(page: Page): Promise<string> {
+  return await page.evaluate(() => window.location.origin);
+}
+
+/**
+ * "native" means the browser itself exposes document.modelContext: the property comes from
+ * Document.prototype rather than from an own property assigned by page script, and registerTool
+ * is a native function. Anything else - including a page-installed compatibility object and a
+ * page with no WebMCP at all - is reported as not native.
+ */
+export async function observeWebMcpSurface(page: Page): Promise<WebMcpSurface> {
+  return await page.evaluate(() => {
+    const target = document as Document & { modelContext?: { registerTool?: unknown } };
+    const context = target.modelContext;
+    const ownProperty = Object.getOwnPropertyDescriptor(document, "modelContext") !== undefined;
+    const prototypeProperty = Object.getOwnPropertyDescriptor(Document.prototype, "modelContext") !== undefined;
+    const register = context?.registerTool;
+    const nativeRegisterTool = typeof register === "function"
+      && Function.prototype.toString.call(register).includes("[native code]");
+    return {
+      present: !!context,
+      ownProperty,
+      nativeRegisterTool,
+      native: !!context && !ownProperty && prototypeProperty && nativeRegisterTool,
+    };
+  });
+}
+
+export async function observeRegisteredTools(page: Page): Promise<readonly string[]> {
+  const names = await page.evaluate(async () => {
+    const target = document as Document & { modelContext?: { getTools?: () => Promise<unknown> } };
+    const context = target.modelContext;
+    if (!context || typeof context.getTools !== "function") return [];
+    try {
+      const tools = await context.getTools();
+      if (!Array.isArray(tools)) return [];
+      return tools.slice(0, 100).map((tool) => String((tool as { name?: unknown })?.name ?? ""));
+    } catch {
+      return [];
+    }
+  });
+  return Object.freeze([...new Set(names.filter((name) => /^[a-z][a-z0-9_]{0,63}$/.test(name)))].sort());
+}
+
+export async function observeModuleExecution(page: Page, releaseId: string): Promise<ModuleExecution | undefined> {
+  const observed = await page.evaluate((key) => {
+    const registry = (globalThis as Record<symbol, unknown>)[Symbol.for("page2webmcp.release.registry.v1")];
+    if (!(registry instanceof Map)) return undefined;
+    const state = registry.get(key) as { status?: unknown; registeredToolNames?: unknown } | undefined;
+    if (!state) return undefined;
+    return {
+      status: String(state.status ?? ""),
+      registeredToolNames: Array.isArray(state.registeredToolNames)
+        ? state.registeredToolNames.slice(0, 100).map((name) => String(name))
+        : [],
+    };
+  }, releaseId);
+  return observed ?? undefined;
+}
+
+/**
+ * Loads the already-executed module a second time and asks it to register again. The module map
+ * returns the same instance, so this exercises the release's own duplicate-registration path
+ * rather than injecting a second registration. Returns null when the module never executed.
+ */
+export async function probeDuplicateLoad(page: Page, artifactUrl: string): Promise<boolean | null> {
+  const before = await observeRegisteredTools(page);
+  const result = await page.evaluate(async (url) => {
+    try {
+      const loaded = await import(url) as { registerPage2WebMCPTools?: () => Promise<{ supported?: boolean }> };
+      if (typeof loaded.registerPage2WebMCPTools !== "function") return { attempted: false, supported: false };
+      const outcome = await loaded.registerPage2WebMCPTools();
+      return { attempted: true, supported: outcome?.supported === true };
+    } catch {
+      return { attempted: true, supported: false };
+    }
+  }, artifactUrl);
+  if (!result.attempted) return null;
+  const after = await observeRegisteredTools(page);
+  return result.supported && before.length === after.length && before.every((name, index) => name === after[index]);
+}

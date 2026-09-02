@@ -19,6 +19,8 @@ import {
 const HASH = "a".repeat(64);
 const OTHER_HASH = "b".repeat(64);
 const NOW = new Date("2026-09-01T12:00:00.000Z");
+const SIGNING_KEY = `receipt_signing_${"k".repeat(32)}`;
+const OTHER_SIGNING_KEY = `receipt_signing_${"z".repeat(32)}`;
 const HOSTED_STORAGE =
   "https://bimqgiedckdurqiywctl.supabase.co/storage/v1/object/public/page2webmcp-releases";
 const WEBSITE_LIVE_KEYS = [
@@ -60,6 +62,7 @@ function commonEnvironment(): Record<string, string> {
     PAGE2WEBMCP_GIT_COMMIT_SHA: "c".repeat(40),
     PAGE2WEBMCP_APPLICATION_RELEASE_ID: "page2webmcp-2026_09_01-rc1",
     PAGE2WEBMCP_OPERATOR_CREDENTIALS_FILE: "/secure/page2webmcp-operator.json",
+    PAGE2WEBMCP_RECEIPT_SIGNING_KEY: `receipt_signing_${"k".repeat(32)}`,
   };
 }
 
@@ -106,6 +109,7 @@ function commonReceiptInput() {
       applicationReleaseId: "page2webmcp-2026_09_01-rc1",
       controlPlaneOrigin: "https://control.widgets.dev",
       controlPlaneIdentityDigest: HASH,
+      sourceTreeSha256: OTHER_HASH,
     },
     database: {
       projectRef: "bimqgiedckdurqiywctl",
@@ -142,6 +146,7 @@ function commonReceiptInput() {
       installedSha256: HASH,
       targetOrigin: "https://staging.widgets.dev",
       environment: "production" as const,
+      verifiedAt: "2026-09-01T12:00:00.000Z",
     },
     verifier: {
       identityDigest: HASH,
@@ -286,6 +291,36 @@ test("website production-live preflight rejects non-production environments befo
   assert.deepEqual(inspectProductionLiveControls("website", websiteEnvironment()).missingControls, []);
 });
 
+test("a local-stack or local verifier origin fails the production-live preflight closed by exact name", () => {
+  for (const mode of ["dry-run", "live"] as const) {
+    const environment = {
+      ...openApiEnvironment(),
+      PAGE2WEBMCP_LOCAL_STACK: "true",
+      PAGE2WEBMCP_LOCAL_RELEASE_VERIFIER_ORIGIN: "http://127.0.0.1:3900",
+    };
+    const result = evaluateProductionLivePreflight({ journey: "openapi", mode, environment });
+    assert.equal(result.status, "failed");
+    assert.equal(result.code, "PRODUCTION_LIVE_LOCAL_STACK_FORBIDDEN");
+    assert.deepEqual(result.missingControls, [
+      "PAGE2WEBMCP_LOCAL_RELEASE_VERIFIER_ORIGIN",
+      "PAGE2WEBMCP_LOCAL_STACK",
+    ]);
+    assert.equal(result.liveSuccess, false);
+  }
+
+  const localStackOnly = evaluateProductionLivePreflight({
+    journey: "openapi",
+    mode: "live",
+    environment: { ...openApiEnvironment(), PAGE2WEBMCP_LOCAL_STACK: "false" },
+  });
+  assert.equal(localStackOnly.code, "PRODUCTION_LIVE_LOCAL_STACK_FORBIDDEN");
+  assert.deepEqual(localStackOnly.missingControls, ["PAGE2WEBMCP_LOCAL_STACK"]);
+
+  assert.equal(evaluateProductionLivePreflight({
+    journey: "openapi", mode: "live", environment: openApiEnvironment(),
+  }).code, "PRODUCTION_LIVE_READY_TO_EXECUTE");
+});
+
 test("dry-run only returns an immutable plan and can never claim live success", () => {
   const result = evaluateProductionLivePreflight({
     journey: "openapi",
@@ -314,15 +349,16 @@ test("receipt builders canonicalize key order and validators reject tampering, u
     provider: { type: "openapi", adapter: "bounded-openapi", adapterVersion: 1 },
     source: { identityDigest: HASH, documentIdentityDigest: OTHER_HASH },
   } as const;
-  const receipt = buildOpenApiLiveJourneyReceipt(input, NOW);
+  const receipt = buildOpenApiLiveJourneyReceipt(input, SIGNING_KEY, NOW);
   assert.equal(receipt.schema, "OpenApiLiveJourneyReceiptV1");
   assert.equal(receipt.schemaVersion, 1);
   assert.equal(receipt.integrity.algorithm, "sha256");
   assert.equal(receipt.integrity.digest, canonicalJsonSha256({
     ...receipt,
     integrity: undefined,
+    signature: undefined,
   }));
-  assert.deepEqual(validateOpenApiLiveJourneyReceipt(receipt, NOW), receipt);
+  assert.deepEqual(validateOpenApiLiveJourneyReceipt(receipt, NOW, SIGNING_KEY), receipt);
 
   const reordered = JSON.parse(JSON.stringify(receipt)) as Record<string, unknown>;
   const reverseEntries = Object.entries(reordered).reverse();
@@ -338,11 +374,11 @@ test("receipt builders canonicalize key order and validators reject tampering, u
       ...input.verifier,
       installation: { ...input.verifier.installation, attestedAt: "2026-09-01T12:00:00.001Z" },
     },
-  }, NOW), /RECEIPT_ATTESTATION_FUTURE/);
+  }, SIGNING_KEY, NOW), /RECEIPT_ATTESTATION_FUTURE/);
   assert.throws(() => buildOpenApiLiveJourneyReceipt({
     ...input,
     readiness: { ...input.readiness, status: "failed" as const },
-  }, NOW), /RECEIPT_LIVE_SUCCESS_INVALID/);
+  }, SIGNING_KEY, NOW), /RECEIPT_LIVE_SUCCESS_INVALID/);
 });
 
 test("website receipt binds browser, ownership, authentication, restart, TTL, and cleanup identities", () => {
@@ -353,7 +389,7 @@ test("website receipt binds browser, ownership, authentication, restart, TTL, an
     browserUse: { sessionIdentityDigest: HASH },
     ownership: { decisionDigest: HASH, verified: true },
     browserLease: { identityDigest: HASH },
-    egress: { policyDigest: HASH },
+    egress: { policyDigest: HASH, referenceDigest: OTHER_HASH },
     cdpObservation: { identityDigest: HASH },
     authentication: {
       checkpointDigest: HASH,
@@ -369,9 +405,9 @@ test("website receipt binds browser, ownership, authentication, restart, TTL, an
       browserCleanupDigest: HASH,
       controlCleanupDigest: HASH,
     },
-  }, NOW);
+  }, SIGNING_KEY, NOW);
   assert.equal(receipt.schema, "WebsiteBrowserUseLiveJourneyReceiptV1");
-  assert.deepEqual(validateWebsiteBrowserUseLiveJourneyReceipt(receipt, NOW), receipt);
+  assert.deepEqual(validateWebsiteBrowserUseLiveJourneyReceipt(receipt, NOW, SIGNING_KEY), receipt);
   assert.doesNotMatch(JSON.stringify(receipt), /apiKey|token|password|cookie|cdpUrl|kmsKeyId|sessionCredential|"organizationId":/i);
 });
 
@@ -384,18 +420,70 @@ test("receipt builders reject non-exact production origins and non-JavaScript MI
   assert.throws(() => buildOpenApiLiveJourneyReceipt({
     ...input,
     deployment: { ...input.deployment, controlPlaneOrigin: "https://control.widgets.dev/api" },
-  }, NOW), /RECEIPT_ORIGIN_INVALID/);
+  }, SIGNING_KEY, NOW), /RECEIPT_ORIGIN_INVALID/);
   assert.throws(() => buildOpenApiLiveJourneyReceipt({
     ...input,
     target: { ...input.target, origin: "https://127.0.0.1" },
     installation: { ...input.installation, targetOrigin: "https://127.0.0.1" },
-  }, NOW), /RECEIPT_ORIGIN_INVALID/);
+  }, SIGNING_KEY, NOW), /RECEIPT_ORIGIN_INVALID/);
   assert.throws(() => buildOpenApiLiveJourneyReceipt({
     ...input,
     artifact: { ...input.artifact, mimeType: "text/javascript" as "application/javascript" },
     hostedObject: { ...input.hostedObject, mimeType: "text/javascript" as "application/javascript" },
     namedDownload: { ...input.namedDownload, mimeType: "text/javascript" as "application/javascript" },
-  }, NOW), /RECEIPT_SCHEMA_INVALID/);
+  }, SIGNING_KEY, NOW), /RECEIPT_SCHEMA_INVALID/);
+});
+
+
+test("the receipt carries the deployed source tree, the installation verification time, and rejects a stale one", () => {
+  const input = {
+    ...commonReceiptInput(),
+    provider: { type: "openapi", adapter: "bounded-openapi", adapterVersion: 1 },
+    source: { identityDigest: HASH, documentIdentityDigest: OTHER_HASH },
+  } as const;
+  const receipt = buildOpenApiLiveJourneyReceipt(input, SIGNING_KEY, NOW);
+  assert.equal(receipt.deployment.sourceTreeSha256, OTHER_HASH);
+  assert.equal(receipt.installation.verifiedAt, "2026-09-01T12:00:00.000Z");
+
+  assert.throws(() => buildOpenApiLiveJourneyReceipt({
+    ...input,
+    installation: { ...input.installation, verifiedAt: "2026-09-01T11:59:59.000Z" },
+  }, SIGNING_KEY, NOW), /RECEIPT_VERIFIER_TIMELINE_INVALID/);
+  assert.throws(() => buildOpenApiLiveJourneyReceipt({
+    ...input,
+    installation: { ...input.installation, verifiedAt: "2026-09-01T12:00:00.001Z" },
+  }, SIGNING_KEY, NOW), /RECEIPT_ATTESTATION_FUTURE/);
+});
+
+
+test("the receipt carries a keyed signature no receipt holder can forge", () => {
+  const input = {
+    ...commonReceiptInput(),
+    provider: { type: "openapi", adapter: "bounded-openapi", adapterVersion: 1 },
+    source: { identityDigest: HASH, documentIdentityDigest: OTHER_HASH },
+  } as const;
+  const receipt = buildOpenApiLiveJourneyReceipt(input, SIGNING_KEY, NOW);
+  assert.equal(receipt.signature.algorithm, "hmac-sha256");
+  assert.match(receipt.signature.value, /^[0-9a-f]{64}$/);
+  assert.match(receipt.signature.keyIdDigest, /^[0-9a-f]{64}$/);
+  assert.equal(receipt.integrity.algorithm, "sha256");
+  assert.equal(JSON.stringify(receipt).includes(SIGNING_KEY), false);
+
+  // The unkeyed digest still verifies on its own for existing consumers.
+  assert.deepEqual(validateOpenApiLiveJourneyReceipt(receipt, NOW), receipt);
+
+  // An editor who recomputes the unkeyed digest still cannot produce the signature.
+  const tampered = { ...receipt, liveSuccess: true, artifact: { ...receipt.artifact, size: 2048 },
+    hostedObject: { ...receipt.hostedObject, size: 2048 },
+    namedDownload: { ...receipt.namedDownload, size: 2048 } } as Record<string, unknown>;
+  const unsigned = { ...tampered };
+  delete unsigned.integrity;
+  delete unsigned.signature;
+  const forged = { ...tampered, integrity: { algorithm: "sha256", digest: canonicalJsonSha256(unsigned) } };
+  assert.doesNotThrow(() => validateOpenApiLiveJourneyReceipt(forged, NOW));
+  assert.throws(() => validateOpenApiLiveJourneyReceipt(forged, NOW, SIGNING_KEY), /RECEIPT_SIGNATURE_INVALID/);
+  assert.throws(() => validateOpenApiLiveJourneyReceipt(receipt, NOW, OTHER_SIGNING_KEY), /RECEIPT_SIGNATURE_INVALID/);
+  assert.throws(() => buildOpenApiLiveJourneyReceipt(input, "short", NOW), /RECEIPT_SIGNING_KEY_REQUIRED/);
 });
 
 test("content-addressed writer is live-only, reconciles exact bytes, and rejects conflicting bytes", async () => {
@@ -405,7 +493,7 @@ test("content-addressed writer is live-only, reconciles exact bytes, and rejects
       ...commonReceiptInput(),
       provider: { type: "openapi", adapter: "bounded-openapi", adapterVersion: 1 },
       source: { identityDigest: HASH, documentIdentityDigest: OTHER_HASH },
-    }, NOW);
+    }, SIGNING_KEY, NOW);
     assert.equal(await writeProductionLiveReceipt({ mode: "dry-run", directory, receipt }), undefined);
 
     const location = await writeProductionLiveReceipt({ mode: "live", directory, receipt });
@@ -431,7 +519,7 @@ test("content-addressed writer rejects unsafe receipt directories and existing s
     ...commonReceiptInput(),
     provider: { type: "openapi", adapter: "bounded-openapi", adapterVersion: 1 },
     source: { identityDigest: HASH, documentIdentityDigest: OTHER_HASH },
-  }, NOW);
+  }, SIGNING_KEY, NOW);
   try {
     const permissive = join(root, "permissive");
     await mkdir(permissive, { mode: 0o755 });

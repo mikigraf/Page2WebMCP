@@ -1,0 +1,42 @@
+ARG NODE_BASE_IMAGE
+FROM ${NODE_BASE_IMAGE} AS build
+
+ARG NODE_BASE_IMAGE
+ARG PAGE2WEBMCP_GIT_COMMIT_SHA
+ARG PAGE2WEBMCP_APPLICATION_RELEASE_ID
+ARG PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN
+WORKDIR /workspace
+COPY .dist/deployment-source.tar /tmp/page2webmcp-deployment-source.tar
+RUN tar --extract --file=/tmp/page2webmcp-deployment-source.tar --directory=/workspace
+COPY .dist/deployment-identity.json ./.dist/deployment-identity.json
+COPY deploy/Dockerfile.release-verifier /tmp/page2webmcp-context.Dockerfile
+RUN PAGE2WEBMCP_DEPLOYMENT_DOCKERFILE=deploy/Dockerfile.release-verifier \
+    node scripts/generate-deployment-identity.mjs --verify-build-context \
+    && rm /tmp/page2webmcp-deployment-source.tar /tmp/page2webmcp-context.Dockerfile
+RUN corepack enable && corepack prepare pnpm@10.14.0 --activate
+RUN pnpm install --frozen-lockfile
+
+ENV PAGE2WEBMCP_PRODUCTION_LIVE_BUILD=true \
+    PAGE2WEBMCP_GIT_COMMIT_SHA=${PAGE2WEBMCP_GIT_COMMIT_SHA} \
+    PAGE2WEBMCP_APPLICATION_RELEASE_ID=${PAGE2WEBMCP_APPLICATION_RELEASE_ID} \
+    PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN=${PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN} \
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+RUN pnpm --filter @page2webmcp/release-verifier build
+RUN pnpm exec playwright install --with-deps chromium
+
+ARG NODE_BASE_IMAGE
+FROM ${NODE_BASE_IMAGE} AS runtime
+
+ENV NODE_ENV=production \
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+WORKDIR /app
+COPY --from=build /ms-playwright /ms-playwright
+COPY --from=build --chown=node:node /workspace/package.json ./package.json
+COPY --from=build --chown=node:node /workspace/node_modules ./node_modules
+COPY --from=build --chown=node:node /workspace/.dist/release-verifier ./.dist/release-verifier
+COPY --from=build --chown=node:node /workspace/.dist/deployment-identity.json ./.dist/deployment-identity.json
+RUN ./node_modules/.bin/playwright install-deps chromium
+
+USER node
+EXPOSE 8443
+CMD ["node", ".dist/release-verifier/apps/release-verifier/src/main.js"]

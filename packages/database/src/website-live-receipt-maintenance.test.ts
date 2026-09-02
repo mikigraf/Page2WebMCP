@@ -2,7 +2,10 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import test from "node:test";
 import type { MaintenanceReadinessPool } from "./readiness.ts";
-import { createWebsiteLiveReceiptEvidenceMaintenanceRepository } from "./website-live-receipt-maintenance.ts";
+import {
+  createWebsiteLiveReceiptEvidenceMaintenanceRepository,
+  createWebsiteLiveReceiptEvidenceRepository,
+} from "./website-live-receipt-maintenance.ts";
 
 const digest = (value: string): string => createHash("sha256").update(value, "utf8").digest("hex");
 const selectedHash = "a".repeat(64);
@@ -72,9 +75,12 @@ function validRow(): Record<string, unknown> {
   };
 }
 
-function repositoryFor(row: Record<string, unknown>, requestedRows = [row]) {
+function repositoryFor(row: Record<string, unknown>, requestedRows = [row], queries: string[] = []) {
   const client = {
-    query: async (sql: string) => sql.startsWith("select *") ? { rows: requestedRows } : { rows: [] },
+    query: async (sql: string) => {
+      queries.push(sql);
+      return sql.startsWith("select * from private.selected_website") ? { rows: requestedRows } : { rows: [] };
+    },
     release: () => undefined,
   };
   return createWebsiteLiveReceiptEvidenceMaintenanceRepository({
@@ -109,4 +115,41 @@ test("maintenance projection rejects mismatched selection, TTL, completion, and 
   for (const row of cases) {
     await assert.rejects(repositoryFor(row).findSelected(selectedHash), /WEBSITE_LIVE_RECEIPT_EVIDENCE_INVALID/);
   }
+});
+
+test("the website projection uses the same bounded snapshot posture as the production-live projection", async () => {
+  const queries: string[] = [];
+  await repositoryFor(validRow(), [validRow()], queries).findSelected(selectedHash);
+  assert.deepEqual(queries, [
+    "begin isolation level repeatable read read only",
+    "set local role page2webmcp_maintenance",
+    "select set_config('statement_timeout', $1, true), set_config('lock_timeout', $2, true), "
+      + "set_config('idle_in_transaction_session_timeout', $3, true)",
+    "select * from private.selected_website_live_receipt_evidence($1)",
+    "commit",
+  ]);
+});
+
+test("the website projection is reachable through the shared connection factory", async () => {
+  const configurations: Array<Record<string, unknown>> = [];
+  const repository = createWebsiteLiveReceiptEvidenceRepository({
+    connectionString: "postgresql://maintenance:secret@db.widgets.dev/postgres",
+    mode: "live",
+    poolFactory: (configuration) => {
+      configurations.push(configuration as unknown as Record<string, unknown>);
+      return {
+        connect: async () => ({
+          query: async (sql: string) => sql.startsWith("select * from private.selected_website")
+            ? { rows: [validRow()] } : { rows: [] },
+          release: () => undefined,
+        }),
+        end: async () => undefined,
+      } as unknown as MaintenanceReadinessPool;
+    },
+  });
+  assert.equal((await repository.findSelected(selectedHash))?.selectedReleaseHash, selectedHash);
+  assert.deepEqual(configurations[0]?.ssl, { rejectUnauthorized: true });
+  assert.equal(configurations[0]?.max, 1);
+  assert.equal(configurations[0]?.allowExitOnIdle, true);
+  await repository.close();
 });

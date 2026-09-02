@@ -246,6 +246,10 @@ The command then requests normal-load native installation verification, runs `--
 
 Successful live receipts are stored under `.page2webmcp/production-live-receipts/<receipt-sha256>.json`. The writer creates the directory with mode 0700 and each immutable file with mode 0600; it rejects symlinks, non-owner paths, permissive modes, and any same-name byte conflict. Preserve these receipts with the corresponding deployment and artifact records.
 
+Set `PAGE2WEBMCP_RECEIPT_SIGNING_KEY` to an owner-only high-entropy secret of at least 32 printable characters, held separately from `PAGE2WEBMCP_RELEASE_VERIFIER_TOKEN`. Every receipt carries both the unkeyed `integrity` SHA-256 digest of its own canonical JSON and a `signature` HMAC-SHA256 over that canonical form keyed by this value, so a receipt edited after the fact fails verification even when its digest is recomputed. The key itself never appears in a receipt; `signature.keyIdDigest` is an HMAC-derived key identifier. Rotate the key by keeping the old value long enough to re-verify archived receipts.
+
+A live run refuses to start unless the operator tree is clean, untracked files included, and `git rev-parse --verify HEAD` equals `PAGE2WEBMCP_GIT_COMMIT_SHA`; otherwise it exits nonzero with `DEPLOYMENT_BUILD_TREE_DIRTY` or `DEPLOYMENT_BUILD_COMMIT_MISMATCH`. A live run also refuses to start beside a configured local stack: `PAGE2WEBMCP_LOCAL_STACK` or `PAGE2WEBMCP_LOCAL_RELEASE_VERIFIER_ORIGIN` present in the environment fails the preflight with `PRODUCTION_LIVE_LOCAL_STACK_FORBIDDEN` and the offending names. The expected migration ledger is derived from that same tree's `supabase/migrations` directory, so the receipt path does not need a hand-edited version pin.
+
 ## Operator diagnostics
 
 Startup and readiness may print sorted missing environment-variable names because they are privileged operator surfaces. They never print values, URLs containing credentials, tokens, private keys, candidate code, DOM, repository source, or API bodies. Public UI/API responses expose stable codes only.

@@ -11,6 +11,8 @@ import { compileWebMcpRelease } from "../../../packages/compiler/src/compiler.ts
 import { acmeCapabilityEvidence, acmeCapabilityPlans } from "../../acme-support/src/capability-plans.ts";
 import {
   InMemoryControlPlaneRepository,
+  liveCandidateVerifierScopeDigest,
+  liveInstallationVerifierScopeDigest,
   type AnalysisResult,
   type PublishedReleaseState,
   type PublishRequest,
@@ -24,10 +26,13 @@ import {
   type ReleaseArtifactPublication,
   type ReleaseArtifactStore,
 } from "../src/artifact-storage.ts";
+import { canonicalVerifierJson } from "../src/release-verifier-protocol-v2.ts";
 import { deriveVerification } from "../src/releases.ts";
 import {
+  LIVE_RELEASE_VERIFIER_PROTOCOL_VERSION,
   REQUIRED_CANDIDATE_CHECKS,
   setReleaseVerificationPortForTest,
+  type CandidateVerificationReport,
   type InstalledVerificationInput,
   type InstalledVerificationReport,
   type ReleaseVerificationPort,
@@ -93,15 +98,80 @@ function exactInstalledReport(
   };
 }
 
+function liveVerifierAttestation<Operation extends "candidate" | "installation">(
+  operation: Operation,
+  scopeDigest: string,
+  payload: unknown,
+) {
+  const attestedAt = new Date();
+  const digest = (value: string) => createHash("sha256").update(value, "utf8").digest("hex");
+  const attestationId = crypto.randomUUID();
+  const requestId = crypto.randomUUID();
+  return {
+    protocolVersion: LIVE_RELEASE_VERIFIER_PROTOCOL_VERSION,
+    attestationId,
+    requestId,
+    nonceDigest: digest(`nonce:${attestationId}`),
+    operation,
+    scopeDigest,
+    payloadDigest: digest(canonicalVerifierJson(payload)),
+    issuedAt: new Date(attestedAt.getTime() - 1_000).toISOString(),
+    attestedAt: attestedAt.toISOString(),
+    expiresAt: new Date(attestedAt.getTime() + 60_000).toISOString(),
+  } as const;
+}
+
 function liveVerificationPort(verifierOriginDigest: string): ReleaseVerificationPort {
   return {
     ...hermeticReleaseVerificationPort,
     mode: "live",
     readiness: async () => ({
-      protocolVersion: 1,
+      protocolVersion: LIVE_RELEASE_VERIFIER_PROTOCOL_VERSION,
       mode: "live",
       webMcpImplementation: "native",
       verifierOriginDigest,
+    }),
+    verifyCandidate: async (input, signal) => ({
+      report: await hermeticReleaseVerificationPort.verifyCandidate(input, signal) as CandidateVerificationReport,
+      verifierAttestation: liveVerifierAttestation("candidate", liveCandidateVerifierScopeDigest({
+        projectId: input.liveContext!.projectId,
+        analysisRunId: input.liveContext!.analysisRunId,
+        sourceIdentityHash: input.liveContext!.sourceIdentityHash,
+        targetOrigin: input.targetOrigin,
+        environment: input.liveContext!.environment,
+        contentHash: input.contentHash,
+      }), {
+        code: input.code,
+        contentHash: input.contentHash,
+        integrity: input.integrity,
+        manifest: input.manifest,
+        targetOrigin: input.targetOrigin,
+        expectedTools: input.expectedTools,
+      }),
+    }),
+    verifyInstalled: async (input, signal) => ({
+      report: await hermeticReleaseVerificationPort.verifyInstalled(input, signal) as InstalledVerificationReport,
+      verifierAttestation: liveVerifierAttestation("installation", liveInstallationVerifierScopeDigest({
+        projectId: input.liveContext!.projectId,
+        releaseId: input.liveContext!.releaseId,
+        installationOperationId: input.liveContext!.installationOperationId,
+        sourceIdentityHash: input.liveContext!.sourceIdentityHash,
+        pageUrl: input.pageUrl,
+        targetOrigin: input.targetOrigin,
+        environment: input.liveContext!.environment,
+        selectedHash: input.contentHash,
+      }), {
+        pageUrl: input.pageUrl,
+        artifactUrl: input.artifactUrl,
+        downloadUrl: input.downloadUrl,
+        localOnly: input.localOnly,
+        contentHash: input.contentHash,
+        integrity: input.integrity,
+        manifest: input.manifest,
+        targetOrigin: input.targetOrigin,
+        expectedTools: input.expectedTools,
+        ...(input.selfHostedUrl ? { selfHostedUrl: input.selfHostedUrl } : {}),
+      }),
     }),
   };
 }
