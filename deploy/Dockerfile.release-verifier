@@ -1,4 +1,25 @@
+# syntax=docker/dockerfile:1
+# Build args. On Render every service environment variable arrives as a build
+# arg, so RENDER_GIT_COMMIT supplies the commit and doubles as the release id
+# unless the operator passes explicit values (see docs/OPERATIONS.md).
 ARG NODE_BASE_IMAGE
+ARG RENDER_GIT_COMMIT
+ARG PAGE2WEBMCP_GIT_COMMIT_SHA=${RENDER_GIT_COMMIT}
+ARG PAGE2WEBMCP_APPLICATION_RELEASE_ID=${PAGE2WEBMCP_GIT_COMMIT_SHA}
+ARG PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN
+
+# Stage 1: derive the immutable deployment identity from the git checkout.
+FROM ${NODE_BASE_IMAGE} AS identity
+
+ARG PAGE2WEBMCP_GIT_COMMIT_SHA
+ARG PAGE2WEBMCP_APPLICATION_RELEASE_ID
+ARG PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN
+COPY . /context
+RUN git clone --quiet /context /identity \
+    && cd /identity \
+    && node scripts/generate-deployment-identity.mjs
+
+# Stage 2: build only from the committed source archive.
 FROM ${NODE_BASE_IMAGE} AS build
 
 ARG NODE_BASE_IMAGE
@@ -6,9 +27,9 @@ ARG PAGE2WEBMCP_GIT_COMMIT_SHA
 ARG PAGE2WEBMCP_APPLICATION_RELEASE_ID
 ARG PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN
 WORKDIR /workspace
-COPY .dist/deployment-source.tar /tmp/page2webmcp-deployment-source.tar
+COPY --from=identity /identity/.dist/deployment-source.tar /tmp/page2webmcp-deployment-source.tar
 RUN tar --extract --file=/tmp/page2webmcp-deployment-source.tar --directory=/workspace
-COPY .dist/deployment-identity.json ./.dist/deployment-identity.json
+COPY --from=identity /identity/.dist/deployment-identity.json ./.dist/deployment-identity.json
 COPY deploy/Dockerfile.release-verifier /tmp/page2webmcp-context.Dockerfile
 RUN PAGE2WEBMCP_DEPLOYMENT_DOCKERFILE=deploy/Dockerfile.release-verifier \
     node scripts/generate-deployment-identity.mjs --verify-build-context \
@@ -24,7 +45,7 @@ ENV PAGE2WEBMCP_PRODUCTION_LIVE_BUILD=true \
 RUN pnpm --filter @page2webmcp/release-verifier build
 RUN pnpm exec playwright install --with-deps chromium
 
-ARG NODE_BASE_IMAGE
+# Stage 3: runtime.
 FROM ${NODE_BASE_IMAGE} AS runtime
 
 ENV NODE_ENV=production \
