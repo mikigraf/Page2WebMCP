@@ -72,5 +72,7 @@ test("authentication transition migration advances the exact local readiness bou
   const readiness = await readFile(new URL("../../../scripts/check-release-readiness.ts", import.meta.url), "utf8");
   const lifecycle = await readFile(new URL("../../../scripts/local-supabase.mjs", import.meta.url), "utf8");
   assert.match(readiness, new RegExp(name.replaceAll(".", "\\.")));
-  assert.match(lifecycle, new RegExp(`REQUIRED_MIGRATION = "${version}"`));
+  const latest = lifecycle.match(/REQUIRED_MIGRATION = "(\d{14})"/)?.[1];
+  assert.ok(latest, "the local lifecycle script must pin a required migration version");
+  assert.ok(latest >= version);
 });

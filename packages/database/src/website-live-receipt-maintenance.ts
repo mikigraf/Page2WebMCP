@@ -1,5 +1,10 @@
 import { createHash } from "node:crypto";
-import type { MaintenanceReadinessPool } from "./readiness.ts";
+import {
+  configureTransactionBounds,
+  readinessPool,
+  type MaintenanceReadinessOptions,
+  type MaintenanceReadinessPool,
+} from "./readiness.ts";
 import {
   normalizeWebsiteCleanupResources,
   type WebsiteAuthenticationCleanupResourceEvidence,
@@ -55,17 +60,30 @@ export type WebsiteLiveReceiptEvidenceMaintenanceRepository = Readonly<{
   close(): Promise<void>;
 }>;
 
+const DEFAULT_STATEMENT_TIMEOUT_MS = 5_000;
+
+// Connection options, timeouts, and transaction posture come from the same
+// readiness factory every other maintenance projection uses.
+export function createWebsiteLiveReceiptEvidenceRepository(
+  options: MaintenanceReadinessOptions,
+): WebsiteLiveReceiptEvidenceMaintenanceRepository {
+  const { pool, timeout } = readinessPool(options);
+  return createWebsiteLiveReceiptEvidenceMaintenanceRepository(pool, timeout);
+}
+
 export function createWebsiteLiveReceiptEvidenceMaintenanceRepository(
   pool: MaintenanceReadinessPool,
+  statementTimeoutMs: number = DEFAULT_STATEMENT_TIMEOUT_MS,
 ): WebsiteLiveReceiptEvidenceMaintenanceRepository {
+  const timeout = Math.max(250, Math.min(statementTimeoutMs, 15_000));
   return {
     async findSelected(hash) {
       if (!HASH.test(hash)) throw new Error("WEBSITE_LIVE_RECEIPT_HASH_INVALID");
       const client = await pool.connect();
       try {
-        await client.query("begin");
-        await client.query("set transaction read only");
+        await client.query("begin isolation level repeatable read read only");
         await client.query("set local role page2webmcp_maintenance");
+        await configureTransactionBounds(client, timeout);
         const result = await client.query(
           "select * from private.selected_website_live_receipt_evidence($1)",
           [hash],

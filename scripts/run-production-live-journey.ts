@@ -1,7 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import pg from "pg";
 import {
   buildOpenApiLiveJourneyReceipt,
   buildWebsiteBrowserUseLiveJourneyReceipt,
@@ -21,7 +20,7 @@ import {
   createMaintenanceReadinessRepository,
 } from "../packages/database/src/readiness.ts";
 import {
-  createWebsiteLiveReceiptEvidenceMaintenanceRepository,
+  createWebsiteLiveReceiptEvidenceRepository,
   type SelectedWebsiteLiveReceiptEvidence,
 } from "../packages/database/src/website-live-receipt-maintenance.ts";
 import { runReadinessCli } from "./check-release-readiness.ts";
@@ -30,6 +29,10 @@ import {
   readProductionOperatorCredentials,
   type ProductionOperatorCredentials,
 } from "./lib/production-live-control-session.ts";
+import {
+  inspectDeploymentWorkTree,
+  type DeploymentWorkTreeInspection,
+} from "./lib/deployment-work-tree.ts";
 import {
   verifyDeploymentIdentity,
   type DeploymentIdentityDependencies,
@@ -43,6 +46,7 @@ const MAX_ARTIFACT_BYTES = 65_536;
 const DEFAULT_MAX_POLLS = 240;
 const DEFAULT_POLL_INTERVAL_MS = 2_500;
 const DEFAULT_RECEIPT_DIRECTORY = ".page2webmcp/production-live-receipts";
+const JAVASCRIPT_MIME = "application/javascript";
 
 type Environment = Readonly<Record<string, string | undefined>>;
 type CommandExitCode = 0 | 1 | 2;
@@ -76,13 +80,19 @@ export type ProductionLiveJourneyDependencies = Readonly<{
   createSession?: (origin: string) => ProductionLiveSessionPort;
   loadBuildIdentity?: NonNullable<DeploymentIdentityDependencies["loadBuildIdentity"]>;
   readCredentials?: (path: string | undefined) => Promise<ProductionOperatorCredentials>;
+  inspectWorkTree?: () => Promise<DeploymentWorkTreeInspection>;
   fetch?: typeof fetch;
   runReadiness?: (
     args: readonly string[],
     environment: Environment,
     binding: Readonly<{ deploymentIdentityDigest: string }>,
   ) => Promise<Readonly<{
-    output: Readonly<{ status: "passed" | "failed" | "skipped"; code: string; liveSuccess: boolean }>;
+    output: Readonly<{
+      status: "passed" | "failed" | "skipped";
+      code: string;
+      liveSuccess: boolean;
+      missingKeys?: readonly string[];
+    }>;
     exitCode: CommandExitCode;
   }>>;
   delay?: (milliseconds: number) => Promise<void>;
@@ -159,6 +169,17 @@ export async function runProductionLiveJourneyCli(
   });
   if (preflight.status === "failed") return { output: preflight, exitCode: 1 };
   if (parsed.mode === "dry-run") return { output: preflight, exitCode: 0 };
+
+  // A live run must be driven from the exact clean tree the deployment identity
+  // names; a stale local build manifest must never stand in for it.
+  const workTree = await inspectOperatorWorkTree(dependencies.inspectWorkTree ?? inspectDeploymentWorkTree);
+  if (!workTree.inspection) {
+    return failed(preflight, [], workTree.code ?? "DEPLOYMENT_BUILD_GIT_FAILED", 1);
+  }
+  if (workTree.inspection.commit !== environment.PAGE2WEBMCP_GIT_COMMIT_SHA) {
+    return failed(preflight, [], "DEPLOYMENT_BUILD_COMMIT_MISMATCH", 1);
+  }
+  if (workTree.inspection.dirty) return failed(preflight, [], "DEPLOYMENT_BUILD_TREE_DIRTY", 1);
 
   const completedOperations: string[] = [];
   let projectId: string | undefined;
@@ -298,6 +319,9 @@ export async function runProductionLiveJourneyCli(
       || readiness.output.code !== "LIVE_READINESS_PASSED") {
       return failed(preflight, completedOperations, readiness.output.code, readiness.exitCode === 1 ? 1 : 2, {
         projectId, analysisRunId, releaseId: release.id, selectedHash: release.contentHash,
+        ...(readiness.output.missingKeys && readiness.output.missingKeys.length > 0
+          ? { missingControls: Object.freeze([...readiness.output.missingKeys].sort()) }
+          : {}),
       });
     }
     completedOperations.push("run-live-readiness");
@@ -319,7 +343,20 @@ export async function runProductionLiveJourneyCli(
       publishedBytes,
       readiness: readiness.output,
       persisted,
+      signingKey: environment.PAGE2WEBMCP_RECEIPT_SIGNING_KEY!,
     });
+    if (parsed.journey === "website") {
+      // Each of these is proven by the persisted website projection the receipt
+      // just bound: the browser session, egress policy, CDP observation, the
+      // consumed authentication handoff, and the reconciled control cleanup.
+      completedOperations.push(
+        "create-browser-use-session",
+        "install-egress-policy",
+        "observe-browser-session",
+        "complete-authentication-handoff",
+        "reconcile-browser-controls",
+      );
+    }
     const receiptLocation = await (dependencies.writeReceipt ?? writeProductionLiveReceipt)({
       mode: "live",
       directory: resolve(dependencies.receiptDirectory ?? DEFAULT_RECEIPT_DIRECTORY),
@@ -352,6 +389,13 @@ export async function runProductionLiveJourneyCli(
       ...(release ? { releaseId: release.id, selectedHash: release.contentHash } : {}),
     });
   }
+}
+
+async function inspectOperatorWorkTree(
+  inspect: () => Promise<DeploymentWorkTreeInspection>,
+): Promise<Readonly<{ inspection?: DeploymentWorkTreeInspection; code?: string }>> {
+  try { return { inspection: await inspect() }; }
+  catch (error) { return { code: stableCode(error) }; }
 }
 
 type ParsedDeploymentIdentity = DeploymentIdentityV1;
@@ -578,17 +622,27 @@ function parsePublishedRelease(value: unknown, environment: Environment): Publis
   return release as PublishedRelease;
 }
 
-type PublishedByteIdentity = Readonly<{ size: number; sha256: string; sri: string }>;
+type PublishedByteIdentity = Readonly<{
+  size: number;
+  sha256: string;
+  sri: string;
+  mimeType: "application/javascript";
+}>;
 
 async function verifyPublishedBytes(transport: typeof fetch, release: PublishedRelease): Promise<PublishedByteIdentity> {
   const [hosted, named] = await Promise.all([
     readArtifact(transport, release.installation.artifactUrl),
     readArtifact(transport, release.installation.downloadUrl),
   ]);
-  if (!hosted.equals(named) || sha256(hosted) !== release.contentHash || sha384(hosted) !== release.sri) {
+  if (!hosted.bytes.equals(named.bytes) || sha256(hosted.bytes) !== release.contentHash
+    || sha384(hosted.bytes) !== release.sri) {
     throw new Error("PUBLISHED_ARTIFACT_IDENTITY_INVALID");
   }
-  return { size: hosted.byteLength, sha256: release.contentHash, sri: release.sri };
+  // The receipt records the media type observed on both published responses.
+  if (hosted.mediaType !== named.mediaType || hosted.mediaType !== JAVASCRIPT_MIME) {
+    throw new Error("PUBLISHED_ARTIFACT_MIME_TYPE_INVALID");
+  }
+  return { size: hosted.bytes.byteLength, sha256: release.contentHash, sri: release.sri, mimeType: hosted.mediaType };
 }
 
 async function loadPersistedReceiptEvidence(
@@ -605,7 +659,7 @@ async function loadPersistedReceiptEvidence(
   const contextRepository = createProductionLiveReceiptContextRepository({
     connectionString: environment.PAGE2WEBMCP_MAINTENANCE_DATABASE_URL!,
   });
-  let websiteRepository: ReturnType<typeof createWebsiteLiveReceiptEvidenceMaintenanceRepository> | undefined;
+  let websiteRepository: ReturnType<typeof createWebsiteLiveReceiptEvidenceRepository> | undefined;
   try {
     const applicationRole = await application.inspectApplicationRole();
     const provider = journey === "openapi"
@@ -618,17 +672,10 @@ async function loadPersistedReceiptEvidence(
     if (!context || context.sourceType !== journey) return undefined;
     let website: ProductionLivePersistedReceiptEvidence["website"];
     if (journey === "website") {
-      const websitePool = new pg.Pool({
+      websiteRepository = createWebsiteLiveReceiptEvidenceRepository({
         connectionString: environment.PAGE2WEBMCP_MAINTENANCE_DATABASE_URL!,
-        max: 1,
-        connectionTimeoutMillis: 5_000,
-        query_timeout: 5_000,
-        statement_timeout: 5_000,
-        idleTimeoutMillis: 5_000,
-        allowExitOnIdle: true,
-        ssl: { rejectUnauthorized: true },
+        mode: "live",
       });
-      websiteRepository = createWebsiteLiveReceiptEvidenceMaintenanceRepository(websitePool);
       const selected = await websiteRepository.findSelected(selectedHash);
       if (!selected || !HASH.test(selected.ownershipDecisionDigest)) return undefined;
       website = selected;
@@ -656,6 +703,7 @@ function buildReceipt(input: Readonly<{
   publishedBytes: PublishedByteIdentity;
   readiness: Readonly<{ status: "passed" | "failed" | "skipped"; code: string; liveSuccess: boolean }>;
   persisted: ProductionLivePersistedReceiptEvidence;
+  signingKey: string;
 }>): ProductionLiveReceiptV1 {
   const { context } = input.persisted;
   if (context.selectedReleaseHash !== input.release.contentHash
@@ -681,6 +729,7 @@ function buildReceipt(input: Readonly<{
       applicationReleaseId: input.deployment.applicationReleaseId,
       controlPlaneOrigin: input.deployment.controlPlaneOrigin,
       controlPlaneIdentityDigest: input.deployment.identityDigest,
+      sourceTreeSha256: input.deployment.sourceTreeSha256,
     },
     database: {
       projectRef: "bimqgiedckdurqiywctl" as const,
@@ -711,7 +760,7 @@ function buildReceipt(input: Readonly<{
       sha256: context.selectedReleaseHash,
       sri: context.artifactIntegrity,
       size: context.artifactSizeBytes,
-      mimeType: "application/javascript" as const,
+      mimeType: input.publishedBytes.mimeType,
     },
     hostedObject: {
       projectRef: "bimqgiedckdurqiywctl" as const,
@@ -720,19 +769,20 @@ function buildReceipt(input: Readonly<{
       identityDigest: context.hostedObjectIdentityDigest,
       sha256: context.selectedReleaseHash,
       size: context.artifactSizeBytes,
-      mimeType: "application/javascript" as const,
+      mimeType: input.publishedBytes.mimeType,
     },
     namedDownload: {
       identityDigest: context.namedDownloadIdentityDigest,
       sha256: context.selectedReleaseHash,
       size: context.artifactSizeBytes,
-      mimeType: "application/javascript" as const,
+      mimeType: input.publishedBytes.mimeType,
     },
     installation: {
       identityDigest: context.installationIdentityDigest,
       installedSha256: context.selectedReleaseHash,
       targetOrigin: context.targetOrigin,
       environment: context.environment,
+      verifiedAt: context.installationVerifiedAt,
     },
     verifier: context.verifier,
     readiness: {
@@ -756,7 +806,7 @@ function buildReceipt(input: Readonly<{
       ...common,
       provider: { type: "openapi", adapter: "bounded-openapi", adapterVersion: 1 },
       cleanup: { status: "passed", revocationDigest: context.openapiCleanupDigest },
-    });
+    }, input.signingKey);
   }
   const website = input.persisted.website;
   if (!website || website.selectedReleaseHash !== context.selectedReleaseHash
@@ -789,7 +839,10 @@ function buildReceipt(input: Readonly<{
     browserUse: { sessionIdentityDigest: website.providerSessionIdentityDigest },
     ownership: { decisionDigest: website.ownershipDecisionDigest, verified: true },
     browserLease: { identityDigest: website.browserLeaseIdentityDigest },
-    egress: { policyDigest: website.egressPolicyDigest },
+    egress: {
+      policyDigest: website.egressPolicyDigest,
+      referenceDigest: website.egressPolicyReferenceDigest,
+    },
     cdpObservation: { identityDigest: website.cdpReferenceDigest },
     authentication: {
       checkpointDigest: website.checkpointIdentityDigest,
@@ -807,14 +860,16 @@ function buildReceipt(input: Readonly<{
       controlCleanupDigest: canonicalJsonSha256(website.cleanupResources.filter(({ resource }) =>
         !["browser_lease", "browser_session", "cdp_observation_lease"].includes(resource))),
     },
-  });
+  }, input.signingKey);
 }
 
 function domainIdentity(domain: "release" | "project" | "analysis", id: string): string {
   return sha256(Buffer.from(`${domain}:${id}`, "utf8"));
 }
 
-async function readArtifact(transport: typeof fetch, url: string): Promise<Buffer> {
+type ObservedArtifact = Readonly<{ bytes: Buffer; mediaType: "application/javascript" }>;
+
+async function readArtifact(transport: typeof fetch, url: string): Promise<ObservedArtifact> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(new Error("ARTIFACT_TIMEOUT")), 10_000);
   timer.unref?.();
@@ -823,8 +878,9 @@ async function readArtifact(transport: typeof fetch, url: string): Promise<Buffe
       method: "GET", redirect: "error", credentials: "omit", cache: "no-store", signal: controller.signal,
     });
     const declared = response.headers.get("content-length");
+    const mediaType = response.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase();
     if (response.status !== 200 || response.url !== url || response.redirected || response.headers.has("set-cookie")
-      || response.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase() !== "application/javascript"
+      || mediaType !== JAVASCRIPT_MIME
       || declared !== null && (!/^\d+$/.test(declared) || Number(declared) > MAX_ARTIFACT_BYTES)
       || !response.body) throw new Error("PUBLISHED_ARTIFACT_IDENTITY_INVALID");
     const reader = response.body.getReader();
@@ -841,7 +897,7 @@ async function readArtifact(transport: typeof fetch, url: string): Promise<Buffe
       chunks.push(Buffer.from(chunk.value));
     }
     if (size < 1) throw new Error("PUBLISHED_ARTIFACT_IDENTITY_INVALID");
-    return Buffer.concat(chunks, size);
+    return { bytes: Buffer.concat(chunks, size), mediaType };
   } finally { clearTimeout(timer); }
 }
 

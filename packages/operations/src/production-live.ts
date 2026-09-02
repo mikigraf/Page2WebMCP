@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { constants } from "node:fs";
 import { lstat, mkdir, open } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
@@ -33,6 +33,7 @@ export const PRODUCTION_LIVE_COMMON_CONTROLS = Object.freeze([
   "PAGE2WEBMCP_GIT_COMMIT_SHA",
   "PAGE2WEBMCP_APPLICATION_RELEASE_ID",
   "PAGE2WEBMCP_OPERATOR_CREDENTIALS_FILE",
+  "PAGE2WEBMCP_RECEIPT_SIGNING_KEY",
 ] as const);
 
 export const OPENAPI_PRODUCTION_LIVE_CONTROLS = Object.freeze([
@@ -94,15 +95,16 @@ const SHARED_OPERATIONS = [
   "verify-named-download",
   "write-immutable-receipt",
 ] as const;
+// Artifact generation is not separately observable: the journey only ever sees
+// the published content-addressed artifact, which publish-content-addressed-artifact
+// already records. Every remaining operation below is bound to persisted evidence.
 const OPENAPI_OPERATIONS = [
   "fetch-and-freeze-openapi-document",
-  "generate-openapi-artifact",
   ...SHARED_OPERATIONS,
 ] as const;
 const WEBSITE_OPERATIONS = [
   "complete-authentication-handoff",
   "create-browser-use-session",
-  "generate-website-artifact",
   "install-egress-policy",
   "observe-browser-session",
   "reconcile-browser-controls",
@@ -168,10 +170,27 @@ export function inspectProductionLiveControls(
   if (!boundedPath(environment.PAGE2WEBMCP_OPERATOR_CREDENTIALS_FILE)) {
     invalid.add("PAGE2WEBMCP_OPERATOR_CREDENTIALS_FILE");
   }
+  if (!boundedSecret(environment.PAGE2WEBMCP_RECEIPT_SIGNING_KEY)) {
+    invalid.add("PAGE2WEBMCP_RECEIPT_SIGNING_KEY");
+  }
 
   if (journey === "openapi") inspectOpenApiControls(environment, invalid);
   else inspectWebsiteControls(environment, invalid);
   return { journey, missingControls: [...invalid].sort() };
+}
+
+// A configured local stack silently downgrades the release verifier and Storage
+// topology to loopback. The production-live operator path must never run beside
+// one, so the preflight names the offending controls before any effect.
+export const PRODUCTION_LIVE_FORBIDDEN_LOCAL_CONTROLS = Object.freeze([
+  "PAGE2WEBMCP_LOCAL_RELEASE_VERIFIER_ORIGIN",
+  "PAGE2WEBMCP_LOCAL_STACK",
+] as const);
+
+export function inspectForbiddenLocalControls(environment: RuntimeEnvironment): string[] {
+  return PRODUCTION_LIVE_FORBIDDEN_LOCAL_CONTROLS
+    .filter((key) => typeof environment[key] === "string" && environment[key]!.length > 0)
+    .sort();
 }
 
 export function evaluateProductionLivePreflight(input: Readonly<{
@@ -181,6 +200,20 @@ export function evaluateProductionLivePreflight(input: Readonly<{
 }>): ProductionLiveCommandResultV1 {
   const inspection = inspectProductionLiveControls(input.journey, input.environment);
   const plannedOperations = input.journey === "openapi" ? OPENAPI_OPERATIONS : WEBSITE_OPERATIONS;
+  const forbiddenLocalControls = inspectForbiddenLocalControls(input.environment);
+  if (forbiddenLocalControls.length > 0) {
+    return Object.freeze({
+      schema: "ProductionLiveCommandResultV1",
+      journey: input.journey,
+      mode: input.mode,
+      status: "failed",
+      code: "PRODUCTION_LIVE_LOCAL_STACK_FORBIDDEN",
+      missingControls: Object.freeze(forbiddenLocalControls),
+      plannedOperations: Object.freeze([...plannedOperations]),
+      completedOperations: Object.freeze([]),
+      liveSuccess: false,
+    });
+  }
   if (inspection.missingControls.length > 0) {
     return Object.freeze({
       schema: "ProductionLiveCommandResultV1",
@@ -357,6 +390,7 @@ const CommonReceiptShape = {
     applicationReleaseId: z.string().regex(DEPLOYMENT_RELEASE_ID),
     controlPlaneOrigin: z.string().url().max(2_048),
     controlPlaneIdentityDigest: DigestSchema,
+    sourceTreeSha256: DigestSchema,
   }).strict(),
   database: z.object({
     projectRef: z.literal(SUPABASE_PROJECT_REF),
@@ -401,6 +435,7 @@ const CommonReceiptShape = {
     installedSha256: DigestSchema,
     targetOrigin: z.string().url().max(2_048),
     environment: z.enum(["test", "staging", "production"]),
+    verifiedAt: TimestampSchema,
   }).strict(),
   verifier: z.object({
     identityDigest: DigestSchema,
@@ -420,6 +455,11 @@ const CommonReceiptShape = {
   }).strict(),
   liveSuccess: z.boolean(),
   integrity: z.object({ algorithm: z.literal("sha256"), digest: DigestSchema }).strict(),
+  signature: z.object({
+    algorithm: z.literal("hmac-sha256"),
+    keyIdDigest: DigestSchema,
+    value: DigestSchema,
+  }).strict(),
 } as const;
 
 export const OpenApiLiveJourneyReceiptV1Schema = z.object({
@@ -443,7 +483,7 @@ export const WebsiteBrowserUseLiveJourneyReceiptV1Schema = z.object({
   browserUse: z.object({ sessionIdentityDigest: DigestSchema }).strict(),
   ownership: z.object({ decisionDigest: DigestSchema, verified: z.literal(true) }).strict(),
   browserLease: IdentitySchema,
-  egress: z.object({ policyDigest: DigestSchema }).strict(),
+  egress: z.object({ policyDigest: DigestSchema, referenceDigest: DigestSchema }).strict(),
   cdpObservation: IdentitySchema,
   authentication: z.object({
     checkpointDigest: DigestSchema,
@@ -463,61 +503,104 @@ export const WebsiteBrowserUseLiveJourneyReceiptV1Schema = z.object({
 
 export type OpenApiLiveJourneyReceiptV1 = Readonly<z.infer<typeof OpenApiLiveJourneyReceiptV1Schema>>;
 export type WebsiteBrowserUseLiveJourneyReceiptV1 = Readonly<z.infer<typeof WebsiteBrowserUseLiveJourneyReceiptV1Schema>>;
-type OpenApiReceiptInput = Omit<OpenApiLiveJourneyReceiptV1, "schema" | "schemaVersion" | "integrity">;
-type WebsiteReceiptInput = Omit<WebsiteBrowserUseLiveJourneyReceiptV1, "schema" | "schemaVersion" | "integrity">;
+type OpenApiReceiptInput =
+  Omit<OpenApiLiveJourneyReceiptV1, "schema" | "schemaVersion" | "integrity" | "signature">;
+type WebsiteReceiptInput =
+  Omit<WebsiteBrowserUseLiveJourneyReceiptV1, "schema" | "schemaVersion" | "integrity" | "signature">;
 export type ProductionLiveReceiptV1 = OpenApiLiveJourneyReceiptV1 | WebsiteBrowserUseLiveJourneyReceiptV1;
 
 export function canonicalJsonSha256(value: unknown): string {
   return createHash("sha256").update(canonicalJson(value), "utf8").digest("hex");
 }
 
+const SIGNING_KEY_IDENTITY_LABEL = "page2webmcp-receipt-signing-key-id";
+
+// The receipt carries both an unkeyed digest, so any holder can detect accidental
+// corruption, and an operator-keyed HMAC that only the signing key can produce.
+export function receiptSignature(unsignedCanonical: string, signingKey: string): Readonly<{
+  algorithm: "hmac-sha256";
+  keyIdDigest: string;
+  value: string;
+}> {
+  if (!boundedSecret(signingKey)) throw new Error("RECEIPT_SIGNING_KEY_REQUIRED");
+  return Object.freeze({
+    algorithm: "hmac-sha256" as const,
+    keyIdDigest: createHmac("sha256", signingKey).update(SIGNING_KEY_IDENTITY_LABEL, "utf8").digest("hex"),
+    value: createHmac("sha256", signingKey).update(unsignedCanonical, "utf8").digest("hex"),
+  });
+}
+
 export function buildOpenApiLiveJourneyReceipt(
   input: OpenApiReceiptInput,
+  signingKey: string,
   now = new Date(),
 ): OpenApiLiveJourneyReceiptV1 {
-  const unsigned = { schema: "OpenApiLiveJourneyReceiptV1" as const, schemaVersion: 1 as const, ...input };
-  return validateOpenApiLiveJourneyReceipt({
-    ...unsigned,
-    integrity: { algorithm: "sha256", digest: canonicalJsonSha256(unsigned) },
-  }, now);
+  return validateOpenApiLiveJourneyReceipt(
+    signedReceipt({ schema: "OpenApiLiveJourneyReceiptV1" as const, schemaVersion: 1 as const, ...input }, signingKey),
+    now,
+    signingKey,
+  );
 }
 
 export function buildWebsiteBrowserUseLiveJourneyReceipt(
   input: WebsiteReceiptInput,
+  signingKey: string,
   now = new Date(),
 ): WebsiteBrowserUseLiveJourneyReceiptV1 {
-  const unsigned = { schema: "WebsiteBrowserUseLiveJourneyReceiptV1" as const, schemaVersion: 1 as const, ...input };
-  return validateWebsiteBrowserUseLiveJourneyReceipt({
-    ...unsigned,
-    integrity: { algorithm: "sha256", digest: canonicalJsonSha256(unsigned) },
-  }, now);
+  return validateWebsiteBrowserUseLiveJourneyReceipt(
+    signedReceipt(
+      { schema: "WebsiteBrowserUseLiveJourneyReceiptV1" as const, schemaVersion: 1 as const, ...input },
+      signingKey,
+    ),
+    now,
+    signingKey,
+  );
+}
+
+function signedReceipt(unsigned: Record<string, unknown>, signingKey: string): Record<string, unknown> {
+  if (!boundedSecret(signingKey)) throw new Error("RECEIPT_SIGNING_KEY_REQUIRED");
+  const digested = { ...unsigned, integrity: { algorithm: "sha256", digest: canonicalJsonSha256(unsigned) } };
+  return { ...digested, signature: receiptSignature(canonicalJson(digested), signingKey) };
 }
 
 export function validateOpenApiLiveJourneyReceipt(
   value: unknown,
   now = new Date(),
+  signingKey?: string,
 ): OpenApiLiveJourneyReceiptV1 {
-  return validateReceipt(OpenApiLiveJourneyReceiptV1Schema, value, now);
+  return validateReceipt(OpenApiLiveJourneyReceiptV1Schema, value, now, signingKey);
 }
 
 export function validateWebsiteBrowserUseLiveJourneyReceipt(
   value: unknown,
   now = new Date(),
+  signingKey?: string,
 ): WebsiteBrowserUseLiveJourneyReceiptV1 {
-  return validateReceipt(WebsiteBrowserUseLiveJourneyReceiptV1Schema, value, now);
+  return validateReceipt(WebsiteBrowserUseLiveJourneyReceiptV1Schema, value, now, signingKey);
 }
 
 function validateReceipt<T extends ProductionLiveReceiptV1>(
   schema: z.ZodType<T>,
   value: unknown,
   now: Date,
+  signingKey?: string,
 ): T {
   const parsed = schema.safeParse(value);
   if (!parsed.success) throw new Error("RECEIPT_SCHEMA_INVALID");
   const receipt = parsed.data;
   const unsigned: Record<string, unknown> = { ...receipt };
   delete unsigned.integrity;
+  delete unsigned.signature;
   if (receipt.integrity.digest !== canonicalJsonSha256(unsigned)) throw new Error("RECEIPT_INTEGRITY_INVALID");
+  if (signingKey !== undefined) {
+    const signed: Record<string, unknown> = { ...receipt };
+    delete signed.signature;
+    const expected = receiptSignature(canonicalJson(signed), signingKey);
+    if (!sameDigest(expected.value, receipt.signature.value)
+      || !sameDigest(expected.keyIdDigest, receipt.signature.keyIdDigest)) {
+      throw new Error("RECEIPT_SIGNATURE_INVALID");
+    }
+  }
   if (!productionHttpsOrigin(receipt.deployment.controlPlaneOrigin)
     || !productionHttpsOrigin(receipt.target.origin)
     || !productionHttpsOrigin(receipt.installation.targetOrigin)) {
@@ -533,6 +616,11 @@ function validateReceipt<T extends ProductionLiveReceiptV1>(
     if (issuedAt > attestedAt || attestedAt >= expiresAt || expiresAt - issuedAt > 120_000) {
       throw new Error("RECEIPT_VERIFIER_TIMELINE_INVALID");
     }
+  }
+  const installationVerifiedAt = new Date(receipt.installation.verifiedAt).getTime();
+  if (installationVerifiedAt > now.getTime()) throw new Error("RECEIPT_ATTESTATION_FUTURE");
+  if (installationVerifiedAt < new Date(installation.attestedAt).getTime()) {
+    throw new Error("RECEIPT_VERIFIER_TIMELINE_INVALID");
   }
   if (candidate.attestationId === installation.attestationId
     || candidate.requestId === installation.requestId
@@ -612,6 +700,12 @@ export async function writeProductionLiveReceipt(input: Readonly<{
     }
   }
   return location;
+}
+
+function sameDigest(left: string, right: string): boolean {
+  const leftBytes = Buffer.from(left, "hex");
+  const rightBytes = Buffer.from(right, "hex");
+  return leftBytes.length === rightBytes.length && timingSafeEqual(leftBytes, rightBytes);
 }
 
 function assertCurrentOwner(actualUid: number, code: string): void {

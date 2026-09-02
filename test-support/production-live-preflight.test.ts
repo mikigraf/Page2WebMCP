@@ -25,6 +25,7 @@ function environment(): Record<string, string> {
     PAGE2WEBMCP_GIT_COMMIT_SHA: "c".repeat(40),
     PAGE2WEBMCP_APPLICATION_RELEASE_ID: "page2webmcp-2026_09_01-rc1",
     PAGE2WEBMCP_OPERATOR_CREDENTIALS_FILE: "/secure/page2webmcp-operator.json",
+    PAGE2WEBMCP_RECEIPT_SIGNING_KEY: `receipt_signing_${"k".repeat(32)}`,
     PAGE2WEBMCP_PROVIDER_MODE: "openapi",
     PAGE2WEBMCP_E2E_SOURCE_URL: "https://specs.widgets.dev/openapi.json",
     PAGE2WEBMCP_OPENAPI_TARGET_ORIGIN: "https://staging.widgets.dev",

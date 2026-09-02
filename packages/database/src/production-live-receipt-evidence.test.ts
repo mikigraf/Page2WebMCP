@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { readdirSync } from "node:fs";
 import test from "node:test";
+import { deployedMigrationRange } from "./migration-ledger.ts";
 import {
   createProductionLiveReceiptContextRepository,
   mapSelectedProductionLiveReceiptEvidence,
@@ -36,8 +38,8 @@ function validRow(overrides: Record<string, unknown> = {}): Record<string, unkno
     provider_mode: "openapi",
     provider_adapter: "bounded-openapi",
     provider_adapter_version: 1,
-    migration_from: "20260826000000",
-    migration_to: "20260901140000",
+    migration_from: deployedMigrationRange().from,
+    migration_to: deployedMigrationRange().to,
     migration_digest: HASH,
     openapi_cleanup_digest: OTHER_HASH,
     candidate_verifier_origin_digest: HASH,
@@ -155,4 +157,25 @@ test("repository rejects invalid hashes and duplicate or mismatched rows", async
     /PRODUCTION_LIVE_RECEIPT_EVIDENCE_INVALID/);
   await assert.rejects(repository([validRow({ selected_release_hash: "d".repeat(64) })]).findSelected(SELECTED_HASH),
     /PRODUCTION_LIVE_RECEIPT_EVIDENCE_INVALID/);
+});
+
+test("the expected migration ledger comes from the deployed tree, not a pinned literal", () => {
+  const versions = readdirSync(new URL("../../../supabase/migrations/", import.meta.url))
+    .map((name) => /^(\d{14})_[a-z0-9_]+\.sql$/.exec(name)?.[1])
+    .filter((version): version is string => version !== undefined)
+    .sort();
+  assert.deepEqual(deployedMigrationRange(), { from: versions[0], to: versions.at(-1) });
+
+  const applied = mapSelectedProductionLiveReceiptEvidence(validRow());
+  assert.deepEqual(applied.migrationRange, {
+    from: versions[0], to: versions.at(-1), digest: HASH,
+  });
+  for (const override of [
+    { migration_to: "20270101000000" },
+    { migration_from: "20260101000000" },
+    { migration_to: versions.at(-2) },
+  ]) {
+    assert.throws(() => mapSelectedProductionLiveReceiptEvidence(validRow(override)),
+      /PRODUCTION_LIVE_RECEIPT_EVIDENCE_INVALID/);
+  }
 });

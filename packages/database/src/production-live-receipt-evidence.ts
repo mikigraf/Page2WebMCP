@@ -1,4 +1,5 @@
 import pg from "pg";
+import { deployedMigrationRange } from "./migration-ledger.ts";
 
 const HASH = /^[0-9a-f]{64}$/;
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -176,7 +177,10 @@ export function mapSelectedProductionLiveReceiptEvidence(
   if (environment !== "test" && environment !== "staging" && environment !== "production") invalid();
   const artifactSizeBytes = integer(row.artifact_size_bytes, 1, 65_536);
   if (typeof row.artifact_integrity !== "string" || !SRI.test(row.artifact_integrity)) invalid();
-  if (row.migration_from !== "20260826000000" || row.migration_to !== "20260901140000") invalid();
+  // The applied range must equal exactly the ledger the deployed tree expects.
+  const expectedMigrationRange = deployedMigrationRange();
+  if (row.migration_from !== expectedMigrationRange.from
+    || row.migration_to !== expectedMigrationRange.to) invalid();
   return Object.freeze({
     selectedReleaseHash,
     releaseIdDigest: digest(row.release_id_digest),

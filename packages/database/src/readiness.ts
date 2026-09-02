@@ -14,6 +14,8 @@ type MaintenanceReadinessClient = Readonly<{
   release(): void;
 }>;
 
+export type MaintenanceReadinessClientPort = MaintenanceReadinessClient;
+
 export type MaintenanceReadinessPool = Readonly<{
   connect(): Promise<MaintenanceReadinessClient>;
   end(): Promise<void>;
@@ -40,7 +42,7 @@ export type ApplicationReadinessRepository = Readonly<{
   close(): Promise<void>;
 }>;
 
-type MaintenanceReadinessOptions = Readonly<{
+export type MaintenanceReadinessOptions = Readonly<{
   connectionString: string;
   mode: "local-live" | "live";
   pool?: MaintenanceReadinessPool;
@@ -239,7 +241,9 @@ export function createMaintenanceReadinessRepository(
   };
 }
 
-function readinessPool(options: MaintenanceReadinessOptions): Readonly<{
+export type ReadinessPoolOptions = MaintenanceReadinessOptions;
+
+export function readinessPool(options: MaintenanceReadinessOptions): Readonly<{
   pool: MaintenanceReadinessPool;
   timeout: number;
 }> {
@@ -262,7 +266,10 @@ function readinessPool(options: MaintenanceReadinessOptions): Readonly<{
   return { pool, timeout };
 }
 
-async function configureTransactionBounds(client: MaintenanceReadinessClient, timeout: number): Promise<void> {
+export async function configureTransactionBounds(
+  client: MaintenanceReadinessClient,
+  timeout: number,
+): Promise<void> {
   await client.query(
     "select set_config('statement_timeout', $1, true), set_config('lock_timeout', $2, true), " +
     "set_config('idle_in_transaction_session_timeout', $3, true)",
@@ -421,7 +428,7 @@ const ROLE_AUDIT_QUERY =
   "select current_user as current_role, session_user as session_role, login.rolsuper as session_superuser, " +
   "login.rolbypassrls as session_bypass_rls, login.rolcanlogin as session_can_login, " +
   "login.rolcreatedb as session_createdb, login.rolcreaterole as session_createrole, " +
-  "login.rolreplication as session_replication, " +
+  "login.rolreplication as session_replication, login.rolinherit as session_inherit, " +
   "coalesce(array(select role.rolname::text from pg_catalog.pg_roles role " +
   "where role.oid <> login.oid and pg_catalog.pg_has_role(session_user, role.oid, 'member') " +
   "order by role.rolname), array[]::text[]) as session_assumable_roles, " +
@@ -449,6 +456,7 @@ function validatedRoleIdentity(
     || typeof sessionRole !== "string" || sessionRole.length === 0 || sessionRole.length > 128
     || row.session_superuser !== false || row.session_bypass_rls !== false || row.session_can_login !== true
     || row.session_createdb !== false || row.session_createrole !== false || row.session_replication !== false
+    || row.session_inherit !== false
     || !Array.isArray(row.session_assumable_roles) || row.session_assumable_roles.length !== 1
     || row.session_assumable_roles[0] !== expectedRole
     || row.session_owns_current_database !== false || row.session_owns_scoped_schema !== false

@@ -1160,12 +1160,16 @@ export function normalizeAnalysisSourceArtifact(
   sourceArtifact: ImmutableSourceArtifactIdentity | undefined,
   provenance: ProviderProvenance | undefined,
   evidence: readonly AnalysisEvidence[],
+  sourceType: SourceType,
 ): ImmutableSourceArtifactIdentity | undefined {
-  if (provenance?.mode !== "openapi") {
+  if (sourceType !== "openapi" || provenance !== undefined && provenance.mode !== "openapi") {
     if (sourceArtifact !== undefined) throw new RepositoryError("INVALID_STATE");
     return undefined;
   }
-  if (sourceArtifact === undefined) throw new RepositoryError("INVALID_STATE");
+  if (sourceArtifact === undefined) {
+    if (provenance?.mode === "openapi") throw new RepositoryError("INVALID_STATE");
+    return undefined;
+  }
   const normalized = normalizeImmutableSourceArtifactIdentity(sourceArtifact);
   const matchingEvidence = evidence.some((item) => {
     if (item.source !== "openapi") return false;
@@ -1183,11 +1187,14 @@ export function normalizePersistedAnalysisSourceArtifact(
   provenance: ProviderProvenance | undefined,
   sourceSnapshotArtifact: ImmutableSourceArtifactIdentity | undefined,
 ): ImmutableSourceArtifactIdentity | undefined {
-  if (provenance?.mode !== "openapi") {
+  if (provenance !== undefined && provenance.mode !== "openapi") {
     if (sourceArtifact !== undefined) throw new RepositoryError("INVALID_STATE");
     return undefined;
   }
-  if (sourceArtifact === undefined) throw new RepositoryError("INVALID_STATE");
+  if (sourceArtifact === undefined) {
+    if (provenance?.mode === "openapi") throw new RepositoryError("INVALID_STATE");
+    return undefined;
+  }
   const normalized = normalizeImmutableSourceArtifactIdentity(sourceArtifact);
   let frozen: ImmutableSourceArtifactIdentity;
   try {
@@ -2911,6 +2918,7 @@ export class InMemoryControlPlaneRepository implements ControlPlaneRepository {
       result.sourceArtifact,
       providerProvenance,
       normalizedEvidence,
+      analysisSource.sourceType,
     );
     let sourceSnapshotToFreeze: SourceSnapshotRecord | undefined;
     if (sourceArtifact) {

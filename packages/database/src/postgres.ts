@@ -2345,6 +2345,7 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
         result.sourceArtifact,
         providerProvenance,
         normalizedEvidence,
+        job.rows[0].source_type as SourceType,
       );
       const releaseHash = result.release === undefined
         ? null

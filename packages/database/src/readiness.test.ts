@@ -165,6 +165,7 @@ function fakePool(
         queries.push({ text, values });
         if (text.includes("session_role")) {
           for (const field of ["session_createdb", "session_createrole", "session_replication",
+            "session_inherit",
             "session_assumable_roles", "session_owns_current_database", "session_owns_scoped_schema",
             "session_owns_scoped_relation", "session_owns_scoped_routine"]) {
             assert.match(text, new RegExp(`\\b${field}\\b`));
@@ -183,6 +184,7 @@ function fakePool(
             session_createdb: false,
             session_createrole: false,
             session_replication: false,
+            session_inherit: false,
             session_assumable_roles: [expectedRole],
             session_owns_current_database: false,
             session_owns_scoped_schema: false,
@@ -228,6 +230,7 @@ test("application readiness rejects privileged, owning, or broadly assumable log
     { session_createdb: true },
     { session_createrole: true },
     { session_replication: true },
+    { session_inherit: true },
     { session_assumable_roles: ["page2webmcp_app", "pg_read_all_data"] },
     { session_owns_current_database: true },
     { session_owns_scoped_schema: true },
@@ -407,6 +410,7 @@ test("maintenance readiness rejects every privilege, ownership, and assumable-ro
     { session_createdb: true },
     { session_createrole: true },
     { session_replication: true },
+    { session_inherit: true },
     { session_assumable_roles: ["page2webmcp_maintenance", "pg_read_all_data"] },
     { session_owns_current_database: true },
     { session_owns_scoped_schema: true },

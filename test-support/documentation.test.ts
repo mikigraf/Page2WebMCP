@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
+import {
+  OPENAPI_PRODUCTION_LIVE_CONTROLS,
+  PRODUCTION_LIVE_COMMON_CONTROLS,
+  WEBSITE_PRODUCTION_LIVE_CONTROLS,
+} from "../packages/operations/src/production-live.ts";
 
 const root = new URL("../", import.meta.url);
 
@@ -102,6 +107,17 @@ test("operator surfaces enumerate all three real provider and verifier controls"
     "idempotent draft PR",
     "Never merge",
   ], "fail-closed guide");
+});
+
+test(".env.example enumerates every production-live control an operator must supply", async () => {
+  const environment = await read(".env.example");
+  const required = [
+    ...PRODUCTION_LIVE_COMMON_CONTROLS,
+    ...OPENAPI_PRODUCTION_LIVE_CONTROLS,
+    ...WEBSITE_PRODUCTION_LIVE_CONTROLS,
+  ];
+  const undocumented = required.filter((name) => !environment.includes(name)).sort();
+  assert.deepEqual(undocumented, [], `.env.example must name every production-live control`);
 });
 
 test("Storage and hosted-project documentation is exact and does not authorize another Supabase project", async () => {
