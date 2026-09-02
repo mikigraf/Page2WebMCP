@@ -77,7 +77,7 @@ services:
     type: web
     runtime: docker
     region: frankfurt
-    plan: starter
+    plan: 1c-2g
     branch: codex/url-to-script
     autoDeployTrigger: commit
     dockerfilePath: deploy/Dockerfile.control-plane
@@ -129,7 +129,7 @@ services:
     type: worker
     runtime: docker
     region: frankfurt
-    plan: starter
+    plan: 1c-2g
     branch: codex/url-to-script
     autoDeployTrigger: commit
     dockerfilePath: deploy/Dockerfile.worker
@@ -167,7 +167,7 @@ services:
     type: web
     runtime: docker
     region: frankfurt
-    plan: standard
+    plan: 2c-4g
     branch: codex/url-to-script
     autoDeployTrigger: commit
     dockerfilePath: deploy/Dockerfile.release-verifier
@@ -209,7 +209,7 @@ services:
     type: web
     runtime: docker
     region: frankfurt
-    plan: starter
+    plan: 0.5c-512mb
     branch: codex/url-to-script
     autoDeployTrigger: commit
     dockerfilePath: deploy/Dockerfile.website-gateway
@@ -248,7 +248,7 @@ services:
     type: web
     runtime: docker
     region: frankfurt
-    plan: starter
+    plan: 0.5c-512mb
     branch: codex/url-to-script
     autoDeployTrigger: commit
     dockerfilePath: deploy/Dockerfile.website-gateway
@@ -272,7 +272,7 @@ services:
     type: web
     runtime: docker
     region: frankfurt
-    plan: starter
+    plan: 0.5c-512mb
     branch: codex/url-to-script
     autoDeployTrigger: commit
     dockerfilePath: deploy/Dockerfile.website-gateway
