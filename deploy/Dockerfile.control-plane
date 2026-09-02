@@ -8,16 +8,28 @@ ARG PAGE2WEBMCP_GIT_COMMIT_SHA=${RENDER_GIT_COMMIT}
 ARG PAGE2WEBMCP_APPLICATION_RELEASE_ID=${PAGE2WEBMCP_GIT_COMMIT_SHA}
 ARG PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN
 
-# Stage 1: derive the immutable deployment identity from the git checkout.
-# A fresh clone of the build context is clean by construction and contains only
-# committed files, so the identity script's dirty-tree and commit checks hold.
+# Stage 1: derive the immutable deployment identity from the git commit.
+# A fresh clone (of the build context's .git, or of the pinned commit from the
+# public repository) is clean by construction and contains only committed files,
+# so the identity script's dirty-tree and commit checks hold.
 FROM ${NODE_BASE_IMAGE} AS identity
 
 ARG PAGE2WEBMCP_GIT_COMMIT_SHA
 ARG PAGE2WEBMCP_APPLICATION_RELEASE_ID
 ARG PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN
+ARG PAGE2WEBMCP_SOURCE_REPOSITORY=https://github.com/mikigraf/Page2WebMCP.git
 COPY . /context
-RUN git clone --quiet /context /identity \
+# Render strips .git from the Docker build context, so when it is absent fetch
+# exactly PAGE2WEBMCP_GIT_COMMIT_SHA from the public repository instead. Either
+# way the identity script still proves HEAD is that commit and the tree is clean.
+RUN if [ -e /context/.git ]; then \
+      git clone --quiet /context /identity; \
+    else \
+      git init --quiet /identity \
+      && git -C /identity remote add origin "${PAGE2WEBMCP_SOURCE_REPOSITORY}" \
+      && git -C /identity fetch --quiet --depth 1 origin "${PAGE2WEBMCP_GIT_COMMIT_SHA}" \
+      && git -C /identity checkout --quiet FETCH_HEAD; \
+    fi \
     && cd /identity \
     && node scripts/generate-deployment-identity.mjs
 

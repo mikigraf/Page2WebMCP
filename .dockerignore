@@ -1,4 +1,5 @@
-# .git stays in the context: the identity stage clones it to derive the release.
+# .git stays in the context when present: the identity stage clones it to derive
+# the release. Render omits .git; the stage then fetches the pinned commit instead.
 .page2webmcp
 .env*
 !.env.example
