@@ -2,7 +2,9 @@ import { HEX64, IDENTIFIER, MAX_OWNERSHIP_CHALLENGE_TTL_MS } from "../constants.
 import { badRequest, conflict, unavailable } from "../errors.ts";
 import {
   challengeDigest,
+  OWNERSHIP_METHODS,
   type OwnershipBinding,
+  type OwnershipMethod,
   type OwnershipStore,
   type OwnershipVerifier,
   type ReplayStore,
@@ -65,9 +67,16 @@ function stateBody(
   };
 }
 
+function requestedMethod(envelope: UserEnvelope): OwnershipMethod | undefined {
+  const method = envelope.source?.method;
+  if (method === undefined) return undefined;
+  if (!OWNERSHIP_METHODS.includes(method as OwnershipMethod)) throw badRequest("GATEWAY_OWNERSHIP_REQUEST_INVALID");
+  return method as OwnershipMethod;
+}
+
 export function issueSourceAttestation(store: OwnershipStore, envelope: UserEnvelope, now: Date): RouteResult {
   const input = binding(envelope);
-  const issued = store.issue(input, now);
+  const issued = store.issue(input, now, requestedMethod(envelope));
   return stateBody(envelope, issued.state, issued.challenge, input.targetOrigin);
 }
 

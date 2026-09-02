@@ -18,3 +18,8 @@ the layout render `<meta name="page2webmcp-status" content="release-unconfigured
 - `PAGE2WEBMCP_EXAMPLE_TARGET_OPERATOR_EMAIL`
 - `PAGE2WEBMCP_EXAMPLE_TARGET_OPERATOR_PASSWORD`
 - `PAGE2WEBMCP_LOCAL_STACK` (`"true"` selects the loopback storage prefix)
+
+Website-ownership verification (only while a challenge is pending): set
+`PAGE2WEBMCP_EXAMPLE_TARGET_OWNERSHIP_VERIFICATION` to the exact three-line content the
+control plane displays (literal or `\n`-escaped newlines) and
+`/.well-known/page2webmcp-verification.txt` serves it as plain text; otherwise 404.

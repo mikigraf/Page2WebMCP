@@ -143,3 +143,29 @@ test("consume refuses a source url that does not belong to the attested origin",
     assert.equal(mismatched.status, 400);
   } finally { await gateway.close(); }
 });
+
+test("a source attestation defaults to the well-known file method and honours an explicit method", async () => {
+  const gateway = await startGateway(testEnvironment(), {
+    clock: () => new Date("2026-08-31T12:00:00.000Z"),
+    ownershipVerifier: { verify: async () => ({ verified: true as const }) },
+  });
+  try {
+    const defaulted = await gateway.json("/v1/website-ownership/source-attestations/issue", uiEnvelope("m0"), { token });
+    assert.equal(defaulted.status, 200);
+    assert.equal(defaulted.body?.method, "well_known");
+
+    const dnsEnvelope = uiEnvelope("m1");
+    (dnsEnvelope.source as Record<string, unknown>).method = "dns_txt";
+    const dns = await gateway.json("/v1/website-ownership/source-attestations/issue", dnsEnvelope, { token });
+    assert.equal(dns.status, 200);
+    assert.equal(dns.body?.method, "dns_txt");
+
+    const status = await gateway.json("/v1/website-ownership/source-attestations/status", uiEnvelope("m2"), { token });
+    assert.equal(status.body?.method, "dns_txt", "the latest issued method is the pending one");
+
+    const invalid = uiEnvelope("m3");
+    (invalid.source as Record<string, unknown>).method = "ftp";
+    const rejected = await gateway.json("/v1/website-ownership/source-attestations/issue", invalid, { token });
+    assert.equal(rejected.status, 400);
+  } finally { await gateway.close(); }
+});

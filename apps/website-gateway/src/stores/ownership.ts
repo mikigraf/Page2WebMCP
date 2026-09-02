@@ -9,6 +9,11 @@ export type OwnershipChallenge = Readonly<{
   expiresAt: string;
 }>;
 
+export type OwnershipMethod = OwnershipChallenge["method"];
+export const OWNERSHIP_METHODS: readonly OwnershipMethod[] = Object.freeze(["well_known", "dns_txt"]);
+/** A file on the site works for any website; a DNS record needs zone access. */
+export const DEFAULT_OWNERSHIP_METHOD: OwnershipMethod = "well_known";
+
 export type OwnershipState = "missing" | "pending" | "verified" | "expired" | "failed";
 
 type AttestationRecord = Readonly<{
@@ -37,7 +42,11 @@ export type OwnershipVerifier = Readonly<{
 }>;
 
 export type OwnershipStore = Readonly<{
-  issue(binding: OwnershipBinding, now: Date): Readonly<{ state: OwnershipState; challenge: OwnershipChallenge }>;
+  issue(
+    binding: OwnershipBinding,
+    now: Date,
+    method?: OwnershipMethod,
+  ): Readonly<{ state: OwnershipState; challenge: OwnershipChallenge }>;
   status(binding: OwnershipBinding, now: Date): Readonly<{ state: OwnershipState; challenge?: OwnershipChallenge }>;
   record(binding: OwnershipBinding, now: Date): AttestationRecord | undefined;
   settle(binding: OwnershipBinding, verified: boolean, now: Date): Readonly<{ state: OwnershipState; challenge?: OwnershipChallenge }>;
@@ -62,14 +71,14 @@ export function createOwnershipStore(): OwnershipStore {
   };
 
   const store: OwnershipStore = {
-    issue(binding, now) {
+    issue(binding, now, method = DEFAULT_OWNERSHIP_METHOD) {
       const existing = live(key(binding), now);
       if (existing && existing.state === "verified" && existing.challenge.targetOrigin === binding.targetOrigin) {
         return { state: "verified", challenge: existing.challenge };
       }
       const expiresAtMs = now.getTime() + MAX_OWNERSHIP_CHALLENGE_TTL_MS;
       const challenge: OwnershipChallenge = {
-        method: "dns_txt",
+        method,
         targetOrigin: binding.targetOrigin,
         token: randomBytes(36).toString("base64url"),
         expiresAt: new Date(expiresAtMs).toISOString(),
