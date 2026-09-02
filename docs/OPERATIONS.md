@@ -83,6 +83,8 @@ Select `PAGE2WEBMCP_PROVIDER_MODE=website`. The factory is Browser Use API v4 wi
 
 `PAGE2WEBMCP_BROWSER_USE_API_ORIGIN` is the exact HTTPS origin of an operator-deployed Page2WebMCP Browser Use v4 gateway, not `api.browser-use.com`. The gateway owns the Page2WebMCP `/v1/readiness` and session-control contract, forwards only the bounded v4 operations, and must attest that its configured upstream accepted the supplied Browser Use key and selected `browser-use-2.0`.
 
+Upstream, the gateway uses the Browser Use Cloud v4 browsers API: credentials are checked with a bounded `GET /api/v4/sessions?limit=1`, a session is `POST /api/v4/browsers` with a whole-minute `timeout` derived from the pinned `expiresAt` and the policy digest in `metadata`, stop is `PATCH /api/v4/browsers/{id}` with `{"action":"stop"}`, and the returned https CDP host is exposed to the worker as its `wss://` endpoint. Browser Use does not take the pinned allowlist or proxy policy itself; those stay enforced by the egress controls.
+
 ```text
 PAGE2WEBMCP_BROWSER_USE_API_KEY
 PAGE2WEBMCP_BROWSER_USE_API_ORIGIN
