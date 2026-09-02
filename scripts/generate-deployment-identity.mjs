@@ -69,6 +69,7 @@ export async function verifyDeploymentBuildContext(environment = process.env, de
   if (committedDockerfile !== "deploy/Dockerfile.control-plane"
     && committedDockerfile !== "deploy/Dockerfile.worker"
     && committedDockerfile !== "deploy/Dockerfile.release-verifier"
+    && committedDockerfile !== "deploy/Dockerfile.website-gateway"
     && dependencies.committedDockerfilePath === undefined) {
     throw new Error("DEPLOYMENT_BUILD_DOCKERFILE_REQUIRED");
   }

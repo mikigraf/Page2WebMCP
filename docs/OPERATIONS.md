@@ -145,16 +145,25 @@ PAGE2WEBMCP_PUBLIC_ORIGIN=http://127.0.0.1:58321/storage/v1/object/public/page2w
 
 Production uses distinct managed app, worker, and maintenance login secrets and verified-TLS database URLs. Never deploy with the migration owner URL or give one login multiple authorization memberships.
 
+### Hosted runtime logins
+
+Migrations create only the NOLOGIN roles `page2webmcp_app`, `page2webmcp_worker`, and `page2webmcp_maintenance`. After `supabase db push`, run `deploy/sql/hosted-runtime-roles.sql` once as the project owner with fresh passwords substituted for the placeholders. It creates `page2webmcp_app_hosted`, `page2webmcp_worker_hosted`, and `page2webmcp_maintenance_hosted`, grants each exactly one application role, and pins that role with `alter role ... set role` because the Supabase session pooler does not forward the `options` startup parameter. Re-running the file rotates the passwords in place.
+
+Runtime URLs go through the session pooler with full TLS verification:
+
+```text
+postgresql://page2webmcp_app_hosted.<project-ref>:<password>@<region>.pooler.supabase.com:5432/postgres?sslmode=verify-full
+```
+
+The pooler chain terminates in Supabase's private `Supabase Root 2021 CA`, which Node does not trust by default. The control-plane and worker images copy `deploy/certs/supabase-prod-ca-2021.crt` and set `NODE_EXTRA_CA_CERTS` to it; without that, every connection fails with `self-signed certificate in certificate chain`. The committed file must match the root Supabase serves; compare `openssl x509 -fingerprint -sha256` against the chain from `openssl s_client -starttls postgres` before replacing it.
+
 ## Production images and deployment identity
 
-Build the control plane and worker as separate images from one clean, committed source tree. The operator must supply an approved `node:24@sha256:<lowercase-digest>` base image (an optional registry prefix is allowed); an unpinned tag or a non-Node-24 repository/tag is rejected inside each build. Generate the immutable identity and committed-source archive once before either image build, then pass the same commit, release ID, and HTTPS control-plane origin to both builds:
+Build the control plane and worker as separate images from one clean, committed source tree. The operator must supply an approved `node:24@sha256:<lowercase-digest>` base image (an optional registry prefix is allowed); an unpinned tag or a non-Node-24 repository/tag is rejected inside each build.
+
+Each Dockerfile derives the immutable identity itself. Its first stage clones the build context's `.git` into a fresh working tree, which is clean by construction and contains only committed files, and runs `scripts/generate-deployment-identity.mjs` there. Later stages build only from the archive that stage produced and re-verify it. The build context therefore must be a git checkout at the commit being deployed (a worktree's `.git` file does not work; build from a real clone). Pass the same commit, release ID, and HTTPS control-plane origin to every image:
 
 ```bash
-PAGE2WEBMCP_GIT_COMMIT_SHA=<exact-clean-commit> \
-PAGE2WEBMCP_APPLICATION_RELEASE_ID=<immutable-release-id> \
-PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN=https://control.example \
-pnpm build:identity
-
 docker build -f deploy/Dockerfile.control-plane \
   --build-arg NODE_BASE_IMAGE=<approved-node-24-image@sha256:digest> \
   --build-arg PAGE2WEBMCP_GIT_COMMIT_SHA=<exact-clean-commit> \
@@ -170,7 +179,11 @@ docker build -f deploy/Dockerfile.worker \
   -t page2webmcp-worker:<immutable-release-id> .
 ```
 
-Identity generation fails on a dirty tree, commit mismatch, non-HTTPS origin, or conflicting prior manifest/archive. It writes read-only `.dist/deployment-identity.json` and `.dist/deployment-source.tar`. Each image extracts only that exact committed archive, re-hashes it, compares its active Dockerfile with the committed Dockerfile, and verifies the same runtime identity arguments before installing or compiling anything. Later workspace edits therefore cannot enter an image under an older identity. Both images run as the base image's non-root `node` user and copy the same read-only deployment identity.
+Identity generation fails on a dirty tree, commit mismatch, non-HTTPS origin, or conflicting prior manifest/archive. It writes read-only `.dist/deployment-identity.json` and `.dist/deployment-source.tar`. Each image extracts only that exact committed archive, re-hashes it, compares its active Dockerfile with the committed Dockerfile, and verifies the same runtime identity arguments before installing or compiling anything. Later workspace edits therefore cannot enter an image under an older identity. Both images run as the base image's non-root `node` user and copy the same read-only deployment identity. The runtime stages of the control-plane and worker images also bake `PAGE2WEBMCP_GIT_COMMIT_SHA`, `PAGE2WEBMCP_APPLICATION_RELEASE_ID`, and `PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN` as environment defaults, so a hosted service does not have to repeat them.
+
+### Render Blueprint
+
+`render.yaml` at the repository root deploys all six hosted services (control plane, worker, release verifier, and the three gateway processes) from these Dockerfiles. Render passes every service environment variable to `docker build` as a build argument, and `RENDER_GIT_COMMIT` fills `PAGE2WEBMCP_GIT_COMMIT_SHA` and the release ID when they are not set explicitly. The `page2webmcp-shared` environment group carries the pinned `NODE_BASE_IMAGE`, every public origin, and the hosted Supabase values; secrets are prompted at Blueprint creation (`sync: false`) or generated once on the control plane and mirrored to the other services with `fromService`. Origins are baked into the images, so if Render assigns a different hostname than the group predicts, update the group and redeploy.
 
 ## Immutable Supabase Storage artifacts
 

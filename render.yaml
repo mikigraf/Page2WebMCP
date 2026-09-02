@@ -1,0 +1,296 @@
+# Render Blueprint for Page2WebMCP.
+#
+# Connect this repository in Render -> Blueprints. Every service builds from the
+# committed Dockerfiles; the deployment identity is derived inside each build
+# from Render's own checkout (RENDER_GIT_COMMIT), so nothing is prebuilt.
+# See docs/OPERATIONS.md "Production images and deployment identity" and
+# deploy/env/README.md for what must match across services.
+#
+# Before applying:
+#   1. Push the branch named below.
+#   2. Have the hosted Supabase values ready (.env in the operator checkout):
+#      DATABASE_URL, PAGE2WEBMCP_WORKER_DATABASE_URL, PAGE2WEBMCP_SUPABASE_SECRET_KEY,
+#      NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY. Render prompts for every `sync: false` value.
+#   3. If Render reports a service name is taken, it appends a suffix to the URL.
+#      Then update the matching *_ORIGIN values in the `page2webmcp-shared` group
+#      and redeploy, because origins are baked into the images and verified at runtime.
+#
+# After the first deploy:
+#   - Point Supabase Auth site_url / redirect URLs at the control-plane origin.
+#   - The three gateway services are only needed for the Website / Browser Use
+#     journey. Suspend them for the OpenAPI journey.
+
+previews:
+  generation: off
+
+envVarGroups:
+  - name: page2webmcp-shared
+    envVars:
+      # Pinned Node 24 base image. Builds refuse an unpinned tag.
+      - key: NODE_BASE_IMAGE
+        value: node:24@sha256:be23f54a88d34e8824c741b19b91064094f92c1c97b194144bfc8b50d67258e2
+      # Exact public HTTPS origins of the services below. Baked into every image.
+      - key: PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN
+        value: https://page2webmcp-control-plane.onrender.com
+      - key: PAGE2WEBMCP_RELEASE_VERIFIER_ORIGIN
+        value: https://page2webmcp-release-verifier.onrender.com
+      - key: PAGE2WEBMCP_AUTH_HANDOFF_ORIGIN
+        value: https://page2webmcp-gateway-handoff.onrender.com
+      - key: PAGE2WEBMCP_BROWSER_USE_API_ORIGIN
+        value: https://page2webmcp-gateway-browser-use.onrender.com
+      - key: PAGE2WEBMCP_BROWSER_LEASE_STORE_ORIGIN
+        value: https://page2webmcp-gateway-controls.onrender.com
+      - key: PAGE2WEBMCP_CDP_OBSERVER_ORIGIN
+        value: https://page2webmcp-gateway-controls.onrender.com
+      - key: PAGE2WEBMCP_EGRESS_POLICY_ORIGIN
+        value: https://page2webmcp-gateway-controls.onrender.com
+      - key: PAGE2WEBMCP_EGRESS_PROXY_ORIGIN
+        value: https://page2webmcp-gateway-controls.onrender.com
+      - key: PAGE2WEBMCP_EVIDENCE_STORE_ORIGIN
+        value: https://page2webmcp-gateway-controls.onrender.com
+      - key: PAGE2WEBMCP_OWNERSHIP_STORE_ORIGIN
+        value: https://page2webmcp-gateway-controls.onrender.com
+      - key: PAGE2WEBMCP_SECRET_STORE_ORIGIN
+        value: https://page2webmcp-gateway-controls.onrender.com
+      # Hosted Supabase project (non-secret values).
+      - key: PAGE2WEBMCP_SUPABASE_URL
+        value: https://bimqgiedckdurqiywctl.supabase.co
+      - key: NEXT_PUBLIC_SUPABASE_URL
+        value: https://bimqgiedckdurqiywctl.supabase.co
+      - key: PAGE2WEBMCP_PUBLIC_ORIGIN
+        value: https://bimqgiedckdurqiywctl.supabase.co/storage/v1/object/public/page2webmcp-releases
+      # Live runs require durable persistence and one real provider adapter.
+      # website = Browser Use journey (needs the three gateways); openapi = OpenAPI journey.
+      - key: PAGE2WEBMCP_STORAGE_MODE
+        value: postgres
+      - key: PAGE2WEBMCP_PROVIDER_MODE
+        value: website
+      # Opaque label; the worker only ever sends its SHA-256.
+      - key: PAGE2WEBMCP_SECRET_STORE_KMS_KEY_ID
+        value: page2webmcp-ttl-secrets-v1
+
+services:
+  # ---------------------------------------------------------------------------
+  # Control plane (Next.js). Owns the generated secrets other services mirror.
+  # ---------------------------------------------------------------------------
+  - name: page2webmcp-control-plane
+    type: web
+    runtime: docker
+    region: frankfurt
+    plan: 1c-2g
+    branch: codex/url-to-script
+    autoDeployTrigger: commit
+    dockerfilePath: deploy/Dockerfile.control-plane
+    dockerContext: .
+    healthCheckPath: /api/deployment-identity
+    envVars:
+      - fromGroup: page2webmcp-shared
+      - key: PORT
+        value: "10000"
+      - key: HOSTNAME
+        value: 0.0.0.0
+      # Hosted Supabase secrets (from the operator .env).
+      - key: DATABASE_URL
+        sync: false
+      - key: PAGE2WEBMCP_SUPABASE_SECRET_KEY
+        sync: false
+      - key: NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY
+        sync: false
+      # Generated once here; other services reference them via fromService.
+      - key: PAGE2WEBMCP_SESSION_SECRET
+        generateValue: true
+      - key: PAGE2WEBMCP_RELEASE_VERIFIER_TOKEN
+        generateValue: true
+      - key: PAGE2WEBMCP_AUTH_HANDOFF_TOKEN
+        generateValue: true
+      - key: PAGE2WEBMCP_BROWSER_LEASE_STORE_TOKEN
+        generateValue: true
+      - key: PAGE2WEBMCP_CDP_OBSERVER_TOKEN
+        generateValue: true
+      - key: PAGE2WEBMCP_EGRESS_POLICY_TOKEN
+        generateValue: true
+      - key: PAGE2WEBMCP_EGRESS_PROXY_TOKEN
+        generateValue: true
+      - key: PAGE2WEBMCP_EVIDENCE_STORE_TOKEN
+        generateValue: true
+      - key: PAGE2WEBMCP_OWNERSHIP_STORE_TOKEN
+        generateValue: true
+      - key: PAGE2WEBMCP_SECRET_STORE_TOKEN
+        generateValue: true
+      # Inbound credential the worker presents to YOUR browser-use gateway.
+      # Format bu_...; choose any random value with that prefix.
+      - key: PAGE2WEBMCP_BROWSER_USE_API_KEY
+        sync: false
+
+  # ---------------------------------------------------------------------------
+  # Worker. Same application environment, its own bounded database login.
+  # ---------------------------------------------------------------------------
+  - name: page2webmcp-worker
+    type: worker
+    runtime: docker
+    region: frankfurt
+    plan: 1c-2g
+    branch: codex/url-to-script
+    autoDeployTrigger: commit
+    dockerfilePath: deploy/Dockerfile.worker
+    dockerContext: .
+    envVars:
+      - fromGroup: page2webmcp-shared
+      # Paste PAGE2WEBMCP_WORKER_DATABASE_URL from the operator .env here.
+      - key: DATABASE_URL
+        sync: false
+      - key: PAGE2WEBMCP_SUPABASE_SECRET_KEY
+        sync: false
+      - key: PAGE2WEBMCP_AUTH_HANDOFF_TOKEN
+        fromService: { name: page2webmcp-control-plane, type: web, envVarKey: PAGE2WEBMCP_AUTH_HANDOFF_TOKEN }
+      - key: PAGE2WEBMCP_BROWSER_LEASE_STORE_TOKEN
+        fromService: { name: page2webmcp-control-plane, type: web, envVarKey: PAGE2WEBMCP_BROWSER_LEASE_STORE_TOKEN }
+      - key: PAGE2WEBMCP_CDP_OBSERVER_TOKEN
+        fromService: { name: page2webmcp-control-plane, type: web, envVarKey: PAGE2WEBMCP_CDP_OBSERVER_TOKEN }
+      - key: PAGE2WEBMCP_EGRESS_POLICY_TOKEN
+        fromService: { name: page2webmcp-control-plane, type: web, envVarKey: PAGE2WEBMCP_EGRESS_POLICY_TOKEN }
+      - key: PAGE2WEBMCP_EGRESS_PROXY_TOKEN
+        fromService: { name: page2webmcp-control-plane, type: web, envVarKey: PAGE2WEBMCP_EGRESS_PROXY_TOKEN }
+      - key: PAGE2WEBMCP_EVIDENCE_STORE_TOKEN
+        fromService: { name: page2webmcp-control-plane, type: web, envVarKey: PAGE2WEBMCP_EVIDENCE_STORE_TOKEN }
+      - key: PAGE2WEBMCP_OWNERSHIP_STORE_TOKEN
+        fromService: { name: page2webmcp-control-plane, type: web, envVarKey: PAGE2WEBMCP_OWNERSHIP_STORE_TOKEN }
+      - key: PAGE2WEBMCP_SECRET_STORE_TOKEN
+        fromService: { name: page2webmcp-control-plane, type: web, envVarKey: PAGE2WEBMCP_SECRET_STORE_TOKEN }
+      - key: PAGE2WEBMCP_BROWSER_USE_API_KEY
+        fromService: { name: page2webmcp-control-plane, type: web, envVarKey: PAGE2WEBMCP_BROWSER_USE_API_KEY }
+
+  # ---------------------------------------------------------------------------
+  # Release verifier (headless Chromium). One HTTPS origin.
+  # ---------------------------------------------------------------------------
+  - name: page2webmcp-release-verifier
+    type: web
+    runtime: docker
+    region: frankfurt
+    plan: 2c-4g
+    branch: codex/url-to-script
+    autoDeployTrigger: commit
+    dockerfilePath: deploy/Dockerfile.release-verifier
+    dockerContext: .
+    disk:
+      name: page2webmcp-verifier-replay
+      mountPath: /var/lib/page2webmcp
+      sizeGB: 1
+    envVars:
+      - fromGroup: page2webmcp-shared
+      - key: PORT
+        value: "10000"
+      - key: PAGE2WEBMCP_RELEASE_VERIFIER_BIND_ADDRESS
+        value: 0.0.0.0
+      - key: PAGE2WEBMCP_RELEASE_VERIFIER_PORT
+        value: "10000"
+      - key: PAGE2WEBMCP_RELEASE_VERIFIER_BROWSER_HEADLESS
+        value: "true"
+      - key: PAGE2WEBMCP_RELEASE_VERIFIER_REPLAY_STORE_PATH
+        value: /var/lib/page2webmcp/replay.log
+      - key: PAGE2WEBMCP_RELEASE_VERIFIER_TOKEN
+        fromService: { name: page2webmcp-control-plane, type: web, envVarKey: PAGE2WEBMCP_RELEASE_VERIFIER_TOKEN }
+      - key: PAGE2WEBMCP_RELEASE_VERIFIER_CONTROL_PLANE_ORIGIN
+        value: https://page2webmcp-control-plane.onrender.com
+      # Exact origin of the deployed example target (Vercel).
+      - key: PAGE2WEBMCP_RELEASE_VERIFIER_ALLOWED_TARGET_ORIGINS
+        sync: false
+      # Set before a live run; see deploy/env/release-verifier.env.example.
+      - key: PAGE2WEBMCP_RELEASE_VERIFIER_TARGET_SESSION_COOKIES
+        sync: false
+      - key: PAGE2WEBMCP_RELEASE_VERIFIER_EXECUTION_PLAN
+        sync: false
+
+  # ---------------------------------------------------------------------------
+  # Website control gateway, deployed three times from one image.
+  # Only needed for the Website / Browser Use journey.
+  # ---------------------------------------------------------------------------
+  - name: page2webmcp-gateway-controls
+    type: web
+    runtime: docker
+    region: frankfurt
+    plan: 0.5c-512mb
+    branch: codex/url-to-script
+    autoDeployTrigger: commit
+    dockerfilePath: deploy/Dockerfile.website-gateway
+    dockerContext: .
+    envVars:
+      - fromGroup: page2webmcp-shared
+      - key: PORT
+        value: "10000"
+      - key: PAGE2WEBMCP_GATEWAY_BIND_ADDRESS
+        value: 0.0.0.0
+      - key: PAGE2WEBMCP_GATEWAY_PORT
+        value: "10000"
+      - key: PAGE2WEBMCP_GATEWAY_CONTROLS
+        value: browser-lease-store,cdp-observer,egress-policy-store,egress-proxy,evidence-store,ownership-store,ttl-secret-store
+      - key: PAGE2WEBMCP_GATEWAY_BROWSER_LEASE_STORE_TOKEN
+        fromService: { name: page2webmcp-control-plane, type: web, envVarKey: PAGE2WEBMCP_BROWSER_LEASE_STORE_TOKEN }
+      - key: PAGE2WEBMCP_GATEWAY_CDP_OBSERVER_TOKEN
+        fromService: { name: page2webmcp-control-plane, type: web, envVarKey: PAGE2WEBMCP_CDP_OBSERVER_TOKEN }
+      - key: PAGE2WEBMCP_GATEWAY_EGRESS_POLICY_TOKEN
+        fromService: { name: page2webmcp-control-plane, type: web, envVarKey: PAGE2WEBMCP_EGRESS_POLICY_TOKEN }
+      - key: PAGE2WEBMCP_GATEWAY_EGRESS_PROXY_TOKEN
+        fromService: { name: page2webmcp-control-plane, type: web, envVarKey: PAGE2WEBMCP_EGRESS_PROXY_TOKEN }
+      - key: PAGE2WEBMCP_GATEWAY_EVIDENCE_STORE_TOKEN
+        fromService: { name: page2webmcp-control-plane, type: web, envVarKey: PAGE2WEBMCP_EVIDENCE_STORE_TOKEN }
+      - key: PAGE2WEBMCP_GATEWAY_OWNERSHIP_STORE_TOKEN
+        fromService: { name: page2webmcp-control-plane, type: web, envVarKey: PAGE2WEBMCP_OWNERSHIP_STORE_TOKEN }
+      - key: PAGE2WEBMCP_GATEWAY_SECRET_STORE_TOKEN
+        fromService: { name: page2webmcp-control-plane, type: web, envVarKey: PAGE2WEBMCP_SECRET_STORE_TOKEN }
+      - key: PAGE2WEBMCP_GATEWAY_SECRET_STORE_KMS_KEY_ID
+        value: page2webmcp-ttl-secrets-v1
+      # Base64 of 32 random bytes (openssl rand -base64 32).
+      - key: PAGE2WEBMCP_GATEWAY_SECRET_STORE_KMS_ROOT_KEY
+        sync: false
+
+  - name: page2webmcp-gateway-handoff
+    type: web
+    runtime: docker
+    region: frankfurt
+    plan: 0.5c-512mb
+    branch: codex/url-to-script
+    autoDeployTrigger: commit
+    dockerfilePath: deploy/Dockerfile.website-gateway
+    dockerContext: .
+    envVars:
+      - fromGroup: page2webmcp-shared
+      - key: PORT
+        value: "10000"
+      - key: PAGE2WEBMCP_GATEWAY_BIND_ADDRESS
+        value: 0.0.0.0
+      - key: PAGE2WEBMCP_GATEWAY_PORT
+        value: "10000"
+      - key: PAGE2WEBMCP_GATEWAY_CONTROLS
+        value: authentication-handoff
+      - key: PAGE2WEBMCP_GATEWAY_AUTH_HANDOFF_TOKEN
+        fromService: { name: page2webmcp-control-plane, type: web, envVarKey: PAGE2WEBMCP_AUTH_HANDOFF_TOKEN }
+      - key: PAGE2WEBMCP_GATEWAY_AUTH_HANDOFF_PUBLIC_ORIGIN
+        value: https://page2webmcp-gateway-handoff.onrender.com
+
+  - name: page2webmcp-gateway-browser-use
+    type: web
+    runtime: docker
+    region: frankfurt
+    plan: 0.5c-512mb
+    branch: codex/url-to-script
+    autoDeployTrigger: commit
+    dockerfilePath: deploy/Dockerfile.website-gateway
+    dockerContext: .
+    envVars:
+      - fromGroup: page2webmcp-shared
+      - key: PORT
+        value: "10000"
+      - key: PAGE2WEBMCP_GATEWAY_BIND_ADDRESS
+        value: 0.0.0.0
+      - key: PAGE2WEBMCP_GATEWAY_PORT
+        value: "10000"
+      - key: PAGE2WEBMCP_GATEWAY_CONTROLS
+        value: browser-use-v4
+      - key: PAGE2WEBMCP_GATEWAY_BROWSER_USE_API_KEY
+        fromService: { name: page2webmcp-control-plane, type: web, envVarKey: PAGE2WEBMCP_BROWSER_USE_API_KEY }
+      # Your real Browser Use Cloud key (https://cloud.browser-use.com -> API keys).
+      - key: PAGE2WEBMCP_GATEWAY_BROWSER_USE_UPSTREAM_API_KEY
+        sync: false
+      - key: PAGE2WEBMCP_GATEWAY_BROWSER_USE_UPSTREAM_ORIGIN
+        value: https://api.browser-use.com

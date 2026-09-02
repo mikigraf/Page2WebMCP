@@ -1,4 +1,4 @@
-.git
+# .git stays in the context: the identity stage clones it to derive the release.
 .page2webmcp
 .env*
 !.env.example
