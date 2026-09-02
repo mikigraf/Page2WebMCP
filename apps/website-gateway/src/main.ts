@@ -1,7 +1,7 @@
 import { loadWebsiteGatewayConfiguration, websiteGatewayMissingConfiguration } from "./config.ts";
 import { createWebsiteGatewayServer } from "./server.ts";
 import { createBrowserUseCloudUpstream } from "./upstream/browser-use-cloud.ts";
-import { createDnsOwnershipVerifier } from "./ownership/dns-verifier.ts";
+import { createOwnershipVerifier } from "./ownership/verifier.ts";
 import { createAuthenticationObserver, createCdpObserver } from "./observer/cdp-observer.ts";
 import type { GatewayDependencies } from "./dependencies.ts";
 
@@ -20,7 +20,7 @@ export function main(environment: NodeJS.ProcessEnv = process.env): void {
   const clock = () => new Date();
   const dependencies: GatewayDependencies = {
     clock,
-    ownershipVerifier: createDnsOwnershipVerifier(),
+    ownershipVerifier: createOwnershipVerifier(),
     cdpObserver: createCdpObserver(clock),
     authenticationObserver: createAuthenticationObserver(clock),
     ...(configuration.controls.has("browser-use-v4")

@@ -64,12 +64,16 @@ export type WebsiteOwnershipState =
     expiresAt?: string;
   }>;
 
+export type WebsiteOwnershipMethod = "dns_txt" | "well_known";
+const OWNERSHIP_METHODS: readonly WebsiteOwnershipMethod[] = Object.freeze(["dns_txt", "well_known"]);
+
 export interface WebsiteUserHandoffPort {
   ownershipStatus(binding: WebsiteUserHandoffBinding, signal: AbortSignal): Promise<WebsiteOwnershipState>;
   issueOwnershipChallenge(
     binding: WebsiteUserHandoffBinding,
     idempotencyKey: string,
     signal: AbortSignal,
+    method?: WebsiteOwnershipMethod,
   ): Promise<WebsiteOwnershipState>;
   checkOwnership(
     binding: WebsiteUserHandoffBinding,
@@ -181,9 +185,11 @@ export function createConfiguredWebsiteUserHandoffPort(
     binding: WebsiteUserHandoffBinding,
     callerKey: string,
     signal: AbortSignal,
+    method?: WebsiteOwnershipMethod,
   ): Promise<WebsiteOwnershipState> => {
     const normalized = validateBinding(binding);
-    const request = sourceControlEnvelope(normalized, operation, callerKey);
+    if (method !== undefined && !OWNERSHIP_METHODS.includes(method)) throw stableError("WEBSITE_HANDOFF_INPUT_INVALID");
+    const request = sourceControlEnvelope(normalized, operation, callerKey, method);
     const response = await requestControl(
       transport,
       configuration.ownershipOrigin,
@@ -205,12 +211,13 @@ export function createConfiguredWebsiteUserHandoffPort(
       `status:${binding.sourceIdentityHash}`,
       signal,
     ),
-    issueOwnershipChallenge: (binding, idempotencyKey, signal) => ownershipRequest(
+    issueOwnershipChallenge: (binding, idempotencyKey, signal, method) => ownershipRequest(
       WEBSITE_USER_HANDOFF_PATHS.ownershipChallenge,
       "ownership-challenge",
       binding,
       idempotencyKey,
       signal,
+      method,
     ),
     checkOwnership: (binding, idempotencyKey, signal) => ownershipRequest(
       WEBSITE_USER_HANDOFF_PATHS.ownershipCheck,
@@ -356,6 +363,7 @@ function sourceControlEnvelope(
   binding: WebsiteUserHandoffBinding,
   operation: string,
   callerKey: string,
+  method?: WebsiteOwnershipMethod,
 ): Record<string, unknown> {
   if (!IDEMPOTENCY_KEY.test(callerKey)) throw stableError("WEBSITE_HANDOFF_INPUT_INVALID");
   const idempotencyKey = `website-ui:${createHash("sha256").update([
@@ -380,6 +388,7 @@ function sourceControlEnvelope(
       sourceIdentityHash: binding.sourceIdentityHash,
       sourceUrl: binding.sourceUrl,
       targetOrigin: binding.targetOrigin,
+      ...(method ? { method } : {}),
     },
   };
 }

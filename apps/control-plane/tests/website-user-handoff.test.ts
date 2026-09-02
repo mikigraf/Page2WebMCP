@@ -239,3 +239,33 @@ test("authentication portal validation rejects off-origin, credential-shaped, an
     );
   }
 });
+
+test("issueOwnershipChallenge forwards an explicit method and renders well-known instructions", async () => {
+  const requests: Parameters<NodePinnedJsonTransport["request"]>[0][] = [];
+  const transport: NodePinnedJsonTransport = {
+    request: async (request) => {
+      requests.push(request);
+      const body = JSON.parse(request.body ?? "{}") as Record<string, unknown>;
+      return jsonResponse(request.url, {
+        ...body,
+        state: "pending",
+        method: "well_known",
+        token: "A".repeat(43),
+        targetOrigin: binding.targetOrigin,
+        expiresAt: "2026-09-01T12:15:00.000Z",
+      });
+    },
+  };
+  const port = createConfiguredWebsiteUserHandoffPort(environment, {
+    transport, clock: () => new Date("2026-09-01T12:00:00.000Z"),
+  });
+  const result = await port.issueOwnershipChallenge(binding, "ownership-challenge-0002", new AbortController().signal, "well_known");
+  assert.equal(result.state, "pending");
+  assert.equal(result.method, "well_known");
+  const requestBody = JSON.parse(requests[0]!.body ?? "{}") as Record<string, unknown>;
+  assert.equal((requestBody.source as Record<string, unknown>).method, "well_known");
+  await assert.rejects(
+    port.issueOwnershipChallenge(binding, "ownership-challenge-0003", new AbortController().signal, "ftp" as never),
+    { message: "WEBSITE_HANDOFF_INPUT_INVALID" },
+  );
+});

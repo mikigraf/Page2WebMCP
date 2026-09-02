@@ -250,7 +250,7 @@ Set `PAGE2WEBMCP_OPERATOR_CREDENTIALS_FILE` to an owner-only, non-symlink mode-0
 
 These commands are deliberately resumable through server idempotency and durable PostgreSQL state. A nonzero action result is a checkpoint, not success:
 
-- `WEBSITE_OWNERSHIP_ACTION_REQUIRED`: complete the displayed project ownership flow in the UI, then rerun.
+- `WEBSITE_OWNERSHIP_ACTION_REQUIRED`: complete the displayed project ownership flow in the UI, then rerun. The challenge defaults to a `/.well-known/page2webmcp-verification.txt` file on the target, which any site can publish; pass `method: "dns_txt"` to the ownership API to receive a `_page2webmcp` TXT record instead. The gateway verifies exactly the issued method and the worker re-proves it.
 - `WEBSITE_WORKER_RESTART_AND_AUTHENTICATION_REQUIRED`: recycle the production worker, complete the safe owner/editor handoff in the UI, then rerun Website with `--resume-authentication`. The database still requires a different completing worker/lease generation; the flag itself is not evidence.
 - `CAPABILITY_REVIEW_REQUIRED`: review the evidence-backed capabilities in the UI, then rerun.
 - `INSTALLATION_ACTION_REQUIRED`: install the returned exact module script in the target's site-wide layout. Rerun with `--confirm-installed <returned-sha256>` only after installation.

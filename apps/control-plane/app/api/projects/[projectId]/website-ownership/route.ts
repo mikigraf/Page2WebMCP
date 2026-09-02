@@ -17,7 +17,11 @@ import {
 import { websiteUserHandoffPort } from "../../../../../src/website-user-handoff.ts";
 
 const ProjectIdSchema = z.string().uuid();
-const MutationSchema = z.object({ action: z.enum(["challenge", "check"]) }).strict();
+const MutationSchema = z.object({
+  action: z.enum(["challenge", "check"]),
+  // Ownership proof the operator can publish; a well-known file works for any site.
+  method: z.enum(["well_known", "dns_txt"]).optional(),
+}).strict();
 const IDEMPOTENCY_KEY = /^[A-Za-z0-9._:-]{8,128}$/;
 
 export async function GET(request: Request, context: { params: Promise<{ projectId: string }> }) {
@@ -47,7 +51,7 @@ export async function POST(request: Request, context: { params: Promise<{ projec
     const binding = await loadWebsiteUserHandoffBinding(repository, actor, projectId);
     const port = websiteUserHandoffPort();
     const state = input.action === "challenge"
-      ? await port.issueOwnershipChallenge(binding, idempotencyKey, request.signal)
+      ? await port.issueOwnershipChallenge(binding, idempotencyKey, request.signal, input.method)
       : await port.checkOwnership(binding, idempotencyKey, request.signal);
     const ownership = publicOwnershipState(state);
     return successResponse({ ownership, canAnalyze: ownership.state === "verified" }, requestId);
