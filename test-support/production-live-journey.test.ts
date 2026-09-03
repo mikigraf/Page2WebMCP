@@ -279,6 +279,105 @@ test("published exact bytes produce installation instructions and no verifier ca
   assert.equal(session.calls.some((call) => call.path?.endsWith("/installation")), false);
 });
 
+test("a CDN session cookie on the hosted artifact does not invalidate its identity", async () => {
+  // Hosted Storage is fronted by a CDN that sets its own bot-management cookie.
+  // The read omits credentials and every byte is hash-verified, so the cookie
+  // cannot affect the artifact and must not fail the publication.
+  const bytes = Buffer.from("bundle");
+  const { createHash } = await import("node:crypto");
+  const hash = createHash("sha256").update(bytes).digest("hex");
+  const sri = `sha384-${createHash("sha384").update(bytes).digest("base64")}`;
+  const artifactUrl = `${HOSTED}/${hash}.js`;
+  const downloadUrl = `${artifactUrl}?download=page2webmcp-${hash}.js`;
+  const session = new FakeSession([
+    deploymentIdentity(),
+    { role: "owner" },
+    { id: "11111111-1111-4111-8111-111111111111", sourceType: "openapi" },
+    {},
+    { runId: "22222222-2222-4222-8222-222222222222", status: "succeeded" },
+    {
+      run: { id: "22222222-2222-4222-8222-222222222222", status: "succeeded" },
+      result: { providerProvenance: { mode: "openapi", fixture: false } },
+      capabilities: [{
+        id: "33333333-3333-4333-8333-333333333333", riskTier: "R1", status: "reviewed", version: 2,
+      }],
+    },
+    { verification: { eligible: true, verificationMode: "live" } },
+    { release: {
+      id: "44444444-4444-4444-8444-444444444444", contentHash: hash, sri, url: artifactUrl,
+      installation: {
+        artifactUrl, downloadUrl,
+        moduleScriptTag: `<script type="module" src="${artifactUrl}" integrity="${sri}" crossorigin="anonymous"></script>`,
+        contentHash: hash, integrity: sri,
+        targetOrigin: "https://staging.widgets.dev",
+        verificationPageUrl: "https://staging.widgets.dev/webmcp-test",
+        localOnly: false,
+      },
+    } },
+  ]);
+  const result = await runProductionLiveJourneyCli(["--live", "--provider", "openapi"], environment(), dependencies(session, {
+    fetch: async (resource) => {
+      const url = String(resource);
+      const response = new Response("bundle", {
+        status: 200,
+        headers: {
+          "content-type": "application/javascript",
+          "set-cookie": "__cf_bm=opaque; HttpOnly; Secure; Path=/; Domain=supabase.co",
+        },
+      });
+      Object.defineProperty(response, "url", { value: url });
+      return response;
+    },
+  }));
+  assert.equal(result.output.code, "INSTALLATION_ACTION_REQUIRED");
+  assert.equal(result.output.selectedHash, hash);
+});
+
+test("a redirected or drifted artifact URL still fails the publication", async () => {
+  const bytes = Buffer.from("bundle");
+  const { createHash } = await import("node:crypto");
+  const hash = createHash("sha256").update(bytes).digest("hex");
+  const sri = `sha384-${createHash("sha384").update(bytes).digest("base64")}`;
+  const artifactUrl = `${HOSTED}/${hash}.js`;
+  const downloadUrl = `${artifactUrl}?download=page2webmcp-${hash}.js`;
+  const session = new FakeSession([
+    deploymentIdentity(),
+    { role: "owner" },
+    { id: "11111111-1111-4111-8111-111111111111", sourceType: "openapi" },
+    {},
+    { runId: "22222222-2222-4222-8222-222222222222", status: "succeeded" },
+    {
+      run: { id: "22222222-2222-4222-8222-222222222222", status: "succeeded" },
+      result: { providerProvenance: { mode: "openapi", fixture: false } },
+      capabilities: [{
+        id: "33333333-3333-4333-8333-333333333333", riskTier: "R1", status: "reviewed", version: 2,
+      }],
+    },
+    { verification: { eligible: true, verificationMode: "live" } },
+    { release: {
+      id: "44444444-4444-4444-8444-444444444444", contentHash: hash, sri, url: artifactUrl,
+      installation: {
+        artifactUrl, downloadUrl,
+        moduleScriptTag: `<script type="module" src="${artifactUrl}" integrity="${sri}" crossorigin="anonymous"></script>`,
+        contentHash: hash, integrity: sri,
+        targetOrigin: "https://staging.widgets.dev",
+        verificationPageUrl: "https://staging.widgets.dev/webmcp-test",
+        localOnly: false,
+      },
+    } },
+  ]);
+  const result = await runProductionLiveJourneyCli(["--live", "--provider", "openapi"], environment(), dependencies(session, {
+    fetch: async () => {
+      const response = new Response("bundle", {
+        status: 200, headers: { "content-type": "application/javascript" },
+      });
+      Object.defineProperty(response, "url", { value: `${HOSTED}/elsewhere.js` });
+      return response;
+    },
+  }));
+  assert.equal(result.output.code, "PUBLISHED_ARTIFACT_IDENTITY_INVALID");
+});
+
 test("website journey creates a real ownership challenge and stops before analysis", async () => {
   const session = new FakeSession([
     deploymentIdentity(),

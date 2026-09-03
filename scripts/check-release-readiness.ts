@@ -343,7 +343,10 @@ async function fetchSelectedArtifact(
     });
     const mediaType = response.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase();
     const declared = response.headers.get("content-length");
-    if (response.url !== url || response.redirected || response.status !== 200 || response.headers.has("set-cookie")
+    // Hosted Storage is fronted by a CDN that sets its own bot-management
+    // cookie. The read omits credentials and every byte is hash-verified, so a
+    // cookie cannot affect the artifact. Redirects and URL drift stay fatal.
+    if (response.url !== url || response.redirected || response.status !== 200
       || mediaType !== "application/javascript"
       || declared !== null && (!/^\d+$/.test(declared) || Number(declared) > MAX_ARTIFACT_BYTES)) {
       throw new Error("ARTIFACT_INVALID");

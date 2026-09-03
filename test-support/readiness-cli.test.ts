@@ -466,6 +466,34 @@ test("local-live runs its selected-provider topology diagnostics but can never c
   });
 });
 
+test("a CDN session cookie on the hosted artifact does not fail readiness", async () => {
+  // Hosted Storage is fronted by a CDN that sets its own bot-management cookie.
+  // The read omits credentials and every byte is hash-verified, so the cookie
+  // cannot affect the artifact. A drifted URL still fails.
+  const order: string[] = [];
+  const withCookie = await runReadinessCli(["--local-live"], completeEnvironment("local-live"), {
+    ...dependencies(order, true),
+    fetch: async (input) => {
+      const value = new Response(artifactBytes, {
+        status: 200,
+        headers: {
+          "content-type": "application/javascript",
+          "set-cookie": "__cf_bm=opaque; HttpOnly; Secure; Path=/; Domain=supabase.co",
+        },
+      });
+      Object.defineProperty(value, "url", { value: String(input) });
+      return value;
+    },
+  });
+  assert.equal(withCookie.output.code, "LOCAL_LIVE_READINESS_PASSED");
+
+  const drifted = await runReadinessCli(["--local-live"], completeEnvironment("local-live"), {
+    ...dependencies([], true),
+    fetch: async () => response(`${local}/elsewhere.js`),
+  });
+  assert.notEqual(drifted.output.code, "LOCAL_LIVE_READINESS_PASSED");
+});
+
 test("live readiness reports the same deployment-identity and hosted Storage controls as the journey preflight", async () => {
   // Operator-only controls the readiness command never uses: it neither writes a
   // receipt nor authenticates as the operator.
