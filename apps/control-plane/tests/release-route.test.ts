@@ -569,6 +569,46 @@ test("publication cannot reuse verification after its exact-run evidence expires
   });
 });
 
+test("verification of an unchanged published candidate is reused, not re-executed", async () => {
+  // Once the release is installed, the page under test already registers its
+  // tools, so a re-execution of the same candidate bytes registers none and is
+  // refused. The bytes are content-addressed, so the stored attestation stands.
+  const repository = new InMemoryControlPlaneRepository();
+  installTestRepository(repository);
+  const { project, run } = await fixture(repository);
+  await approveTicket(repository, project.id);
+
+  const first = await verify(verificationRequest(project.id, run.id));
+  assert.equal(first.status, 200);
+  const stored = (await first.json()).verification;
+  assert.equal(stored.eligible, true);
+
+  const published = await publish(
+    request(project.id, run.id, "publish-before-reverification"),
+    { params: Promise.resolve({ projectId: project.id }) },
+  );
+  assert.equal(published.status, 201);
+
+  setReleaseVerificationPortForTest({
+    mode: "hermetic",
+    verifyCandidate: async () => { throw new Error("CANDIDATE_MUST_NOT_RE_EXECUTE"); },
+    verifyInstalled: async () => { throw new Error("UNUSED"); },
+  });
+  try {
+    const again = await verify(verificationRequest(project.id, run.id));
+    assert.equal(again.status, 200);
+    const reused = (await again.json()).verification;
+    assert.equal(reused.eligible, true);
+    assert.equal(reused.candidateContentHash, stored.candidateContentHash);
+    // Stable across repeated calls: it is the published release's attestation.
+    const repeated = await verify(verificationRequest(project.id, run.id));
+    assert.equal(repeated.status, 200);
+    assert.equal((await repeated.json()).verification.id, reused.id);
+  } finally {
+    setReleaseVerificationPortForTest(undefined);
+  }
+});
+
 test("verification persists the trusted target's typed failure instead of treating compiler replay as browser execution", async () => {
   const repository = new InMemoryControlPlaneRepository();
   installTestRepository(repository);
