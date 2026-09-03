@@ -112,8 +112,9 @@ export function openApiDocument(): OpenApiDocument {
               resolution: { kind: "meta", name: "csrf-token" },
             },
           },
+          // idempotency-key is declared by the reviewed effect above, not as a
+          // parameter: a capability compiler supplies it itself.
           parameters: [
-            { name: "idempotency-key", in: "header", required: true, schema: { type: "string", minLength: 8, maxLength: 128 } },
             { name: "x-page2webmcp-confirmation", in: "header", required: true, schema: { type: "string", minLength: 1, maxLength: 128 } },
           ],
           requestBody: { required: true, content: { "application/json": { schema: reference("ReservationInput") } } },
