@@ -31,7 +31,10 @@ test("production images are separate, digest-pinned by the caller, non-root, and
   assert.match(worker, /pnpm build:worker/);
   assert.match(worker, /\.dist\/worker\/apps\/worker\/src\/main\.js/);
   assert.doesNotMatch(worker, /next start|control-plane\/server/);
-  assert.match(ignore, /^\.git$/m);
+  // .git is deliberately not ignored: the identity stage clones it to derive the
+  // release. It never reaches a runtime stage, which the COPY assertion above
+  // enforces for every image.
+  assert.doesNotMatch(ignore, /^\.git$/m);
   assert.match(ignore, /^\.page2webmcp$/m);
   assert.match(ignore, /^\.env/m);
   assert.match(ignore, /^node_modules$/m);

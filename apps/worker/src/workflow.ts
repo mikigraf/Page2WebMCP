@@ -458,6 +458,18 @@ function assertWebsiteControls(configuration: WebsiteAnalysisConfiguration): voi
   }
 }
 
+/**
+ * Every checkpoint rejection reports the same stable code, which leaves a live
+ * failure unattributable. The message stays the code; the reason names the
+ * validation that refused it, on the error and in the worker log.
+ */
+function checkpointInvalid(reason: string): Error {
+  console.error(JSON.stringify({
+    level: "error", event: "website_authentication_checkpoint_invalid", reason,
+  }));
+  return Object.assign(new Error("WEBSITE_AUTHENTICATION_CHECKPOINT_INVALID"), { reason });
+}
+
 function websiteTargetOriginDigest(targetOrigin: string): string {
   return createHash("sha256").update(targetOrigin, "utf8").digest("hex");
 }
@@ -474,7 +486,7 @@ function checkpointRequest(
     || !/^urn:sha256:[a-f0-9]{64}$/.test(checkpoint.checkpointReference)
     || !/^urn:sha256:[a-f0-9]{64}$/.test(checkpoint.authenticationEvidenceReference)
     || !Number.isFinite(Date.parse(checkpoint.expiresAt))) {
-    throw new Error("WEBSITE_AUTHENTICATION_CHECKPOINT_INVALID");
+    throw checkpointInvalid("checkpoint_identity_mismatch");
   }
   return {
     checkpointReference: checkpoint.checkpointReference,
@@ -602,7 +614,7 @@ export async function resumeWebsiteAuthenticationAnalysis(
     || typeof configuration.authentication.resume !== "function" || typeof configuration.authentication.finalize !== "function"
     || typeof configuration.authentication.reconcile !== "function" || typeof configuration.explorer?.observe !== "function"
     || typeof configuration.evidenceStore?.get !== "function" || typeof configuration.evidenceStore.put !== "function") {
-    throw new Error("WEBSITE_AUTHENTICATION_CHECKPOINT_INVALID");
+    throw checkpointInvalid("resume_configuration_incomplete");
   }
   let parsedSource: URL;
   try { parsedSource = new URL(source.sourceUrl); } catch { throw new Error("WEBSITE_URL_BLOCKED"); }
@@ -615,7 +627,7 @@ export async function resumeWebsiteAuthenticationAnalysis(
     const status = await configuration.authentication.status(request);
     assertAuthenticationCheckpointUnexpired(request, clock);
     if (status.status !== "ready" || canonicalJson(status) !== canonicalJson({ ...request, status: "ready" })) {
-      throw new Error("WEBSITE_AUTHENTICATION_CHECKPOINT_INVALID");
+      throw checkpointInvalid("status_not_ready");
     }
     const resumeInput = {
       ...request,
@@ -639,17 +651,17 @@ export async function resumeWebsiteAuthenticationAnalysis(
       || !/^urn:sha256:[a-f0-9]{64}$/.test(resumed.publicEvidenceReference)
       || Object.keys(resumed).sort().join("\0") !== exactResumeKeys.join("\0")
       || Object.entries(request).some(([key, value]) => canonicalJson(resumed[key as keyof typeof resumed]) !== canonicalJson(value))) {
-      throw new Error("WEBSITE_AUTHENTICATION_CHECKPOINT_INVALID");
+      throw checkpointInvalid("resume_response_invalid");
     }
     let suspensionAttestation: BrowserUseSuspensionAttestation;
     try {
       suspensionAttestation = assertBrowserUseResumeAttestation(resumed.suspensionAttestation, request);
     } catch {
-      throw new Error("WEBSITE_AUTHENTICATION_CHECKPOINT_INVALID");
+      throw checkpointInvalid("suspension_attestation_invalid");
     }
     if (suspensionAttestation.cdpReference !== resumed.cdpReference
       || suspensionAttestation.publicEvidenceReference !== resumed.publicEvidenceReference) {
-      throw new Error("WEBSITE_AUTHENTICATION_CHECKPOINT_INVALID");
+      throw checkpointInvalid("suspension_attestation_unbound");
     }
     const authentication = assertWebsiteAuthenticationSignal(resumed.authentication, targetOrigin, request.expiresAt, resumeNow);
     const publicEvidence = await readWebsiteEvidence({
@@ -832,7 +844,7 @@ export function createWebsiteAnalysisAdapter(configuration: WebsiteAnalysisConfi
   analyze.finalizeAuthenticationCheckpoint = async (source) => {
     if (!source.organizationId || !source.projectId || !source.id || !source.sourceSnapshotId
       || !source.sourceIdentityHash || !source.authenticationCheckpoint) {
-      throw new Error("WEBSITE_AUTHENTICATION_CHECKPOINT_INVALID");
+      throw checkpointInvalid("finalize_source_incomplete");
     }
     return finalizeWebsiteAuthentication(configuration, {
       checkpointReference: source.authenticationCheckpoint.checkpointReference,

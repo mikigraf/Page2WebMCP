@@ -914,7 +914,10 @@ async function readArtifact(transport: typeof fetch, url: string): Promise<Obser
     });
     const declared = response.headers.get("content-length");
     const mediaType = response.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase();
-    if (response.status !== 200 || response.url !== url || response.redirected || response.headers.has("set-cookie")
+    // Hosted Storage is fronted by a CDN that sets its own bot-management
+    // cookie. The read omits credentials and every byte is hash-verified, so a
+    // cookie cannot affect the artifact. Redirects and URL drift stay fatal.
+    if (response.status !== 200 || response.url !== url || response.redirected
       || mediaType !== JAVASCRIPT_MIME
       || declared !== null && (!/^\d+$/.test(declared) || Number(declared) > MAX_ARTIFACT_BYTES)
       || !response.body) throw new Error("PUBLISHED_ARTIFACT_IDENTITY_INVALID");

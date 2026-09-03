@@ -251,6 +251,14 @@ function defaultControlRejectionReport(rejection: WebsiteControlRejection): void
   console.error(JSON.stringify({ level: "error", event: "website_control_rejected", ...rejection }));
 }
 
+/** Mirrors the worker workflow's checkpoint diagnostic for the live adapter's own guard. */
+function checkpointInvalid(reason: string): Error {
+  console.error(JSON.stringify({
+    level: "error", event: "website_authentication_checkpoint_invalid", reason,
+  }));
+  return Object.assign(new Error("WEBSITE_AUTHENTICATION_CHECKPOINT_INVALID"), { reason });
+}
+
 function reportRejection(
   report: ((rejection: WebsiteControlRejection) => void) | undefined,
   control: string,
@@ -1162,7 +1170,7 @@ export function createConfiguredWebsiteAnalysisAdapter(
   configuredAdapter.finalizeAuthenticationCheckpoint = async (source, finalizeSignal) => {
     if (!source.id || !source.organizationId || !source.projectId || !source.sourceSnapshotId
       || !source.sourceIdentityHash || !source.authenticationCheckpoint) {
-      throw new Error("WEBSITE_AUTHENTICATION_CHECKPOINT_INVALID");
+      throw checkpointInvalid("finalize_source_incomplete");
     }
     const ownershipIdentity = {
       organizationId: source.organizationId,

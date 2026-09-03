@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import {
   createOpenApiAnalysisAdapter,
   createWebsiteAnalysisAdapter,
+  resumeWebsiteAuthenticationAnalysis,
   type WebsiteAnalysisConfiguration,
 } from "./workflow.ts";
 import {
@@ -588,6 +589,27 @@ test("website authentication resume rejects a fresh CDP reference that is not th
       expiresAt: waiting.expiresAt,
     },
   }, new AbortController().signal), /^Error: WEBSITE_AUTHENTICATION_CHECKPOINT_INVALID$/);
+});
+
+test("a rejected authentication checkpoint names which validation refused it", async () => {
+  // The stable code is the same for every rejection, which makes a live failure
+  // unattributable. Each throw carries a distinct reason for the operator.
+  await assert.rejects(
+    () => resumeWebsiteAuthenticationAnalysis(
+      {
+        sourceType: "website", sourceUrl: `${websiteOrigin}/`, organizationId: "org-1", projectId: "project-1",
+        id: "run-no-checkpoint", sourceConfiguration: { kind: "website" }, sourceIdentityHash: "f".repeat(64),
+        sourceSnapshotId: "snapshot-no-checkpoint",
+      },
+      new AbortController().signal,
+      {} as never,
+    ),
+    (error: unknown) => {
+      assert.equal((error as Error).message, "WEBSITE_AUTHENTICATION_CHECKPOINT_INVALID");
+      assert.equal((error as { reason?: string }).reason, "resume_configuration_incomplete");
+      return true;
+    },
+  );
 });
 
 test("website authentication expiry is enforced after every external resume boundary", async () => {
