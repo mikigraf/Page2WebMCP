@@ -242,7 +242,7 @@ export function openApiDocument(): OpenApiDocument {
             orderReference: { type: "string" },
             status: { type: "string", enum: ["reserved", "released"] },
             createdAt: { type: "string", minLength: 20, maxLength: 40 },
-            releasedAt: { type: ["string", "null"], minLength: 20, maxLength: 40 },
+            releasedAt: { type: "string", maxLength: 40 },
           },
         },
         Error: {
