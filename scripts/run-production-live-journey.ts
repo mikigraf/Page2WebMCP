@@ -223,10 +223,11 @@ export async function runProductionLiveJourneyCli(
     // Binding it to the project's latest terminated attempt starts exactly one
     // fresh run no matter how many earlier attempts failed, and leaves a live
     // attempt on the base key so it is still resumed rather than duplicated.
+    const projectDetail = await session.get<unknown>(`/api/projects/${projectId}`);
     const enqueued = parseEnqueued(await session.post<unknown>(
       "/api/projects/analyze",
       { projectId },
-      idempotencyKey("analysis", parsed.journey, environment, "", terminatedAttemptId(projectResponse)),
+      idempotencyKey("analysis", parsed.journey, environment, "", terminatedAttemptId(projectDetail)),
     ));
     if (enqueued.terminated) throw new Error("ANALYSIS_TERMINATED");
     analysisRunId = enqueued.runId;
@@ -478,12 +479,13 @@ const ENQUEUED_STATUSES = ["queued", "running", "waiting", "succeeded"] as const
 const TERMINATED_STATUSES = ["failed", "cancelled"] as const;
 
 /**
- * The id of the project's latest attempt when it has terminated, else "". Used
+ * The id of the project's latest attempt when it has terminated, else "". Read
+ * from the project detail response, which is the only one that carries it. Used
  * as the enqueue key's attempt identity so a terminated history costs exactly
  * one fresh run, while a live attempt keeps the base key and is resumed.
  */
-function terminatedAttemptId(projectResponse: unknown): string {
-  const latest = plainRecord(plainRecord(projectResponse)?.latestAnalysis);
+function terminatedAttemptId(projectDetail: unknown): string {
+  const latest = plainRecord(plainRecord(projectDetail)?.latestAnalysis);
   if (!latest || !UUID.test(string(latest.id))) return "";
   return (TERMINATED_STATUSES as readonly string[]).includes(string(latest.status)) ? string(latest.id) : "";
 }
