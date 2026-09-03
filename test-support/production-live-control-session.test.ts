@@ -88,3 +88,11 @@ function json(url: string, value: unknown, headers: Record<string, string> = {},
   Object.defineProperty(response, "url", { value: url });
   return response;
 }
+
+test("the operator deadline outlasts a browser-backed candidate verification", async () => {
+  const { PRODUCTION_CONTROL_REQUEST_TIMEOUT_MS } = await import("../scripts/lib/production-live-control-session.ts");
+  // Observed candidate attestations take just over twenty seconds; the deadline
+  // must leave room for that plus the control plane's own work.
+  assert.ok(PRODUCTION_CONTROL_REQUEST_TIMEOUT_MS >= 90_000,
+    `deadline ${PRODUCTION_CONTROL_REQUEST_TIMEOUT_MS}ms is too short for a browser-backed verification`);
+});
