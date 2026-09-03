@@ -905,37 +905,26 @@ test("the enqueue key is bound to the project's latest terminated attempt, howev
   assert.equal(result.output.code, "CAPABILITY_REVIEW_REQUIRED");
 });
 
-test("a project whose latest attempt is still live resumes it under the base key", async () => {
+test("a project whose latest attempt is still live is resumed instead of re-enqueued", async () => {
   const running = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
-  const withLatest = new FakeSession([
+  const session = new FakeSession([
     deploymentIdentity(),
     { role: "owner" },
     { id: "11111111-1111-4111-8111-111111111111", sourceType: "website" },
     { ownership: { state: "verified", targetOrigin: "https://account.widgets.dev" }, canAnalyze: true },
-    { latestAnalysis: { id: running, status: "running" } },
-    { runId: running, status: "running" },
+    { latestAnalysis: { id: running, status: "waiting" } },
     { run: { id: running, status: "succeeded" },
       result: { providerProvenance: { mode: "website", fixture: false } },
       capabilities: [{ id: "33333333-3333-4333-8333-333333333333", riskTier: "R1", status: "proposed", version: 1 }] },
   ]);
-  const withoutLatest = new FakeSession([
-    deploymentIdentity(),
-    { role: "owner" },
-    { id: "11111111-1111-4111-8111-111111111111", sourceType: "website" },
-    { ownership: { state: "verified", targetOrigin: "https://account.widgets.dev" }, canAnalyze: true },
-    {},
-    { runId: running, status: "queued" },
-    { run: { id: running, status: "succeeded" },
-      result: { providerProvenance: { mode: "website", fixture: false } },
-      capabilities: [{ id: "33333333-3333-4333-8333-333333333333", riskTier: "R1", status: "proposed", version: 1 }] },
-  ]);
-  for (const session of [withLatest, withoutLatest]) {
-    await runProductionLiveJourneyCli(["--live", "--provider", "website"], environment("website"), dependencies(session));
-  }
-  const key = (session: FakeSession) => session.calls.find((call) => call.path === "/api/projects/analyze")?.key;
-  assert.equal(key(withLatest), key(withoutLatest), "a live attempt keeps the base key");
+  const result = await runProductionLiveJourneyCli(
+    ["--live", "--provider", "website"], environment("website"), dependencies(session),
+  );
+  assert.equal(session.calls.filter((call) => call.path === "/api/projects/analyze").length, 0,
+    "an in-flight attempt is never re-enqueued");
+  assert.ok(session.calls.some((call) => call.path === `/api/analysis-runs/${running}`), "it polls the live attempt");
+  assert.equal(result.output.code, "CAPABILITY_REVIEW_REQUIRED");
 });
-
 test("an enqueue that still returns a terminated attempt reports it rather than an invalid response", async () => {
   const latest = "99999999-9999-4999-8999-999999999999";
   const session = new FakeSession([
