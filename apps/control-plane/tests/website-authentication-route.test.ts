@@ -77,10 +77,14 @@ function handoffPort(input: Readonly<{
   onPortal?: (binding: WebsiteAuthenticationHandoffBinding) => void;
   onCheck?: (binding: WebsiteAuthenticationHandoffBinding, idempotencyKey: string) => void;
   checkState?: "ready" | "failed" | "cancelled" | "expired";
+  portalState?: "waiting" | "ready";
 }> = {}): WebsiteAuthenticationHandoffPort {
   return {
     loadAuthenticationPortal: async (binding) => {
       input.onPortal?.(binding);
+      if (input.portalState === "ready") {
+        return { state: "ready", targetOrigin: TARGET_ORIGIN, expiresAt: EXPIRES_AT };
+      }
       return {
         state: "waiting",
         targetOrigin: TARGET_ORIGIN,
@@ -425,4 +429,25 @@ test("cancellation durably queues one worker-owned cleanup and is restart idempo
   assert.equal(cleanup?.analysisRunId, waiting.runId);
   assert.equal(cleanup?.terminalState, "cancelled");
   assert.match(cleanup?.cleanupIdempotencyKey ?? "", /^website-auth-cleanup:[0-9a-f]{64}$/);
+});
+
+test("website authentication GET reports a session the gateway already observed as ready", async () => {
+  const repository = installTestRepository(new InMemoryControlPlaneRepository(() => TEST_NOW));
+  const waiting = await waitingWebsite(repository, "ready-projection");
+  setWebsiteAuthenticationHandoffPortForTest(handoffPort({ portalState: "ready" }));
+
+  const response = await authenticationState(new Request(
+    `https://control.example/api/workflow-runs/${waiting.runId}/website-authentication`,
+    { headers: { cookie: authenticatedHeaders(owner).cookie } },
+  ), runContext(waiting.runId));
+  assert.equal(response.status, 200);
+  // Masking this as "waiting" hides the only state the resume path acts on.
+  assert.deepEqual(await response.json(), {
+    authentication: {
+      state: "ready",
+      targetOrigin: TARGET_ORIGIN,
+      expiresAt: EXPIRES_AT,
+      canAct: true,
+    },
+  });
 });

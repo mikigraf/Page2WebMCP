@@ -35,8 +35,11 @@ export async function GET(request: Request, context: { params: Promise<{ runId: 
     }
     const external = await websiteAuthenticationHandoffPort()
       .loadAuthenticationPortal(handoff.binding, request.signal);
+    // "waiting" carries the portal to open; "ready" is the state the operator
+    // acts on to resume. Reporting either as the durable "waiting" would hide
+    // the only transition the resume path can complete.
     return successResponse({
-      authentication: external.state === "waiting"
+      authentication: external.state === "waiting" || external.state === "ready"
         ? publicAuthenticationState(handoff, true, external)
         : durable,
     }, requestId);
