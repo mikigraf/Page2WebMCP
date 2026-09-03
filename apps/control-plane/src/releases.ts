@@ -78,15 +78,23 @@ export async function publishPersistedRelease(
     run.id,
     sourceCandidate,
   );
-  const verificationRequest = await deriveTrustedVerification(
-    project.id, analysisRunId, target, result, capabilities, signal
-  );
-  const verification = await repository.saveVerification(actor, project.id, verificationRequest);
+  // Publishing an already published candidate must not re-execute it: the
+  // target page now serves that release, so the candidate registers no tools
+  // and is refused. The candidate is content-addressed, so an unchanged hash
+  // means the stored attestation describes exactly these bytes.
+  const prepared = deriveVerification(analysisRunId, target.targetOrigin, result, capabilities);
+  const published = await repository.getLatestPublishedRelease(actor, project.id);
+  const reusable = published?.verification.analysisRunId === run.id
+    && published.verification.candidateContentHash === prepared.candidate.contentHash
+    ? published.verification
+    : undefined;
+  const verification = reusable ?? await repository.saveVerification(actor, project.id,
+    await deriveTrustedVerification(project.id, analysisRunId, target, result, capabilities, signal));
   if (!verification.eligible) {
     throw new ApiError("RELEASE_GATE_FAILED", 409, false,
       verification.failures.length > 0 ? verification.failures : ["VERIFICATION_INELIGIBLE"]);
   }
-  const candidate = verificationRequest.candidate;
+  const candidate = prepared.candidate;
   const integrity = `sha384-${createHash("sha384").update(candidate.code).digest("base64")}`;
   // Publication failures are stable, actionable codes; reporting them as an
   // unmapped 500 leaves an operator with nothing to act on.
