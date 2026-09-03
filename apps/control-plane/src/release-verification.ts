@@ -232,24 +232,14 @@ export async function attestReleaseCandidate(
     const result = candidateVerifierResult(await port.verifyCandidate(input, deadlineSignal), port.mode);
     return { verifierIdentity: identity, ...result };
   }, signal);
-  if (!report || typeof report !== "object"
-    || report.observedContentHash !== input.contentHash
-    || report.observedIntegrity !== input.integrity
-    || report.observedReleaseId !== input.manifest.releaseId
-    || report.observedTargetOrigin !== input.targetOrigin
-    || !equalStrings(report.registeredTools, input.expectedTools)
-    || report.trustedLoader?.enforcedBeforeEvaluation !== true
-    || report.trustedLoader.evaluatedContentHash !== input.contentHash
-    || report.controlPlaneRequestsDuringExecution !== 0
-    || report.modelRequestsDuringExecution !== 0) {
-    throw new Error("CANDIDATE_VERIFICATION_INVALID");
-  }
+  const rejection = candidateReportRejection(report, input);
+  if (rejection) throw candidateInvalid(rejection);
   const checks = normalizeChecks(report.checks);
   const passed = new Set(checks.filter(({ status }) => status === "passed").map(({ name }) => name));
   const allPassed = passed.size === REQUIRED_CANDIDATE_CHECKS.length;
   if (!report.csp || !["allowed", "blocked"].includes(report.csp.hosted)
     || report.csp.directive !== undefined && !safeDirective(report.csp.directive)) {
-    throw new Error("CANDIDATE_VERIFICATION_INVALID");
+    throw candidateInvalid("csp");
   }
   const normalizedReport = normalizeCandidateReport(report, checks);
   return {
@@ -700,12 +690,43 @@ function jsonByteLength(value: unknown): number {
   }
 }
 
+/**
+ * The candidate report is refused by one stable code, which leaves a live
+ * rejection unattributable. The message stays the code; the reason names the
+ * field that refused it, on the error and in the control-plane log.
+ */
+function candidateInvalid(reason: string): Error {
+  console.error(JSON.stringify({
+    level: "error", event: "candidate_verification_invalid", reason,
+  }));
+  return Object.assign(new Error("CANDIDATE_VERIFICATION_INVALID"), { reason });
+}
+
+function candidateReportRejection(
+  report: CandidateVerificationReport | undefined,
+  input: CandidateVerificationInput,
+): string | undefined {
+  if (!report || typeof report !== "object") return "report_missing";
+  if (report.observedContentHash !== input.contentHash) return "content_hash";
+  if (report.observedIntegrity !== input.integrity) return "integrity";
+  if (report.observedReleaseId !== input.manifest.releaseId) return "release_id";
+  if (report.observedTargetOrigin !== input.targetOrigin) return "target_origin";
+  if (!equalStrings(report.registeredTools, input.expectedTools)) {
+    return `registered_tools observed=${JSON.stringify(report.registeredTools)} expected=${JSON.stringify(input.expectedTools)}`;
+  }
+  if (report.trustedLoader?.enforcedBeforeEvaluation !== true) return "trusted_loader_not_enforced";
+  if (report.trustedLoader.evaluatedContentHash !== input.contentHash) return "trusted_loader_hash";
+  if (report.controlPlaneRequestsDuringExecution !== 0) return "control_plane_requests";
+  if (report.modelRequestsDuringExecution !== 0) return "model_requests";
+  return undefined;
+}
+
 function assertCandidateInput(input: CandidateVerificationInput): void {
   if (!input || typeof input.code !== "string" || Buffer.byteLength(input.code) > 65_536
     || !HASH.test(input.contentHash) || !SRI.test(input.integrity)
     || !HASH.test(input.manifest?.releaseId) || exactHttpsOrigin(input.targetOrigin) !== input.targetOrigin
     || !validTools(input.expectedTools) || jsonByteLength(input) > MAX_VERIFIER_REQUEST_BYTES) {
-    throw new Error("CANDIDATE_VERIFICATION_INVALID");
+    throw candidateInvalid("input");
   }
 }
 
@@ -848,7 +869,7 @@ function normalizedCsp(csp: InstalledVerificationReport["csp"]): InstalledVerifi
 
 function normalizeChecks(value: readonly ReleaseVerificationCheck[]): ReleaseVerificationCheck[] {
   if (!Array.isArray(value) || value.length !== REQUIRED_CANDIDATE_CHECKS.length) {
-    throw new Error("CANDIDATE_VERIFICATION_INVALID");
+    throw candidateInvalid(`check_count ${Array.isArray(value) ? value.length : "not-array"}`);
   }
   const allowedNames = new Set<string>(REQUIRED_CANDIDATE_CHECKS);
   const allowedCodes = new Set<string>([
@@ -862,7 +883,7 @@ function normalizeChecks(value: readonly ReleaseVerificationCheck[]): ReleaseVer
       || !["passed", "failed"].includes(check.status)
       || check.status === "passed" && check.code !== undefined
       || check.status === "failed" && !allowedCodes.has(check.code ?? "")) {
-      throw new Error("CANDIDATE_VERIFICATION_INVALID");
+      throw candidateInvalid(`check ${JSON.stringify(check)}`);
     }
     names.add(check.name);
     return { name: check.name, status: check.status, ...(check.code ? { code: check.code } : {}) };

@@ -345,6 +345,26 @@ test("candidate verification rejects an over-cap JSON envelope before readiness 
   assert.equal(calls, 0);
 });
 
+test("a refused candidate report names the field that refused it", async () => {
+  // One stable code covers every rejection, which leaves a live refusal
+  // unattributable. The reason names the field and, for the tools, the diff.
+  const port: ReleaseVerificationPort = {
+    mode: "hermetic",
+    verifyCandidate: async () => report({ registeredTools: [...expectedTools, "find_order"] }),
+    verifyInstalled: async () => { throw new Error("UNUSED"); },
+  };
+  await assert.rejects(
+    attestReleaseCandidate(candidateInput(), port, new AbortController().signal),
+    (error: unknown) => {
+      assert.equal((error as Error).message, "CANDIDATE_VERIFICATION_INVALID");
+      const reason = (error as { reason?: string }).reason ?? "";
+      assert.match(reason, /^registered_tools /);
+      assert.match(reason, /find_order/);
+      return true;
+    },
+  );
+});
+
 test("configured installation performs a fresh readiness handshake and returns its identity", async () => {
   const origin = "https://verifier.example";
   const token = "v".repeat(32);
