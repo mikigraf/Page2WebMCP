@@ -82,6 +82,32 @@ test("the workspace view resolves only for an authenticated session", () => {
   assert.equal(view.parts[0]?.sku, "PC-1180");
 });
 
+test("the workspace view narrows to a search query without dropping the unauthenticated gate", () => {
+  const app = new PartsConsole({
+    operator: { email: "operator@beaconworks.dev", password: "example-target-password" },
+    now: () => Date.parse("2026-09-01T00:00:00.000Z"),
+  });
+  const session = app.login("operator@beaconworks.dev", "example-target-password");
+  const filtered = resolveWorkspaceView(app, session, "PC-1180");
+  assert.ok(filtered);
+  assert.equal(filtered.parts.length, 1);
+  assert.equal(filtered.parts[0]?.sku, "PC-1180");
+  const empty = resolveWorkspaceView(app, session, "no-such-part");
+  assert.ok(empty);
+  assert.equal(empty.parts.length, 0);
+  assert.equal(resolveWorkspaceView(app, "", "PC-1180"), null);
+});
+
+test("the workspace exposes a real GET search form the browser can discover without interaction", async () => {
+  // Website-journey discovery is passive: it only ever proposes a GET form
+  // with named controls, never one requiring interaction or POST. This form
+  // is the one read capability the browser can find without automating a
+  // click, matching the site's own listParts query support.
+  const page = await readFile(path.join(root, "app/workspace/page.tsx"), "utf8");
+  assert.match(page, /<form[^>]*method=["']?get["']?[^>]*>/i);
+  assert.match(page, /name=["']q["']/);
+});
+
 test("no source file hardcodes operator credentials or logs them", async () => {
   const shipped = [...await sourceFiles(path.join(root, "app")), ...await sourceFiles(path.join(root, "src"))];
   for (const file of shipped) {

@@ -13,11 +13,11 @@ export type WorkspaceView = Readonly<{
  * not authenticated. Callers turn `null` into a 401 interrupt; they never
  * degrade to a partially rendered page.
  */
-export function resolveWorkspaceView(app: PartsConsole, session: string): WorkspaceView | null {
+export function resolveWorkspaceView(app: PartsConsole, session: string, query?: string | null): WorkspaceView | null {
   if (!app.isAuthenticated(session)) return null;
   return {
     title: WORKSPACE_VIEW_TITLE,
-    parts: app.listParts(session),
+    parts: app.listParts(session, query),
     reservations: app.listReservations(session),
   };
 }
