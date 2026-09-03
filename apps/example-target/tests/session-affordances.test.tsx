@@ -30,3 +30,18 @@ test("the console navigation shows a sign-out control only while signed in", asy
   assert.doesNotMatch(signedIn, />Sign in</);
   assert.match(signedIn, /action="\/api\/auth\/logout"/);
 });
+
+test("the console navigation exposes a GET search affordance only while signed in", async () => {
+  // Website-journey discovery only ever visits the home page, and only ever
+  // proposes a GET form with named controls it can find without interaction.
+  // Gating it on signedIn keeps it out of the unauthenticated observation, so
+  // it is correctly discovered as an authenticated read.
+  const { ConsoleNavigation } = await import("../app/console-navigation.tsx");
+
+  const signedOut = renderToStaticMarkup(<ConsoleNavigation signedIn={false} />);
+  assert.doesNotMatch(signedOut, /<form[^>]*method="get"/i);
+
+  const signedIn = renderToStaticMarkup(<ConsoleNavigation signedIn />);
+  assert.match(signedIn, /<form action="\/workspace" method="get">/i);
+  assert.match(signedIn, /name="q"/);
+});

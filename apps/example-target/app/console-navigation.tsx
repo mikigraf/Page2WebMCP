@@ -13,5 +13,9 @@ export function ConsoleNavigation({ signedIn }: { signedIn: boolean }) {
       : <Link href="/login">Sign in</Link>}
     {" \u00b7 "}
     <a href="/openapi.json">API description</a>
+    {signedIn && <form method="get" action="/workspace">
+      <label>Search parts <input aria-label="Search parts" name="q" /></label>
+      <button type="submit">Search</button>
+    </form>}
   </nav>;
 }
