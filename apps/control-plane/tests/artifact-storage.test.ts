@@ -578,7 +578,6 @@ test("fails closed without retry on exact-serving, MIME, cookie, or download-dis
   const mismatches: readonly (readonly Response[])[] = [
     [exactResponse(ARTIFACT_URL, "export const changed = true;\n")],
     [exactResponse(ARTIFACT_URL, CODE, { contentType: "text/javascript" })],
-    [exactResponse(ARTIFACT_URL, CODE, { setCookie: "session=forbidden" })],
     [exactResponse(`${ARTIFACT_URL}/redirected`)],
     [
       exactResponse(ARTIFACT_URL),
@@ -641,7 +640,6 @@ test("cancels response bodies on every rejected non-consumed public response pat
     { response: (body) => [exactResponse(ARTIFACT_URL, body, { status: 400 })], code: "RELEASE_ARTIFACT_READ_FAILED" },
     { response: (body) => [exactResponse(`${ARTIFACT_URL}/wrong`, body)], code: "RELEASE_ARTIFACT_MISMATCH" },
     { response: (body) => [exactResponse(ARTIFACT_URL, body, { contentType: "text/javascript" })], code: "RELEASE_ARTIFACT_MISMATCH" },
-    { response: (body) => [exactResponse(ARTIFACT_URL, body, { setCookie: "forbidden=1" })], code: "RELEASE_ARTIFACT_MISMATCH" },
     {
       response: (body) => [
         exactResponse(ARTIFACT_URL),
@@ -749,4 +747,22 @@ test("does not miss a caller abort between the publish precheck and lifecycle li
   );
   assert.equal(fixture.clientCalls.length, 0);
   assert.equal(fixture.fetchCalls.length, 0);
+});
+
+test("a CDN cookie on the public artifact does not fail publication", async () => {
+  // Hosted Storage sits behind Cloudflare, which attaches __cf_bm to every
+  // public read. The bytes are still exact and hash-verified.
+  const cookie = "__cf_bm=abc123; path=/; HttpOnly; Secure; SameSite=None";
+  const fixture = harness({
+    responses: [
+      exactResponse(ARTIFACT_URL, CODE, { setCookie: cookie }),
+      exactResponse(DOWNLOAD_URL, CODE, {
+        setCookie: cookie,
+        disposition: `attachment; filename="page2webmcp-${CONTENT_HASH}.js"`,
+      }),
+    ],
+  });
+  const published = await fixture.store.publish(input(), new AbortController().signal);
+  assert.equal(published.artifactUrl, ARTIFACT_URL);
+  assert.equal(published.contentHash, CONTENT_HASH);
 });

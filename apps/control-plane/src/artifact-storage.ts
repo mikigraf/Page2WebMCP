@@ -282,7 +282,10 @@ async function verifyPublicIdentity(
       if (lifecycle.signal.aborted) throw lifecycleError(lifecycle);
       throw stableError("RELEASE_ARTIFACT_READ_FAILED");
     }
-    if (response.url !== expectedUrl || response.redirected || response.headers.has("set-cookie")) {
+    // The read omits credentials and every byte is hash-verified, so a CDN's own
+    // cookie (Cloudflare fronts hosted Storage with __cf_bm) cannot affect the
+    // artifact. Redirects and served-URL drift stay fatal.
+    if (response.url !== expectedUrl || response.redirected) {
       await cancelResponseBody(response, lifecycle, "RELEASE_ARTIFACT_MISMATCH");
       throw stableError("RELEASE_ARTIFACT_MISMATCH");
     }
