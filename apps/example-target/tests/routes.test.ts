@@ -15,6 +15,7 @@ const { GET: listParts } = await import("../app/api/parts/route.ts");
 const { GET: getPart } = await import("../app/api/parts/[sku]/route.ts");
 const { POST: createConfirmation } = await import("../app/api/confirmations/route.ts");
 const { POST: createReservation } = await import("../app/api/reservations/route.ts");
+const { partsConsole } = await import("../app/api/_runtime.ts");
 const { GET: getReservation, DELETE: releaseReservation } = await import("../app/api/reservations/[id]/route.ts");
 const { DELETE: deleteAccount } = await import("../app/api/account/route.ts");
 const { GET: openApiDocument } = await import("../app/openapi.json/route.ts");
@@ -111,7 +112,9 @@ test("a confirmed reservation applies exactly one reversible effect and reads ba
   const input = { sku: "PC-1180", quantity: 1, orderReference: "SO-90001", confirmed: true };
   const idempotencyKey = "reserve-route-0001";
 
-  const unconfirmed = await createReservation(mutation("/api/reservations", cookie, input, { "idempotency-key": idempotencyKey }));
+  const requestToken = partsConsole().requestToken(cookie.split("=")[1]!)!;
+  const unconfirmed = await createReservation(mutation("/api/reservations", cookie, input,
+    { "idempotency-key": idempotencyKey, "x-csrf-token": requestToken }));
   assert.equal(unconfirmed.status, 403);
   assert.deepEqual(await unconfirmed.json(), { code: "CONFIRMATION_REQUIRED" });
 
@@ -121,7 +124,7 @@ test("a confirmed reservation applies exactly one reversible effect and reads ba
   assert.equal(confirmation.status, 201);
   const { evidence } = await confirmation.json() as { evidence: string };
 
-  const headers = { "idempotency-key": idempotencyKey, "x-page2webmcp-confirmation": evidence };
+  const headers = { "idempotency-key": idempotencyKey, "x-page2webmcp-confirmation": evidence, "x-csrf-token": requestToken };
   const created = await createReservation(mutation("/api/reservations", cookie, input, headers));
   assert.equal(created.status, 201);
   assert.equal(created.headers.get("cache-control"), "no-store");
