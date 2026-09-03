@@ -71,6 +71,14 @@ const CURRENT_MIGRATION_LEDGER = [
   "20260901120000_live_verifier_attestation_v2.sql",
   "20260901130000_production_live_receipt_evidence.sql",
   "20260901140000_live_verifier_attestation_v2_repair.sql",
+  "20260903225550_readiness_topology_coalesce_repair.sql",
+  "20260903225903_readiness_topology_coalesce_repair.sql",
+  "20260903225919_readiness_topology_legacy_coalesce_repair.sql",
+  "20260903230239_readiness_topology_coalesce_repair_final.sql",
+  "20260903230419_readiness_topology_coalesce_repair_v2.sql",
+  "20260903230528_readiness_topology_coalesce_repair_v3.sql",
+  "20260903230905_readiness_topology_repair_pattern_broaden.sql",
+  "20260903230947_provider_probe_context_project_id_repair.sql",
 ] as const;
 
 type Environment = Readonly<Record<string, string | undefined>>;
@@ -305,6 +313,21 @@ async function probeSelectedProvider(
   }
 }
 
+// An operator's own machine is not NTP-disciplined the way two Render-hosted
+// services calling each other are, so this is the one caller of the live
+// verifier protocol that can observe ordinary inter-machine clock drift large
+// enough to trip the response's zero-tolerance issuedAt/attestedAt-must-not-
+// be-future check (confirmed live: ~50ms of drift was enough). This does not
+// touch that check or its replay protection; it supplies a more accurate
+// "now" for this one operator-CLI call, the same correction NTP-syncing the
+// operator's clock would make. 2s of headroom is negligible against the
+// protocol's 120s MAX_LIFETIME_MS request/response window.
+export const OPERATOR_CLOCK_SKEW_TOLERANCE_MS = 2_000;
+
+export function operatorClockSkewCompensatedNow(): Date {
+  return new Date(Date.now() + OPERATOR_CLOCK_SKEW_TOLERANCE_MS);
+}
+
 async function defaultHandshake(
   environment: Environment,
   mode: "local_live" | "live",
@@ -313,6 +336,7 @@ async function defaultHandshake(
 ): Promise<VerifierIdentity> {
   const port = configuredReleaseVerificationPort(environment, {
     mode,
+    now: operatorClockSkewCompensatedNow,
     ...(binding.deploymentIdentityDigest
       ? { deploymentIdentityDigest: binding.deploymentIdentityDigest }
       : {}),
