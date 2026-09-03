@@ -93,6 +93,15 @@ export function openApiDocument(): OpenApiDocument {
         },
       },
       "/api/reservations": {
+        get: {
+          operationId: "listReservations",
+          summary: "List the operator's reservations with their authoritative state",
+          security: secured,
+          responses: {
+            "200": response("Reservations", { type: "array", maxItems: 100, items: reference("ReservationState") }),
+            "401": errors["401"],
+          },
+        },
         post: {
           operationId: "reservePartStock",
           summary: "Reserve part stock after explicit confirmation (reversible)",
