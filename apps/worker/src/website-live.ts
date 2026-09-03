@@ -244,7 +244,34 @@ type ControlClient = Readonly<{
   request(path: string, body: unknown, signal: AbortSignal): Promise<Record<string, unknown>>;
 }>;
 
-function controlClient(transport: NodePinnedJsonTransport, origin: string, headers: Readonly<Record<string, string>>): ControlClient {
+const GATEWAY_CODE = /^GATEWAY_[A-Z0-9_]{1,64}$/;
+
+/** Operator diagnostics only: which control refused and its stable code. */
+function defaultControlRejectionReport(rejection: WebsiteControlRejection): void {
+  console.error(JSON.stringify({ level: "error", event: "website_control_rejected", ...rejection }));
+}
+
+function reportRejection(
+  report: ((rejection: WebsiteControlRejection) => void) | undefined,
+  control: string,
+  response: NodePinnedJsonResponse,
+): void {
+  if (!report) return;
+  let gatewayCode: string | undefined;
+  try {
+    const body = asRecord(boundedJson(response));
+    const code = body.error;
+    if (typeof code === "string" && GATEWAY_CODE.test(code)) gatewayCode = code;
+  } catch { gatewayCode = undefined; }
+  report(gatewayCode === undefined ? { control, status: response.status } : { control, status: response.status, gatewayCode });
+}
+
+function controlClient(
+  transport: NodePinnedJsonTransport,
+  origin: string,
+  headers: Readonly<Record<string, string>>,
+  report?: (rejection: WebsiteControlRejection) => void,
+): ControlClient {
   return {
     async request(path, body, signal) {
       const url = `${origin}${path}`;
@@ -276,7 +303,12 @@ function controlClient(transport: NodePinnedJsonTransport, origin: string, heade
         if (response.status === 429 || response.status >= 500 && response.status <= 599) {
           throw new Error("WEBSITE_CONTROL_RETRYABLE");
         }
-        if (response.status >= 400 && response.status <= 499) throw new Error("WEBSITE_CONTROL_REJECTED");
+        if (response.status >= 400 && response.status <= 499) {
+          // The path and the gateway's stable code are the only way an operator
+          // can tell which control refused, so they are surfaced deliberately.
+          reportRejection(report, path, response);
+          throw new Error("WEBSITE_CONTROL_REJECTED");
+        }
         if (response.status !== 200
           || response.headers["content-type"]?.split(";", 1)[0]?.trim().toLowerCase() !== "application/json") {
           throw new Error("WEBSITE_CONTROL_RESPONSE_INVALID");
@@ -287,8 +319,13 @@ function controlClient(transport: NodePinnedJsonTransport, origin: string, heade
   };
 }
 
-function bearerClient(transport: NodePinnedJsonTransport, origin: string, token: string): ControlClient {
-  return controlClient(transport, origin, { authorization: `Bearer ${token}` });
+function bearerClient(
+  transport: NodePinnedJsonTransport,
+  origin: string,
+  token: string,
+  report?: (rejection: WebsiteControlRejection) => void,
+): ControlClient {
+  return controlClient(transport, origin, { authorization: `Bearer ${token}` }, report);
 }
 
 function cleanupSignal(): AbortSignal {
@@ -391,7 +428,15 @@ function configuredNetwork(
   };
 }
 
+/** A rejected control call: stable identifiers only, never request or response values. */
+export type WebsiteControlRejection = Readonly<{
+  control: string;
+  status: number;
+  gatewayCode?: string;
+}>;
+
 export type WebsiteLiveDependencies = Readonly<{
+  reportControlRejection?: (rejection: WebsiteControlRejection) => void;
   fetch?: typeof fetch;
   clock?: () => Date;
   resolver?: WebsiteProviderControls["resolver"];
@@ -587,18 +632,19 @@ export function createConfiguredWebsiteAnalysisAdapter(
   const network = configuredNetwork(dependencies.resolver, dependencies.transport);
   const controls = dependencies.controlTransport ?? createNodePinnedJsonTransport();
   const hostedScriptOrigin = new URL(environment.PAGE2WEBMCP_PUBLIC_ORIGIN).origin;
-  const ownership = bearerClient(controls, environment.PAGE2WEBMCP_OWNERSHIP_STORE_ORIGIN, environment.PAGE2WEBMCP_OWNERSHIP_STORE_TOKEN);
-  const policy = bearerClient(controls, environment.PAGE2WEBMCP_EGRESS_POLICY_ORIGIN, environment.PAGE2WEBMCP_EGRESS_POLICY_TOKEN);
-  const proxy = bearerClient(controls, environment.PAGE2WEBMCP_EGRESS_PROXY_ORIGIN, environment.PAGE2WEBMCP_EGRESS_PROXY_TOKEN);
-  const leases = bearerClient(controls, environment.PAGE2WEBMCP_BROWSER_LEASE_STORE_ORIGIN, environment.PAGE2WEBMCP_BROWSER_LEASE_STORE_TOKEN);
-  const secrets = bearerClient(controls, environment.PAGE2WEBMCP_SECRET_STORE_ORIGIN, environment.PAGE2WEBMCP_SECRET_STORE_TOKEN);
-  const auth = bearerClient(controls, environment.PAGE2WEBMCP_AUTH_HANDOFF_ORIGIN, environment.PAGE2WEBMCP_AUTH_HANDOFF_TOKEN);
-  const evidence = bearerClient(controls, environment.PAGE2WEBMCP_EVIDENCE_STORE_ORIGIN, environment.PAGE2WEBMCP_EVIDENCE_STORE_TOKEN);
-  const observer = bearerClient(controls, environment.PAGE2WEBMCP_CDP_OBSERVER_ORIGIN, environment.PAGE2WEBMCP_CDP_OBSERVER_TOKEN);
+  const report = dependencies.reportControlRejection ?? defaultControlRejectionReport;
+  const ownership = bearerClient(controls, environment.PAGE2WEBMCP_OWNERSHIP_STORE_ORIGIN, environment.PAGE2WEBMCP_OWNERSHIP_STORE_TOKEN, report);
+  const policy = bearerClient(controls, environment.PAGE2WEBMCP_EGRESS_POLICY_ORIGIN, environment.PAGE2WEBMCP_EGRESS_POLICY_TOKEN, report);
+  const proxy = bearerClient(controls, environment.PAGE2WEBMCP_EGRESS_PROXY_ORIGIN, environment.PAGE2WEBMCP_EGRESS_PROXY_TOKEN, report);
+  const leases = bearerClient(controls, environment.PAGE2WEBMCP_BROWSER_LEASE_STORE_ORIGIN, environment.PAGE2WEBMCP_BROWSER_LEASE_STORE_TOKEN, report);
+  const secrets = bearerClient(controls, environment.PAGE2WEBMCP_SECRET_STORE_ORIGIN, environment.PAGE2WEBMCP_SECRET_STORE_TOKEN, report);
+  const auth = bearerClient(controls, environment.PAGE2WEBMCP_AUTH_HANDOFF_ORIGIN, environment.PAGE2WEBMCP_AUTH_HANDOFF_TOKEN, report);
+  const evidence = bearerClient(controls, environment.PAGE2WEBMCP_EVIDENCE_STORE_ORIGIN, environment.PAGE2WEBMCP_EVIDENCE_STORE_TOKEN, report);
+  const observer = bearerClient(controls, environment.PAGE2WEBMCP_CDP_OBSERVER_ORIGIN, environment.PAGE2WEBMCP_CDP_OBSERVER_TOKEN, report);
   const browser = controlClient(controls, environment.PAGE2WEBMCP_BROWSER_USE_API_ORIGIN, {
     "x-browser-use-api-key": environment.PAGE2WEBMCP_BROWSER_USE_API_KEY,
     "x-page2webmcp-browser-gateway-version": String(WEBSITE_LIVE_GATEWAY_PROTOCOL_VERSION),
-  });
+  }, report);
 
   const configuredAdapter: AnalysisAdapter = async (source, signal) => {
     if (source.sourceType !== "website") throw new Error("SOURCE_TYPE_UNSUPPORTED");

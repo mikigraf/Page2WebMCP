@@ -271,6 +271,8 @@ A live run refuses to start unless the operator tree is clean, untracked files i
 
 Startup and readiness may print sorted missing environment-variable names because they are privileged operator surfaces. They never print values, URLs containing credentials, tokens, private keys, candidate code, DOM, repository source, or API bodies. Public UI/API responses expose stable codes only.
 
+A rejected website control logs `website_control_rejected` with the control path, the HTTP status, and the gateway's stable `GATEWAY_*` code, so `WEBSITE_CONTROL_REJECTED` can be traced to one control. No request or response value is logged.
+
 `DATABASE_ROLE_FORBIDDEN` names `DATABASE_URL`: the connected login cannot assume the role its process requires, so the worker exits instead of retrying. Give the worker service the worker login (`PAGE2WEBMCP_WORKER_DATABASE_URL`), not the application login.
 
 Useful fail-closed codes include `OPENAPI_LIVE_CONFIGURATION_REQUIRED`, `WEBSITE_LIVE_CONFIGURATION_REQUIRED`, `GITHUB_LIVE_CONFIGURATION_REQUIRED`, `RELEASE_VERIFIER_CONFIGURATION_REQUIRED`, `LIVE_CONTROLS_REQUIRED`, and `LIVE_INSTALLATION_EVIDENCE_REQUIRED`.
