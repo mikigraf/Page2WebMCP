@@ -162,13 +162,13 @@ export function openApiDocument(): OpenApiDocument {
         LoginInput: {
           type: "object", additionalProperties: false, required: ["email", "password"],
           properties: {
-            email: { type: "string", format: "email", maxLength: 254 },
+            email: { type: "string", minLength: 3, maxLength: 254 },
             password: { type: "string", minLength: 8, maxLength: 128 },
           },
         },
         Authentication: {
           type: "object", additionalProperties: false, required: ["authenticated"],
-          properties: { authenticated: { type: "boolean", const: true } },
+          properties: { authenticated: { type: "boolean" } },
         },
         PartSummary: {
           type: "object", additionalProperties: false, required: ["sku", "name", "available"],
@@ -187,7 +187,7 @@ export function openApiDocument(): OpenApiDocument {
             onHand: { type: "integer", minimum: 0 },
             reserved: { type: "integer", minimum: 0 },
             supplierNotes: { type: "string" },
-            untrustedContent: { type: "boolean", const: true },
+            untrustedContent: { type: "boolean" },
           },
         },
         ReservationInput: {
@@ -196,13 +196,13 @@ export function openApiDocument(): OpenApiDocument {
             sku: { type: "string", minLength: 1, maxLength: 64 },
             quantity: { type: "integer", minimum: 1, maximum: 99 },
             orderReference: { type: "string", minLength: 3, maxLength: 64 },
-            confirmed: { type: "boolean", const: true },
+            confirmed: { type: "boolean" },
           },
         },
         ConfirmationRequest: {
           type: "object", additionalProperties: false, required: ["toolName", "input", "idempotencyKey"],
           properties: {
-            toolName: { type: "string", const: "reserve_part_stock" },
+            toolName: { type: "string", enum: ["reserve_part_stock"] },
             input: reference("ReservationInput"),
             idempotencyKey: { type: "string", minLength: 8, maxLength: 128 },
           },
@@ -218,10 +218,10 @@ export function openApiDocument(): OpenApiDocument {
             reservationId: { type: "string" }, sku: { type: "string" },
             quantity: { type: "integer", minimum: 1, maximum: 99 },
             orderReference: { type: "string" },
-            status: { type: "string", const: "reserved" },
-            reversible: { type: "boolean", const: true },
-            effectCount: { type: "integer", const: 1 },
-            createdAt: { type: "string", format: "date-time" },
+            status: { type: "string", enum: ["reserved"] },
+            reversible: { type: "boolean" },
+            effectCount: { type: "integer", minimum: 1, maximum: 1 },
+            createdAt: { type: "string", minLength: 20, maxLength: 40 },
           },
         },
         ReservationState: {
@@ -232,8 +232,8 @@ export function openApiDocument(): OpenApiDocument {
             quantity: { type: "integer", minimum: 1, maximum: 99 },
             orderReference: { type: "string" },
             status: { type: "string", enum: ["reserved", "released"] },
-            createdAt: { type: "string", format: "date-time" },
-            releasedAt: { type: ["string", "null"], format: "date-time" },
+            createdAt: { type: "string", minLength: 20, maxLength: 40 },
+            releasedAt: { type: ["string", "null"], minLength: 20, maxLength: 40 },
           },
         },
         Error: {
