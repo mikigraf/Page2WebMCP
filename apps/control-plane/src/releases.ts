@@ -155,6 +155,21 @@ export async function publishPersistedRelease(
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+/**
+ * Key-order-independent comparison. A stored manifest round-trips through JSONB,
+ * which does not preserve object key order, so comparing raw serialisations
+ * reports a difference where the documents are identical.
+ */
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record).sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
 function assertPublishedReleaseConvergence(input: Readonly<{
   release: ReleaseRecord;
   candidate: CandidateRelease;
@@ -194,7 +209,7 @@ function assertPublishedReleaseConvergence(input: Readonly<{
     candidateManifest.success && releaseManifest.success
       && releaseManifest.data.releaseId !== candidateManifest.data.releaseId && "manifest_release_id",
     candidateManifest.success && releaseManifest.success
-      && JSON.stringify(releaseManifest.data) !== JSON.stringify(candidateManifest.data) && "manifest",
+      && canonicalJson(releaseManifest.data) !== canonicalJson(candidateManifest.data) && "manifest",
     persistedIdentity && persistedIdentity.artifactUrl !== input.artifactIdentity.artifactUrl && "artifact_url",
     persistedIdentity && persistedIdentity.downloadUrl !== input.artifactIdentity.downloadUrl && "download_url",
     persistedIdentity && persistedIdentity.localOnly !== input.artifactIdentity.localOnly && "local_only",
