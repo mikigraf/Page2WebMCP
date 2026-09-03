@@ -173,24 +173,34 @@ function assertPublishedReleaseConvergence(input: Readonly<{
   const releaseManifest = ManifestSchema.safeParse(release.manifest);
   const codeHash = createHash("sha256").update(release.code).digest("hex");
   const codeIntegrity = `sha384-${createHash("sha384").update(release.code).digest("base64")}`;
-  if (!persistedIdentity || !candidateManifest.success || !releaseManifest.success
-    || release.organizationId !== input.organizationId || release.projectId !== input.projectId
-    || release.analysisRunId !== input.analysisRunId
-    || release.capabilityStateDigest !== input.capabilityStateDigest
-    // A replayed publication returns the release created by the first call, which
-    // carries the verification that admitted it. Requiring the freshly minted
-    // verification's id here would make every replay unconvergeable; the release
-    // is still bound to an eligible verification of this candidate and state.
-    || !UUID.test(release.verificationRunId ?? "")
-    || release.code !== candidate.code || release.contentHash !== candidate.contentHash
-    || codeHash !== candidate.contentHash || release.sri !== input.integrity || codeIntegrity !== input.integrity
-    || release.allowedOrigin !== input.targetOrigin || candidate.allowedOrigin !== input.targetOrigin
-    || releaseManifest.data.releaseId !== candidateManifest.data.releaseId
-    || JSON.stringify(releaseManifest.data) !== JSON.stringify(candidateManifest.data)
-    || persistedIdentity.artifactUrl !== input.artifactIdentity.artifactUrl
-    || persistedIdentity.downloadUrl !== input.artifactIdentity.downloadUrl
-    || persistedIdentity.localOnly !== input.artifactIdentity.localOnly) {
-    throw new ApiError("INVALID_STATE", 409);
+  // Naming the divergent fields turns an opaque 409 into something an operator
+  // can act on; none of them carries a value, only the field name.
+  const divergent = [
+    !persistedIdentity && "artifact_identity",
+    !candidateManifest.success && "candidate_manifest",
+    !releaseManifest.success && "release_manifest",
+    release.organizationId !== input.organizationId && "organization",
+    release.projectId !== input.projectId && "project",
+    release.analysisRunId !== input.analysisRunId && "analysis_run",
+    release.capabilityStateDigest !== input.capabilityStateDigest && "capability_state_digest",
+    !UUID.test(release.verificationRunId ?? "") && "verification_run",
+    release.code !== candidate.code && "code",
+    release.contentHash !== candidate.contentHash && "content_hash",
+    codeHash !== candidate.contentHash && "code_hash",
+    release.sri !== input.integrity && "sri",
+    codeIntegrity !== input.integrity && "code_integrity",
+    release.allowedOrigin !== input.targetOrigin && "release_allowed_origin",
+    candidate.allowedOrigin !== input.targetOrigin && "candidate_allowed_origin",
+    candidateManifest.success && releaseManifest.success
+      && releaseManifest.data.releaseId !== candidateManifest.data.releaseId && "manifest_release_id",
+    candidateManifest.success && releaseManifest.success
+      && JSON.stringify(releaseManifest.data) !== JSON.stringify(candidateManifest.data) && "manifest",
+    persistedIdentity && persistedIdentity.artifactUrl !== input.artifactIdentity.artifactUrl && "artifact_url",
+    persistedIdentity && persistedIdentity.downloadUrl !== input.artifactIdentity.downloadUrl && "download_url",
+    persistedIdentity && persistedIdentity.localOnly !== input.artifactIdentity.localOnly && "local_only",
+  ].filter((value): value is string => typeof value === "string");
+  if (divergent.length > 0 || !persistedIdentity) {
+    throw new ApiError("INVALID_STATE", 409, false, divergent);
   }
   return persistedIdentity;
 }
