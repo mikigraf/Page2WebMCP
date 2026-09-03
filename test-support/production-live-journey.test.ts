@@ -870,3 +870,51 @@ test("positive readiness without the persisted receipt projection remains false"
   assert.equal(result.output.liveSuccess, false);
   assert.equal(result.output.receiptLocation, undefined);
 });
+
+test("an idempotent enqueue that returns a failed analysis starts one fresh attempt bound to it", async () => {
+  const failedRunId = "99999999-9999-4999-8999-999999999999";
+  const freshRunId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const verifiedOwnership = {
+    ownership: { state: "verified", targetOrigin: "https://account.widgets.dev" },
+    canAnalyze: true,
+  };
+  const session = new FakeSession([
+    deploymentIdentity(),
+    { role: "owner" },
+    { id: "11111111-1111-4111-8111-111111111111", sourceType: "website" },
+    verifiedOwnership,
+    // The stored idempotent response for the first attempt, now terminally failed.
+    { runId: failedRunId, status: "failed" },
+    // The retry under a distinct key enqueues a new run.
+    { runId: freshRunId, status: "queued" },
+    { run: { id: freshRunId, status: "succeeded" },
+      result: { providerProvenance: { mode: "website", fixture: false } },
+      capabilities: [{ id: "33333333-3333-4333-8333-333333333333", riskTier: "R1", status: "proposed", version: 1 }] },
+  ]);
+  const result = await runProductionLiveJourneyCli(
+    ["--live", "--provider", "website"], environment("website"), dependencies(session),
+  );
+  const enqueues = session.calls.filter((call) => call.path === "/api/projects/analyze");
+  assert.equal(enqueues.length, 2, "the failed attempt is retried exactly once");
+  assert.notEqual(enqueues[0]!.key, enqueues[1]!.key, "the retry uses a distinct idempotency key");
+  assert.ok(String(enqueues[1]!.key).length <= 128);
+  assert.equal(result.output.completedOperations.includes("enqueue-analysis"), true);
+  assert.equal(result.output.code, "CAPABILITY_REVIEW_REQUIRED", "the fresh attempt is polled normally");
+});
+
+test("a still-failing retry is reported as a terminated analysis, not an invalid response", async () => {
+  const failedRunId = "99999999-9999-4999-8999-999999999999";
+  const session = new FakeSession([
+    deploymentIdentity(),
+    { role: "owner" },
+    { id: "11111111-1111-4111-8111-111111111111", sourceType: "website" },
+    { ownership: { state: "verified", targetOrigin: "https://account.widgets.dev" }, canAnalyze: true },
+    { runId: failedRunId, status: "failed" },
+    { runId: failedRunId, status: "failed" },
+  ]);
+  const result = await runProductionLiveJourneyCli(
+    ["--live", "--provider", "website"], environment("website"), dependencies(session),
+  );
+  assert.equal(result.output.liveSuccess, false);
+  assert.equal(result.output.code, "ANALYSIS_TERMINATED");
+});
