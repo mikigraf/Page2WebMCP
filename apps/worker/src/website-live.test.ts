@@ -121,6 +121,7 @@ function controlHarness(input: Readonly<{
   badAuthAttestation?: boolean;
   badSecretDigest?: boolean;
   issueStatus?: number;
+  issueBody?: Record<string, unknown>;
   ambiguousBrowserStartOnce?: boolean;
   rejectedReadinessControl?: string;
   legacyReadinessControl?: "ownership-store";
@@ -207,7 +208,9 @@ function controlHarness(input: Readonly<{
     }
     assert.equal(method, "POST");
     if (url.endsWith("/v1/website-egress-policies/issue")) {
-      if (input.issueStatus !== undefined) return jsonResponse(url, { rejected: true }, input.issueStatus);
+      if (input.issueStatus !== undefined) {
+        return jsonResponse(url, input.issueBody ?? { rejected: true }, input.issueStatus);
+      }
       const idempotencyKey = String(body.idempotencyKey);
       const issued = issuedPolicies.get(idempotencyKey) ?? {
         active: true,
@@ -1136,4 +1139,44 @@ test("website rejects a CDP observer that does not attest the enforced route pol
     sourceType: "website", sourceUrl: "https://widgets.example/app", sourceConfiguration: { kind: "website" }, leaseGeneration: 1,
   }, new AbortController().signal), /^Error: WEBSITE_CONTROL_RESPONSE_INVALID$/);
   assert.equal(harness.calls.filter(({ url }) => url.endsWith(WEBSITE_LIVE_CONTROL_PATHS.evidencePut)).length, 0);
+});
+
+test("a rejected control names its path and the gateway code without leaking any value", async () => {
+  const diagnostics: string[] = [];
+  const harness = controlHarness({ issueStatus: 409, issueBody: { error: "GATEWAY_POLICY_ROUTES_INVALID" } });
+  const adapter = createConfiguredWebsiteAnalysisAdapter(environment(), {
+    controlTransport: harness.transport,
+    clock: () => now,
+    reportControlRejection: (report) => diagnostics.push(JSON.stringify(report)),
+    ...networkControls(harness.expiresAt),
+  });
+  await assert.rejects(adapter({
+    id: "analysis-run-rejection-diagnostic", organizationId: "organization-1", projectId: "project-1",
+    sourceType: "website", sourceUrl: "https://widgets.example/app",
+    sourceConfiguration: { kind: "website" }, leaseGeneration: 1,
+  }, new AbortController().signal), /^Error: WEBSITE_CONTROL_REJECTED$/);
+  assert.equal(diagnostics.length, 1);
+  const report = JSON.parse(diagnostics[0]!) as Record<string, unknown>;
+  assert.deepEqual(report, {
+    control: WEBSITE_LIVE_CONTROL_PATHS.policyIssue,
+    status: 409,
+    gatewayCode: "GATEWAY_POLICY_ROUTES_INVALID",
+  });
+});
+
+test("a rejected control reports no gateway code when the body carries none", async () => {
+  const diagnostics: Record<string, unknown>[] = [];
+  const harness = controlHarness({ issueStatus: 401, issueBody: { error: "not a stable code" } });
+  const adapter = createConfiguredWebsiteAnalysisAdapter(environment(), {
+    controlTransport: harness.transport,
+    clock: () => now,
+    reportControlRejection: (report) => diagnostics.push(report as Record<string, unknown>),
+    ...networkControls(harness.expiresAt),
+  });
+  await assert.rejects(adapter({
+    id: "analysis-run-rejection-unstable", organizationId: "organization-1", projectId: "project-1",
+    sourceType: "website", sourceUrl: "https://widgets.example/app",
+    sourceConfiguration: { kind: "website" }, leaseGeneration: 1,
+  }, new AbortController().signal), /^Error: WEBSITE_CONTROL_REJECTED$/);
+  assert.deepEqual(diagnostics, [{ control: WEBSITE_LIVE_CONTROL_PATHS.policyIssue, status: 401 }]);
 });
