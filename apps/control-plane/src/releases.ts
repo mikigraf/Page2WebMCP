@@ -22,6 +22,7 @@ import {
 } from "../../../packages/database/src/control-plane.ts";
 import { ApiError } from "./api.ts";
 import {
+  ReleaseArtifactError,
   releaseArtifactStore,
   type ReleaseArtifactStore,
 } from "./artifact-storage.ts";
@@ -87,12 +88,20 @@ export async function publishPersistedRelease(
   }
   const candidate = verificationRequest.candidate;
   const integrity = `sha384-${createHash("sha384").update(candidate.code).digest("base64")}`;
-  const publication = await artifactStore.publish({
-    code: candidate.code,
-    contentHash: candidate.contentHash,
-    integrity,
-    targetOrigin: target.targetOrigin,
-  }, signal);
+  // Publication failures are stable, actionable codes; reporting them as an
+  // unmapped 500 leaves an operator with nothing to act on.
+  let publication;
+  try {
+    publication = await artifactStore.publish({
+      code: candidate.code,
+      contentHash: candidate.contentHash,
+      integrity,
+      targetOrigin: target.targetOrigin,
+    }, signal);
+  } catch (error) {
+    if (error instanceof ReleaseArtifactError) throw new ApiError(error.message, 502, true);
+    throw error;
+  }
   if (publication.contentHash !== candidate.contentHash || publication.integrity !== integrity) {
     throw new Error("RELEASE_ARTIFACT_IDENTITY_MISMATCH");
   }
