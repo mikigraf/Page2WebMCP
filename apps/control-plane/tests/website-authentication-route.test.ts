@@ -83,7 +83,12 @@ function handoffPort(input: Readonly<{
     loadAuthenticationPortal: async (binding) => {
       input.onPortal?.(binding);
       if (input.portalState === "ready") {
-        return { state: "ready", targetOrigin: TARGET_ORIGIN, expiresAt: EXPIRES_AT };
+        return {
+          state: "ready",
+          targetOrigin: TARGET_ORIGIN,
+          expiresAt: EXPIRES_AT,
+          authenticationEvidenceReference: EVIDENCE_REFERENCE,
+        };
       }
       return {
         state: "waiting",
