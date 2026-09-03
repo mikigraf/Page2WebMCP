@@ -188,9 +188,17 @@ export class PostgresControlPlaneRepository implements ControlPlaneRepository {
     const client = await this.#pool.connect();
     try {
       await client.query("begin");
-      await client.query(context.kind === "worker"
-        ? "set local role page2webmcp_worker"
-        : "set local role page2webmcp_app");
+      // A login that cannot assume this role is misconfigured for the whole
+      // process, so it is reported apart from an ordinary authorization denial.
+      try {
+        await client.query(context.kind === "worker"
+          ? "set local role page2webmcp_worker"
+          : "set local role page2webmcp_app");
+      } catch (error) {
+        throw error instanceof pg.DatabaseError && error.code === "42501"
+          ? new RepositoryError("DATABASE_ROLE_FORBIDDEN")
+          : error;
+      }
       await client.query(
         "select set_config('statement_timeout', $1, true), set_config('lock_timeout', $2, true), " +
         "set_config('idle_in_transaction_session_timeout', $3, true)",

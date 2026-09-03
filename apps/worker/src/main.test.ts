@@ -3,8 +3,8 @@ import { execFile } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import test from "node:test";
-import { InMemoryControlPlaneRepository } from "../../../packages/database/src/control-plane.ts";
-import { runProductionWorker } from "./main.ts";
+import { InMemoryControlPlaneRepository, RepositoryError } from "../../../packages/database/src/control-plane.ts";
+import { runProductionWorker, WorkerStartupConfigurationError } from "./main.ts";
 
 const run = promisify(execFile);
 const root = fileURLToPath(new URL("../../../", import.meta.url));
@@ -212,3 +212,76 @@ async function runFailure(environment: Record<string, string>): Promise<unknown>
   }
   assert.fail("worker startup unexpectedly succeeded");
 }
+
+test("a database login that cannot assume the worker role stops the worker naming DATABASE_URL", async () => {
+  const repository = new InMemoryControlPlaneRepository();
+  const provider = {
+    analysisSourceTypes: ["openapi"] as const,
+    provenance: {
+      mode: "openapi" as const, adapter: "bounded-openapi" as const,
+      adapterVersion: 1 as const, fixture: false as const,
+    },
+    analyze: async () => ({ capabilities: [], diagnostics: [], evidence: [] }),
+    probe: async () => undefined,
+  };
+  let iterations = 0;
+  const failure = runProductionWorker({ PAGE2WEBMCP_PROVIDER_MODE: "openapi" }, {
+    constructProvider: () => provider,
+    validateConfiguration: () => undefined,
+    getRepository: () => repository,
+    createRuntime: () => ({
+      analyze: provider.analyze,
+      analysisSourceTypes: provider.analysisSourceTypes,
+      providerProvenance: provider.provenance,
+    }),
+    registerObservability: async () => undefined,
+    shutdownObservability: async () => undefined,
+    closeRepository: async () => undefined,
+    processIteration: async () => {
+      iterations += 1;
+      throw new RepositoryError("DATABASE_ROLE_FORBIDDEN");
+    },
+  });
+  await assert.rejects(failure, (error: unknown) => {
+    assert.ok(error instanceof WorkerStartupConfigurationError);
+    assert.equal(error.code, "DATABASE_ROLE_FORBIDDEN");
+    assert.deepEqual([...error.missingEnvironment], ["DATABASE_URL"]);
+    return true;
+  });
+  assert.equal(iterations, 1, "a permanently misconfigured login is never retried");
+});
+
+test("an ordinary authorization failure keeps the worker looping", async () => {
+  const repository = new InMemoryControlPlaneRepository();
+  const provider = {
+    analysisSourceTypes: ["openapi"] as const,
+    provenance: {
+      mode: "openapi" as const, adapter: "bounded-openapi" as const,
+      adapterVersion: 1 as const, fixture: false as const,
+    },
+    analyze: async () => ({ capabilities: [], diagnostics: [], evidence: [] }),
+    probe: async () => undefined,
+  };
+  const controller = new AbortController();
+  let iterations = 0;
+  await runProductionWorker({ PAGE2WEBMCP_PROVIDER_MODE: "openapi", PAGE2WEBMCP_WORKER_POLL_MS: "100" }, {
+    signal: controller.signal,
+    constructProvider: () => provider,
+    validateConfiguration: () => undefined,
+    getRepository: () => repository,
+    createRuntime: () => ({
+      analyze: provider.analyze,
+      analysisSourceTypes: provider.analysisSourceTypes,
+      providerProvenance: provider.provenance,
+    }),
+    registerObservability: async () => undefined,
+    shutdownObservability: async () => undefined,
+    closeRepository: async () => undefined,
+    processIteration: async () => {
+      iterations += 1;
+      if (iterations >= 2) controller.abort();
+      throw new RepositoryError("FORBIDDEN");
+    },
+  });
+  assert.ok(iterations >= 2, "a transient FORBIDDEN is retried");
+});
