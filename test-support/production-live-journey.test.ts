@@ -174,6 +174,7 @@ test("live verifies the public deployment identity before opening operator crede
     deploymentIdentity(),
     { role: "owner" },
     { id: "11111111-1111-4111-8111-111111111111", sourceType: "openapi" },
+    {},
     { runId: "22222222-2222-4222-8222-222222222222", status: "queued" },
     {
       run: { id: "22222222-2222-4222-8222-222222222222", status: "succeeded" },
@@ -208,6 +209,7 @@ test("live OpenAPI uses customer APIs and stops for explicit human capability re
     deploymentIdentity(),
     { role: "owner" },
     { id: "11111111-1111-4111-8111-111111111111", sourceType: "openapi" },
+    {},
     { runId: "22222222-2222-4222-8222-222222222222", status: "queued" },
     {
       run: { id: "22222222-2222-4222-8222-222222222222", status: "succeeded" },
@@ -243,6 +245,7 @@ test("published exact bytes produce installation instructions and no verifier ca
     deploymentIdentity(),
     { role: "owner" },
     { id: "11111111-1111-4111-8111-111111111111", sourceType: "openapi" },
+    {},
     { runId: "22222222-2222-4222-8222-222222222222", status: "succeeded" },
     {
       run: { id: "22222222-2222-4222-8222-222222222222", status: "succeeded" },
@@ -303,6 +306,7 @@ test("website authentication handoff requires an explicit worker recycle boundar
     { role: "owner" },
     { id: "11111111-1111-4111-8111-111111111111", sourceType: "website" },
     { ownership: { state: "verified", targetOrigin: "https://account.widgets.dev" }, canAnalyze: true },
+    {},
     { runId: "22222222-2222-4222-8222-222222222222", status: "queued" },
     {
       run: { id: "22222222-2222-4222-8222-222222222222", status: "waiting" },
@@ -333,6 +337,7 @@ test("website authentication acknowledgement uses the durable handoff API and th
     { role: "owner" },
     { id: "11111111-1111-4111-8111-111111111111", sourceType: "website" },
     { ownership: { state: "verified", targetOrigin: "https://account.widgets.dev" }, canAnalyze: true },
+    {},
     { runId, status: "queued" },
     { run: { id: runId, status: "waiting" }, capabilities: [],
       websiteUserHandoff: { authentication: { endpoint, state: "waiting" } } },
@@ -366,6 +371,7 @@ test("live result stays false when installed verification exists but readiness l
     deploymentIdentity(),
     { role: "owner" },
     { id: "11111111-1111-4111-8111-111111111111", sourceType: "openapi" },
+    {},
     { runId: "22222222-2222-4222-8222-222222222222", status: "succeeded" },
     {
       run: { id: "22222222-2222-4222-8222-222222222222", status: "succeeded" },
@@ -411,6 +417,7 @@ test("each live execution requests a fresh append-only installation attestation"
   const session = () => new FakeSession([
     deploymentIdentity(), { role: "owner" },
     { id: "11111111-1111-4111-8111-111111111111", sourceType: "openapi" },
+    {},
     { runId: "22222222-2222-4222-8222-222222222222", status: "succeeded" },
     { run: { id: "22222222-2222-4222-8222-222222222222", status: "succeeded" },
       result: { providerProvenance: { mode: "openapi", fixture: false } },
@@ -480,6 +487,7 @@ test("live success is emitted only after the exact persisted v2 receipt projecti
   const releaseId = "44444444-4444-4444-8444-444444444444";
   const session = new FakeSession([
     deploymentIdentity(), { role: "owner" }, { id: projectId, sourceType: "openapi" },
+    {},
     { runId, status: "succeeded" },
     { run: { id: runId, status: "succeeded" },
       result: { providerProvenance: { mode: "openapi", fixture: false } },
@@ -663,6 +671,7 @@ test("a passed website journey completes every planned operation and binds the e
   const session = new FakeSession([
     deploymentIdentity(), { role: "owner" }, { id: projectId, sourceType: "website" },
     { ownership: { state: "verified", targetOrigin: "https://account.widgets.dev" }, canAnalyze: true },
+    {},
     { runId, status: "succeeded" },
     { run: { id: runId, status: "succeeded" },
       result: { providerProvenance: { mode: "website", fixture: false } },
@@ -762,6 +771,7 @@ test("a published artifact served with a non-JavaScript media type fails the jou
   const downloadUrl = `${artifactUrl}?download=page2webmcp-${hash}.js`;
   const session = new FakeSession([
     deploymentIdentity(), { role: "owner" }, { id: "11111111-1111-4111-8111-111111111111", sourceType: "openapi" },
+    {},
     { runId: "22222222-2222-4222-8222-222222222222", status: "succeeded" },
     { run: { id: "22222222-2222-4222-8222-222222222222", status: "succeeded" },
       result: { providerProvenance: { mode: "openapi", fixture: false } },
@@ -798,6 +808,7 @@ test("a mid-journey readiness control failure names every missing control exactl
   const downloadUrl = `${artifactUrl}?download=page2webmcp-${hash}.js`;
   const session = new FakeSession([
     deploymentIdentity(), { role: "owner" }, { id: "11111111-1111-4111-8111-111111111111", sourceType: "openapi" },
+    {},
     { runId: "22222222-2222-4222-8222-222222222222", status: "succeeded" },
     { run: { id: "22222222-2222-4222-8222-222222222222", status: "succeeded" },
       result: { providerProvenance: { mode: "openapi", fixture: false } },
@@ -842,6 +853,7 @@ test("positive readiness without the persisted receipt projection remains false"
   const downloadUrl = `${artifactUrl}?download=page2webmcp-${hash}.js`;
   const session = new FakeSession([
     deploymentIdentity(), { role: "owner" }, { id: "11111111-1111-4111-8111-111111111111", sourceType: "openapi" },
+    {},
     { runId: "22222222-2222-4222-8222-222222222222", status: "succeeded" },
     { run: { id: "22222222-2222-4222-8222-222222222222", status: "succeeded" },
       result: { providerProvenance: { mode: "openapi", fixture: false } },
@@ -877,9 +889,9 @@ test("the enqueue key is bound to the project's latest terminated attempt, howev
   const session = new FakeSession([
     deploymentIdentity(),
     { role: "owner" },
-    { id: "11111111-1111-4111-8111-111111111111", sourceType: "website",
-      latestAnalysis: { id: latest, status: "failed" } },
+    { id: "11111111-1111-4111-8111-111111111111", sourceType: "website" },
     { ownership: { state: "verified", targetOrigin: "https://account.widgets.dev" }, canAnalyze: true },
+    { latestAnalysis: { id: latest, status: "failed" } },
     { runId: fresh, status: "queued" },
     { run: { id: fresh, status: "succeeded" },
       result: { providerProvenance: { mode: "website", fixture: false } },
@@ -898,9 +910,9 @@ test("a project whose latest attempt is still live resumes it under the base key
   const withLatest = new FakeSession([
     deploymentIdentity(),
     { role: "owner" },
-    { id: "11111111-1111-4111-8111-111111111111", sourceType: "website",
-      latestAnalysis: { id: running, status: "running" } },
+    { id: "11111111-1111-4111-8111-111111111111", sourceType: "website" },
     { ownership: { state: "verified", targetOrigin: "https://account.widgets.dev" }, canAnalyze: true },
+    { latestAnalysis: { id: running, status: "running" } },
     { runId: running, status: "running" },
     { run: { id: running, status: "succeeded" },
       result: { providerProvenance: { mode: "website", fixture: false } },
@@ -911,6 +923,7 @@ test("a project whose latest attempt is still live resumes it under the base key
     { role: "owner" },
     { id: "11111111-1111-4111-8111-111111111111", sourceType: "website" },
     { ownership: { state: "verified", targetOrigin: "https://account.widgets.dev" }, canAnalyze: true },
+    {},
     { runId: running, status: "queued" },
     { run: { id: running, status: "succeeded" },
       result: { providerProvenance: { mode: "website", fixture: false } },
@@ -928,9 +941,9 @@ test("an enqueue that still returns a terminated attempt reports it rather than 
   const session = new FakeSession([
     deploymentIdentity(),
     { role: "owner" },
-    { id: "11111111-1111-4111-8111-111111111111", sourceType: "website",
-      latestAnalysis: { id: latest, status: "failed" } },
+    { id: "11111111-1111-4111-8111-111111111111", sourceType: "website" },
     { ownership: { state: "verified", targetOrigin: "https://account.widgets.dev" }, canAnalyze: true },
+    { latestAnalysis: { id: latest, status: "failed" } },
     { runId: latest, status: "failed" },
   ]);
   const result = await runProductionLiveJourneyCli(
