@@ -44,7 +44,7 @@ function routingTransport(routes: Readonly<Record<string, string>>): NodePinnedJ
 function workerEnvironment(): Record<string, string> {
   return {
     PAGE2WEBMCP_PROVIDER_MODE: "website",
-    PAGE2WEBMCP_AUTH_HANDOFF_ORIGIN: "https://auth-handoff.example",
+    PAGE2WEBMCP_AUTH_HANDOFF_ORIGIN: "https://controls.example",
     PAGE2WEBMCP_AUTH_HANDOFF_TOKEN: TEST_TOKENS["authentication-handoff"],
     PAGE2WEBMCP_BROWSER_LEASE_STORE_ORIGIN: "https://controls.example",
     PAGE2WEBMCP_BROWSER_LEASE_STORE_TOKEN: TEST_TOKENS["browser-lease-store"],
@@ -68,16 +68,13 @@ function workerEnvironment(): Record<string, string> {
   };
 }
 
-test("the worker's own readiness client accepts this gateway across the required origin split", async () => {
+test("the worker's readiness client accepts the handoff colocated with the secret store", async () => {
   assert.deepEqual(websiteMissingControls(workerEnvironment()), []);
   const shared = await startGateway(testEnvironment({
     PAGE2WEBMCP_GATEWAY_CONTROLS: [
-      "browser-lease-store", "cdp-observer", "egress-policy-store", "egress-proxy",
-      "evidence-store", "ownership-store", "ttl-secret-store",
+      "authentication-handoff", "browser-lease-store", "cdp-observer", "egress-policy-store",
+      "egress-proxy", "evidence-store", "ownership-store", "ttl-secret-store",
     ].join(","),
-  }));
-  const authentication = await startGateway(testEnvironment({
-    PAGE2WEBMCP_GATEWAY_CONTROLS: "authentication-handoff",
   }));
   const browser = await startGateway(testEnvironment({
     PAGE2WEBMCP_GATEWAY_CONTROLS: "browser-use-v4",
@@ -86,24 +83,20 @@ test("the worker's own readiness client accepts this gateway across the required
     await probeConfiguredWebsiteControlStartup(workerEnvironment(), {
       controlTransport: routingTransport({
         "https://controls.example": shared.origin,
-        "https://auth-handoff.example": authentication.origin,
         "https://browser-gateway.example": browser.origin,
       }),
     }, new AbortController().signal);
   } finally {
-    await Promise.all([shared.close(), authentication.close(), browser.close()]);
+    await Promise.all([shared.close(), browser.close()]);
   }
 });
 
-test("the worker's readiness client rejects a gateway that is missing a control", async () => {
+test("a gateway missing the authentication handoff control is rejected", async () => {
   const shared = await startGateway(testEnvironment({
     PAGE2WEBMCP_GATEWAY_CONTROLS: [
       "browser-lease-store", "cdp-observer", "egress-policy-store", "egress-proxy",
-      "evidence-store", "ownership-store",
+      "evidence-store", "ownership-store", "ttl-secret-store",
     ].join(","),
-  }));
-  const authentication = await startGateway(testEnvironment({
-    PAGE2WEBMCP_GATEWAY_CONTROLS: "authentication-handoff",
   }));
   const browser = await startGateway(testEnvironment({
     PAGE2WEBMCP_GATEWAY_CONTROLS: "browser-use-v4",
@@ -112,11 +105,10 @@ test("the worker's readiness client rejects a gateway that is missing a control"
     await assert.rejects(probeConfiguredWebsiteControlStartup(workerEnvironment(), {
       controlTransport: routingTransport({
         "https://controls.example": shared.origin,
-        "https://auth-handoff.example": authentication.origin,
         "https://browser-gateway.example": browser.origin,
       }),
     }, new AbortController().signal), /WEBSITE_PROVIDER_PROBE_FAILED/);
   } finally {
-    await Promise.all([shared.close(), authentication.close(), browser.close()]);
+    await Promise.all([shared.close(), browser.close()]);
   }
 });

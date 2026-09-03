@@ -55,3 +55,27 @@ test("the kms root key must be a real 32 byte key", () => {
     PAGE2WEBMCP_GATEWAY_SECRET_STORE_KMS_ROOT_KEY: "c2hvcnQ=",
   })), ["PAGE2WEBMCP_GATEWAY_SECRET_STORE_KMS_ROOT_KEY"]);
 });
+
+test("controls that resolve stored secrets must be colocated with the secret store", () => {
+  // The portal reads the checkpoint's CDP reference from the secret store in
+  // its own process, so splitting them across services can never verify.
+  for (const control of ["authentication-handoff", "cdp-observer"] as const) {
+    const environment = testEnvironment({ PAGE2WEBMCP_GATEWAY_CONTROLS: control });
+    assert.throws(
+      () => loadWebsiteGatewayConfiguration(environment),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.equal(error.message, "WEBSITE_GATEWAY_CONTROL_COLOCATION_REQUIRED");
+        return true;
+      },
+      control,
+    );
+    const colocated = testEnvironment({ PAGE2WEBMCP_GATEWAY_CONTROLS: `${control},ttl-secret-store` });
+    assert.ok(loadWebsiteGatewayConfiguration(colocated).controls.has(control));
+  }
+});
+
+test("a control list without either resolving control needs no secret store", () => {
+  const environment = testEnvironment({ PAGE2WEBMCP_GATEWAY_CONTROLS: "browser-lease-store" });
+  assert.ok(loadWebsiteGatewayConfiguration(environment).controls.has("browser-lease-store"));
+});

@@ -81,6 +81,8 @@ The source and target inputs are exact HTTPS. `testPageUrl` is same-origin with 
 
 Select `PAGE2WEBMCP_PROVIDER_MODE=website`. The factory is Browser Use API v4 with model `browser-use-2.0`, exact target allowlists, ephemeral sessions, and recording/profile/workspace/memory/uploads/downloads disabled. Every listed control is required:
 
+The authentication handoff and the CDP observer resolve stored references through the secret store in their own process, so `PAGE2WEBMCP_AUTH_HANDOFF_ORIGIN` and `PAGE2WEBMCP_CDP_OBSERVER_ORIGIN` must name the same service as `PAGE2WEBMCP_SECRET_STORE_ORIGIN`. A gateway that serves either without `ttl-secret-store` refuses to start with `WEBSITE_GATEWAY_CONTROL_COLOCATION_REQUIRED`. Only the Browser Use v4 gateway needs its own origin.
+
 `PAGE2WEBMCP_BROWSER_USE_API_ORIGIN` is the exact HTTPS origin of an operator-deployed Page2WebMCP Browser Use v4 gateway, not `api.browser-use.com`. The gateway owns the Page2WebMCP `/v1/readiness` and session-control contract, forwards only the bounded v4 operations, and must attest that its configured upstream accepted the supplied Browser Use key and selected `browser-use-2.0`.
 
 Upstream, the gateway uses the Browser Use Cloud v4 browsers API: credentials are checked with a bounded `GET /api/v4/sessions?limit=1`, a session is `POST /api/v4/browsers` with a whole-minute `timeout` derived from the pinned `expiresAt` and the policy digest in `metadata`, stop is `PATCH /api/v4/browsers/{id}` with `{"action":"stop"}`, and the returned https CDP host is exposed to the worker as its `wss://` endpoint. Browser Use does not take the pinned allowlist or proxy policy itself; those stay enforced by the egress controls.
@@ -185,7 +187,7 @@ Identity generation fails on a dirty tree, commit mismatch, non-HTTPS origin, or
 
 ### Render Blueprint
 
-`render.yaml` at the repository root deploys all six hosted services (control plane, worker, release verifier, and the three gateway processes) from these Dockerfiles. Render passes every service environment variable to `docker build` as a build argument, and `RENDER_GIT_COMMIT` fills `PAGE2WEBMCP_GIT_COMMIT_SHA` and the release ID when they are not set explicitly. The `page2webmcp-shared` environment group carries the pinned `NODE_BASE_IMAGE`, every public origin, and the hosted Supabase values; secrets are prompted at Blueprint creation (`sync: false`) or generated once on the control plane and mirrored to the other services with `fromService`. Origins are baked into the images, so if Render assigns a different hostname than the group predicts, update the group and redeploy.
+`render.yaml` at the repository root deploys all five hosted services (control plane, worker, release verifier, and the two gateway processes) from these Dockerfiles. Render passes every service environment variable to `docker build` as a build argument, and `RENDER_GIT_COMMIT` fills `PAGE2WEBMCP_GIT_COMMIT_SHA` and the release ID when they are not set explicitly. The `page2webmcp-shared` environment group carries the pinned `NODE_BASE_IMAGE`, every public origin, and the hosted Supabase values; secrets are prompted at Blueprint creation (`sync: false`) or generated once on the control plane and mirrored to the other services with `fromService`. Origins are baked into the images, so if Render assigns a different hostname than the group predicts, update the group and redeploy.
 
 ## Immutable Supabase Storage artifacts
 
