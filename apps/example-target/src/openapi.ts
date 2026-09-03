@@ -45,6 +45,17 @@ export function openApiDocument(): OpenApiDocument {
           },
         },
       },
+      "/api/auth/logout": {
+        post: {
+          operationId: "logout",
+          summary: "End the parts console operator session",
+          security: secured,
+          responses: {
+            "303": { description: "Session ended; the operator is returned to the console home" },
+            "401": errors["401"], "403": errors["403"],
+          },
+        },
+      },
       "/api/parts": {
         get: {
           operationId: "listParts",

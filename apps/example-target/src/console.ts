@@ -140,6 +140,15 @@ export class PartsConsole {
     return session;
   }
 
+  /** Ends a session. Unknown or already-ended sessions are accepted silently. */
+  logout(session: Session): void {
+    this.#sweep(this.#now());
+    this.#sessions.delete(session);
+    for (const [evidence, value] of this.#confirmations) {
+      if (value.session === session) this.#confirmations.delete(evidence);
+    }
+  }
+
   isAuthenticated(session: Session): boolean {
     try {
       this.#requireUser(session);
