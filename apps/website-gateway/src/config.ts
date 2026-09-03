@@ -150,10 +150,19 @@ export function websiteGatewayMissingConfiguration(environment: RuntimeEnvironme
   return [...invalid].sort();
 }
 
+// These controls resolve a stored reference through the secret store in their
+// own process, so a deployment that splits them across services can never
+// complete: the portal cannot read the checkpoint's CDP reference.
+const SECRET_STORE_DEPENDENTS = Object.freeze(["authentication-handoff", "cdp-observer"] as const);
+
 export function loadWebsiteGatewayConfiguration(environment: RuntimeEnvironment): GatewayConfiguration {
   const missing = websiteGatewayMissingConfiguration(environment);
   if (missing.length > 0) throw new GatewayError("WEBSITE_GATEWAY_CONFIGURATION_REQUIRED", 500);
   const controls = new Set(parsedControls(environment.PAGE2WEBMCP_GATEWAY_CONTROLS)!);
+  if (!controls.has("ttl-secret-store")
+    && SECRET_STORE_DEPENDENTS.some((control) => controls.has(control))) {
+    throw new GatewayError("WEBSITE_GATEWAY_CONTROL_COLOCATION_REQUIRED", 500);
+  }
   const tokens: Partial<Record<ControlName, string>> = {};
   for (const control of controls) {
     const key = CONTROL_TOKEN_KEYS[control];

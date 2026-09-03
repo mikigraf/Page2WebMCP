@@ -17,7 +17,7 @@
 #
 # After the first deploy:
 #   - Point Supabase Auth site_url / redirect URLs at the control-plane origin.
-#   - The three gateway services are only needed for the Website / Browser Use
+#   - The two gateway services are only needed for the Website / Browser Use
 #     journey. Suspend them for the OpenAPI journey.
 
 previews:
@@ -34,8 +34,10 @@ envVarGroups:
         value: https://page2webmcp-control-plane.onrender.com
       - key: PAGE2WEBMCP_RELEASE_VERIFIER_ORIGIN
         value: https://page2webmcp-release-verifier.onrender.com
+      # The handoff portal reads the checkpoint's CDP reference from the secret
+      # store in its own process, so it runs on the controls service.
       - key: PAGE2WEBMCP_AUTH_HANDOFF_ORIGIN
-        value: https://page2webmcp-gateway-handoff.onrender.com
+        value: https://page2webmcp-gateway-controls.onrender.com
       - key: PAGE2WEBMCP_BROWSER_USE_API_ORIGIN
         value: https://page2webmcp-gateway-browser-use.onrender.com
       - key: PAGE2WEBMCP_BROWSER_LEASE_STORE_ORIGIN
@@ -223,7 +225,7 @@ services:
       - key: PAGE2WEBMCP_GATEWAY_PORT
         value: "10000"
       - key: PAGE2WEBMCP_GATEWAY_CONTROLS
-        value: browser-lease-store,cdp-observer,egress-policy-store,egress-proxy,evidence-store,ownership-store,ttl-secret-store
+        value: authentication-handoff,browser-lease-store,cdp-observer,egress-policy-store,egress-proxy,evidence-store,ownership-store,ttl-secret-store
       - key: PAGE2WEBMCP_GATEWAY_BROWSER_LEASE_STORE_TOKEN
         fromService: { name: page2webmcp-control-plane, type: web, envVarKey: PAGE2WEBMCP_BROWSER_LEASE_STORE_TOKEN }
       - key: PAGE2WEBMCP_GATEWAY_CDP_OBSERVER_TOKEN
@@ -243,30 +245,10 @@ services:
       # Base64 of 32 random bytes (openssl rand -base64 32).
       - key: PAGE2WEBMCP_GATEWAY_SECRET_STORE_KMS_ROOT_KEY
         sync: false
-
-  - name: page2webmcp-gateway-handoff
-    type: web
-    runtime: docker
-    region: frankfurt
-    plan: 0.5c-512mb
-    branch: main
-    autoDeployTrigger: commit
-    dockerfilePath: deploy/Dockerfile.website-gateway
-    dockerContext: .
-    envVars:
-      - fromGroup: page2webmcp-shared
-      - key: PORT
-        value: "10000"
-      - key: PAGE2WEBMCP_GATEWAY_BIND_ADDRESS
-        value: 0.0.0.0
-      - key: PAGE2WEBMCP_GATEWAY_PORT
-        value: "10000"
-      - key: PAGE2WEBMCP_GATEWAY_CONTROLS
-        value: authentication-handoff
       - key: PAGE2WEBMCP_GATEWAY_AUTH_HANDOFF_TOKEN
         fromService: { name: page2webmcp-control-plane, type: web, envVarKey: PAGE2WEBMCP_AUTH_HANDOFF_TOKEN }
       - key: PAGE2WEBMCP_GATEWAY_AUTH_HANDOFF_PUBLIC_ORIGIN
-        value: https://page2webmcp-gateway-handoff.onrender.com
+        value: https://page2webmcp-gateway-controls.onrender.com
 
   - name: page2webmcp-gateway-browser-use
     type: web
