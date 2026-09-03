@@ -918,3 +918,47 @@ test("a still-failing retry is reported as a terminated analysis, not an invalid
   assert.equal(result.output.liveSuccess, false);
   assert.equal(result.output.code, "ANALYSIS_TERMINATED");
 });
+
+test("a chain of terminated attempts is walked to the newest one within a bounded number of enqueues", async () => {
+  const first = "99999999-9999-4999-8999-999999999999";
+  const second = "88888888-8888-4888-8888-888888888888";
+  const fresh = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const session = new FakeSession([
+    deploymentIdentity(),
+    { role: "owner" },
+    { id: "11111111-1111-4111-8111-111111111111", sourceType: "website" },
+    { ownership: { state: "verified", targetOrigin: "https://account.widgets.dev" }, canAnalyze: true },
+    { runId: first, status: "failed" },
+    { runId: second, status: "cancelled" },
+    { runId: fresh, status: "queued" },
+    { run: { id: fresh, status: "succeeded" },
+      result: { providerProvenance: { mode: "website", fixture: false } },
+      capabilities: [{ id: "33333333-3333-4333-8333-333333333333", riskTier: "R1", status: "proposed", version: 1 }] },
+  ]);
+  const result = await runProductionLiveJourneyCli(
+    ["--live", "--provider", "website"], environment("website"), dependencies(session),
+  );
+  const keys = session.calls.filter((call) => call.path === "/api/projects/analyze").map((call) => call.key);
+  assert.equal(keys.length, 3);
+  assert.equal(new Set(keys).size, 3, "each step uses its own deterministic key");
+  assert.equal(result.output.code, "CAPABILITY_REVIEW_REQUIRED");
+});
+
+test("a chain that never yields a live attempt stops after the bounded walk", async () => {
+  const terminated = (runId: string) => ({ runId, status: "failed" });
+  const session = new FakeSession([
+    deploymentIdentity(),
+    { role: "owner" },
+    { id: "11111111-1111-4111-8111-111111111111", sourceType: "website" },
+    { ownership: { state: "verified", targetOrigin: "https://account.widgets.dev" }, canAnalyze: true },
+    terminated("99999999-9999-4999-8999-999999999999"),
+    terminated("88888888-8888-4888-8888-888888888888"),
+    terminated("77777777-7777-4777-8777-777777777777"),
+    terminated("66666666-6666-4666-8666-666666666666"),
+  ]);
+  const result = await runProductionLiveJourneyCli(
+    ["--live", "--provider", "website"], environment("website"), dependencies(session),
+  );
+  assert.equal(result.output.code, "ANALYSIS_TERMINATED");
+  assert.equal(session.calls.filter((call) => call.path === "/api/projects/analyze").length, 4);
+});

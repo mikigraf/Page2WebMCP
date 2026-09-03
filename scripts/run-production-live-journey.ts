@@ -227,14 +227,17 @@ export async function runProductionLiveJourneyCli(
       { projectId },
       idempotencyKey("analysis", parsed.journey, environment),
     ));
-    if (enqueued.terminated) {
+    const attempted = new Set<string>();
+    while (enqueued.terminated && attempted.size < MAX_ANALYSIS_ENQUEUE_RETRIES
+      && !attempted.has(enqueued.runId)) {
+      attempted.add(enqueued.runId);
       enqueued = parseEnqueued(await session.post<unknown>(
         "/api/projects/analyze",
         { projectId },
         idempotencyKey("analysis", parsed.journey, environment, "", enqueued.runId),
       ));
-      if (enqueued.terminated) throw new Error("ANALYSIS_TERMINATED");
     }
+    if (enqueued.terminated) throw new Error("ANALYSIS_TERMINATED");
     analysisRunId = enqueued.runId;
     completedOperations.push("enqueue-analysis");
     const analysis = await waitForAnalysis({
@@ -482,6 +485,9 @@ function parseProject(value: unknown, journey: ProductionLiveJourney): string {
 
 const ENQUEUED_STATUSES = ["queued", "running", "waiting", "succeeded"] as const;
 const TERMINATED_STATUSES = ["failed", "cancelled"] as const;
+// Each terminated attempt yields a distinct next key, so a bounded walk reaches
+// the newest attempt without ever enqueueing an unbounded number of runs.
+const MAX_ANALYSIS_ENQUEUE_RETRIES = 3;
 
 function parseEnqueued(value: unknown): Readonly<{ runId: string; terminated: boolean }> {
   const record = plainRecord(value);
