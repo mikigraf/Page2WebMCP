@@ -58,8 +58,7 @@ test("the document declares cookie session security, an authenticated read, and 
   assert.equal(reserve.operationId, "reservePartStock");
   assert.deepEqual(reserve.security, [{ partsConsoleSession: [] }]);
   const parameters = reserve.parameters as Array<{ name: string; in: string; required: boolean }>;
-  assert.deepEqual(parameters.map((parameter) => parameter.name).sort(),
-    ["idempotency-key", "x-csrf-token", "x-page2webmcp-confirmation"]);
+  assert.deepEqual(parameters.map((parameter) => parameter.name).sort(), ["idempotency-key", "x-page2webmcp-confirmation"]);
   assert.ok(parameters.every((parameter) => parameter.in === "header" && parameter.required));
 
   const release = document.paths["/api/reservations/{id}"].delete;
@@ -85,8 +84,8 @@ test("every documented operation declares responses and every schema is referenc
   }
 });
 
-test("the versioned document path serves the identical description", async () => {
+test("any revision path serves the identical description", async () => {
   const { GET: canonical } = await import("../app/openapi.json/route.ts");
-  const { GET: versioned } = await import("../app/openapi.v2.json/route.ts");
-  assert.deepEqual(await versioned().json(), await canonical().json());
+  const { GET: revision } = await import("../app/openapi/[revision]/route.ts");
+  assert.deepEqual(await revision().json(), await canonical().json());
 });
