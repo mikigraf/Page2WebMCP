@@ -7,6 +7,10 @@ production-live journey analyzes, installs a release on, and verifies.
   (`app/hosted-release-script.tsx`), never the control-plane artifact route.
 - It is deliberately not the Acme fixture: production-live rejects `acme` hosts.
 - All state is in memory, per server process, seeded on boot.
+- It therefore needs **one persistent process**: a page render and a route
+  handler on separate serverless instances do not share the console, so a
+  signed-in session is invisible to pages. `deploy/Dockerfile.example-target`
+  and the `page2webmcp-example-target` Render service provide that.
 
 Configuration (all required for a working install; missing or invalid values make
 the layout render `<meta name="page2webmcp-status" content="release-unconfigured">`):

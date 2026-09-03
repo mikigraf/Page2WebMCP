@@ -207,6 +207,46 @@ services:
   # Website control gateway, deployed three times from one image.
   # Only needed for the Website / Browser Use journey.
   # ---------------------------------------------------------------------------
+  # ---------------------------------------------------------------------------
+  # Example target: the customer-owned demo site a journey analyzes. It needs a
+  # single persistent process because its console keeps sessions and
+  # reservations in memory, which serverless hosting cannot share between a
+  # page render and a route handler.
+  # ---------------------------------------------------------------------------
+  - name: page2webmcp-example-target
+    type: web
+    runtime: docker
+    region: frankfurt
+    plan: 0.5c-512mb
+    branch: main
+    autoDeployTrigger: commit
+    dockerfilePath: deploy/Dockerfile.example-target
+    dockerContext: .
+    envVars:
+      - key: NODE_BASE_IMAGE
+        value: node:24@sha256:be23f54a88d34e8824c741b19b91064094f92c1c97b194144bfc8b50d67258e2
+      - key: PORT
+        value: "10000"
+      - key: HOSTNAME
+        value: 0.0.0.0
+      - key: PAGE2WEBMCP_EXAMPLE_TARGET_PUBLIC_ORIGIN
+        value: https://page2webmcp-example-target.onrender.com
+      # The single operator identity the journey signs in as.
+      - key: PAGE2WEBMCP_EXAMPLE_TARGET_OPERATOR_EMAIL
+        sync: false
+      - key: PAGE2WEBMCP_EXAMPLE_TARGET_OPERATOR_PASSWORD
+        sync: false
+      # Set only while a website-ownership challenge is pending.
+      - key: PAGE2WEBMCP_EXAMPLE_TARGET_OWNERSHIP_VERIFICATION
+        sync: false
+      # Set after the journey returns the installation instructions.
+      - key: PAGE2WEBMCP_EXAMPLE_TARGET_RELEASE_URL
+        sync: false
+      - key: PAGE2WEBMCP_EXAMPLE_TARGET_RELEASE_CONTENT_HASH
+        sync: false
+      - key: PAGE2WEBMCP_EXAMPLE_TARGET_RELEASE_INTEGRITY
+        sync: false
+
   - name: page2webmcp-gateway-controls
     type: web
     runtime: docker
