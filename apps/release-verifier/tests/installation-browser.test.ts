@@ -53,6 +53,31 @@ function payloadFor(fixture: TargetFixture) {
   };
 }
 
+test("duplicate-load reports harmless even when registration is still completing when first observed", { skip }, async () => {
+  // A release with several sequential registerTool awaits (or a slower real
+  // implementation) can still be registering when the verifier first checks.
+  // The registration wait must not give up before it actually completes, and
+  // the duplicate-load probe must not run against a still-registering page.
+  const fixture = await startTargetFixture({
+    plans: verifierFixturePlans,
+    installCompatibilityShim: true,
+    registrationDelayMs: 4_500,
+  });
+  try {
+    const result = await verifyInstalledRelease({
+      config: config(fixture),
+      payload: payloadFor(fixture),
+      deadline: Date.now() + 120_000,
+    });
+    assert.equal(result.ok, true, result.ok ? "" : `unexpected failure ${JSON.stringify(result)}`);
+    if (!result.ok) return;
+    assert.deepEqual([...result.report.registeredTools], ["create_support_ticket", "find_order"]);
+    assert.equal(result.report.duplicateLoadHarmless, true);
+  } finally {
+    await fixture.close();
+  }
+});
+
 test("a real Chromium load reports what the page actually served, executed, and registered", { skip }, async () => {
   const fixture = await startTargetFixture({ plans: verifierFixturePlans });
   try {

@@ -17,6 +17,7 @@ export type TargetFixtureOptions = Readonly<{
   plans: (targetOrigin: string) => CapabilityPlan[];
   tamperServedBytes?: boolean;
   installCompatibilityShim?: boolean;
+  registrationDelayMs?: number;
   start?: boolean;
 }>;
 
@@ -92,7 +93,8 @@ function handle(
   }
   if (url.pathname === "/support") {
     state.pageRequests += 1;
-    send(response, 200, "text/html; charset=utf-8", supportPage(release(), options.installCompatibilityShim === true));
+    send(response, 200, "text/html; charset=utf-8",
+      supportPage(release(), options.installCompatibilityShim === true, options.registrationDelayMs ?? 0));
     return;
   }
   if (url.pathname === `/releases/${release().contentHash}.js`) {
@@ -140,14 +142,19 @@ function send(response: ServerResponse, status: number, contentType: string, bod
 
 /**
  * The page registers its tools through the browser's own WebMCP surface. It installs a shim only
- * when a test explicitly asks for one, so the default page is what a real target looks like.
+ * when a test explicitly asks for one, so the default page is what a real target looks like. An
+ * optional per-tool delay reproduces a slow real registration (many capabilities, a slow native
+ * implementation) without depending on real browser timing.
  */
-function supportPage(release: CompiledRelease, installCompatibilityShim: boolean): string {
+function supportPage(release: CompiledRelease, installCompatibilityShim: boolean, registrationDelayMs: number): string {
   const shim = !installCompatibilityShim ? "" : `<script>
 (() => {
   const tools = [];
   Object.defineProperty(document, "modelContext", { value: Object.freeze({
-    registerTool: async (tool) => { tools.push(tool); },
+    registerTool: async (tool) => {
+      if (${registrationDelayMs} > 0) await new Promise((resolve) => setTimeout(resolve, ${registrationDelayMs}));
+      tools.push(tool);
+    },
     getTools: async () => tools.slice(),
   }), configurable: false });
 })();
