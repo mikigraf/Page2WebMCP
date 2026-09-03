@@ -32,7 +32,7 @@ export type InstallationScopeFacts = Readonly<{
 }>;
 
 const REGISTRATION_POLL_MS = 250;
-const REGISTRATION_WINDOW_MS = 8_000;
+
 
 export async function verifyInstalledRelease(input: Readonly<{
   config: VerifierConfig;
@@ -85,7 +85,11 @@ export async function verifyInstalledRelease(input: Readonly<{
     const surface = await observeWebMcpSurface(session.page);
     const registeredTools = await observeRegisteredTools(session.page);
     const execution = releaseId ? await observeModuleExecution(session.page, releaseId) : undefined;
-    const executed = execution?.status === "registered" || execution?.status === "registering";
+    // A still-registering page must never be probed for duplicate-load or have
+    // its execution evidence collected: the probe's own duplicate-registration
+    // call would then race the original registration to completion, making an
+    // in-flight (not duplicate) load look non-harmless.
+    const executed = execution?.status === "registered";
     const executedContentHash = executed ? await log.artifactBodyHash() ?? null : null;
     const csp = cspDisposition(log, executedUrl);
     if (!csp) return failure("RELEASE_VERIFIER_CSP_DISPOSITION_UNOBSERVED");
@@ -140,6 +144,11 @@ function failure(code: string): InstallationOutcome {
 function boundedRemaining(deadline: number, minimum: number): number {
   return Math.max(minimum, Math.min(deadline - Date.now(), 120_000));
 }
+
+// Generous enough for several sequential registerTool awaits against a real,
+// possibly slow native implementation; still short enough that a release
+// which genuinely never registers doesn't stall the whole request.
+const REGISTRATION_WINDOW_MS = 20_000;
 
 async function waitForRegistration(
   page: Parameters<typeof observeRegisteredTools>[0],
