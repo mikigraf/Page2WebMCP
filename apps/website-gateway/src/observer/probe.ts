@@ -38,7 +38,7 @@ export const WEBSITE_PROBE_SCRIPT = `(() => {
     forms.push({ action: action.origin + action.pathname, controls, label });
   }
   return JSON.stringify({
-    signals: Array.prototype.slice.call(signals, 0, 3),
+    signals: Array.from(signals).slice(0, 3),
     signIn,
     forms,
     url: location.origin + location.pathname,
