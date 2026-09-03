@@ -112,16 +112,27 @@ export async function observeModuleExecution(page: Page, releaseId: string): Pro
  */
 export async function probeDuplicateLoad(page: Page, artifactUrl: string): Promise<boolean | null> {
   const before = await observeRegisteredTools(page);
-  const result = await page.evaluate(async (url) => {
+  // Evaluated from a source string rather than a function: a literal
+  // `import(url)` inside a page.evaluate callback compiles, under this
+  // package's rewriteRelativeImportExtensions build option, to a call to a
+  // per-file runtime helper the compiler emits alongside it. page.evaluate
+  // ships only the extracted callback body to the browser, so that helper
+  // never travels with it and a real dynamic import throws ReferenceError
+  // there. A string is opaque to that compile-time rewrite; the artifact
+  // URL is JSON-encoded into it, never concatenated, so it cannot break out
+  // of the string it's embedded in.
+  const probeSource = `(async () => {
     try {
-      const loaded = await import(url) as { registerPage2WebMCPTools?: () => Promise<{ supported?: boolean; reason?: string }> };
+      const loaded = await import(${JSON.stringify(artifactUrl)});
       if (typeof loaded.registerPage2WebMCPTools !== "function") return { attempted: false, supported: false, detail: "no_register_export" };
       const outcome = await loaded.registerPage2WebMCPTools();
       return { attempted: true, supported: outcome?.supported === true, detail: outcome?.reason ?? "" };
     } catch (error) {
-      return { attempted: true, supported: false, detail: error instanceof Error ? `${error.name}: ${error.message}` : String(error) };
+      return { attempted: true, supported: false, detail: error instanceof Error ? \`\${error.name}: \${error.message}\` : String(error) };
     }
-  }, artifactUrl);
+  })()`;
+  const result = await page.evaluate(probeSource) as
+    Readonly<{ attempted: boolean; supported: boolean; detail: string }>;
   if (!result.attempted) return null;
   const after = await observeRegisteredTools(page);
   const harmless = result.supported && before.length === after.length && before.every((name, index) => name === after[index]);
