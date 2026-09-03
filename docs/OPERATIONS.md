@@ -254,7 +254,7 @@ Set `PAGE2WEBMCP_OPERATOR_CREDENTIALS_FILE` to an owner-only, non-symlink mode-0
 
 These commands are deliberately resumable through server idempotency and durable PostgreSQL state. A nonzero action result is a checkpoint, not success:
 
-The analysis enqueue key is derived from the journey and its target, so rerunning resumes the same attempt. If that attempt has terminated, the command retries exactly once under a key bound to the failed run id, then reports `ANALYSIS_TERMINATED` rather than an opaque response error.
+The analysis enqueue key is derived from the journey and its target, so rerunning resumes the same attempt. When the project's latest attempt has terminated the key is bound to that attempt's id, so one fresh run is started no matter how many earlier attempts failed; a still-terminated result reports `ANALYSIS_TERMINATED` rather than an opaque response error.
 
 - `WEBSITE_OWNERSHIP_ACTION_REQUIRED`: complete the displayed project ownership flow in the UI, then rerun. The challenge defaults to a `/.well-known/page2webmcp-verification.txt` file on the target, which any site can publish; pass `method: "dns_txt"` to the ownership API to receive a `_page2webmcp` TXT record instead. The gateway verifies exactly the issued method and the worker re-proves it.
 - `WEBSITE_WORKER_RESTART_AND_AUTHENTICATION_REQUIRED`: recycle the production worker, complete the safe owner/editor handoff in the UI, then rerun Website with `--resume-authentication`. The database still requires a different completing worker/lease generation; the flag itself is not evidence.
