@@ -69,10 +69,17 @@ test("a part read exposes supplier notes as untrusted content and never hides th
 test("reserving stock requires explicit confirmation and applies exactly one effect", () => {
   const app = consoleAt();
   const session = app.login(operator.email, operator.password);
-  assert.throws(() => app.reserve(session, reservationInput, "reserve-request-0001", null), { code: "CONFIRMATION_REQUIRED" });
+  assert.throws(
+    () => app.reserve(session, { ...reservationInput, confirmed: false }, "reserve-request-0001", null),
+    { code: "CONFIRMATION_REQUIRED" },
+  );
   assert.throws(
     () => app.reserve(session, { ...reservationInput, confirmed: false }, "reserve-request-0001", "cnf_x"),
     { code: "CONFIRMATION_REQUIRED" },
+  );
+  assert.throws(
+    () => app.reserve(session, reservationInput, "reserve-request-0002", "cnf_not_issued"),
+    { code: "CONFIRMATION_INVALID" },
   );
   const { evidence, idempotencyKey } = confirmed(app, session);
   const reservation = app.reserve(session, reservationInput, idempotencyKey, evidence);

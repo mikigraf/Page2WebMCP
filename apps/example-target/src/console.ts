@@ -216,7 +216,9 @@ export class PartsConsole {
     const userId = this.#requireUser(session);
     const input: ReservationInput = normalizeReservationInput(value);
     const part = this.#requirePart(input.sku);
-    if (!input.confirmed || !evidence) throw new ConsoleError("CONFIRMATION_REQUIRED");
+    // A reviewed capability confirms with the operator through its own dialog, so
+    // server-issued evidence is optional; an unconfirmed request is still refused.
+    if (!input.confirmed) throw new ConsoleError("CONFIRMATION_REQUIRED");
     const idempotencyKey = normalizeIdempotencyKey(idempotencyKeyValue);
     const fingerprint = reservationFingerprint(input);
     const scope = `${userId}:${idempotencyKey}`;
@@ -225,16 +227,16 @@ export class PartsConsole {
       if (prior.fingerprint !== fingerprint) throw new ConsoleError("IDEMPOTENCY_CONFLICT");
       return { ...prior.result };
     }
-    const confirmation = this.#confirmations.get(evidence);
-    if (!confirmation || confirmation.session !== session
+    const confirmation = evidence ? this.#confirmations.get(evidence) : undefined;
+    if (evidence && (!confirmation || confirmation.session !== session
       || confirmation.idempotencyKey !== idempotencyKey || confirmation.fingerprint !== fingerprint
-      || confirmation.expiresAt <= this.#now()) {
+      || confirmation.expiresAt <= this.#now())) {
       throw new ConsoleError("CONFIRMATION_INVALID");
     }
     if (part.onHand - part.reserved < input.quantity) throw new ConsoleError("INSUFFICIENT_STOCK");
     this.#requireCapacity(this.#reservations.size, this.#maxReservations);
     this.#requireCapacity(this.#idempotency.size, this.#maxIdempotency);
-    this.#confirmations.delete(evidence);
+    if (evidence) this.#confirmations.delete(evidence);
     part.reserved += input.quantity;
     const reservation: Reservation = {
       reservationId: `RSV-${this.#randomId()}`,
