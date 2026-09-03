@@ -84,3 +84,9 @@ test("every documented operation declares responses and every schema is referenc
     assert.ok(serialized.includes(`#/components/schemas/${name}`), `${name} is referenced`);
   }
 });
+
+test("the versioned document path serves the identical description", async () => {
+  const { GET: canonical } = await import("../app/openapi.json/route.ts");
+  const { GET: versioned } = await import("../app/openapi.v2.json/route.ts");
+  assert.deepEqual(await versioned().json(), await canonical().json());
+});
