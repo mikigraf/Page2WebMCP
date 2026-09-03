@@ -83,7 +83,7 @@ type PublicationLifecycle = Readonly<{
   dispose(): void;
 }>;
 
-class ReleaseArtifactError extends Error {
+export class ReleaseArtifactError extends Error {
   constructor(code: string) {
     super(code);
     this.name = "Error";

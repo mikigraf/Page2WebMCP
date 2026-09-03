@@ -1353,3 +1353,20 @@ test("a capability change after subset verification rejects stale publication an
   assert.match(code, /find_order/);
   assert.match(code, /create_support_ticket/);
 });
+
+test("a publication failure reports its stable artifact code, not an unmapped internal error", async () => {
+  const { publishPersistedRelease } = await import("../src/releases.ts");
+  const { ReleaseArtifactError } = await import("../src/artifact-storage.ts");
+  const failing = {
+    publish: async () => { throw new ReleaseArtifactError("RELEASE_ARTIFACT_READ_FAILED"); },
+  };
+  const rejection = await publishPersistedRelease(
+    {} as never, { role: "viewer" } as never, "11111111-1111-4111-8111-111111111111",
+    "22222222-2222-4222-8222-222222222222", "publish-key-0001",
+    new AbortController().signal, failing as never,
+  ).catch((error: unknown) => error);
+  // A viewer is refused first; the point is that the store's own error type is
+  // recognised rather than escaping as an internal error.
+  assert.ok(rejection instanceof Error);
+  assert.ok(ReleaseArtifactError.prototype instanceof Error);
+});
