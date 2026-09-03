@@ -924,6 +924,47 @@ test("website TTL secrets stay exact and authenticated sites return only a durab
     assert.doesNotMatch(String(call.body.idempotencyKey), /:2:/);
   }
 
+  // The claimed run record the runner passes to finalize is a raw DB row: it
+  // never carries a top-level sourceIdentityHash (only resume enriches it).
+  // Finalize must fall back to the checkpoint's own hash.
+  const secondHarness = controlHarness({ requiresAuthentication: true });
+  const secondAdapter = createConfiguredWebsiteAnalysisAdapter(environment(), {
+    controlTransport: secondHarness.transport, clock: () => now, ...networkControls(secondHarness.expiresAt),
+  });
+  const secondWaiting = await secondAdapter({
+    id: "analysis-run-auth-2", organizationId: "organization-1", projectId: "project-1",
+    sourceType: "website", sourceUrl: "https://widgets.example/app", sourceConfiguration: { kind: "website" },
+    sourceSnapshotId: "snapshot-auth-2", leaseGeneration: 1,
+  }, new AbortController().signal);
+  if (secondWaiting.disposition !== "waiting_for_authentication") throw new Error("WAITING_OUTCOME_REQUIRED");
+  const secondEvidenceReference = `urn:sha256:${"c".repeat(64)}`;
+  const secondResumedSource = {
+    id: "analysis-run-auth-2", organizationId: "organization-1", projectId: "project-1",
+    sourceType: "website" as const, sourceUrl: "https://widgets.example/app",
+    sourceConfiguration: { kind: "website" as const },
+    sourceSnapshotId: "snapshot-auth-2", sourceIdentityHash: secondWaiting.sourceIdentityHash, leaseGeneration: 2,
+    authenticationCheckpoint: {
+      checkpointReference: secondWaiting.checkpointReference,
+      authenticationEvidenceReference: secondEvidenceReference,
+      sourceSnapshotId: secondWaiting.sourceSnapshotId,
+      sourceIdentityHash: secondWaiting.sourceIdentityHash,
+      targetOriginDigest: secondWaiting.targetOriginDigest,
+      expiresAt: secondWaiting.expiresAt,
+      liveReceiptEvidence: liveReceiptFor(secondWaiting, secondEvidenceReference),
+    },
+  };
+  await secondAdapter(secondResumedSource, new AbortController().signal);
+  const claimedRecordShape = {
+    id: secondResumedSource.id, organizationId: secondResumedSource.organizationId,
+    projectId: secondResumedSource.projectId, sourceType: secondResumedSource.sourceType,
+    sourceUrl: secondResumedSource.sourceUrl, sourceConfiguration: secondResumedSource.sourceConfiguration,
+    sourceSnapshotId: secondResumedSource.sourceSnapshotId, leaseGeneration: secondResumedSource.leaseGeneration,
+    authenticationCheckpoint: secondResumedSource.authenticationCheckpoint,
+  };
+  assert.equal("sourceIdentityHash" in claimedRecordShape, false);
+  assert.ok(secondAdapter.finalizeAuthenticationCheckpoint);
+  await secondAdapter.finalizeAuthenticationCheckpoint(claimedRecordShape, new AbortController().signal);
+
   const malformedSecret = controlHarness({ badSecretDigest: true });
   const malformedSecretAdapter = createConfiguredWebsiteAnalysisAdapter(environment(), {
     controlTransport: malformedSecret.transport, clock: () => now, ...networkControls(malformedSecret.expiresAt),
