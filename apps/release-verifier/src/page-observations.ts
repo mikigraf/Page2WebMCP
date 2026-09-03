@@ -114,15 +114,26 @@ export async function probeDuplicateLoad(page: Page, artifactUrl: string): Promi
   const before = await observeRegisteredTools(page);
   const result = await page.evaluate(async (url) => {
     try {
-      const loaded = await import(url) as { registerPage2WebMCPTools?: () => Promise<{ supported?: boolean }> };
-      if (typeof loaded.registerPage2WebMCPTools !== "function") return { attempted: false, supported: false };
+      const loaded = await import(url) as { registerPage2WebMCPTools?: () => Promise<{ supported?: boolean; reason?: string }> };
+      if (typeof loaded.registerPage2WebMCPTools !== "function") return { attempted: false, supported: false, detail: "no_register_export" };
       const outcome = await loaded.registerPage2WebMCPTools();
-      return { attempted: true, supported: outcome?.supported === true };
-    } catch {
-      return { attempted: true, supported: false };
+      return { attempted: true, supported: outcome?.supported === true, detail: outcome?.reason ?? "" };
+    } catch (error) {
+      return { attempted: true, supported: false, detail: error instanceof Error ? `${error.name}: ${error.message}` : String(error) };
     }
   }, artifactUrl);
   if (!result.attempted) return null;
   const after = await observeRegisteredTools(page);
-  return result.supported && before.length === after.length && before.every((name, index) => name === after[index]);
+  const harmless = result.supported && before.length === after.length && before.every((name, index) => name === after[index]);
+  // The stable duplicateLoadHarmless field alone gives no way to attribute a
+  // live refusal: log the raw probe outcome and tool sets on the verifier
+  // itself (never sent to the control plane) so the next occurrence is
+  // diagnosable without another blind guess.
+  if (!harmless) {
+    console.error(JSON.stringify({
+      level: "error", event: "duplicate_load_probe_failed",
+      supported: result.supported, detail: result.detail, before, after,
+    }));
+  }
+  return harmless;
 }
