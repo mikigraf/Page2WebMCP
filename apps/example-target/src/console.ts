@@ -72,7 +72,7 @@ function positiveLimit(value: number | undefined, fallback: number): number {
  */
 export class PartsConsole {
   readonly #operator: OperatorCredentials | null;
-  readonly #sessions = new Map<Session, { userId: string; expiresAt: number }>();
+  readonly #sessions = new Map<Session, { userId: string; expiresAt: number; requestToken: string }>();
   readonly #confirmations = new Map<string, { session: Session; fingerprint: string; idempotencyKey: string; expiresAt: number }>();
   readonly #idempotency = new Map<string, { fingerprint: string; result: ReservationResult; expiresAt: number }>();
   readonly #reservations = new Map<string, Reservation>();
@@ -136,8 +136,21 @@ export class PartsConsole {
     this.#sweep(this.#now());
     this.#requireCapacity(this.#sessions.size, this.#maxSessions);
     const session = randomBytes(32).toString("base64url");
-    this.#sessions.set(session, { userId: "operator", expiresAt: this.#now() + this.#sessionTtlMs });
+    this.#sessions.set(session, {
+      userId: "operator",
+      expiresAt: this.#now() + this.#sessionTtlMs,
+      requestToken: randomBytes(18).toString("base64url"),
+    });
     return session;
+  }
+
+  /**
+   * The session's request token. Pages publish it and reviewed mutations must
+   * echo it, so a request that merely carries the cookie is not enough.
+   */
+  requestToken(session: Session): string | undefined {
+    this.#sweep(this.#now());
+    return this.#sessions.get(session)?.requestToken;
   }
 
   /** Ends a session. Unknown or already-ended sessions are accepted silently. */

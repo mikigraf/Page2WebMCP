@@ -97,7 +97,23 @@ export function openApiDocument(): OpenApiDocument {
           operationId: "reservePartStock",
           summary: "Reserve part stock after explicit confirmation (reversible)",
           security: secured,
+          // The reviewed effect a capability compiler needs to propose this as a
+          // confirmed, reversible mutation, with the request token it must echo.
+          "x-page2webmcp": {
+            reviewed: true,
+            effect: "mutation",
+            riskTier: "R1",
+            reversible: true,
+            idempotencyHeader: "idempotency-key",
+            idempotencyVerified: true,
+            csrf: {
+              reviewed: true,
+              headerName: "x-csrf-token",
+              resolution: { kind: "meta", name: "csrf-token" },
+            },
+          },
           parameters: [
+            { name: "x-csrf-token", in: "header", required: true, schema: { type: "string", minLength: 16, maxLength: 128 } },
             { name: "idempotency-key", in: "header", required: true, schema: { type: "string", minLength: 8, maxLength: 128 } },
             { name: "x-page2webmcp-confirmation", in: "header", required: true, schema: { type: "string", minLength: 1, maxLength: 128 } },
           ],

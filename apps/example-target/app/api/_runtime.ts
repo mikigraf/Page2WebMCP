@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { PartsConsole } from "../../src/console";
-import { parseOperatorCredentials } from "../../src/credentials";
+import { parseOperatorCredentials, secretsMatch } from "../../src/credentials";
 import { ConsoleError, consoleErrorStatus } from "../../src/errors";
 
 export const SESSION_COOKIE = "parts_console_session";
@@ -26,6 +26,18 @@ export function partsConsole(): PartsConsole {
 
 export function session(request: NextRequest): string {
   return request.cookies.get(SESSION_COOKIE)?.value ?? "";
+}
+
+/**
+ * A reviewed mutation must echo the session's published request token, so a
+ * request that only carries the cookie is refused.
+ */
+export function requireRequestToken(request: NextRequest): void {
+  const expected = partsConsole().requestToken(session(request));
+  const presented = request.headers.get("x-csrf-token") ?? "";
+  if (!expected || presented.length !== expected.length || !secretsMatch(presented, expected)) {
+    throw new ConsoleError("REQUEST_TOKEN_REQUIRED");
+  }
 }
 
 export function requireSameOrigin(request: NextRequest): void {

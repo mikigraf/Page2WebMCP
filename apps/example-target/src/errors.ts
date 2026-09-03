@@ -1,6 +1,7 @@
 export type ConsoleErrorCode =
   | "AUTH_REQUIRED"
   | "ORIGIN_MISMATCH"
+  | "REQUEST_TOKEN_REQUIRED"
   | "NOT_FOUND"
   | "VALIDATION_ERROR"
   | "INVALID_JSON"
@@ -23,7 +24,7 @@ export class ConsoleError extends Error {
 
 export function consoleErrorStatus(code: ConsoleErrorCode | "INTERNAL_ERROR"): number {
   if (code === "AUTH_REQUIRED") return 401;
-  if (code === "ORIGIN_MISMATCH" || code === "HIGH_RISK_ACTION"
+  if (code === "ORIGIN_MISMATCH" || code === "REQUEST_TOKEN_REQUIRED" || code === "HIGH_RISK_ACTION"
     || code === "CONFIRMATION_REQUIRED" || code === "CONFIRMATION_INVALID") return 403;
   if (code === "NOT_FOUND") return 404;
   if (code === "IDEMPOTENCY_CONFLICT" || code === "INSUFFICIENT_STOCK") return 409;
