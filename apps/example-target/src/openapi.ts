@@ -113,7 +113,6 @@ export function openApiDocument(): OpenApiDocument {
             },
           },
           parameters: [
-            { name: "x-csrf-token", in: "header", required: true, schema: { type: "string", minLength: 16, maxLength: 128 } },
             { name: "idempotency-key", in: "header", required: true, schema: { type: "string", minLength: 8, maxLength: 128 } },
             { name: "x-page2webmcp-confirmation", in: "header", required: true, schema: { type: "string", minLength: 1, maxLength: 128 } },
           ],
