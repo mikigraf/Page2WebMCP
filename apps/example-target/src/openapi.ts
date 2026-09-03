@@ -123,9 +123,6 @@ export function openApiDocument(): OpenApiDocument {
           },
           // idempotency-key is declared by the reviewed effect above, not as a
           // parameter: a capability compiler supplies it itself.
-          parameters: [
-            { name: "x-page2webmcp-confirmation", in: "header", required: true, schema: { type: "string", minLength: 1, maxLength: 128 } },
-          ],
           requestBody: { required: true, content: { "application/json": { schema: reference("ReservationInput") } } },
           responses: {
             "201": response("Reservation applied", reference("Reservation")),

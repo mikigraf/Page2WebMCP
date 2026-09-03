@@ -113,7 +113,10 @@ test("a confirmed reservation applies exactly one reversible effect and reads ba
   const idempotencyKey = "reserve-route-0001";
 
   const requestToken = partsConsole().requestToken(cookie.split("=")[1]!)!;
-  const unconfirmed = await createReservation(mutation("/api/reservations", cookie, input,
+  // A caller that does not confirm is still refused; explicit confirmation no
+  // longer needs server-issued evidence.
+  const unconfirmed = await createReservation(mutation("/api/reservations", cookie,
+    { ...input, confirmed: false },
     { "idempotency-key": idempotencyKey, "x-csrf-token": requestToken }));
   assert.equal(unconfirmed.status, 403);
   assert.deepEqual(await unconfirmed.json(), { code: "CONFIRMATION_REQUIRED" });

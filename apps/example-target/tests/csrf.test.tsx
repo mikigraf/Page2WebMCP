@@ -54,3 +54,19 @@ test("the reservation mutation requires the session's request token", async () =
   const accepted = await reserve(request({ "x-csrf-token": token }));
   assert.notEqual(accepted.status, 403, "the published token is accepted");
 });
+
+test("an explicitly confirmed reservation is accepted without server-issued evidence", async () => {
+  const { PartsConsole } = await import("../src/console.ts");
+  const app = new PartsConsole({ operator });
+  const session = app.login(operator.email, operator.password);
+  const parts = app.listParts(session);
+  const input = { sku: parts[0]!.sku, quantity: 1, orderReference: "SO-77001", confirmed: true };
+
+  // A reviewed capability confirms with the operator itself, so evidence is
+  // optional; an unconfirmed request is still refused.
+  const applied = app.reserve(session, input, "idem-key-77001");
+  assert.equal(applied.orderReference, "SO-77001");
+  assert.equal(applied.effectCount, 1);
+  assert.throws(() => app.reserve(session, { ...input, confirmed: false, orderReference: "SO-77002" }, "idem-key-77002"),
+    /CONFIRMATION_REQUIRED/);
+});
