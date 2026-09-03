@@ -429,6 +429,16 @@ export async function verifyPersistedRelease(
   const sourceCandidate = result.release;
   if (!sourceCandidate) throw new ApiError("INVALID_STATE", 409);
   const capabilities = await repository.listAnalysisCapabilities(actor, run.id);
+  // Re-executing an already published candidate is not only redundant but
+  // impossible: the target page now serves that very release, so the candidate
+  // registers no tools and the report is refused. The candidate is
+  // content-addressed, so an unchanged hash means the stored attestation
+  // describes exactly these bytes.
+  const published = await repository.getLatestPublishedRelease(actor, project.id);
+  if (published?.verification.analysisRunId === run.id
+    && published.verification.candidateContentHash === sourceCandidate.contentHash) {
+    return published.verification;
+  }
   const target = await resolveReleaseTarget(
     repository,
     actor,
