@@ -235,6 +235,7 @@ export function successResponse(data: unknown, requestId: string, status = 200, 
 
 export function errorResponse(error: unknown, requestId: string, request?: Request): Response {
   const mapped = mapError(error);
+  if (mapped.code === "INTERNAL_ERROR" && !(error instanceof ApiError)) reportUnhandledFailure(error, requestId);
   const body: {
     code: string;
     error: { code: string; retryable: boolean; details?: string[] };
@@ -256,6 +257,22 @@ export function errorResponse(error: unknown, requestId: string, request?: Reque
     ]);
   }
   return successResponse(body, requestId, mapped.status, headers);
+}
+
+/**
+ * An unexpected failure reaches the client as an opaque code, which leaves a
+ * production 500 unattributable. The cause is logged server-side only; the
+ * response body is unchanged.
+ */
+function reportUnhandledFailure(error: unknown, requestId: string): void {
+  console.error(JSON.stringify({
+    level: "error",
+    event: "unhandled_api_failure",
+    request_id: requestId,
+    error_name: error instanceof Error ? error.name : typeof error,
+    error_message: error instanceof Error ? error.message : String(error),
+    stack: error instanceof Error ? error.stack ?? "" : "",
+  }));
 }
 
 function mapError(error: unknown): ApiError {
