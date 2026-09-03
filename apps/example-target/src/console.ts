@@ -24,7 +24,7 @@ export type ReservationState = Readonly<{
   orderReference: string;
   status: "reserved" | "released";
   createdAt: string;
-  releasedAt: string | null;
+  releasedAt: string;
 }>;
 export type ReservationResult = Readonly<{
   reservationId: string;
@@ -39,7 +39,7 @@ export type ReservationResult = Readonly<{
 
 type Session = string;
 type Part = { sku: string; name: string; onHand: number; reserved: number; supplierNotes: string };
-type Reservation = { reservationId: string; sku: string; quantity: number; orderReference: string; status: "reserved" | "released"; createdAt: string; releasedAt: string | null };
+type Reservation = { reservationId: string; sku: string; quantity: number; orderReference: string; status: "reserved" | "released"; createdAt: string; releasedAt: string };
 
 export type PartsConsoleOptions = Readonly<{
   operator: OperatorCredentials | null;
@@ -243,7 +243,7 @@ export class PartsConsole {
       orderReference: input.orderReference,
       status: "reserved",
       createdAt: new Date(this.#now()).toISOString(),
-      releasedAt: null,
+      releasedAt: "",
     };
     this.#reservations.set(reservation.reservationId, reservation);
     const result: ReservationResult = {

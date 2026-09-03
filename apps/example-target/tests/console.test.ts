@@ -160,7 +160,7 @@ test("the authoritative final state is readable back from the target", () => {
     orderReference: "SO-77120",
     status: "reserved",
     createdAt: "2026-09-01T00:00:00.000Z",
-    releasedAt: null,
+    releasedAt: "",
   });
   assert.throws(() => app.getReservation(session, "RSV-missing"), { code: "NOT_FOUND" });
 });

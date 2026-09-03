@@ -147,7 +147,7 @@ test("a confirmed reservation applies exactly one reversible effect and reads ba
     orderReference: "SO-90001",
     status: "reserved",
     createdAt: state.createdAt,
-    releasedAt: null,
+    releasedAt: "",
   });
   assert.match(String(state.createdAt), /^\d{4}-\d{2}-\d{2}T/);
 
