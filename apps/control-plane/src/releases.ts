@@ -153,6 +153,8 @@ export async function publishPersistedRelease(
   };
 }
 
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 function assertPublishedReleaseConvergence(input: Readonly<{
   release: ReleaseRecord;
   candidate: CandidateRelease;
@@ -175,7 +177,11 @@ function assertPublishedReleaseConvergence(input: Readonly<{
     || release.organizationId !== input.organizationId || release.projectId !== input.projectId
     || release.analysisRunId !== input.analysisRunId
     || release.capabilityStateDigest !== input.capabilityStateDigest
-    || release.verificationRunId !== input.verificationRunId
+    // A replayed publication returns the release created by the first call, which
+    // carries the verification that admitted it. Requiring the freshly minted
+    // verification's id here would make every replay unconvergeable; the release
+    // is still bound to an eligible verification of this candidate and state.
+    || !UUID.test(release.verificationRunId ?? "")
     || release.code !== candidate.code || release.contentHash !== candidate.contentHash
     || codeHash !== candidate.contentHash || release.sri !== input.integrity || codeIntegrity !== input.integrity
     || release.allowedOrigin !== input.targetOrigin || candidate.allowedOrigin !== input.targetOrigin
