@@ -9,6 +9,9 @@ const securityHeaders = [
 ];
 
 const nextConfig: NextConfig = {
+  // One persistent server process: the console's sessions and reservations
+  // live in memory and must be coherent across pages and route handlers.
+  output: "standalone",
   reactStrictMode: true,
   allowedDevOrigins: ["127.0.0.1"],
   experimental: { authInterrupts: true },

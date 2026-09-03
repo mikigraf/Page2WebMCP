@@ -1,0 +1,27 @@
+# syntax=docker/dockerfile:1
+# The example target is the customer-owned demo site a production-live journey
+# analyzes. It is deliberately not part of the trusted deployment, so it carries
+# no deployment identity; it only needs one persistent process, because the
+# console keeps every session and reservation in memory.
+ARG NODE_BASE_IMAGE
+
+FROM ${NODE_BASE_IMAGE} AS build
+
+WORKDIR /workspace
+COPY . /workspace
+RUN corepack enable && corepack prepare pnpm@10.14.0 --activate
+RUN pnpm install --frozen-lockfile
+RUN pnpm --filter @page2webmcp/example-target build
+
+FROM ${NODE_BASE_IMAGE} AS runtime
+
+ENV NODE_ENV=production \
+    PORT=3000 \
+    HOSTNAME=0.0.0.0
+WORKDIR /app
+COPY --from=build --chown=node:node /workspace/apps/example-target/.next/standalone ./
+COPY --from=build --chown=node:node /workspace/apps/example-target/.next/static ./apps/example-target/.next/static
+
+USER node
+EXPOSE 3000
+CMD ["node", "apps/example-target/server.js"]
