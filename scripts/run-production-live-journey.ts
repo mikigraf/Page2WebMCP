@@ -219,11 +219,22 @@ export async function runProductionLiveJourneyCli(
       completedOperations.push("verify-source-ownership");
     }
 
-    const enqueued = parseEnqueued(await session.post<unknown>(
+    // The enqueue key is deterministic so a rerun resumes the same attempt. When
+    // that stored attempt has terminated, retry exactly once under a key bound to
+    // it: still deterministic, so the retry itself stays resumable.
+    let enqueued = parseEnqueued(await session.post<unknown>(
       "/api/projects/analyze",
       { projectId },
       idempotencyKey("analysis", parsed.journey, environment),
     ));
+    if (enqueued.terminated) {
+      enqueued = parseEnqueued(await session.post<unknown>(
+        "/api/projects/analyze",
+        { projectId },
+        idempotencyKey("analysis", parsed.journey, environment, "", enqueued.runId),
+      ));
+      if (enqueued.terminated) throw new Error("ANALYSIS_TERMINATED");
+    }
     analysisRunId = enqueued.runId;
     completedOperations.push("enqueue-analysis");
     const analysis = await waitForAnalysis({
@@ -469,13 +480,18 @@ function parseProject(value: unknown, journey: ProductionLiveJourney): string {
   return record.id as string;
 }
 
-function parseEnqueued(value: unknown): Readonly<{ runId: string }> {
+const ENQUEUED_STATUSES = ["queued", "running", "waiting", "succeeded"] as const;
+const TERMINATED_STATUSES = ["failed", "cancelled"] as const;
+
+function parseEnqueued(value: unknown): Readonly<{ runId: string; terminated: boolean }> {
   const record = plainRecord(value);
+  const status = record ? string(record.status) : "";
+  const terminated = (TERMINATED_STATUSES as readonly string[]).includes(status);
   if (!record || !UUID.test(string(record.runId))
-    || !["queued", "running", "waiting", "succeeded"].includes(string(record.status))) {
+    || !terminated && !(ENQUEUED_STATUSES as readonly string[]).includes(status)) {
     throw new Error("CONTROL_RESPONSE_INVALID");
   }
-  return { runId: record.runId as string };
+  return { runId: record.runId as string, terminated };
 }
 
 async function ensureWebsiteOwnership(
