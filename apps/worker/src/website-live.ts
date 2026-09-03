@@ -1168,8 +1168,13 @@ export function createConfiguredWebsiteAnalysisAdapter(
     }
   };
   configuredAdapter.finalizeAuthenticationCheckpoint = async (source, finalizeSignal) => {
+    // The claimed run record the runner passes here is a raw DB row: it never
+    // carries a top-level sourceIdentityHash (only the resume/analyze paths
+    // compute and attach it). The checkpoint's own hash is already validated
+    // against the persisted source snapshot at claim time, so it stands in.
+    const sourceIdentityHash = source.sourceIdentityHash ?? source.authenticationCheckpoint?.sourceIdentityHash;
     if (!source.id || !source.organizationId || !source.projectId || !source.sourceSnapshotId
-      || !source.sourceIdentityHash || !source.authenticationCheckpoint) {
+      || !sourceIdentityHash || !source.authenticationCheckpoint) {
       throw checkpointInvalid("finalize_source_incomplete");
     }
     const ownershipIdentity = {
@@ -1181,7 +1186,7 @@ export function createConfiguredWebsiteAnalysisAdapter(
       checkpointReference: source.authenticationCheckpoint.checkpointReference,
       ...ownershipIdentity,
       sourceSnapshotId: source.sourceSnapshotId,
-      sourceIdentityHash: source.sourceIdentityHash,
+      sourceIdentityHash,
       targetOriginDigest: source.authenticationCheckpoint.targetOriginDigest,
       expiresAt: source.authenticationCheckpoint.expiresAt,
       outcome: "completed" as const,
