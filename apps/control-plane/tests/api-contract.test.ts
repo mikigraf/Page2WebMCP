@@ -112,3 +112,36 @@ test("safe error responses include stable correlation without raw details", asyn
   });
   assert.doesNotMatch(JSON.stringify(body), /do-not-leak/);
 });
+
+test("an unexpected failure is logged server-side with its cause and correlation", async () => {
+  // The client body stays opaque, but discarding the cause entirely leaves a
+  // production 500 unattributable. The server log carries it.
+  const requestId = createRequestId();
+  const lines: string[] = [];
+  const original = console.error;
+  console.error = (line: unknown) => { lines.push(String(line)); };
+  try {
+    errorResponse(new TypeError("upstream shape changed"), requestId);
+  } finally {
+    console.error = original;
+  }
+  assert.equal(lines.length, 1);
+  const logged = JSON.parse(lines[0]!) as Record<string, unknown>;
+  assert.equal(logged.event, "unhandled_api_failure");
+  assert.equal(logged.request_id, requestId);
+  assert.equal(logged.error_name, "TypeError");
+  assert.equal(logged.error_message, "upstream shape changed");
+  assert.equal(typeof logged.stack, "string");
+});
+
+test("a mapped failure is not logged as unhandled", () => {
+  const lines: string[] = [];
+  const original = console.error;
+  console.error = (line: unknown) => { lines.push(String(line)); };
+  try {
+    errorResponse(new ApiError("NOT_FOUND", 404), createRequestId());
+  } finally {
+    console.error = original;
+  }
+  assert.deepEqual(lines, []);
+});
