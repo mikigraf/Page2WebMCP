@@ -244,7 +244,9 @@ export type WebsiteAnalysisConfiguration = Readonly<{
   }>;
   explorer: {
     observe(input: Readonly<{
-      phase: "public" | "authenticated";
+      // The gateway observation contract: "public" names an observed
+      // authentication result, never a request phase.
+      phase: "unauthenticated" | "authenticated";
       targetOrigin: string;
       sourceUrl: string;
       cdpReference: string;
@@ -763,7 +765,7 @@ export function createWebsiteAnalysisAdapter(configuration: WebsiteAnalysisConfi
       proxyPolicyReference: configuration.browser.proxyPolicyReference,
     }, { ...configuration.browser.controls, signal }, async (session, sessionSignal) => {
       const first = await configuration.explorer.observe({
-        phase: "public",
+        phase: "unauthenticated",
         targetOrigin: preflight.targetOrigin,
         sourceUrl: preflight.finalUrl,
         cdpReference: session.cdpReference,
