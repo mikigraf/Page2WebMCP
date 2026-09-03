@@ -483,6 +483,7 @@ function parseProject(value: unknown, journey: ProductionLiveJourney): string {
 
 const ENQUEUED_STATUSES = ["queued", "running", "waiting", "succeeded"] as const;
 const TERMINATED_STATUSES = ["failed", "cancelled"] as const;
+const RESUMABLE_AUTHENTICATION: readonly string[] = ["waiting", "ready"];
 
 /**
  * The project's latest analysis attempt, with whether it has terminated. A live
@@ -567,7 +568,10 @@ async function waitForAnalysis(input: Readonly<{
         await input.delay(DEFAULT_POLL_INTERVAL_MS);
         continue;
       }
-      if (!input.resumeAuthentication || handoff.state !== "ready") {
+      // The status projection reports "waiting" until the checkpoint is
+      // consumed, so an operator resuming after signing in asks the durable
+      // handoff API to complete it and treats only "resumed" as done.
+      if (!input.resumeAuthentication || !RESUMABLE_AUTHENTICATION.includes(handoff.state)) {
         return { actionCode: input.resumeAuthentication
           ? "WEBSITE_AUTHENTICATION_ACTION_REQUIRED"
           : "WEBSITE_WORKER_RESTART_AND_AUTHENTICATION_REQUIRED" };

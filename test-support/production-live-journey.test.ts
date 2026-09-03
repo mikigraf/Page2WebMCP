@@ -941,3 +941,60 @@ test("an enqueue that still returns a terminated attempt reports it rather than 
   assert.equal(result.output.code, "ANALYSIS_TERMINATED");
   assert.equal(session.calls.filter((call) => call.path === "/api/projects/analyze").length, 1);
 });
+
+test("resuming completes a handoff the status projection still reports as waiting", async () => {
+  const runId = "22222222-2222-4222-8222-222222222222";
+  const endpoint = `/api/workflow-runs/${runId}/website-authentication`;
+  const session = new FakeSession([
+    deploymentIdentity(),
+    { role: "owner" },
+    { id: "11111111-1111-4111-8111-111111111111", sourceType: "website" },
+    { ownership: { state: "verified", targetOrigin: "https://account.widgets.dev" }, canAnalyze: true },
+    {},
+    { runId, status: "queued" },
+    { run: { id: runId, status: "waiting" }, capabilities: [],
+      websiteUserHandoff: { authentication: { endpoint, state: "waiting" } } },
+    // The projection stays "waiting" until the checkpoint is consumed.
+    { authentication: { state: "waiting", targetOrigin: "https://account.widgets.dev",
+      expiresAt: "2026-09-01T13:00:00.000Z", canAct: true } },
+    { authentication: { state: "resumed", targetOrigin: "https://account.widgets.dev",
+      expiresAt: "2026-09-01T13:00:00.000Z", canAct: false } },
+    { run: { id: runId, status: "succeeded" },
+      result: { providerProvenance: { mode: "website", fixture: false } },
+      capabilities: [{ id: "33333333-3333-4333-8333-333333333333", riskTier: "R1", status: "proposed", version: 1 }] },
+  ]);
+  const result = await runProductionLiveJourneyCli(
+    ["--provider", "website", "--live", "--resume-authentication"],
+    environment("website"),
+    dependencies(session),
+  );
+  const acknowledgement = session.calls.find((call) => call.method === "post" && call.path === endpoint);
+  assert.deepEqual(acknowledgement?.body, { action: "check" }, "the durable handoff API is asked to complete it");
+  assert.equal(result.output.code, "CAPABILITY_REVIEW_REQUIRED");
+});
+
+test("resuming without an actionable handoff still reports the action, not a false completion", async () => {
+  const runId = "22222222-2222-4222-8222-222222222222";
+  const endpoint = `/api/workflow-runs/${runId}/website-authentication`;
+  const session = new FakeSession([
+    deploymentIdentity(),
+    { role: "owner" },
+    { id: "11111111-1111-4111-8111-111111111111", sourceType: "website" },
+    { ownership: { state: "verified", targetOrigin: "https://account.widgets.dev" }, canAnalyze: true },
+    {},
+    { runId, status: "queued" },
+    { run: { id: runId, status: "waiting" }, capabilities: [],
+      websiteUserHandoff: { authentication: { endpoint, state: "waiting" } } },
+    { authentication: { state: "waiting", targetOrigin: "https://account.widgets.dev",
+      expiresAt: "2026-09-01T13:00:00.000Z", canAct: true } },
+    { authentication: { state: "waiting", targetOrigin: "https://account.widgets.dev",
+      expiresAt: "2026-09-01T13:00:00.000Z", canAct: true } },
+  ]);
+  const result = await runProductionLiveJourneyCli(
+    ["--provider", "website", "--live", "--resume-authentication"],
+    environment("website"),
+    dependencies(session),
+  );
+  assert.equal(result.output.code, "WEBSITE_AUTHENTICATION_ACTION_REQUIRED");
+  assert.equal(result.output.liveSuccess, false);
+});
