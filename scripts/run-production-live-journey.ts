@@ -219,24 +219,15 @@ export async function runProductionLiveJourneyCli(
       completedOperations.push("verify-source-ownership");
     }
 
-    // The enqueue key is deterministic so a rerun resumes the same attempt. When
-    // that stored attempt has terminated, retry exactly once under a key bound to
-    // it: still deterministic, so the retry itself stays resumable.
-    let enqueued = parseEnqueued(await session.post<unknown>(
+    // The enqueue key is deterministic, so a rerun resumes the stored attempt.
+    // Binding it to the project's latest terminated attempt starts exactly one
+    // fresh run no matter how many earlier attempts failed, and leaves a live
+    // attempt on the base key so it is still resumed rather than duplicated.
+    const enqueued = parseEnqueued(await session.post<unknown>(
       "/api/projects/analyze",
       { projectId },
-      idempotencyKey("analysis", parsed.journey, environment),
+      idempotencyKey("analysis", parsed.journey, environment, "", terminatedAttemptId(projectResponse)),
     ));
-    const attempted = new Set<string>();
-    while (enqueued.terminated && attempted.size < MAX_ANALYSIS_ENQUEUE_RETRIES
-      && !attempted.has(enqueued.runId)) {
-      attempted.add(enqueued.runId);
-      enqueued = parseEnqueued(await session.post<unknown>(
-        "/api/projects/analyze",
-        { projectId },
-        idempotencyKey("analysis", parsed.journey, environment, "", enqueued.runId),
-      ));
-    }
     if (enqueued.terminated) throw new Error("ANALYSIS_TERMINATED");
     analysisRunId = enqueued.runId;
     completedOperations.push("enqueue-analysis");
@@ -485,9 +476,17 @@ function parseProject(value: unknown, journey: ProductionLiveJourney): string {
 
 const ENQUEUED_STATUSES = ["queued", "running", "waiting", "succeeded"] as const;
 const TERMINATED_STATUSES = ["failed", "cancelled"] as const;
-// Each terminated attempt yields a distinct next key, so a bounded walk reaches
-// the newest attempt without ever enqueueing an unbounded number of runs.
-const MAX_ANALYSIS_ENQUEUE_RETRIES = 3;
+
+/**
+ * The id of the project's latest attempt when it has terminated, else "". Used
+ * as the enqueue key's attempt identity so a terminated history costs exactly
+ * one fresh run, while a live attempt keeps the base key and is resumed.
+ */
+function terminatedAttemptId(projectResponse: unknown): string {
+  const latest = plainRecord(plainRecord(projectResponse)?.latestAnalysis);
+  if (!latest || !UUID.test(string(latest.id))) return "";
+  return (TERMINATED_STATUSES as readonly string[]).includes(string(latest.status)) ? string(latest.id) : "";
+}
 
 function parseEnqueued(value: unknown): Readonly<{ runId: string; terminated: boolean }> {
   const record = plainRecord(value);

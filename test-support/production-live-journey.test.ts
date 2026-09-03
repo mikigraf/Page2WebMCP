@@ -871,65 +871,15 @@ test("positive readiness without the persisted receipt projection remains false"
   assert.equal(result.output.receiptLocation, undefined);
 });
 
-test("an idempotent enqueue that returns a failed analysis starts one fresh attempt bound to it", async () => {
-  const failedRunId = "99999999-9999-4999-8999-999999999999";
-  const freshRunId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-  const verifiedOwnership = {
-    ownership: { state: "verified", targetOrigin: "https://account.widgets.dev" },
-    canAnalyze: true,
-  };
-  const session = new FakeSession([
-    deploymentIdentity(),
-    { role: "owner" },
-    { id: "11111111-1111-4111-8111-111111111111", sourceType: "website" },
-    verifiedOwnership,
-    // The stored idempotent response for the first attempt, now terminally failed.
-    { runId: failedRunId, status: "failed" },
-    // The retry under a distinct key enqueues a new run.
-    { runId: freshRunId, status: "queued" },
-    { run: { id: freshRunId, status: "succeeded" },
-      result: { providerProvenance: { mode: "website", fixture: false } },
-      capabilities: [{ id: "33333333-3333-4333-8333-333333333333", riskTier: "R1", status: "proposed", version: 1 }] },
-  ]);
-  const result = await runProductionLiveJourneyCli(
-    ["--live", "--provider", "website"], environment("website"), dependencies(session),
-  );
-  const enqueues = session.calls.filter((call) => call.path === "/api/projects/analyze");
-  assert.equal(enqueues.length, 2, "the failed attempt is retried exactly once");
-  assert.notEqual(enqueues[0]!.key, enqueues[1]!.key, "the retry uses a distinct idempotency key");
-  assert.ok(String(enqueues[1]!.key).length <= 128);
-  assert.equal(result.output.completedOperations.includes("enqueue-analysis"), true);
-  assert.equal(result.output.code, "CAPABILITY_REVIEW_REQUIRED", "the fresh attempt is polled normally");
-});
-
-test("a still-failing retry is reported as a terminated analysis, not an invalid response", async () => {
-  const failedRunId = "99999999-9999-4999-8999-999999999999";
-  const session = new FakeSession([
-    deploymentIdentity(),
-    { role: "owner" },
-    { id: "11111111-1111-4111-8111-111111111111", sourceType: "website" },
-    { ownership: { state: "verified", targetOrigin: "https://account.widgets.dev" }, canAnalyze: true },
-    { runId: failedRunId, status: "failed" },
-    { runId: failedRunId, status: "failed" },
-  ]);
-  const result = await runProductionLiveJourneyCli(
-    ["--live", "--provider", "website"], environment("website"), dependencies(session),
-  );
-  assert.equal(result.output.liveSuccess, false);
-  assert.equal(result.output.code, "ANALYSIS_TERMINATED");
-});
-
-test("a chain of terminated attempts is walked to the newest one within a bounded number of enqueues", async () => {
-  const first = "99999999-9999-4999-8999-999999999999";
-  const second = "88888888-8888-4888-8888-888888888888";
+test("the enqueue key is bound to the project's latest terminated attempt, however long its history", async () => {
+  const latest = "99999999-9999-4999-8999-999999999999";
   const fresh = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
   const session = new FakeSession([
     deploymentIdentity(),
     { role: "owner" },
-    { id: "11111111-1111-4111-8111-111111111111", sourceType: "website" },
+    { id: "11111111-1111-4111-8111-111111111111", sourceType: "website",
+      latestAnalysis: { id: latest, status: "failed" } },
     { ownership: { state: "verified", targetOrigin: "https://account.widgets.dev" }, canAnalyze: true },
-    { runId: first, status: "failed" },
-    { runId: second, status: "cancelled" },
     { runId: fresh, status: "queued" },
     { run: { id: fresh, status: "succeeded" },
       result: { providerProvenance: { mode: "website", fixture: false } },
@@ -938,27 +888,54 @@ test("a chain of terminated attempts is walked to the newest one within a bounde
   const result = await runProductionLiveJourneyCli(
     ["--live", "--provider", "website"], environment("website"), dependencies(session),
   );
-  const keys = session.calls.filter((call) => call.path === "/api/projects/analyze").map((call) => call.key);
-  assert.equal(keys.length, 3);
-  assert.equal(new Set(keys).size, 3, "each step uses its own deterministic key");
+  const enqueues = session.calls.filter((call) => call.path === "/api/projects/analyze");
+  assert.equal(enqueues.length, 1, "one enqueue regardless of how many attempts failed before");
   assert.equal(result.output.code, "CAPABILITY_REVIEW_REQUIRED");
 });
 
-test("a chain that never yields a live attempt stops after the bounded walk", async () => {
-  const terminated = (runId: string) => ({ runId, status: "failed" });
-  const session = new FakeSession([
+test("a project whose latest attempt is still live resumes it under the base key", async () => {
+  const running = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+  const withLatest = new FakeSession([
+    deploymentIdentity(),
+    { role: "owner" },
+    { id: "11111111-1111-4111-8111-111111111111", sourceType: "website",
+      latestAnalysis: { id: running, status: "running" } },
+    { ownership: { state: "verified", targetOrigin: "https://account.widgets.dev" }, canAnalyze: true },
+    { runId: running, status: "running" },
+    { run: { id: running, status: "succeeded" },
+      result: { providerProvenance: { mode: "website", fixture: false } },
+      capabilities: [{ id: "33333333-3333-4333-8333-333333333333", riskTier: "R1", status: "proposed", version: 1 }] },
+  ]);
+  const withoutLatest = new FakeSession([
     deploymentIdentity(),
     { role: "owner" },
     { id: "11111111-1111-4111-8111-111111111111", sourceType: "website" },
     { ownership: { state: "verified", targetOrigin: "https://account.widgets.dev" }, canAnalyze: true },
-    terminated("99999999-9999-4999-8999-999999999999"),
-    terminated("88888888-8888-4888-8888-888888888888"),
-    terminated("77777777-7777-4777-8777-777777777777"),
-    terminated("66666666-6666-4666-8666-666666666666"),
+    { runId: running, status: "queued" },
+    { run: { id: running, status: "succeeded" },
+      result: { providerProvenance: { mode: "website", fixture: false } },
+      capabilities: [{ id: "33333333-3333-4333-8333-333333333333", riskTier: "R1", status: "proposed", version: 1 }] },
+  ]);
+  for (const session of [withLatest, withoutLatest]) {
+    await runProductionLiveJourneyCli(["--live", "--provider", "website"], environment("website"), dependencies(session));
+  }
+  const key = (session: FakeSession) => session.calls.find((call) => call.path === "/api/projects/analyze")?.key;
+  assert.equal(key(withLatest), key(withoutLatest), "a live attempt keeps the base key");
+});
+
+test("an enqueue that still returns a terminated attempt reports it rather than an invalid response", async () => {
+  const latest = "99999999-9999-4999-8999-999999999999";
+  const session = new FakeSession([
+    deploymentIdentity(),
+    { role: "owner" },
+    { id: "11111111-1111-4111-8111-111111111111", sourceType: "website",
+      latestAnalysis: { id: latest, status: "failed" } },
+    { ownership: { state: "verified", targetOrigin: "https://account.widgets.dev" }, canAnalyze: true },
+    { runId: latest, status: "failed" },
   ]);
   const result = await runProductionLiveJourneyCli(
     ["--live", "--provider", "website"], environment("website"), dependencies(session),
   );
   assert.equal(result.output.code, "ANALYSIS_TERMINATED");
-  assert.equal(session.calls.filter((call) => call.path === "/api/projects/analyze").length, 4);
+  assert.equal(session.calls.filter((call) => call.path === "/api/projects/analyze").length, 1);
 });
