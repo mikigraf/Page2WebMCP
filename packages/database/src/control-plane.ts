@@ -610,6 +610,9 @@ export type PublishRequest = IdempotentRequest & {
 
 export type RepositoryErrorCode =
   | "FORBIDDEN"
+  // The connected login cannot assume the role its execution context requires:
+  // a deployment misconfiguration, never a per-request authorization outcome.
+  | "DATABASE_ROLE_FORBIDDEN"
   | "NOT_FOUND"
   | "IDEMPOTENCY_CONFLICT"
   | "VERSION_CONFLICT"

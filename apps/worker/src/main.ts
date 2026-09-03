@@ -32,7 +32,7 @@ export type ProductionWorkerMainDependencies = Readonly<{
   workerId?: string;
 }>;
 
-class WorkerStartupConfigurationError extends Error {
+export class WorkerStartupConfigurationError extends Error {
   constructor(readonly code: string, readonly missingEnvironment: readonly string[]) {
     super(code);
     this.name = "WorkerStartupConfigurationError";
@@ -81,6 +81,10 @@ export async function runProductionWorker(
         consecutiveFailures = 0;
         if (!processed) await delay(pollMs, signal);
       } catch (error) {
+        // Retrying cannot fix a login that lacks the worker role; stop and name it.
+        if (stableCode(error) === "DATABASE_ROLE_FORBIDDEN") {
+          throw new WorkerStartupConfigurationError("DATABASE_ROLE_FORBIDDEN", ["DATABASE_URL"]);
+        }
         consecutiveFailures += 1;
         console.error(JSON.stringify({
           level: "error",
@@ -124,6 +128,7 @@ function startupFailure(error: unknown): Readonly<{ code: string; missingEnviron
   }
   const code = stableCode(error, "WORKER_STARTUP_FAILED");
   const keysByCode: Readonly<Record<string, readonly string[]>> = {
+    DATABASE_ROLE_FORBIDDEN: ["DATABASE_URL"],
     DATABASE_URL_REQUIRED: ["DATABASE_URL"],
     INVALID_PROVIDER_MODE: ["PAGE2WEBMCP_PROVIDER_MODE"],
     INVALID_STORAGE_MODE: ["PAGE2WEBMCP_STORAGE_MODE"],
