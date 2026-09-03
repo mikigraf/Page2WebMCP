@@ -4,7 +4,11 @@ import { open } from "node:fs/promises";
 
 const MAX_CREDENTIAL_BYTES = 8_192;
 const MAX_CONTROL_RESPONSE_BYTES = 1_048_576;
-const REQUEST_TIMEOUT_MS = 20_000;
+// Candidate verification drives a real browser in the release verifier and
+// routinely takes longer than twenty seconds, so the operator's deadline has to
+// outlast it or the command aborts a request the server is completing.
+export const PRODUCTION_CONTROL_REQUEST_TIMEOUT_MS = 120_000;
+const REQUEST_TIMEOUT_MS = PRODUCTION_CONTROL_REQUEST_TIMEOUT_MS;
 const IDEMPOTENCY_KEY = /^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/;
 const API_PATH = /^\/api\/[A-Za-z0-9_./-]+$/;
 const COOKIE_NAME = /^[!#$%&'*+.^_`|~0-9A-Za-z-]{1,128}$/;
