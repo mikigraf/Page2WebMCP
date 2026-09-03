@@ -416,6 +416,25 @@ test("website worker checkpoints public evidence and resumes the exact suspended
   await adapter.finalizeAuthenticationCheckpoint(resumedSource, new AbortController().signal);
   assert.deepEqual(events, ["auth:finalize", "auth:reconcile"]);
 
+  // The claimed run record the runner passes to finalize is a raw DB row: it
+  // never carries a top-level sourceIdentityHash (only resume/analyze enrich
+  // it). Finalize must fall back to the checkpoint's own hash, which the claim
+  // transaction already validated against the persisted source snapshot.
+  const finalizeEvents: string[] = [];
+  const finalizeOnly = createWebsiteAnalysisAdapter(websiteConfiguration(finalizeEvents, async () => {
+    throw new Error("ANALYZE_MUST_NOT_RUN");
+  }));
+  const claimedRecordShape = {
+    sourceType: "website" as const, sourceUrl: `${websiteOrigin}/`,
+    organizationId: "org-1", projectId: "project-1", id: "run-auth",
+    sourceConfiguration: { kind: "website" as const }, sourceSnapshotId: "snapshot-1",
+    authenticationCheckpoint: resumedSource.authenticationCheckpoint,
+  };
+  assert.equal("sourceIdentityHash" in claimedRecordShape, false);
+  assert.ok(finalizeOnly.finalizeAuthenticationCheckpoint);
+  await finalizeOnly.finalizeAuthenticationCheckpoint(claimedRecordShape, new AbortController().signal);
+  assert.deepEqual(finalizeEvents, ["auth:finalize", "auth:reconcile"]);
+
   const failedEvents: string[] = [];
   const failed = createWebsiteAnalysisAdapter(websiteConfiguration(failedEvents, async () => { throw new Error("EXPLORER_CRASHED"); }));
   await assert.rejects(failed({

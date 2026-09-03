@@ -269,35 +269,37 @@ export async function attestReleaseInstallation(
     const result = installedVerifierResult(await port.verifyInstalled(input, deadlineSignal), port.mode);
     return { verifierIdentity: identity, ...result };
   }, signal);
-  if (!report || typeof report !== "object"
-    || report.observedArtifactUrl !== input.artifactUrl
-    || report.observedDownloadUrl !== input.downloadUrl
-    || report.observedLocalOnly !== input.localOnly
-    || report.observedIntegrity !== input.integrity
-    || report.servedContentHash !== input.contentHash
-    || report.observedTargetOrigin !== input.targetOrigin
-    || report.normalPageLoad !== true
-    || report.routeInterception !== false
-    || report.injectedRegistration !== false
-    || report.syntheticHarness !== false
-    || !["native", "compatibility_shim"].includes(report.webMcpImplementation)
-    || !report.csp || !["allowed", "blocked"].includes(report.csp.hosted)
-    || report.csp.directive !== undefined && !safeDirective(report.csp.directive)) {
-    throw new Error("INSTALLED_VERIFICATION_INVALID");
-  }
+  if (!report || typeof report !== "object") throw installedInvalid("report_missing");
+  if (report.observedArtifactUrl !== input.artifactUrl) throw installedInvalid("artifact_url");
+  if (report.observedDownloadUrl !== input.downloadUrl) throw installedInvalid("download_url");
+  if (report.observedLocalOnly !== input.localOnly) throw installedInvalid("local_only");
+  if (report.observedIntegrity !== input.integrity) throw installedInvalid("integrity");
+  if (report.servedContentHash !== input.contentHash) throw installedInvalid("served_content_hash");
+  if (report.observedTargetOrigin !== input.targetOrigin) throw installedInvalid("target_origin");
+  if (report.normalPageLoad !== true) throw installedInvalid("normal_page_load");
+  if (report.routeInterception !== false) throw installedInvalid("route_interception");
+  if (report.injectedRegistration !== false) throw installedInvalid("injected_registration");
+  if (report.syntheticHarness !== false) throw installedInvalid("synthetic_harness");
+  if (!["native", "compatibility_shim"].includes(report.webMcpImplementation)) throw installedInvalid("webmcp_implementation");
+  if (!report.csp || !["allowed", "blocked"].includes(report.csp.hosted)
+    || report.csp.directive !== undefined && !safeDirective(report.csp.directive)) throw installedInvalid("csp");
   const pendingSelfHost = !input.selfHostedUrl && report.csp.hosted === "blocked";
   if (pendingSelfHost) {
     if (report.executedArtifactUrl !== null || report.executedContentHash !== null
       || !Array.isArray(report.registeredTools) || report.registeredTools.length !== 0
       || report.duplicateLoadHarmless !== null || report.executionEvidence !== null) {
-      throw new Error("INSTALLED_VERIFICATION_INVALID");
+      throw installedInvalid("pending_self_host_not_idle");
     }
-  } else if (report.executedArtifactUrl !== (input.selfHostedUrl ?? input.artifactUrl)
-    || report.executedContentHash !== input.contentHash
-    || !equalStrings(report.registeredTools, input.expectedTools)
-    || report.duplicateLoadHarmless !== true
-    || !validInstalledExecutionEvidence(report.executionEvidence, input.manifest, input.expectedTools)) {
-    throw new Error("INSTALLED_VERIFICATION_INVALID");
+  } else if (report.executedArtifactUrl !== (input.selfHostedUrl ?? input.artifactUrl)) {
+    throw installedInvalid("executed_artifact_url");
+  } else if (report.executedContentHash !== input.contentHash) {
+    throw installedInvalid("executed_content_hash");
+  } else if (!equalStrings(report.registeredTools, input.expectedTools)) {
+    throw installedInvalid(`registered_tools observed=${JSON.stringify(report.registeredTools)} expected=${JSON.stringify(input.expectedTools)}`);
+  } else if (report.duplicateLoadHarmless !== true) {
+    throw installedInvalid("duplicate_load_not_harmless");
+  } else if (!validInstalledExecutionEvidence(report.executionEvidence, input.manifest, input.expectedTools)) {
+    throw installedInvalid("execution_evidence");
   }
   if (port.mode !== "hermetic" && report.webMcpImplementation !== "native") {
     throw new Error("WEBMCP_NATIVE_REQUIRED");
@@ -702,6 +704,14 @@ function candidateInvalid(reason: string): Error {
   return Object.assign(new Error("CANDIDATE_VERIFICATION_INVALID"), { reason });
 }
 
+/** Mirrors candidateInvalid for the installed-release report and its input. */
+function installedInvalid(reason: string): Error {
+  console.error(JSON.stringify({
+    level: "error", event: "installed_verification_invalid", reason,
+  }));
+  return Object.assign(new Error("INSTALLED_VERIFICATION_INVALID"), { reason });
+}
+
 function candidateReportRejection(
   report: CandidateVerificationReport | undefined,
   input: CandidateVerificationInput,
@@ -736,28 +746,38 @@ function assertInstalledInput(input: InstalledVerificationInput, mode: ReleaseVe
   try {
     page = new URL(input.pageUrl);
   } catch {
-    throw new Error("INSTALLED_VERIFICATION_INVALID");
+    throw installedInvalid("page_url_unparseable");
   }
   const prefix = input.localOnly
     ? "http://127.0.0.1:58321/storage/v1/object/public/page2webmcp-releases"
     : "https://bimqgiedckdurqiywctl.supabase.co/storage/v1/object/public/page2webmcp-releases";
   const artifactUrl = `${prefix}/${input.contentHash}.js`;
   const downloadUrl = `${artifactUrl}?download=page2webmcp-${input.contentHash}.js`;
-  if (!targetOrigin || page.origin !== targetOrigin || page.username || page.password || page.search || page.hash
-    || typeof input.localOnly !== "boolean" || mode === "live" && input.localOnly
-    || input.artifactUrl !== artifactUrl || input.downloadUrl !== downloadUrl
-    || !HASH.test(input.contentHash) || !SRI.test(input.integrity) || !validTools(input.expectedTools)) {
-    throw new Error("INSTALLED_VERIFICATION_INVALID");
+  if (!targetOrigin) throw installedInvalid("target_origin_not_exact_https");
+  if (page.origin !== targetOrigin || page.username || page.password || page.search || page.hash) {
+    throw installedInvalid("page_url_not_bare_target_origin");
   }
+  if (typeof input.localOnly !== "boolean") throw installedInvalid("local_only_not_boolean");
+  if (mode === "live" && input.localOnly) throw installedInvalid("local_only_in_live_mode");
+  if (input.artifactUrl !== artifactUrl) {
+    throw installedInvalid(`artifact_url computed=${JSON.stringify(artifactUrl)} input=${JSON.stringify(input.artifactUrl)}`);
+  }
+  if (input.downloadUrl !== downloadUrl) {
+    throw installedInvalid(`download_url computed=${JSON.stringify(downloadUrl)} input=${JSON.stringify(input.downloadUrl)}`);
+  }
+  if (!HASH.test(input.contentHash)) throw installedInvalid("content_hash_shape");
+  if (!SRI.test(input.integrity)) throw installedInvalid("integrity_shape");
+  if (!validTools(input.expectedTools)) throw installedInvalid("expected_tools_shape");
   if (input.selfHostedUrl) {
     try {
       const selfHosted = new URL(input.selfHostedUrl);
       if (selfHosted.origin !== targetOrigin || selfHosted.username || selfHosted.password
         || selfHosted.search || selfHosted.hash) {
-        throw new Error("INSTALLED_VERIFICATION_INVALID");
+        throw installedInvalid("self_hosted_url_not_bare_target_origin");
       }
-    } catch {
-      throw new Error("INSTALLED_VERIFICATION_INVALID");
+    } catch (error) {
+      if (error instanceof Error && error.message === "INSTALLED_VERIFICATION_INVALID") throw error;
+      throw installedInvalid("self_hosted_url_unparseable");
     }
   }
 }

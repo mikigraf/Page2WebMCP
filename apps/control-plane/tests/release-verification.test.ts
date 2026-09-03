@@ -365,6 +365,44 @@ test("a refused candidate report names the field that refused it", async () => {
   );
 });
 
+test("a refused installation report names the field that refused it", async () => {
+  // One stable code covers every rejection, which leaves a live refusal
+  // unattributable. The reason names the field and, for the tools, the diff.
+  const port: ReleaseVerificationPort = {
+    mode: "hermetic",
+    verifyCandidate: async () => { throw new Error("UNUSED"); },
+    verifyInstalled: async (input) => ({
+      observedArtifactUrl: input.artifactUrl,
+      observedDownloadUrl: input.downloadUrl,
+      observedLocalOnly: input.localOnly,
+      observedIntegrity: input.integrity,
+      executedArtifactUrl: input.artifactUrl,
+      servedContentHash: input.contentHash,
+      executedContentHash: input.contentHash,
+      observedTargetOrigin: input.targetOrigin,
+      registeredTools: [...input.expectedTools, "find_order"],
+      webMcpImplementation: "native",
+      normalPageLoad: true,
+      routeInterception: false,
+      injectedRegistration: false,
+      syntheticHarness: false,
+      duplicateLoadHarmless: true,
+      executionEvidence: installedExecutionEvidence(),
+      csp: { hosted: "allowed" },
+    }),
+  };
+  await assert.rejects(
+    attestReleaseInstallation(installedInput(), port, new AbortController().signal),
+    (error: unknown) => {
+      assert.equal((error as Error).message, "INSTALLED_VERIFICATION_INVALID");
+      const reason = (error as { reason?: string }).reason ?? "";
+      assert.match(reason, /^registered_tools /);
+      assert.match(reason, /find_order/);
+      return true;
+    },
+  );
+});
+
 test("configured installation performs a fresh readiness handshake and returns its identity", async () => {
   const origin = "https://verifier.example";
   const token = "v".repeat(32);
