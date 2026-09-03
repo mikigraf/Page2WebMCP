@@ -141,6 +141,7 @@ function controlHarness(input: Readonly<{
   const activeLeaseByRun = new Map<string, string>();
   let browserStartAttempts = 0;
   let observationCount = 0;
+  const observedPhases: string[] = [];
   const cleanupResourcesFor = (checkpointReference: string) => {
     const retained = terminalCleanupByCheckpoint.get(checkpointReference);
     if (retained) return retained;
@@ -319,6 +320,7 @@ function controlHarness(input: Readonly<{
     }
     if (url.endsWith("/v1/website-observations/observe")) {
       observationCount += 1;
+      observedPhases.push(String(body.phase));
       return jsonResponse(url, {
         gatewayProtocolVersion: body.gatewayProtocolVersion,
         idempotencyKey: body.idempotencyKey,
@@ -461,7 +463,7 @@ function controlHarness(input: Readonly<{
     },
   };
   return {
-    calls, fetch: fetcher, transport, expiresAt: () => currentExpiry,
+    calls, fetch: fetcher, transport, expiresAt: () => currentExpiry, observedPhases,
     policyReferences: () => [...issuedPolicies.values()].map(({ reference }) => reference),
     leaseIds: () => [...issuedLeases.values()],
     providerSessionIds: () => [...issuedBrowserSessions.values()],
@@ -1179,4 +1181,21 @@ test("a rejected control reports no gateway code when the body carries none", as
     sourceConfiguration: { kind: "website" }, leaseGeneration: 1,
   }, new AbortController().signal), /^Error: WEBSITE_CONTROL_REJECTED$/);
   assert.deepEqual(diagnostics, [{ control: WEBSITE_LIVE_CONTROL_PATHS.policyIssue, status: 401 }]);
+});
+
+test("observation requests use the phase vocabulary the gateway accepts", async () => {
+  const harness = controlHarness();
+  const adapter = createConfiguredWebsiteAnalysisAdapter(environment(), {
+    controlTransport: harness.transport, clock: () => now, ...networkControls(harness.expiresAt),
+  });
+  await adapter({
+    id: "analysis-run-observation-phase", organizationId: "organization-1", projectId: "project-1",
+    sourceType: "website", sourceUrl: "https://widgets.example/app",
+    sourceConfiguration: { kind: "website" }, leaseGeneration: 1,
+  }, new AbortController().signal).catch(() => undefined);
+  assert.ok(harness.observedPhases.length > 0, "at least one observation is requested");
+  for (const phase of harness.observedPhases) {
+    assert.ok(["unauthenticated", "authenticated"].includes(phase), `unexpected wire phase ${phase}`);
+  }
+  assert.equal(harness.observedPhases[0], "unauthenticated");
 });

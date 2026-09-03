@@ -197,7 +197,7 @@ function websiteObservations(): WebsiteObservationInput {
   };
 }
 
-function websiteConfiguration(events: string[], observe: (phase: "public" | "authenticated", signal: AbortSignal) => Promise<{ observations: WebsiteObservationInput; requiresAuthentication: boolean }>) {
+function websiteConfiguration(events: string[], observe: (phase: "unauthenticated" | "authenticated", signal: AbortSignal) => Promise<{ observations: WebsiteObservationInput; requiresAuthentication: boolean }>) {
   type AuthenticationControls = WebsiteAnalysisConfiguration["authentication"];
   const storedEvidence = new Map<string, import("../../../packages/providers/src/website-evidence.ts").WebsiteEvidence>();
   let storedCheckpointAttestation: BrowserUseSuspensionAttestation | undefined;
@@ -303,7 +303,7 @@ function websiteConfiguration(events: string[], observe: (phase: "public" | "aut
       finalize: async () => { events.push("auth:finalize"); return { finalized: true as const }; },
       reconcile: async () => { events.push("auth:reconcile"); return { reconciled: true as const, terminated: true as const }; },
     },
-    explorer: { observe: async ({ phase, firewall, signal }: { phase: "public" | "authenticated"; firewall: ReturnType<typeof import("../../../packages/security/src/security.ts")["createDiscoveryFirewall"]>; signal: AbortSignal }) => {
+    explorer: { observe: async ({ phase, firewall, signal }: { phase: "unauthenticated" | "authenticated"; firewall: ReturnType<typeof import("../../../packages/security/src/security.ts")["createDiscoveryFirewall"]>; signal: AbortSignal }) => {
       assert.deepEqual(firewall.decide({ method: "POST", url: `${websiteOrigin}/api/widgets`, kind: "subresource" }), { allow: false, code: "MUTATION_BLOCKED" });
       return observe(phase, signal);
     } },
@@ -368,7 +368,7 @@ test("website worker checkpoints public evidence and resumes the exact suspended
   const phases: string[] = [];
   const adapter = createWebsiteAnalysisAdapter(websiteConfiguration(events, async (phase) => {
     phases.push(phase);
-    return phase === "public"
+    return phase === "unauthenticated"
       ? { observations: { ...websiteObservations(), network: [] }, requiresAuthentication: true }
       : { observations: {
         ...websiteObservations(),
@@ -391,7 +391,7 @@ test("website worker checkpoints public evidence and resumes the exact suspended
   });
   assert.equal(waiting.suspensionEvidence?.ownershipDecisionDigest,
     createHash("sha256").update(ownershipDecision, "utf8").digest("hex"));
-  assert.deepEqual(phases, ["public"]);
+  assert.deepEqual(phases, ["unauthenticated"]);
   assert.deepEqual(events, []);
 
   const resumedSource = {
@@ -409,7 +409,7 @@ test("website worker checkpoints public evidence and resumes the exact suspended
   } as const;
   const completed = await adapter(resumedSource, new AbortController().signal);
   assert.equal(completed.capabilities[0]?.plan.authentication.mode, "same_origin_cookie");
-  assert.deepEqual(phases, ["public", "authenticated"]);
+  assert.deepEqual(phases, ["unauthenticated", "authenticated"]);
   assert.deepEqual(events, [], "successful cleanup must wait until the result checkpoint is durable");
   assert.ok(adapter.finalizeAuthenticationCheckpoint);
   await adapter.finalizeAuthenticationCheckpoint(resumedSource, new AbortController().signal);
@@ -432,7 +432,7 @@ test("website authentication resume reconciles every failed external boundary wi
       observations: phase === "authenticated"
         ? { ...websiteObservations(), authSignals: [] }
         : { ...websiteObservations(), network: [] },
-      requiresAuthentication: phase === "public",
+      requiresAuthentication: phase === "unauthenticated",
     }));
     const adapter = createWebsiteAnalysisAdapter(configuration);
     const waiting = await adapter({
@@ -467,7 +467,7 @@ test("website authentication resume reconciles every failed external boundary wi
 
   const events: string[] = [];
   const credentialConfiguration = websiteConfiguration(events, async (phase) => ({
-    observations: websiteObservations(), requiresAuthentication: phase === "public",
+    observations: websiteObservations(), requiresAuthentication: phase === "unauthenticated",
   }));
   const credentialAdapter = createWebsiteAnalysisAdapter(credentialConfiguration);
   const waiting = await credentialAdapter({
@@ -527,8 +527,8 @@ test("website authentication resume rejects stale or non-exact semantic signals"
 
   for (const [index, unsafeSignal] of unsafeSignals.entries()) {
     const configuration = websiteConfiguration([], async (phase) => ({
-      observations: phase === "public" ? { ...websiteObservations(), network: [] } : websiteObservations(),
-      requiresAuthentication: phase === "public",
+      observations: phase === "unauthenticated" ? { ...websiteObservations(), network: [] } : websiteObservations(),
+      requiresAuthentication: phase === "unauthenticated",
     }));
     const adapter = createWebsiteAnalysisAdapter(configuration);
     const runId = `run-unsafe-auth-${index}`;
@@ -560,8 +560,8 @@ test("website authentication resume rejects stale or non-exact semantic signals"
 
 test("website authentication resume rejects a fresh CDP reference that is not the suspended checkpoint session", async () => {
   const configuration = websiteConfiguration([], async (phase) => ({
-    observations: phase === "public" ? { ...websiteObservations(), network: [] } : websiteObservations(),
-    requiresAuthentication: phase === "public",
+    observations: phase === "unauthenticated" ? { ...websiteObservations(), network: [] } : websiteObservations(),
+    requiresAuthentication: phase === "unauthenticated",
   }));
   const adapter = createWebsiteAnalysisAdapter(configuration);
   const waiting = await adapter({
@@ -594,8 +594,8 @@ test("website authentication expiry is enforced after every external resume boun
   for (const boundary of ["status", "resume", "evidence", "observe"] as const) {
     let current = websiteNow;
     const configuration = websiteConfiguration([], async (phase) => ({
-      observations: phase === "public" ? { ...websiteObservations(), network: [] } : websiteObservations(),
-      requiresAuthentication: phase === "public",
+      observations: phase === "unauthenticated" ? { ...websiteObservations(), network: [] } : websiteObservations(),
+      requiresAuthentication: phase === "unauthenticated",
     }));
     configuration.clock = () => current;
     const adapter = createWebsiteAnalysisAdapter(configuration);
