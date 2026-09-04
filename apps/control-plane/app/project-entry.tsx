@@ -962,11 +962,12 @@ export function ProjectEntry({ authState }: Readonly<{ authState?: "verified" | 
       {nextProjectsCursor && <button type="button" disabled={busy} onClick={loadMoreProjects}>Load more projects</button>}
     </section>}
     <form onSubmit={createProject}>
-      <label>Source type <select value={sourceType} onChange={(event) => selectSource(event.target.value as SourceType)}>
+      <label htmlFor="source-type">Source type</label>
+      <select id="source-type" value={sourceType} onChange={(event) => selectSource(event.target.value as SourceType)}>
         <option value="website">Website URL</option>
         <option value="openapi">OpenAPI URL</option>
         <option value="github">GitHub repository</option>
-      </select></label>
+      </select>
       <p id="source-guidance">Choose a public source you are authorized to inspect. Browser recovery is only an aid; reopening a project reloads its source configuration from the server.</p>
       <label>{sourceType === "openapi" ? "OpenAPI source URL" : sourceType === "github" ? "GitHub repository URL" : "Website URL"} <input type="url" value={url} onChange={(event) => { setUrl(event.target.value); resetWorkflow(); }} required /></label>
       {sourceType === "openapi" && <fieldset aria-describedby="openapi-guidance">

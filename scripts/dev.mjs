@@ -6,6 +6,10 @@ const children = [
     ...process.env,
     PAGE2WEBMCP_SESSION_SECRET: process.env.PAGE2WEBMCP_SESSION_SECRET
       ?? "page2webmcp-local-dev-session-secret-2026",
+    PAGE2WEBMCP_PROVIDER_MODE: process.env.PAGE2WEBMCP_PROVIDER_MODE ?? "local",
+    PAGE2WEBMCP_TEST_MODE: "true",
+    PAGE2WEBMCP_ALLOW_EPHEMERAL_STORAGE: "true",
+    PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN: "http://127.0.0.1:3100",
     PAGE2WEBMCP_STORAGE_MODE: process.env.PAGE2WEBMCP_STORAGE_MODE ?? "memory"
   })
 ];

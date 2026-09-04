@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { createClient, StorageApiError } from "@supabase/supabase-js";
+import { localFixtureRuntimeEnabled } from "./local-runtime.ts";
 
 const RELEASE_BUCKET = "page2webmcp-releases";
 const MAX_CANDIDATE_BYTES = 65_536;
@@ -9,6 +10,7 @@ const HOSTED_SUPABASE_URL = "https://bimqgiedckdurqiywctl.supabase.co";
 const HOSTED_PUBLIC_ORIGIN = `${HOSTED_SUPABASE_URL}/storage/v1/object/public/${RELEASE_BUCKET}`;
 const LOCAL_SUPABASE_URL = "http://127.0.0.1:58321";
 const LOCAL_PUBLIC_ORIGIN = `${LOCAL_SUPABASE_URL}/storage/v1/object/public/${RELEASE_BUCKET}`;
+const HERMETIC_CONTROL_PLANE_ORIGIN = "http://127.0.0.1:3100";
 const HASH = /^[0-9a-f]{64}$/;
 const SRI = /^sha384-[A-Za-z0-9+/]+={0,2}$/;
 
@@ -60,7 +62,37 @@ export function setReleaseArtifactStoreForTest(store: ReleaseArtifactStore | und
 }
 
 export function releaseArtifactStore(): ReleaseArtifactStore {
-  return testStore ?? createConfiguredReleaseArtifactStore(process.env);
+  if (testStore) return testStore;
+  if (localFixtureRuntimeEnabled()) return createHermeticReleaseArtifactStore(process.env);
+  return createConfiguredReleaseArtifactStore(process.env);
+}
+
+/**
+ * In the explicit hermetic demo, the repository is the byte store and the
+ * normal immutable release route serves those persisted bytes. This keeps the
+ * demo runnable without Docker while never changing the hosted/local-live
+ * Storage contract.
+ */
+export function createHermeticReleaseArtifactStore(
+  environment: RuntimeEnvironment = process.env,
+): ReleaseArtifactStore {
+  const origin = environment.PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN ?? HERMETIC_CONTROL_PLANE_ORIGIN;
+  if (origin !== HERMETIC_CONTROL_PLANE_ORIGIN) throw stableError("RELEASE_ARTIFACT_CONFIGURATION_REQUIRED");
+  return {
+    async publish(input, signal) {
+      if (!(signal instanceof AbortSignal)) throw stableError("RELEASE_ARTIFACT_INPUT_INVALID");
+      if (signal.aborted) throw stableError("RELEASE_ARTIFACT_ABORTED");
+      const candidate = validateCandidate(input);
+      const artifactUrl = `${origin}/api/releases/${candidate.contentHash}.js`;
+      return {
+        artifactUrl,
+        downloadUrl: `${artifactUrl}?download=page2webmcp-${candidate.contentHash}.js`,
+        contentHash: candidate.contentHash,
+        integrity: candidate.integrity,
+        localOnly: true,
+      };
+    },
+  };
 }
 
 export type ReleaseArtifactStoreDependencies = Readonly<{

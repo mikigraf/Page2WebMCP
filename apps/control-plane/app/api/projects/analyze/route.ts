@@ -6,6 +6,7 @@ import {
 } from "../../../../../../packages/database/src/control-plane.ts";
 import { getControlPlaneRepository } from "../../../../../../packages/database/src/factory.ts";
 import { processNextAnalysis } from "../../../../../worker/src/runner.ts";
+import { createLocalFixtureAnalysisAdapter } from "../../../../../worker/src/local-fixture.ts";
 import {
   ApiError,
   createRequestId,
@@ -19,6 +20,7 @@ import {
   websiteUserHandoffApiError,
 } from "../../../../src/website-user-handoff-api.ts";
 import { websiteUserHandoffPort } from "../../../../src/website-user-handoff.ts";
+import { localFixtureRuntimeEnabled } from "../../../../src/local-runtime.ts";
 
 const AnalyzeInputSchema = z.object({ projectId: z.string().uuid() }).strict();
 const IDEMPOTENCY_KEY = /^[a-zA-Z0-9._:-]{8,128}$/;
@@ -38,8 +40,9 @@ export async function POST(request: Request) {
       inputHash: createHash("sha256").update(JSON.stringify(input)).digest("hex"),
     };
     const project = await repository.getProject(actor, input.projectId);
+    const localFixture = localFixtureRuntimeEnabled();
     let run: AnalysisRunRecord | undefined;
-    if (project.sourceType === "website") {
+    if (project.sourceType === "website" && !localFixture) {
       run = await repository.getAnalysisReplay(actor, idempotency);
       if (!run) {
         const binding = await loadWebsiteUserHandoffBinding(repository, actor, project.id);
@@ -65,7 +68,9 @@ export async function POST(request: Request) {
       for (let processed = 0; processed < 256; processed += 1) {
         const target = await repository.getAnalysis(actor, run.id);
         if (target.status !== "queued") break;
-        if (!await processNextAnalysis(repository)) break;
+        if (!await processNextAnalysis(repository, localFixture
+          ? { analyze: createLocalFixtureAnalysisAdapter() }
+          : undefined)) break;
       }
     }
     const current = await repository.getAnalysis(actor, run.id);

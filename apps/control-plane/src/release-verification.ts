@@ -14,6 +14,7 @@ import {
   type NodePinnedJsonTransport,
 } from "../../worker/src/node-network.ts";
 import { configuredDeploymentIdentity } from "./deployment-identity.ts";
+import { localFixtureRuntimeEnabled } from "./local-runtime.ts";
 import {
   buildLiveVerifierRequest,
   verifyLiveVerifierResponse,
@@ -216,9 +217,56 @@ export function setReleaseVerificationPortForTest(port: ReleaseVerificationPort 
 
 export function releaseVerificationPort(): ReleaseVerificationPort {
   if (testPort) return testPort;
+  if (localFixtureRuntimeEnabled()) return hermeticDemoVerificationPort();
   const mode = process.env.PAGE2WEBMCP_LOCAL_STACK === "true"
     && process.env.PAGE2WEBMCP_LOCAL_RELEASE_VERIFIER_ORIGIN !== undefined ? "local_live" : "live";
   return configuredReleaseVerificationPort(process.env, { mode });
+}
+
+function hermeticDemoVerificationPort(): ReleaseVerificationPort {
+  return {
+    mode: "hermetic",
+    verifyCandidate: async (input) => ({
+      observedContentHash: input.contentHash,
+      observedIntegrity: input.integrity,
+      observedReleaseId: input.manifest.releaseId,
+      observedTargetOrigin: input.targetOrigin,
+      registeredTools: [...input.expectedTools],
+      trustedLoader: { enforcedBeforeEvaluation: true, evaluatedContentHash: input.contentHash },
+      controlPlaneRequestsDuringExecution: 0,
+      modelRequestsDuringExecution: 0,
+      checks: REQUIRED_CANDIDATE_CHECKS.map((name) => ({ name, status: "passed" as const })),
+      csp: { hosted: "allowed" as const },
+    }),
+    verifyInstalled: async (input) => ({
+      observedArtifactUrl: input.artifactUrl,
+      observedDownloadUrl: input.downloadUrl,
+      observedLocalOnly: input.localOnly,
+      observedIntegrity: input.integrity,
+      executedArtifactUrl: input.selfHostedUrl ?? input.artifactUrl,
+      servedContentHash: input.contentHash,
+      executedContentHash: input.contentHash,
+      observedTargetOrigin: input.targetOrigin,
+      registeredTools: [...input.expectedTools],
+      webMcpImplementation: "native" as const,
+      normalPageLoad: true,
+      routeInterception: false,
+      injectedRegistration: false,
+      syntheticHarness: false,
+      duplicateLoadHarmless: true,
+      executionEvidence: {
+        authenticatedRead: { toolName: "find_order", authenticated: true as const, succeeded: true as const },
+        confirmedReversibleMutation: {
+          toolName: "create_support_ticket", confirmation: "explicit" as const,
+          reversible: true as const, succeeded: true as const, effectCount: 1,
+        },
+        authoritativeFinalState: {
+          mutationToolName: "create_support_ticket", source: "target" as const, verified: true as const,
+        },
+      },
+      csp: { hosted: "allowed" as const },
+    }),
+  };
 }
 
 export async function attestReleaseCandidate(

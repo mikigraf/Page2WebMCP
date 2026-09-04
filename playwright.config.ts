@@ -46,7 +46,8 @@ export default defineConfig({
         PAGE2WEBMCP_OWNER_PASSWORD: ownerPassword,
         PAGE2WEBMCP_EDITOR_PASSWORD: editorPassword,
         PAGE2WEBMCP_CONTROL_PLANE_PUBLIC_ORIGIN: controlPlaneUrl,
-        PAGE2WEBMCP_STORAGE_MODE: "memory"
+        PAGE2WEBMCP_STORAGE_MODE: "memory",
+        PAGE2WEBMCP_PROVIDER_MODE: process.env.PAGE2WEBMCP_PROVIDER_MODE ?? "local"
       },
       url: controlPlaneUrl,
       reuseExistingServer: false,

@@ -1,4 +1,6 @@
 import { createBrowserClient, createServerClient } from "@supabase/ssr";
+import { createFixtureAuthService } from "./auth-fixture.ts";
+import { localFixtureRuntimeEnabled } from "./local-runtime.ts";
 import { unsafeSupabaseBrowserKey } from "./supabase-config.ts";
 
 export type AuthIdentity = Readonly<{
@@ -360,9 +362,16 @@ export function createPublicSupabaseBrowserClient(
 
 let testAuthService: AuthService | undefined;
 let configuredAuthService: AuthService | undefined;
+let localFixtureAuthService: AuthService | undefined;
 
 export function getAuthService(): AuthService {
   if (testAuthService) return testAuthService;
+  if (localFixtureRuntimeEnabled()) {
+    localFixtureAuthService ??= createFixtureAuthService({
+      password: process.env.PAGE2WEBMCP_OWNER_PASSWORD ?? "fixture-password"
+    });
+    return localFixtureAuthService;
+  }
   configuredAuthService ??= createConfiguredSupabaseAuthService();
   return configuredAuthService;
 }
@@ -371,6 +380,7 @@ export function setAuthServiceForTest(service: AuthService | undefined): void {
   if (process.env.NODE_ENV === "production") throw new Error("TEST_AUTH_OVERRIDE_FORBIDDEN");
   testAuthService = service;
   configuredAuthService = undefined;
+  localFixtureAuthService = undefined;
 }
 
 export function serializeSupabaseCookie(

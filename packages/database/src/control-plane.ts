@@ -3862,6 +3862,8 @@ const HOSTED_RELEASE_ARTIFACT_PREFIX =
   "https://bimqgiedckdurqiywctl.supabase.co/storage/v1/object/public/page2webmcp-releases";
 const LOCAL_RELEASE_ARTIFACT_PREFIX =
   "http://127.0.0.1:58321/storage/v1/object/public/page2webmcp-releases";
+const HERMETIC_RELEASE_ARTIFACT_PREFIX =
+  "http://127.0.0.1:3100/api/releases";
 
 export function normalizeReleaseArtifactIdentity(
   input: Readonly<{ artifactUrl: string; downloadUrl: string; localOnly: boolean }>,
@@ -3872,7 +3874,11 @@ export function normalizeReleaseArtifactIdentity(
     || input.artifactUrl.length > 2_048 || input.downloadUrl.length > 2_048) {
     throw new RepositoryError("INVALID_STATE");
   }
-  const prefix = input.localOnly ? LOCAL_RELEASE_ARTIFACT_PREFIX : HOSTED_RELEASE_ARTIFACT_PREFIX;
+  const prefixes = input.localOnly
+    ? [LOCAL_RELEASE_ARTIFACT_PREFIX, HERMETIC_RELEASE_ARTIFACT_PREFIX]
+    : [HOSTED_RELEASE_ARTIFACT_PREFIX];
+  const prefix = prefixes.find((candidate) => input.artifactUrl === `${candidate}/${contentHash}.js`);
+  if (!prefix) throw new RepositoryError("INVALID_STATE");
   const artifactUrl = `${prefix}/${contentHash}.js`;
   const downloadUrl = `${artifactUrl}?download=page2webmcp-${contentHash}.js`;
   if (input.artifactUrl !== artifactUrl || input.downloadUrl !== downloadUrl) {

@@ -15,6 +15,7 @@ import {
   websiteUserHandoffApiError,
 } from "../../../../../src/website-user-handoff-api.ts";
 import { websiteUserHandoffPort } from "../../../../../src/website-user-handoff.ts";
+import { localFixtureRuntimeEnabled } from "../../../../../src/local-runtime.ts";
 
 const ProjectIdSchema = z.string().uuid();
 const MutationSchema = z.object({
@@ -31,7 +32,9 @@ export async function GET(request: Request, context: { params: Promise<{ project
     const actor = await requireActor(request, repository);
     const projectId = parsedProjectId((await context.params).projectId);
     const binding = await loadWebsiteUserHandoffBinding(repository, actor, projectId);
-    const ownership = publicOwnershipState(await websiteUserHandoffPort().ownershipStatus(binding, request.signal));
+    const ownership = publicOwnershipState(localFixtureRuntimeEnabled()
+      ? { state: "verified" as const, targetOrigin: binding.targetOrigin }
+      : await websiteUserHandoffPort().ownershipStatus(binding, request.signal));
     return successResponse({ ownership, canAnalyze: ownership.state === "verified" }, requestId);
   } catch (error) {
     return errorResponse(websiteUserHandoffApiError(error), requestId, request);
@@ -49,10 +52,11 @@ export async function POST(request: Request, context: { params: Promise<{ projec
     const idempotencyKey = request.headers.get("idempotency-key") ?? "";
     if (!IDEMPOTENCY_KEY.test(idempotencyKey)) throw new ApiError("IDEMPOTENCY_KEY_REQUIRED", 400);
     const binding = await loadWebsiteUserHandoffBinding(repository, actor, projectId);
-    const port = websiteUserHandoffPort();
-    const state = input.action === "challenge"
-      ? await port.issueOwnershipChallenge(binding, idempotencyKey, request.signal, input.method)
-      : await port.checkOwnership(binding, idempotencyKey, request.signal);
+    const state = localFixtureRuntimeEnabled()
+      ? { state: "verified" as const, targetOrigin: binding.targetOrigin }
+      : await (input.action === "challenge"
+        ? websiteUserHandoffPort().issueOwnershipChallenge(binding, idempotencyKey, request.signal, input.method)
+        : websiteUserHandoffPort().checkOwnership(binding, idempotencyKey, request.signal));
     const ownership = publicOwnershipState(state);
     return successResponse({ ownership, canAnalyze: ownership.state === "verified" }, requestId);
   } catch (error) {

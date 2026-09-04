@@ -3,7 +3,7 @@ import type { RepositoryActor } from "../../../packages/database/src/control-pla
 import type { AuthIdentity, AuthService } from "./auth.ts";
 
 type Credential = RepositoryActor & { email: string };
-type SessionOptions = { secret?: string; now?: Date; ttlSeconds?: number };
+type SessionOptions = { secret?: string; now?: Date; ttlSeconds?: number; password?: string };
 type Payload = { sid: string; sub: string; iat: number; exp: number };
 
 const SESSION_COOKIE = "page2webmcp_fixture_session";
@@ -74,9 +74,13 @@ function tokenFromRequest(request: Request): string | undefined {
     .find((part) => part.startsWith(prefix))?.slice(prefix.length);
 }
 
-export function authenticate(email: string, password: string): RepositoryActor | undefined {
+export function authenticate(
+  email: string,
+  password: string,
+  expectedPassword = "fixture-password",
+): RepositoryActor | undefined {
   const account = credentials[email.toLowerCase()];
-  if (!account || !constantTimeEqual(password, "fixture-password")) return undefined;
+  if (!account || !constantTimeEqual(password, expectedPassword)) return undefined;
   return { id: account.id, organizationId: account.organizationId, role: account.role };
 }
 
@@ -132,7 +136,7 @@ export function createFixtureAuthService(options: SessionOptions = {}): AuthServ
     async identity(request) { return identity(request); },
     async signUp() { return { emailVerificationRequired: true, cookies: [] }; },
     async signIn(request, email, password) {
-      const actor = authenticate(email, password);
+      const actor = authenticate(email, password, options.password ?? "fixture-password");
       if (!actor) return { cookies: [] };
       const token = issueSession(actor, options);
       const secure = new URL(request.url).protocol === "https:";
