@@ -74,7 +74,12 @@ export async function runTool(
           return { ok: true, output: result };
         }
       } catch (error) {
-        return { ok: false, error: String((error as { code?: string })?.code ?? "EXECUTION_FAILED") };
+        const failure = error as { code?: string; name?: string; message?: string };
+        return {
+          ok: false,
+          error: String(failure?.code ?? "EXECUTION_FAILED"),
+          detail: `name=${String(failure?.name ?? "")} message=${String(failure?.message ?? "")} code=${String(failure?.code ?? "")}`,
+        };
       }
     }, [toolName, toolInput, options.abortImmediately === true] as [
       string,
