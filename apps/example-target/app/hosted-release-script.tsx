@@ -11,6 +11,26 @@ export const LOCAL_ARTIFACT_PREFIX = `${LOCAL_SUPABASE_URL}/storage/v1/object/pu
 const CONTENT_HASH = /^[0-9a-f]{64}$/;
 const SHA384_SRI = /^sha384-[A-Za-z0-9+/]+={0,2}$/;
 const LOOPBACK_ORIGIN = /^http:\/\/127\.0\.0\.1:\d{2,5}$/;
+const EMBEDDED_TARGET_ORIGIN = "https://page2webmcp-example-target.vercel.app";
+const EMBEDDED_CONTENT_HASH = "6eadef4b0f64fb97f2df02b752460cb949801f383e92439e5ae9797899332a66";
+const EMBEDDED_INTEGRITY = "sha384-gncxe7XoWxzNNX3CjqFC6ruzzq3tEF1M6xy4BIdrLaeE+u+/iyWWb+dOOJktrdPV";
+
+/** The generated, content-addressed WebMCP layer shipped with this demo target. */
+export function parseEmbeddedLayerScript(
+  environment: Record<string, string | undefined>,
+): HostedReleaseScriptConfig | undefined {
+  if (environment.PAGE2WEBMCP_EXAMPLE_TARGET_EMBEDDED_LAYER !== "true"
+    || environment.PAGE2WEBMCP_EXAMPLE_TARGET_PUBLIC_ORIGIN !== EMBEDDED_TARGET_ORIGIN) {
+    return undefined;
+  }
+  return {
+    src: `/webmcp/page2webmcp-${EMBEDDED_CONTENT_HASH}.js`,
+    integrity: EMBEDDED_INTEGRITY,
+    contentHash: EMBEDDED_CONTENT_HASH,
+    targetOrigin: EMBEDDED_TARGET_ORIGIN,
+    localOnly: false,
+  };
+}
 
 export type HostedReleaseScriptConfig = Readonly<{
   src: string;
@@ -72,7 +92,17 @@ export function HostedReleaseScript() {
   try {
     config = parseHostedReleaseScript(process.env);
   } catch {
-    return <meta name="page2webmcp-status" content="release-unconfigured" />;
+    const embedded = parseEmbeddedLayerScript(process.env);
+    if (!embedded) return <meta name="page2webmcp-status" content="release-unconfigured" />;
+    return <script
+      async
+      type="module"
+      src={embedded.src}
+      integrity={embedded.integrity}
+      crossOrigin="anonymous"
+      data-page2webmcp-content-hash={embedded.contentHash}
+      data-page2webmcp-target-origin={embedded.targetOrigin}
+    />;
   }
   return <script
     async

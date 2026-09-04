@@ -14,6 +14,7 @@ export default defineConfig([
     "**/.next/**",
     "**/coverage/**",
     "**/node_modules/**",
+    "apps/example-target/public/webmcp/**",
     "supabase/.branches/**",
     "supabase/.temp/**"
   ])
