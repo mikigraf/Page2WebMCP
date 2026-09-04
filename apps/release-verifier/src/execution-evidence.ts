@@ -65,7 +65,7 @@ export async function collectExecutionEvidence(input: Readonly<{
   const cookieNames = input.config.targetSessionCookies.map((cookie) => cookie.name);
   const readStartedAt = Date.now();
   const read = await runTool(input.page, plan.read.toolName, plan.read.input, input.config.timeouts.toolMs);
-  if (!read.ok) return abort(`read_tool_failed detail=${read.error ?? ""}`);
+  if (!read.ok) return abort(`read_tool_failed detail=${read.detail ?? read.error ?? ""}`);
   await input.log.settle();
   if (!authenticatedRequestObserved(input, cookieNames, readStartedAt, Date.now())) return abort("read_not_authenticated");
 
@@ -78,7 +78,7 @@ export async function collectExecutionEvidence(input: Readonly<{
     input.config.timeouts.toolMs,
   );
   const mutationEndedAt = Date.now();
-  if (!mutation.ok) return abort(`mutation_tool_failed detail=${mutation.error ?? ""}`);
+  if (!mutation.ok) return abort(`mutation_tool_failed detail=${mutation.detail ?? mutation.error ?? ""}`);
   if (!mutation.dialogObserved) return abort("mutation_dialog_not_observed");
   const effects = mutatingRequestsWithin(input.log, input.targetOrigin, mutationStartedAt, mutationEndedAt);
   if (effects.length !== 1) return abort(`mutation_effect_count=${effects.length}`);
@@ -89,7 +89,7 @@ export async function collectExecutionEvidence(input: Readonly<{
     plan.finalState.input,
     input.config.timeouts.toolMs,
   );
-  if (!finalState.ok) return abort(`final_state_tool_failed detail=${finalState.error ?? ""}`);
+  if (!finalState.ok) return abort(`final_state_tool_failed detail=${finalState.detail ?? finalState.error ?? ""}`);
   if (!JSON.stringify(finalState.output ?? null).includes(marker)) return abort("final_state_marker_not_found");
 
   return Object.freeze({
