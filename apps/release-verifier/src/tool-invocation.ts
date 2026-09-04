@@ -20,7 +20,7 @@ import type { Page } from "@playwright/test";
  * there, and it is reported as unsupported rather than being reported as a cancellation.
  */
 
-export type ToolOutcome = Readonly<{ ok: boolean; output?: unknown; error?: string }>;
+export type ToolOutcome = Readonly<{ ok: boolean; output?: unknown; error?: string; detail?: string }>;
 
 /** Error reported when a cancellation was asked for on a surface that cannot express one. */
 export const CANCELLATION_UNSUPPORTED = "CANCELLATION_UNSUPPORTED";
@@ -54,7 +54,12 @@ export async function runTool(
         try {
           return { ok: true, output: await tool.execute(args, { signal: controller.signal }) };
         } catch (error) {
-          return { ok: false, error: String((error as { code?: string })?.code ?? "EXECUTION_FAILED") };
+          const failure = error as { code?: string; name?: string; message?: string };
+          return {
+            ok: false,
+            error: String(failure?.code ?? "EXECUTION_FAILED"),
+            detail: `name=${String(failure?.name ?? "")} message=${String(failure?.message ?? "")} code=${String(failure?.code ?? "")}`,
+          };
         }
       }
       if (typeof context.executeTool !== "function") return { ok: false, error: "TOOL_UNAVAILABLE" };
