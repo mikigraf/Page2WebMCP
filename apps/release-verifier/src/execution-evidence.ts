@@ -46,24 +46,28 @@ export async function collectExecutionEvidence(input: Readonly<{
   registeredTools: readonly string[];
 }>): Promise<InstalledExecutionEvidence | null> {
   const plan = input.config.executionPlan;
-  if (!plan || input.config.targetSessionCookies.length === 0) return null;
+  if (!plan) return abort("no_execution_plan");
+  if (input.config.targetSessionCookies.length === 0) return abort("no_target_session_cookies");
   const readPlan = input.plans.find((entry) => entry.tool.name === plan.read.toolName);
   const mutationPlan = input.plans.find((entry) => entry.tool.name === plan.mutation.toolName);
-  if (!readPlan || !mutationPlan
-    || !input.registeredTools.includes(plan.read.toolName)
-    || !input.registeredTools.includes(plan.mutation.toolName)
-    || readPlan.effects.kind !== "read" || !readPlan.annotations.readOnly
-    || !["same_origin_cookie", "browser_oauth"].includes(readPlan.authentication.mode)
-    || mutationPlan.effects.kind !== "mutation" || mutationPlan.annotations.readOnly
+  if (!readPlan) return abort(`read_plan_not_found tool=${plan.read.toolName}`);
+  if (!mutationPlan) return abort(`mutation_plan_not_found tool=${plan.mutation.toolName}`);
+  if (!input.registeredTools.includes(plan.read.toolName)) return abort(`read_tool_not_registered tool=${plan.read.toolName}`);
+  if (!input.registeredTools.includes(plan.mutation.toolName)) {
+    return abort(`mutation_tool_not_registered tool=${plan.mutation.toolName}`);
+  }
+  if (readPlan.effects.kind !== "read" || !readPlan.annotations.readOnly
+    || !["same_origin_cookie", "browser_oauth"].includes(readPlan.authentication.mode)) return abort("read_plan_shape");
+  if (mutationPlan.effects.kind !== "mutation" || mutationPlan.annotations.readOnly
     || !mutationPlan.effects.reversible || mutationPlan.effects.confirmation !== "always"
-    || mutationPlan.effects.sourceNativeConfirmation !== undefined) return null;
+    || mutationPlan.effects.sourceNativeConfirmation !== undefined) return abort("mutation_plan_shape");
 
   const cookieNames = input.config.targetSessionCookies.map((cookie) => cookie.name);
   const readStartedAt = Date.now();
   const read = await runTool(input.page, plan.read.toolName, plan.read.input, input.config.timeouts.toolMs);
-  if (!read.ok) return null;
+  if (!read.ok) return abort(`read_tool_failed detail=${read.error ?? ""}`);
   await input.log.settle();
-  if (!authenticatedRequestObserved(input, cookieNames, readStartedAt, Date.now())) return null;
+  if (!authenticatedRequestObserved(input, cookieNames, readStartedAt, Date.now())) return abort("read_not_authenticated");
 
   const marker = `p2wm-${randomUUID()}`;
   const mutationStartedAt = Date.now();
@@ -74,9 +78,10 @@ export async function collectExecutionEvidence(input: Readonly<{
     input.config.timeouts.toolMs,
   );
   const mutationEndedAt = Date.now();
-  if (!mutation.ok || !mutation.dialogObserved) return null;
+  if (!mutation.ok) return abort(`mutation_tool_failed detail=${mutation.error ?? ""}`);
+  if (!mutation.dialogObserved) return abort("mutation_dialog_not_observed");
   const effects = mutatingRequestsWithin(input.log, input.targetOrigin, mutationStartedAt, mutationEndedAt);
-  if (effects.length !== 1) return null;
+  if (effects.length !== 1) return abort(`mutation_effect_count=${effects.length}`);
 
   const finalState = await runTool(
     input.page,
@@ -84,7 +89,8 @@ export async function collectExecutionEvidence(input: Readonly<{
     plan.finalState.input,
     input.config.timeouts.toolMs,
   );
-  if (!finalState.ok || !JSON.stringify(finalState.output ?? null).includes(marker)) return null;
+  if (!finalState.ok) return abort(`final_state_tool_failed detail=${finalState.error ?? ""}`);
+  if (!JSON.stringify(finalState.output ?? null).includes(marker)) return abort("final_state_marker_not_found");
 
   return Object.freeze({
     authenticatedRead: Object.freeze({ toolName: plan.read.toolName, authenticated: true as const, succeeded: true as const }),
@@ -101,6 +107,16 @@ export async function collectExecutionEvidence(input: Readonly<{
       verified: true as const,
     }),
   });
+}
+
+/**
+ * Every early return above collapsed into one indistinguishable null, leaving a live refusal
+ * unattributable. This logs the specific step that stopped execution on the verifier itself,
+ * never sent to the control plane, mirroring probeDuplicateLoad's own diagnostic.
+ */
+function abort(reason: string): null {
+  console.error(JSON.stringify({ level: "error", event: "execution_evidence_aborted", reason }));
+  return null;
 }
 
 function authenticatedRequestObserved(
