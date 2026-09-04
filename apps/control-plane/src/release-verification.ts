@@ -298,8 +298,11 @@ export async function attestReleaseInstallation(
     throw installedInvalid(`registered_tools observed=${JSON.stringify(report.registeredTools)} expected=${JSON.stringify(input.expectedTools)}`);
   } else if (report.duplicateLoadHarmless !== true) {
     throw installedInvalid("duplicate_load_not_harmless");
-  } else if (!validInstalledExecutionEvidence(report.executionEvidence, input.manifest, input.expectedTools)) {
-    throw installedInvalid("execution_evidence");
+  } else {
+    const executionEvidenceRejection = installedExecutionEvidenceRejection(
+      report.executionEvidence, input.manifest, input.expectedTools,
+    );
+    if (executionEvidenceRejection) throw installedInvalid(`execution_evidence:${executionEvidenceRejection}`);
   }
   if (port.mode !== "hermetic" && report.webMcpImplementation !== "native") {
     throw new Error("WEBMCP_NATIVE_REQUIRED");
@@ -829,36 +832,50 @@ function normalizeInstalledReport(report: InstalledVerificationReport): Installe
   };
 }
 
-function validInstalledExecutionEvidence(
+/**
+ * Mirrors candidateInvalid/installedInvalid: one stable outer code
+ * (INSTALLED_VERIFICATION_INVALID, reason execution_evidence) left a live
+ * refusal of this specific evidence unattributable across its ~15 conditions.
+ * Each branch below names the one that refused it.
+ */
+function installedExecutionEvidenceRejection(
   value: unknown,
   manifest: unknown,
   expectedTools: readonly string[],
-): value is InstalledExecutionEvidence {
+): string | undefined {
   if (!plainRecordWithKeys(value, ["authenticatedRead", "authoritativeFinalState", "confirmedReversibleMutation"])) {
-    return false;
+    return "shape";
   }
   const read = value.authenticatedRead;
   const mutation = value.confirmedReversibleMutation;
   const finalState = value.authoritativeFinalState;
-  if (!plainRecordWithKeys(read, ["authenticated", "succeeded", "toolName"])
-    || !plainRecordWithKeys(mutation, ["confirmation", "effectCount", "reversible", "succeeded", "toolName"])
-    || !plainRecordWithKeys(finalState, ["mutationToolName", "source", "verified"])
-    || !validToolName(read.toolName) || !validToolName(mutation.toolName)
-    || finalState.mutationToolName !== mutation.toolName
-    || read.authenticated !== true || read.succeeded !== true
-    || mutation.confirmation !== "explicit" || mutation.reversible !== true || mutation.succeeded !== true
-    || mutation.effectCount !== 1
-    || finalState.source !== "target" || finalState.verified !== true
-    || read.toolName === mutation.toolName
-    || !expectedTools.includes(read.toolName) || !expectedTools.includes(mutation.toolName)) return false;
+  if (!plainRecordWithKeys(read, ["authenticated", "succeeded", "toolName"])) return "read_shape";
+  if (!plainRecordWithKeys(mutation, ["confirmation", "effectCount", "reversible", "succeeded", "toolName"])) {
+    return "mutation_shape";
+  }
+  if (!plainRecordWithKeys(finalState, ["mutationToolName", "source", "verified"])) return "final_state_shape";
+  if (!validToolName(read.toolName) || !validToolName(mutation.toolName)) return "tool_name";
+  if (read.toolName === mutation.toolName) return "tool_collision";
+  if (!expectedTools.includes(read.toolName) || !expectedTools.includes(mutation.toolName)) return "unexpected_tool";
+  if (read.authenticated !== true || read.succeeded !== true) return "read_failed";
+  if (mutation.confirmation !== "explicit") return "mutation_not_explicit";
+  if (mutation.reversible !== true) return "mutation_not_reversible";
+  if (mutation.succeeded !== true) return "mutation_not_succeeded";
+  if (mutation.effectCount !== 1) return `mutation_effect_count=${JSON.stringify(mutation.effectCount)}`;
+  if (finalState.mutationToolName !== mutation.toolName) return "final_state_tool_mismatch";
+  if (finalState.source !== "target") return `final_state_source=${JSON.stringify(finalState.source)}`;
+  if (finalState.verified !== true) return "final_state_not_verified";
   const plans = installedPlans(manifest);
-  if (!plans) return false;
+  if (!plans) return "manifest_missing";
   const readPlan = plans.find(({ tool }) => tool.name === read.toolName);
   const mutationPlan = plans.find(({ tool }) => tool.name === mutation.toolName);
-  return readPlan?.effects.kind === "read" && readPlan.annotations.readOnly
-    && ["same_origin_cookie", "browser_oauth"].includes(readPlan.authentication.mode)
-    && mutationPlan?.effects.kind === "mutation" && !mutationPlan.annotations.readOnly
-    && mutationPlan.effects.reversible && mutationPlan.effects.confirmation === "always";
+  if (readPlan?.effects.kind !== "read" || !readPlan.annotations.readOnly
+    || !["same_origin_cookie", "browser_oauth"].includes(readPlan.authentication.mode)) return "read_plan_mismatch";
+  if (mutationPlan?.effects.kind !== "mutation" || mutationPlan.annotations.readOnly
+    || !mutationPlan.effects.reversible || mutationPlan.effects.confirmation !== "always") {
+    return "mutation_plan_mismatch";
+  }
+  return undefined;
 }
 
 function installedPlans(manifest: unknown): readonly CapabilityPlan[] | undefined {
