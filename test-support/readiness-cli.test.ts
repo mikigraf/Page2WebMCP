@@ -7,6 +7,8 @@ import { promisify } from "node:util";
 import test from "node:test";
 import { buildDeploymentIdentity } from "../apps/control-plane/src/deployment-identity.ts";
 import {
+  operatorClockSkewCompensatedNow,
+  OPERATOR_CLOCK_SKEW_TOLERANCE_MS,
   parseReadinessMode,
   runReadinessCli,
   sourceMigrationLedgerCurrent,
@@ -532,4 +534,17 @@ test("live readiness reports the same deployment-identity and hosted Storage con
   }, dependencies([], true));
   assert.notEqual(local.output.code, "LIVE_CONTROLS_REQUIRED");
   assert.equal(local.output.missingKeys, undefined);
+});
+
+test("the operator clock-skew compensated now() is ahead of the raw clock by the documented tolerance", () => {
+  // An operator's own machine drifting a few tens of milliseconds behind true
+  // time is enough to trip the live verifier's zero-tolerance "response must
+  // not be from the future" check, since two Render-hosted services calling
+  // each other never see that drift. This asserts the compensation this CLI
+  // applies for its own handshake, not the verifier's own validation.
+  const before = Date.now();
+  const compensated = operatorClockSkewCompensatedNow().getTime();
+  const after = Date.now();
+  assert.ok(compensated >= before + OPERATOR_CLOCK_SKEW_TOLERANCE_MS);
+  assert.ok(compensated <= after + OPERATOR_CLOCK_SKEW_TOLERANCE_MS);
 });
